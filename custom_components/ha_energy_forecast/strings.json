@@ -3,41 +3,36 @@
   "config": {
     "step": {
       "user": {
-        "title": "Set up HA Energy Forecast",
-        "description": "Configure your energy and weather sources.",
+        "title": "HA Energy Forecast",
         "data": {
           "energy_sensor": "Grid import energy sensor",
           "outdoor_temp_sensor": "Outdoor temperature sensor (optional)",
-          "plz": "MeteoSwiss postal code (PLZ)",
-          "latitude": "Home latitude",
-          "longitude": "Home longitude"
+          "plz": "MeteoSwiss PLZ",
+          "latitude": "Latitude",
+          "longitude": "Longitude"
         }
       }
     },
     "error": {
-      "sensor_not_found": "Sensor not found in Home Assistant",
+      "sensor_not_found": "Sensor not found",
       "sensor_not_numeric": "Sensor state is not a number"
     },
     "abort": {
-      "already_configured": "Already configured for this sensor"
+      "already_configured": "Already configured"
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Reconfigure HA Energy Forecast",
+        "title": "HA Energy Forecast",
         "data": {
           "energy_sensor": "Grid import energy sensor",
           "outdoor_temp_sensor": "Outdoor temperature sensor (optional)",
-          "plz": "MeteoSwiss postal code (PLZ)",
-          "latitude": "Home latitude",
-          "longitude": "Home longitude"
+          "plz": "MeteoSwiss PLZ",
+          "latitude": "Latitude",
+          "longitude": "Longitude"
         }
       }
-    },
-    "error": {
-      "sensor_not_found": "Sensor not found in Home Assistant",
-      "sensor_not_numeric": "Sensor state is not a number"
     }
   }
 }

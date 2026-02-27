@@ -19,8 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pandas as pd
+
+
 
 from .const import (
     MAX_HOURLY_KWH,
@@ -165,12 +165,14 @@ class EnergyForecastModel:
 
     def train(
         self,
-        energy_df: pd.DataFrame,
-        weather_df: pd.DataFrame,
-        outdoor_df: pd.DataFrame | None,
+        energy_df: Any,
+        weather_df: Any,
+        outdoor_df: Any | None,
     ) -> None:
         """Train (or retrain) the model. Installs ML packages if needed."""
 
+        import pandas as pd  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
         ok, engine_name = ensure_ml_packages()
         if not ok:
             raise RuntimeError(
@@ -236,10 +238,12 @@ class EnergyForecastModel:
 
     def predict(
         self,
-        forecast_df: pd.DataFrame,
+        forecast_df: Any,
         live_temp: float | None,
-    ) -> pd.DataFrame:
+    ) -> Any:
         """Return 48-hour DataFrame with columns [timestamp, predicted_kwh]."""
+        import pandas as pd  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
         if self.model is None:
             raise RuntimeError("Model has not been trained yet")
 
@@ -303,10 +307,12 @@ class EnergyForecastModel:
 # ── Feature engineering ───────────────────────────────────────────────────────
 
 def _engineer_features(
-    df: pd.DataFrame,
-    weather_df: pd.DataFrame,
-    outdoor_df: pd.DataFrame | None,
-) -> pd.DataFrame:
+    df,  # pd.DataFrame
+    weather_df,  # pd.DataFrame
+    outdoor_df,  # pd.DataFrame | None
+) -> Any:
+    import pandas as pd  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
@@ -359,10 +365,11 @@ def _engineer_features(
 
 
 def _build_prediction_temp_df(
-    future_hours: pd.DatetimeIndex,
-    forecast_df: pd.DataFrame,
+    future_hours,  # pd.DatetimeIndex
+    forecast_df,   # pd.DataFrame
     live_temp: float,
-) -> pd.DataFrame:
+) -> Any:
+    import pandas as pd  # noqa: PLC0415
     fc_indexed = (
         forecast_df.set_index("timestamp")["temp_c"]
         .reindex(future_hours, method="nearest")
