@@ -1,0 +1,7 @@
+{
+  "name": "HA Energy Forecast",
+  "description": "Predicts gross household energy consumption using LightGBM and MeteoSwiss weather forecasts. Supports heat pump and EV households.",
+  "content_in_root": false,
+  "homeassistant": "2023.6.0",
+  "render_readme": true
+}

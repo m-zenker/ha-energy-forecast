@@ -1,0 +1,50 @@
+{
+  "title": "HA Energy Forecast",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up HA Energy Forecast",
+        "description": "Configure your energy and weather sources. Your historical grid import data will be used to train a local ML model.",
+        "data": {
+          "energy_sensor": "Grid import energy sensor",
+          "outdoor_temp_sensor": "Outdoor temperature sensor (optional)",
+          "plz": "MeteoSwiss postal code (PLZ)",
+          "latitude": "Home latitude",
+          "longitude": "Home longitude"
+        },
+        "data_description": {
+          "energy_sensor": "Cumulative kWh sensor from your Energy Dashboard (total_increasing)",
+          "outdoor_temp_sensor": "Improves near-term predictions. Leave blank to use forecast temperature only.",
+          "plz": "4-digit Swiss postal code, e.g. 8001 for Zürich",
+          "latitude": "Used as fallback if MeteoSwiss PLZ is unavailable",
+          "longitude": "Used as fallback if MeteoSwiss PLZ is unavailable"
+        }
+      }
+    },
+    "error": {
+      "sensor_not_found": "Sensor not found in Home Assistant",
+      "sensor_not_numeric": "Sensor state is not a number — check the entity ID"
+    },
+    "abort": {
+      "already_configured": "HA Energy Forecast is already configured for this sensor"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Reconfigure HA Energy Forecast",
+        "data": {
+          "energy_sensor": "Grid import energy sensor",
+          "outdoor_temp_sensor": "Outdoor temperature sensor (optional)",
+          "plz": "MeteoSwiss postal code (PLZ)",
+          "latitude": "Home latitude",
+          "longitude": "Home longitude"
+        }
+      }
+    },
+    "error": {
+      "sensor_not_found": "Sensor not found in Home Assistant",
+      "sensor_not_numeric": "Sensor state is not a number — check the entity ID"
+    }
+  }
+}
