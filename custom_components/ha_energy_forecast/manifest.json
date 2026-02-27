@@ -2,8 +2,8 @@
   "domain": "ha_energy_forecast",
   "name": "HA Energy Forecast",
   "version": "1.0.0",
-  "documentation": "https://github.com/YOUR_USERNAME/ha-energy-forecast",
-  "issue_tracker": "https://github.com/YOUR_USERNAME/ha-energy-forecast/issues",
+  "documentation": "https://github.com/m-zenker/ha-energy-forecast",
+  "issue_tracker": "https://github.com/m-zenker/ha-energy-forecast/issues",
   "codeowners": ["@YOUR_USERNAME"],
   "requirements": [
     "lightgbm>=4.0.0",
