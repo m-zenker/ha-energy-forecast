@@ -5,7 +5,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import DOMAIN, PLATFORMS
 from .coordinator import EnergyForecastCoordinator
@@ -17,23 +17,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up HA Energy Forecast from a config entry."""
     coordinator = EnergyForecastCoordinator(hass, entry)
 
-    # First refresh — may raise UpdateFailed if no model yet (that's OK,
-    # HA will retry; the integration stays loaded and trains in background)
+    # Attempt the first refresh but never let it block setup.
+    # UpdateFailed is expected when no model is trained yet — sensors will
+    # show unavailable and the coordinator will retry on schedule.
     try:
-        await coordinator.async_config_entry_first_refresh()
-    except ConfigEntryNotReady:
-        # Not enough history yet — still register, will retry on schedule
+        await coordinator.async_refresh()
+    except Exception as exc:  # noqa: BLE001
         _LOGGER.info(
-            "HA Energy Forecast: not enough history for initial prediction. "
-            "Will retry in %d minutes.",
-            coordinator.update_interval.seconds // 60,
+            "HA Energy Forecast: initial refresh did not complete (%s). "
+            "Sensors will be unavailable until the model is trained.",
+            exc,
         )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Re-run coordinator when options change (e.g. sensor entity updated)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     return True

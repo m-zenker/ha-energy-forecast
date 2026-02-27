@@ -10,6 +10,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -158,7 +159,7 @@ class EnergyForecastMAE(_EnergyForecastBase):
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:chart-bell-curve"
     _attr_name = "Forecast Model MAE"
-    _attr_entity_category = "diagnostic"  # type: ignore[assignment]
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,

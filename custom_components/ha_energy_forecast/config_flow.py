@@ -6,9 +6,9 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
-import homeassistant.helpers.config_validation as cv
 
 from .const import (
     DOMAIN,
@@ -39,7 +39,7 @@ def _base_schema(
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(
                     domain="sensor",
-                    device_class="energy",
+                    device_class=SensorDeviceClass.ENERGY,
                     multiple=False,
                 )
             ),
@@ -49,7 +49,7 @@ def _base_schema(
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(
                     domain="sensor",
-                    device_class="temperature",
+                    device_class=SensorDeviceClass.TEMPERATURE,
                     multiple=False,
                 )
             ),
