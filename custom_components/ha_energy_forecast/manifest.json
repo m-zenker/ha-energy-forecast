@@ -4,10 +4,8 @@
   "version": "1.0.0",
   "documentation": "https://github.com/m-zenker/ha-energy-forecast",
   "issue_tracker": "https://github.com/m-zenker/ha-energy-forecast/issues",
-  "codeowners": ["@YOUR_USERNAME"],
+  "codeowners": ["@m-zenker"],
   "requirements": [
-    "lightgbm>=4.0.0",
-    "scikit-learn>=1.3.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "requests>=2.31.0"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -10,9 +11,8 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -34,24 +34,28 @@ async def async_setup_entry(
     coordinator: EnergyForecastCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     entities: list[SensorEntity] = [
-        EnergyForecastSummary(coordinator, entry, "next_3h",   "Next 3h"),
-        EnergyForecastSummary(coordinator, entry, "today",     "Today"),
-        EnergyForecastSummary(coordinator, entry, "tomorrow",  "Tomorrow"),
+        EnergyForecastSummary(coordinator, entry, "next_3h", "Next 3h"),
+        EnergyForecastSummary(coordinator, entry, "today", "Today"),
+        EnergyForecastSummary(coordinator, entry, "tomorrow", "Tomorrow"),
         EnergyForecastMAE(coordinator, entry),
     ]
 
     for slot in BLOCK_SLOTS:
         h_start = int(slot[:2])
-        h_end   = int(slot[3:])
-        entities.append(EnergyForecastBlock(coordinator, entry, "today",    slot, h_start, h_end))
-        entities.append(EnergyForecastBlock(coordinator, entry, "tomorrow", slot, h_start, h_end))
+        h_end = int(slot[3:])
+        entities.append(
+            EnergyForecastBlock(coordinator, entry, "today", slot, h_start, h_end)
+        )
+        entities.append(
+            EnergyForecastBlock(coordinator, entry, "tomorrow", slot, h_start, h_end)
+        )
 
     async_add_entities(entities)
 
 
 # ── Shared base ───────────────────────────────────────────────────────────────
 
-class _EnergyForecastBase(CoordinatorEntity[EnergyForecastCoordinator]):
+class _EnergyForecastBase(CoordinatorEntity):
     """Base class shared by all HA Energy Forecast sensors."""
 
     _attr_attribution = ATTRIBUTION
@@ -66,17 +70,22 @@ class _EnergyForecastBase(CoordinatorEntity[EnergyForecastCoordinator]):
         super().__init__(coordinator)
         self._entry = entry
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{unique_suffix}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name="HA Energy Forecast",
-            manufacturer="HA Energy Forecast",
-            model=coordinator.ml_model.engine,
-            sw_version="1.0.0",
-        )
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "HA Energy Forecast",
+            "manufacturer": "HA Energy Forecast",
+            "model": coordinator.ml_model.engine,
+            "sw_version": "1.0.0",
+        }
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         model = self.coordinator.ml_model
+        live_temp = (
+            self.coordinator.data.get("live_temp")
+            if self.coordinator.data
+            else None
+        )
         return {
             "last_trained": (
                 model.last_trained.strftime("%Y-%m-%d %H:%M")
@@ -85,18 +94,18 @@ class _EnergyForecastBase(CoordinatorEntity[EnergyForecastCoordinator]):
             ),
             "model_engine": model.engine,
             "live_outdoor_temp": (
-                f"{self.coordinator.data['live_temp']:.1f} °C"
-                if self.coordinator.data and self.coordinator.data.get("live_temp") is not None
-                else "n/a"
+                f"{live_temp:.1f} °C" if live_temp is not None else "n/a"
             ),
         }
 
 
-# ── Summary sensors (next_3h / today / tomorrow) ──────────────────────────────
+# ── Summary sensors ───────────────────────────────────────────────────────────
 
 class EnergyForecastSummary(_EnergyForecastBase):
+    """Summary sensors: next_3h, today, tomorrow."""
+
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class  = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:lightning-bolt"
 
@@ -108,8 +117,7 @@ class EnergyForecastSummary(_EnergyForecastBase):
         label: str,
     ) -> None:
         super().__init__(coordinator, entry, key)
-        self._key   = key
-        self._label = label
+        self._key = key
         self._attr_name = f"Gross Forecast {label}"
 
     @property
@@ -122,8 +130,10 @@ class EnergyForecastSummary(_EnergyForecastBase):
 # ── 3-hour block sensors ──────────────────────────────────────────────────────
 
 class EnergyForecastBlock(_EnergyForecastBase):
+    """3-hour block sensors."""
+
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class  = SensorStateClass.MEASUREMENT
+    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:clock-time-three-outline"
 
@@ -131,17 +141,17 @@ class EnergyForecastBlock(_EnergyForecastBase):
         self,
         coordinator: EnergyForecastCoordinator,
         entry: ConfigEntry,
-        day_label: str,   # "today" | "tomorrow"
-        slot: str,         # "00_03", "03_06", ...
+        day_label: str,
+        slot: str,
         h_start: int,
         h_end: int,
     ) -> None:
         super().__init__(coordinator, entry, f"{day_label}_{slot}")
         self._day_label = day_label
-        self._slot      = slot
+        self._slot = slot
         self._attr_name = (
             f"Gross Forecast {day_label.capitalize()} "
-            f"{h_start:02d}:00–{h_end:02d}:00"
+            f"{h_start:02d}:00\u2013{h_end:02d}:00"
         )
 
     @property
@@ -152,9 +162,11 @@ class EnergyForecastBlock(_EnergyForecastBase):
         return self.coordinator.data.get(blocks_key, {}).get(self._slot)
 
 
-# ── MAE diagnostics sensor ────────────────────────────────────────────────────
+# ── MAE diagnostic sensor ─────────────────────────────────────────────────────
 
 class EnergyForecastMAE(_EnergyForecastBase):
+    """Diagnostic sensor showing model mean absolute error."""
+
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:chart-bell-curve"
@@ -173,16 +185,15 @@ class EnergyForecastMAE(_EnergyForecastBase):
         return self.coordinator.ml_model.last_mae
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self) -> dict[str, Any]:
         model = self.coordinator.ml_model
         base = super().extra_state_attributes
+        hours = model.hours_since_trained()
         return {
             **base,
             "feature_count": len(model.feature_cols),
             "features": ", ".join(model.feature_cols),
             "hours_since_trained": (
-                round(model.hours_since_trained(), 1)
-                if model.hours_since_trained() != float("inf")
-                else "never"
+                round(hours, 1) if hours != float("inf") else "never"
             ),
         }
