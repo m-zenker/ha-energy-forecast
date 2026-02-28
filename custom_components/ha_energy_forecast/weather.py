@@ -5,8 +5,6 @@ import logging
 from datetime import date
 from typing import Any
 
-import requests
-
 from .const import METEOSWISS_URL, OPENMETEO_FORECAST_URL, OPENMETEO_ARCHIVE_URL
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,6 +13,8 @@ _HEADERS = {"User-Agent": "HAEnergyForecast/1.0"}
 
 def fetch_forecast(plz: str, latitude: float, longitude: float) -> Any:
     """Return 48h+ hourly forecast DataFrame. MeteoSwiss → Open-Meteo fallback."""
+    import requests  # noqa: PLC0415
+
     try:
         resp = requests.get(METEOSWISS_URL, params={"plz": plz}, headers=_HEADERS, timeout=15)
         resp.raise_for_status()
@@ -38,10 +38,10 @@ def _parse_meteoswiss(data: dict) -> Any:
         vals = fc.get(key, [])
         return [v if v is not None else default for v in vals]
 
-    temps   = _safe("temperature",   10.0)
-    precip  = _safe("precipitation",  0.0)
-    sun     = _safe("sunshine",       0.0)
-    wind    = _safe("wind",           0.0)
+    temps  = _safe("temperature",   10.0)
+    precip = _safe("precipitation",  0.0)
+    sun    = _safe("sunshine",       0.0)
+    wind   = _safe("wind",           0.0)
 
     rows = []
     for i, ts in enumerate(timestamps):
@@ -62,6 +62,7 @@ def _parse_meteoswiss(data: dict) -> Any:
 
 def _fetch_openmeteo_forecast(latitude: float, longitude: float) -> Any:
     import pandas as pd  # noqa: PLC0415
+    import requests  # noqa: PLC0415
 
     resp = requests.get(
         OPENMETEO_FORECAST_URL,
@@ -90,6 +91,7 @@ def fetch_historical_weather(
 ) -> Any:
     """Historical hourly weather from Open-Meteo Archive (free, no key)."""
     import pandas as pd  # noqa: PLC0415
+    import requests  # noqa: PLC0415
 
     resp = requests.get(
         OPENMETEO_ARCHIVE_URL,

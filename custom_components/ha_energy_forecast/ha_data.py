@@ -1,12 +1,9 @@
-from typing import Any
-
 """Home Assistant data access — pulls energy and temperature history from HA recorder."""
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-
-import requests
+from typing import Any
 
 from .const import HISTORY_MONTHS, MAX_HOURLY_KWH
 
@@ -16,6 +13,7 @@ _LOGGER = logging.getLogger(__name__)
 def fetch_energy_history(ha_url: str, token: str, entity_id: str) -> Any:
     """Pull cumulative grid-import history and differentiate to hourly gross kWh."""
     import pandas as pd  # noqa: PLC0415
+    import requests  # noqa: PLC0415
 
     end   = datetime.now()
     start = end - timedelta(days=30 * HISTORY_MONTHS)
@@ -55,6 +53,7 @@ def _fetch_ha_history(
     start: datetime, end: datetime,
 ) -> Any:
     import pandas as pd  # noqa: PLC0415
+    import requests  # noqa: PLC0415
 
     url = (
         f"{ha_url}/api/history/period/{start.isoformat()}"
