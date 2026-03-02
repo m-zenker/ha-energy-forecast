@@ -1,7 +1,9 @@
 """Constants for HA Energy Forecast integration."""
 
+from homeassistant.const import Platform
+
 DOMAIN = "ha_energy_forecast"
-PLATFORMS = ["sensor"]
+PLATFORMS = [Platform.SENSOR]
 
 # ── Config entry keys ────────────────────────────────────────────────────────
 CONF_ENERGY_SENSOR = "energy_sensor"

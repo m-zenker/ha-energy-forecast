@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
-    SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
@@ -102,10 +101,14 @@ class _EnergyForecastBase(CoordinatorEntity):
 # ── Summary sensors ───────────────────────────────────────────────────────────
 
 class EnergyForecastSummary(_EnergyForecastBase):
-    """Summary sensors: next_3h, today, tomorrow."""
+    """Summary sensors: next_3h, today, tomorrow.
 
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    No state_class is set intentionally: these are forecasts, not live
+    energy measurements. Assigning SensorStateClass.MEASUREMENT would cause
+    HA to accumulate long-term statistics and surface these values in the
+    Energy dashboard as if they were real consumption.
+    """
+
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:lightning-bolt"
 
@@ -130,10 +133,8 @@ class EnergyForecastSummary(_EnergyForecastBase):
 # ── 3-hour block sensors ──────────────────────────────────────────────────────
 
 class EnergyForecastBlock(_EnergyForecastBase):
-    """3-hour block sensors."""
+    """3-hour block sensors — forecast, not live measurement."""
 
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "kWh"
     _attr_icon = "mdi:clock-time-three-outline"
 

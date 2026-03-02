@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -79,13 +78,13 @@ class EnergyForecastCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Retraining failed: %s", exc)
 
     def _retrain_sync(self) -> None:
-        """Synchronous retraining — runs in executor thread."""
+        """Synchronous retraining — runs in executor thread.
+
+        Uses HA's recorder API directly (no HTTP, no token required).
+        """
         import pandas as pd  # noqa: PLC0415 — lazy import, pandas may not be ready at module load
 
-        token  = self._get_ha_token()
-        ha_url = self._get_ha_url()
-
-        energy_df = ha_data.fetch_energy_history(ha_url, token, self._energy_sensor)
+        energy_df = ha_data.fetch_energy_history(self.hass, self._energy_sensor)
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             _LOGGER.warning(
@@ -111,7 +110,8 @@ class EnergyForecastCoordinator(DataUpdateCoordinator):
         if self._outdoor_sensor:
             try:
                 outdoor_df = ha_data.fetch_outdoor_temp_history(
-                    ha_url, token, self._outdoor_sensor,
+                    self.hass,
+                    self._outdoor_sensor,
                     energy_df["timestamp"].min().to_pydatetime(),
                     energy_df["timestamp"].max().to_pydatetime(),
                 )
@@ -167,13 +167,3 @@ class EnergyForecastCoordinator(DataUpdateCoordinator):
             "blocks_tomorrow": _blocks(tomorrow),
             "live_temp":       live_temp,
         }
-
-    def _get_ha_token(self) -> str:
-        return (
-            os.environ.get("SUPERVISOR_TOKEN")
-            or os.environ.get("HASSIO_TOKEN")
-            or ""
-        )
-
-    def _get_ha_url(self) -> str:
-        return "http://homeassistant:8123"

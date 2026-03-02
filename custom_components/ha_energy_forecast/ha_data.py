@@ -1,29 +1,36 @@
-"""Home Assistant data access — pulls energy and temperature history from HA recorder."""
+"""Home Assistant data access — pulls energy and temperature history from HA recorder.
+
+Uses the HA recorder's internal Python API so no HTTP calls, no token, and no
+hardcoded URL are needed. Works on all HA install types (HAOS, Container, Core).
+The functions here are synchronous and intended to be called from an executor
+thread via hass.async_add_executor_job().
+"""
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
 from typing import Any
 
+from homeassistant.core import HomeAssistant
+
 from .const import HISTORY_MONTHS, MAX_HOURLY_KWH
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def fetch_energy_history(ha_url: str, token: str, entity_id: str) -> Any:
+def fetch_energy_history(hass: HomeAssistant, entity_id: str) -> Any:
     """Pull cumulative grid-import history and differentiate to hourly gross kWh."""
     import pandas as pd  # noqa: PLC0415
-    import requests  # noqa: PLC0415
 
-    end   = datetime.now()
+    end = datetime.now()
     start = end - timedelta(days=30 * HISTORY_MONTHS)
-    raw   = _fetch_ha_history(ha_url, token, entity_id, start, end)
+    raw = _fetch_recorder_history(hass, entity_id, start, end)
 
     if raw.empty:
         raise ValueError(f"No history returned for {entity_id}")
 
     hourly = raw.set_index("timestamp")["value"].resample("1h").last().ffill()
-    diff   = hourly.diff().clip(lower=0).reset_index()
+    diff = hourly.diff().clip(lower=0).reset_index()
     diff.columns = ["timestamp", "gross_kwh"]
     diff = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].dropna()
 
@@ -32,13 +39,15 @@ def fetch_energy_history(ha_url: str, token: str, entity_id: str) -> Any:
 
 
 def fetch_outdoor_temp_history(
-    ha_url: str, token: str, entity_id: str,
-    start: datetime, end: datetime,
+    hass: HomeAssistant,
+    entity_id: str,
+    start: datetime,
+    end: datetime,
 ) -> Any:
     """Pull outdoor temperature history resampled to hourly means."""
     import pandas as pd  # noqa: PLC0415
 
-    raw = _fetch_ha_history(ha_url, token, entity_id, start, end)
+    raw = _fetch_recorder_history(hass, entity_id, start, end)
     if raw.empty:
         _LOGGER.warning("No outdoor temp history for %s", entity_id)
         return pd.DataFrame(columns=["timestamp", "outdoor_temp_live"])
@@ -48,43 +57,51 @@ def fetch_outdoor_temp_history(
     return hourly.dropna()
 
 
-def _fetch_ha_history(
-    ha_url: str, token: str, entity_id: str,
-    start: datetime, end: datetime,
+def _fetch_recorder_history(
+    hass: HomeAssistant,
+    entity_id: str,
+    start: datetime,
+    end: datetime,
 ) -> Any:
-    import pandas as pd  # noqa: PLC0415
-    import requests  # noqa: PLC0415
+    """Fetch state history directly from the HA recorder.
 
-    url = (
-        f"{ha_url}/api/history/period/{start.isoformat()}"
-        f"?filter_entity_id={entity_id}"
-        f"&end_time={end.isoformat()}"
-        f"&significant_changes_only=false"
-        f"&minimal_response=true"
+    No HTTP connection, no auth token, and no hardcoded URL required.
+    state_changes_during_period() is thread-safe and designed to be called
+    from executor threads.
+    """
+    import pandas as pd  # noqa: PLC0415
+    from homeassistant.components.recorder.history import (  # noqa: PLC0415
+        state_changes_during_period,
     )
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     try:
-        resp = requests.get(url, headers=headers, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        _LOGGER.error("HA history request failed for %s: %s", entity_id, exc)
+        states_by_entity = state_changes_during_period(
+            hass,
+            start,
+            end,
+            entity_id=entity_id,
+            no_attributes=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.error("Recorder history fetch failed for %s: %s", entity_id, exc)
         return pd.DataFrame(columns=["timestamp", "value"])
 
-    if not data or not data[0]:
+    states = states_by_entity.get(entity_id, [])
+    if not states:
+        _LOGGER.warning("Recorder returned no states for %s", entity_id)
         return pd.DataFrame(columns=["timestamp", "value"])
 
     rows = []
-    for state in data[0]:
+    for state in states:
         try:
-            val = float(state["state"])
-            ts  = pd.to_datetime(state["last_updated"]).tz_convert("Europe/Zurich")
-            rows.append({"timestamp": ts, "value": val})
-        except (ValueError, KeyError, TypeError):
+            val = float(state.state)
+            rows.append({"timestamp": state.last_updated, "value": val})
+        except (ValueError, TypeError):
             continue
 
     if not rows:
         return pd.DataFrame(columns=["timestamp", "value"])
 
-    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert("Europe/Zurich")
+    return df.sort_values("timestamp").reset_index(drop=True)

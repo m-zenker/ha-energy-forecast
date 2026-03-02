@@ -1,26 +1,17 @@
 """
 ML model — feature engineering, training, prediction and disk persistence.
 
-lightgbm and scikit-learn are installed lazily at first training time using
-HA's own package installer (pkg_util), which respects the HAOS constraints
-file and finds pre-built wheels correctly.
-
-All CPU-bound work is designed to be called via hass.async_add_executor_job()
-so it never blocks the HA event loop.
+lightgbm and scikit-learn are declared in manifest.json so HA installs them
+automatically before the integration loads. All CPU-bound work is called via
+hass.async_add_executor_job() so it never blocks the HA event loop.
 """
 from __future__ import annotations
 
-import importlib
 import logging
 import pickle
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-
-
 
 from .const import (
     MAX_HOURLY_KWH,
@@ -30,12 +21,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# ── Package specs ─────────────────────────────────────────────────────────────
-_SKLEARN_PKG = "scikit-learn"
-_SKLEARN_MIN = "1.3.0"
-_LGBM_PKG    = "lightgbm"
-_LGBM_MIN    = "4.0.0"
-
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
     "hour", "hour_block", "day_of_week", "month", "is_weekend", "season",
@@ -44,51 +29,6 @@ _FEATURES_BASE = [
     "heating_degree", "cooling_degree",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
-
-
-def _install_package(package: str, min_version: str) -> bool:
-    """
-    Install a package using pip if not already present.
-    Uses --no-cache-dir and --prefer-binary to maximise chance of finding
-    a pre-built wheel in the HAOS environment.
-    Returns True on success.
-    """
-    try:
-        # Check if already installed
-        dist = importlib.metadata.version(package)
-        from packaging.version import Version
-        if Version(dist) >= Version(min_version):
-            _LOGGER.debug("%s %s already installed", package, dist)
-            return True
-    except importlib.metadata.PackageNotFoundError:
-        pass
-    except Exception:  # noqa: BLE001
-        pass
-
-    _LOGGER.info("Installing %s>=%s ...", package, min_version)
-    try:
-        result = subprocess.run(  # noqa: S603
-            [
-                sys.executable, "-m", "pip", "install",
-                f"{package}>={min_version}",
-                "--prefer-binary",
-                "--no-cache-dir",
-                "--quiet",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            _LOGGER.info("Successfully installed %s", package)
-            return True
-        _LOGGER.error(
-            "Failed to install %s: %s", package, result.stderr[-500:]
-        )
-        return False
-    except Exception as exc:  # noqa: BLE001
-        _LOGGER.error("Exception installing %s: %s", package, exc)
-        return False
 
 
 def _try_import_lgbm() -> Any | None:
@@ -119,26 +59,23 @@ def _try_import_mae() -> Any | None:
 
 
 def ensure_ml_packages() -> tuple[bool, str]:
-    """
-    Ensure scikit-learn and (optionally) lightgbm are available.
-    Called from the executor thread before training.
+    """Verify that the required ML packages are importable.
+
+    Both lightgbm and scikit-learn are declared in manifest.json, so HA
+    installs them before the integration loads. This function confirms they
+    are available and selects the preferred engine.
 
     Returns (success, engine_name).
     """
-    # Try lightgbm first
     lgb = _try_import_lgbm()
-    if lgb is None:
-        if _install_package(_LGBM_PKG, _LGBM_MIN):
-            lgb = _try_import_lgbm()
-
-    # sklearn is the hard requirement
     gbr = _try_import_sklearn_gbr()
+
     if gbr is None:
-        if not _install_package(_SKLEARN_PKG, _SKLEARN_MIN):
-            return False, "none"
-        gbr = _try_import_sklearn_gbr()
-        if gbr is None:
-            return False, "none"
+        _LOGGER.error(
+            "scikit-learn is not importable. Ensure it is listed in manifest.json "
+            "requirements and that HA has restarted after installation."
+        )
+        return False, "none"
 
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
     return True, engine
@@ -169,18 +106,19 @@ class EnergyForecastModel:
         weather_df: Any,
         outdoor_df: Any | None,
     ) -> None:
-        """Train (or retrain) the model. Installs ML packages if needed."""
-
+        """Train (or retrain) the model."""
         import pandas as pd  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
+
         ok, engine_name = ensure_ml_packages()
         if not ok:
             raise RuntimeError(
-                "Could not install scikit-learn. Check HA logs for pip errors."
+                "scikit-learn is not available. Check that manifest.json "
+                "requirements are correct and HA has been restarted."
             )
 
-        lgb = _try_import_lgbm()
-        GBR = _try_import_sklearn_gbr()
+        lgb    = _try_import_lgbm()
+        GBR    = _try_import_sklearn_gbr()
         mae_fn = _try_import_mae()
 
         df = _engineer_features(energy_df, weather_df, outdoor_df)
@@ -244,6 +182,7 @@ class EnergyForecastModel:
         """Return 48-hour DataFrame with columns [timestamp, predicted_kwh]."""
         import pandas as pd  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
+
         if self.model is None:
             raise RuntimeError("Model has not been trained yet")
 
@@ -307,12 +246,13 @@ class EnergyForecastModel:
 # ── Feature engineering ───────────────────────────────────────────────────────
 
 def _engineer_features(
-    df,  # pd.DataFrame
+    df,          # pd.DataFrame
     weather_df,  # pd.DataFrame
     outdoor_df,  # pd.DataFrame | None
 ) -> Any:
     import pandas as pd  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
+
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
@@ -370,6 +310,7 @@ def _build_prediction_temp_df(
     live_temp: float,
 ) -> Any:
     import pandas as pd  # noqa: PLC0415
+
     fc_indexed = (
         forecast_df.set_index("timestamp")["temp_c"]
         .reindex(future_hours, method="nearest")
