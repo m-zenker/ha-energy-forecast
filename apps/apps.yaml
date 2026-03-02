@@ -1,0 +1,40 @@
+# HA Energy Forecast — AppDaemon configuration
+#
+# Add this block to your appdaemon/apps/apps.yaml file.
+# Replace the values below with your own entity IDs and location.
+#
+# ── Required ──────────────────────────────────────────────────────────────────
+#
+#   energy_sensor     The entity_id of your cumulative grid-import energy
+#                     sensor. Must be a kWh meter that counts upward over time
+#                     (i.e. total_increasing). Example: sensor.grid_import_kwh
+#
+#   plz               Your Swiss postal code for MeteoSwiss forecasts.
+#                     Open-Meteo is used automatically if MeteoSwiss fails.
+#
+#   latitude          Your home latitude  (decimal degrees)
+#   longitude         Your home longitude (decimal degrees)
+#
+# ── Optional ──────────────────────────────────────────────────────────────────
+#
+#   outdoor_temp_sensor   entity_id of an outdoor temperature sensor.
+#                         When provided, it is blended with the MeteoSwiss
+#                         forecast for the first 12 hours to improve accuracy.
+#
+#   timezone          Timezone for all forecasts. Default: Europe/Zurich
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+energy_forecast:
+  module: energy_forecast.energy_forecast
+  class: EnergyForecast
+
+  # ── Required ────────────────────────────────────────────────────────────────
+  energy_sensor: sensor.grid_import_kwh       # ← change this
+  plz: "8001"                                 # ← change this
+  latitude: 47.3769                           # ← change this
+  longitude: 8.5417                           # ← change this
+
+  # ── Optional ────────────────────────────────────────────────────────────────
+  # outdoor_temp_sensor: sensor.outdoor_temperature
+  # timezone: Europe/Zurich

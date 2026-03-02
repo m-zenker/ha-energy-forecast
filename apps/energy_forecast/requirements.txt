@@ -1,0 +1,14 @@
+# HA Energy Forecast — AppDaemon pip requirements
+# AppDaemon installs these into its own isolated environment on startup,
+# completely separate from Home Assistant's Python environment.
+# No constraints file, no architecture wheel problems.
+
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+scikit-learn>=1.3.0
+
+# lightgbm is optional — if it fails to install on your platform (e.g. armv7),
+# the app automatically falls back to scikit-learn's GradientBoostingRegressor.
+# Comment it out if you get build errors and don't have a C compiler available.
+lightgbm>=4.0.0

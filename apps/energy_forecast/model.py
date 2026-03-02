@@ -1,9 +1,9 @@
 """
 ML model — feature engineering, training, prediction and disk persistence.
 
-lightgbm and scikit-learn are declared in manifest.json so HA installs them
-automatically before the integration loads. All CPU-bound work is called via
-hass.async_add_executor_job() so it never blocks the HA event loop.
+lightgbm and scikit-learn are installed via AppDaemon's requirements.txt.
+All CPU-bound work is called from AppDaemon's thread pool via timer callbacks
+in energy_forecast.py — it never blocks the event loop.
 """
 from __future__ import annotations
 
