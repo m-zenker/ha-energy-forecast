@@ -55,6 +55,8 @@ class EnergyForecast(hass.Hass):
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
 
+        self._validate_config()
+
         model_dir = Path(__file__).parent / "models"
         self._ml_model = EnergyForecastModel(model_dir)
         self._lock = threading.Lock()
@@ -71,6 +73,30 @@ class EnergyForecast(hass.Hass):
             f"HA Energy Forecast ready. "
             f"EV threshold: {self._ev_threshold} kWh/h, "
             f"charger: {self._ev_charger_kw} kW"
+        )
+
+    # ── Config validation ─────────────────────────────────────────────────────
+
+    def _validate_config(self) -> None:
+        """Validate configuration values at startup; raises ValueError on bad input."""
+        if not (-90 <= self._lat <= 90):
+            raise ValueError(f"latitude must be between -90 and 90, got {self._lat}")
+        if not (-180 <= self._lon <= 180):
+            raise ValueError(f"longitude must be between -180 and 180, got {self._lon}")
+        if self._weight_halflife <= 0:
+            raise ValueError(
+                f"weight_halflife_days must be positive, got {self._weight_halflife}"
+            )
+        if self._ev_threshold <= 0:
+            raise ValueError(
+                f"ev_charging_threshold_kwh must be positive, got {self._ev_threshold}"
+            )
+        if self._ev_charger_kw <= 0:
+            raise ValueError(f"ev_charger_kw must be positive, got {self._ev_charger_kw}")
+        self.log(
+            f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
+            f"weight_halflife={self._weight_halflife}d, "
+            f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW"
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -127,7 +153,12 @@ class EnergyForecast(hass.Hass):
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date)
             weather_df = _strip_tz(weather_df)
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Historical weather fetch failed: {exc}", level="WARNING")
+            self.log(
+                f"Historical weather fetch failed: {exc} — "
+                "temp_c, heating_degree, cooling_degree and temp_rolling_3d will be "
+                "imputed from training-set medians; forecast quality will be reduced.",
+                level="WARNING",
+            )
             weather_df = _empty_weather_df()
 
         self._ml_model.train(
