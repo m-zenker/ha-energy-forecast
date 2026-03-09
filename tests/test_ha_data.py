@@ -4,6 +4,7 @@ Covers:
   - _merge_energy_frames: winner selection, empty inputs, NaN dropping, ordering
   - fetch_energy_history: HA-only, cache-only, conflict resolution, error cases
   - fetch_recent_energy:  same merge contract as fetch_energy_history
+  - _check_dst_duplicates: DST fall-back duplicate detection, spring-forward gap
 
 _fetch_history is patched throughout so tests run without AppDaemon or a live
 Home Assistant instance.  Timestamps follow Europe/Zurich (UTC+1 in January,
@@ -11,13 +12,14 @@ UTC+2 in summer) — test data uses UTC inputs that map to predictable local hou
 """
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
 from energy_forecast import ha_data
-from energy_forecast.ha_data import _merge_energy_frames
+from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -279,3 +281,110 @@ class TestFetchRecentEnergy:
             ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert cache_path.exists()
+
+
+# ── _check_dst_duplicates ─────────────────────────────────────────────────────
+
+class TestCheckDstDuplicates:
+    """Fix 5.1 — DST fall-back produces duplicate naive timestamps.
+
+    Europe/Zurich falls back on the last Sunday of October: at 03:00 CEST the
+    clock jumps back to 02:00 CET.  After tz_localize(None) the naive timestamps
+    02:00 and 02:59 appear twice — once in summer time, once in winter time.
+
+    Spring-forward (last Sunday of March) creates a gap: 02:00–02:59 never
+    exist.  The resample/ffill in fetch functions fills this gap silently; this
+    is documented accepted behaviour and does NOT trigger a warning.
+    """
+
+    # ── fall-back (autumn DST): duplicate naive timestamps ────────────────────
+
+    def test_no_duplicates_no_warning(self, caplog):
+        """Clean data — no WARNING is emitted."""
+        df = make_energy_df(
+            ["2024-10-27 01:00", "2024-10-27 03:00", "2024-10-27 04:00"],
+            [1.0, 1.0, 1.0],
+        )
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        assert not any("DST" in r.message or "duplicate" in r.message.lower() for r in caplog.records)
+
+    def test_duplicate_timestamps_emits_warning(self, caplog):
+        """Duplicate naive 02:00 (fall-back) triggers a WARNING."""
+        # Both rows have the naive timestamp 02:00; one was CEST, one CET
+        df = make_energy_df(
+            ["2024-10-27 02:00", "2024-10-27 02:00", "2024-10-27 03:00"],
+            [1.0, 1.1, 1.0],
+        )
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        assert any("duplicate" in r.message.lower() or "DST" in r.message for r in caplog.records)
+
+    def test_duplicate_count_mentioned_in_warning(self, caplog):
+        """Warning message includes the count of duplicated timestamps."""
+        df = make_energy_df(
+            ["2024-10-27 02:00", "2024-10-27 02:00"],
+            [1.0, 1.1],
+        )
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_texts, "expected at least one WARNING"
+        assert any("1" in t for t in warning_texts), "expected duplicate count in message"
+
+    def test_empty_dataframe_no_warning(self, caplog):
+        """Empty DataFrame does not raise and emits no warning."""
+        df = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        assert not caplog.records
+
+    def test_single_row_no_warning(self, caplog):
+        """Single-row DataFrame cannot have duplicates."""
+        df = make_energy_df(["2024-10-27 02:00"], [1.0])
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        assert not caplog.records
+
+    # ── spring-forward (gap): accepted, no warning ────────────────────────────
+
+    def test_spring_forward_gap_no_warning(self, caplog):
+        """Spring-forward gap (02:00–02:59 missing) is accepted — no WARNING."""
+        # 2024 spring-forward: 31 March 02:00 CEST → 03:00; 02:xx never exist
+        df = make_energy_df(
+            ["2024-03-31 01:00", "2024-03-31 03:00", "2024-03-31 04:00"],
+            [1.0, 1.0, 1.0],
+        )
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            _check_dst_duplicates(df, _LOGGER)
+        assert not caplog.records
+
+    # ── integration: warning fires after fetch when fall-back data present ────
+
+    def test_fetch_energy_history_warns_on_dst_duplicates(self, mock_app, tmp_path, caplog):
+        """fetch_energy_history emits a DST WARNING when merged data has duplicates."""
+        cache_path = tmp_path / "energy_history.csv"
+
+        # Seed the cache with the first 02:00 occurrence (CEST naive)
+        make_energy_df(["2024-10-27 02:00"], [1.0]).to_csv(cache_path, index=False)
+
+        # HA returns the second 02:00 occurrence (CET naive) — different value
+        # We inject it via df_new directly by making HA raw return something that
+        # after diff/processing yields a row at naive 02:00 with value 1.1.
+        # Simplest: patch _merge_energy_frames to return a frame with duplicates,
+        # so we specifically test that fetch_energy_history calls _check_dst_duplicates.
+        dup_df = make_energy_df(
+            ["2024-10-27 01:00", "2024-10-27 02:00", "2024-10-27 02:00"],
+            [1.0, 1.0, 1.1],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            with patch.object(ha_data, "_merge_energy_frames", return_value=dup_df):
+                with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+                    ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert any("duplicate" in r.message.lower() or "DST" in r.message for r in caplog.records)
+
+
+# Module-level logger used directly in DST tests (mirrors ha_data's own logger)
+import logging as _logging
+_LOGGER = _logging.getLogger("energy_forecast.ha_data")
