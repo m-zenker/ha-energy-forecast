@@ -26,10 +26,16 @@ import logging
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from .const import (
+    HOLDOUT_FRACTION,
     MAX_HOURLY_KWH,
+    MIN_CV_ROWS,
+    MIN_TRAINING_ROWS,
     SENSOR_BLEND_HOURS,
     SENSOR_FULL_TRUST_HOURS,
 )
@@ -141,9 +147,9 @@ class EnergyForecastModel:
 
     def train(
         self,
-        energy_df: Any,          # naive timestamps, cols: timestamp, gross_kwh
-        weather_df: Any,         # naive timestamps
-        outdoor_df: Any | None,  # naive timestamps
+        energy_df: pd.DataFrame,          # naive timestamps, cols: timestamp, gross_kwh
+        weather_df: pd.DataFrame,         # naive timestamps
+        outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
     ) -> None:
         """Train/retrain the model on historical data."""
@@ -198,8 +204,8 @@ class EnergyForecastModel:
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
         df = df[df["gross_kwh"] > 0]
 
-        if len(df) < 100:
-            _LOGGER.warning("Only %d clean rows — skipping (need ≥100)", len(df))
+        if len(df) < MIN_TRAINING_ROWS:
+            _LOGGER.warning("Only %d clean rows — skipping (need ≥%d)", len(df), MIN_TRAINING_ROWS)
             return
 
         # ── Store medians for NaN-filling at predict time ───────────────────
@@ -219,7 +225,7 @@ class EnergyForecastModel:
 
         # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
         cv_mae = None
-        if mae_fn is not None and len(df) >= 500:
+        if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
                 tscv   = TimeSeriesSplit(n_splits=3)
@@ -246,7 +252,7 @@ class EnergyForecastModel:
         # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
         holdout_mae = None
         if mae_fn is not None:
-            split = max(int(len(X) * 0.9), len(X) - 500)
+            split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
                 holdout_mae = round(float(mae_fn(y[split:], model.predict(X.iloc[split:]))), 4)
             except (ValueError, IndexError):
@@ -269,10 +275,10 @@ class EnergyForecastModel:
 
     def predict(
         self,
-        forecast_df: Any,           # naive timestamps
+        forecast_df: pd.DataFrame,                    # naive timestamps
         live_temp: float | None,
-        recent_actuals: Any = None, # naive timestamps, cols: timestamp, gross_kwh
-    ) -> Any:
+        recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
+    ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
         import numpy as np
@@ -283,7 +289,7 @@ class EnergyForecastModel:
         # ── BUG FIX: generate NAIVE timestamps so they match the tz-stripped ──
         # forecast_df and training data throughout the pipeline.
         now_aware   = pd.Timestamp.now(tz="Europe/Zurich")
-        now_naive   = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
+        now_naive   = now_aware.tz_localize(None)  # already Europe/Zurich — strip only
         future_hours = pd.date_range(
             start=now_naive.floor("1h"), periods=48, freq="1h"
         )  # no tz kwarg → naive dtype
@@ -372,7 +378,7 @@ class EnergyForecastModel:
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
 
-def _add_lag_and_rolling_training(energy_df: Any, active_lags: list[int]) -> Any:
+def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int]) -> pd.DataFrame:
     """Compute lag and rolling features during training using shift().
 
     Only computes lags in active_lags — lags that would leave fewer than
@@ -398,7 +404,7 @@ def _add_lag_and_rolling_training(energy_df: Any, active_lags: list[int]) -> Any
     return df
 
 
-def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
+def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.DataFrame | None) -> pd.DataFrame:
     """Fill lag and rolling features for the 48-hour prediction horizon.
 
     For each future hour h:
@@ -429,9 +435,7 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
     for lag in LAG_HOURS:
         lag_td = pd.Timedelta(hours=lag)
         lag_times = future_df["timestamp"] - lag_td
-        future_df[f"lag_{lag}h"] = [
-            actuals.get(t, np.nan) for t in lag_times
-        ]
+        future_df[f"lag_{lag}h"] = actuals.reindex(lag_times).values
         nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
         if nan_count > len(future_df) * 0.5:
             _LOGGER.warning(
@@ -459,10 +463,10 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 def _engineer_features(
-    df,          # pd.DataFrame with naive timestamps
-    weather_df,  # pd.DataFrame with naive timestamps
-    outdoor_df,  # pd.DataFrame | None with naive timestamps
-) -> Any:
+    df: pd.DataFrame,                   # naive timestamps
+    weather_df: pd.DataFrame,           # naive timestamps
+    outdoor_df: pd.DataFrame | None,    # naive timestamps
+) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
 
@@ -530,7 +534,7 @@ def _engineer_features(
 
     return df
 
-def _add_holiday_feature(df: Any) -> Any:
+def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
     """Add binary is_public_holiday column using the `holidays` package.
 
     Falls back gracefully to 0 if the package is not installed.

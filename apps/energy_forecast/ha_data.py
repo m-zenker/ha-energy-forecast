@@ -10,15 +10,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import pandas as pd
     import hassapi as hass
+
+from .const import CACHE_PATH
 
 _LOGGER = logging.getLogger(__name__)
 
-CACHE_PATH = Path(__file__).parent / "energy_history.csv"
 MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
 
 
-def _merge_energy_frames(df_winner: Any, df_loser: Any) -> Any:
+def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
 
     Concatenates loser first so that keep="last" in drop_duplicates() always
@@ -35,15 +37,19 @@ def _merge_energy_frames(df_winner: Any, df_loser: Any) -> Any:
     )
 
 
-def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
+def fetch_energy_history(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path = CACHE_PATH,
+) -> pd.DataFrame:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
 
     # 1. Load existing cache if it exists
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-    if CACHE_PATH.exists():
+    if cache_path.exists():
         try:
-            df_cache = pd.read_csv(CACHE_PATH)
+            df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"])
             # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
             if ts.dt.tz is not None:
@@ -75,7 +81,7 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
 
     # 5. Save back to CSV
     try:
-        combined.to_csv(CACHE_PATH, index=False)
+        combined.to_csv(cache_path, index=False)
         app.log(f"Cache updated. Total history: {len(combined)} hours.")
     except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
@@ -83,7 +89,7 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
     return combined
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any:
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
     Fetches only the last `hours` of HA history (vs. 30 days in
@@ -98,9 +104,9 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
 
     # 1. Load existing cache — this is the bulk of our history
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-    if CACHE_PATH.exists():
+    if cache_path.exists():
         try:
-            df_cache = pd.read_csv(CACHE_PATH)
+            df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"])
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
@@ -130,14 +136,14 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
-        combined.to_csv(CACHE_PATH, index=False)
+        combined.to_csv(cache_path, index=False)
     except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined
 
 
-def split_ev_charging(df: Any, threshold_kwh: float) -> tuple[Any, Any]:
+def split_ev_charging(df: pd.DataFrame, threshold_kwh: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a history DataFrame into baseline and EV charging portions.
 
     Charging hours are identified by gross_kwh > threshold_kwh.  Your charger
@@ -169,7 +175,7 @@ def split_ev_charging(df: Any, threshold_kwh: float) -> tuple[Any, Any]:
     return df, ev_df
 
 
-def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> Any:
+def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:

@@ -25,7 +25,7 @@ from typing import Any
 import hassapi as hass
 
 from . import ha_data, weather
-from .const import EV_CHARGING_THRESHOLD_KWH
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH
 from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
@@ -54,6 +54,7 @@ class EnergyForecast(hass.Hass):
         # Fixed charger power in kW — subtracted from charging hours so the
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
+        self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
 
         self._validate_config()
 
@@ -129,7 +130,7 @@ class EnergyForecast(hass.Hass):
 
     def _retrain(self) -> None:
         self.log("Starting model retraining…")
-        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor)
+        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path)
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             self.log(f"Insufficient history ({len(energy_df)} h). Skipping.", level="WARNING")
@@ -190,7 +191,7 @@ class EnergyForecast(hass.Hass):
         # Uses the lightweight fetch (last 2 days only) to stay well within
         # AppDaemon's 10s callback limit. Full 30-day resync happens in _retrain().
         try:
-            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor)
+            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor, cache_path=self._cache_path)
             full_actuals = _strip_tz(full_actuals)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
