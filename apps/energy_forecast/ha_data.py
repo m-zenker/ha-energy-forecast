@@ -18,6 +18,23 @@ CACHE_PATH = Path(__file__).parent / "energy_history.csv"
 MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
 
 
+def _merge_energy_frames(df_winner: Any, df_loser: Any) -> Any:
+    """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
+
+    Concatenates loser first so that keep="last" in drop_duplicates() always
+    selects the winner's row.  Sorts by timestamp and drops rows with NaN in
+    either key column.
+    """
+    import pandas as pd
+    return (
+        pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp", "gross_kwh"])
+        .reset_index(drop=True)
+    )
+
+
 def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
@@ -53,9 +70,8 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
     else:
         df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
 
-    # 4. Merge and de-duplicate
-    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
-    combined = combined.sort_values("timestamp").dropna()
+    # 4. Merge — fresh HA data wins on timestamp conflicts
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
 
     # 5. Save back to CSV
     try:
@@ -110,9 +126,8 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
     else:
         df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
 
-    # 4. Merge new hours into cache and save
-    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
-    combined = combined.sort_values("timestamp").dropna()
+    # 4. Merge — fresh HA data wins on timestamp conflicts
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
         combined.to_csv(CACHE_PATH, index=False)
