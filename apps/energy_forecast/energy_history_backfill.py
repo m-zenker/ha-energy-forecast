@@ -94,13 +94,16 @@ class EnergyHistoryBackfill(hass.Hass):
             }
 
             if "start_ts" in cols:
-                ts_expr      = "s.start_ts"
-                where_clause = f"s.start_ts >= {cutoff_ts}"
+                ts_expr    = "s.start_ts"
+                where_col  = "s.start_ts"
+                cutoff_val: float | str = cutoff_ts
             else:
-                cutoff_str   = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%d %H:%M:%S")
-                ts_expr      = "strftime('%s', s.start)"
-                where_clause = f"s.start >= '{cutoff_str}'"
+                cutoff_val = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%d %H:%M:%S")
+                ts_expr    = "strftime('%s', s.start)"
+                where_col  = "s.start"
 
+            # where_col is a hardcoded column reference, not user input.
+            # cutoff_val is passed as a bound parameter to prevent injection.
             query = f"""
                 SELECT
                     {ts_expr}  AS epoch,
@@ -108,10 +111,10 @@ class EnergyHistoryBackfill(hass.Hass):
                 FROM statistics s
                 JOIN statistics_meta sm ON s.metadata_id = sm.id
                 WHERE sm.statistic_id = ?
-                  AND {where_clause}
+                  AND {where_col} >= ?
                 ORDER BY epoch
             """
-            rows = con.execute(query, (entity_id,)).fetchall()
+            rows = con.execute(query, (entity_id, cutoff_val)).fetchall()
         finally:
             con.close()
 
