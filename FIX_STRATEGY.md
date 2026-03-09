@@ -65,11 +65,15 @@ know forecast quality will be reduced.
 
 ## Milestone 3 — Observability
 
+**Next milestone to implement. Start here in the next session.**
+Branch: `fix/milestone-1-security` (continue on same branch).
+Suggested order: 3.3 → 3.1 → 3.2.
+
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
 | 3.1 | Replace broad `except Exception` with specific types (10+ sites) | all files | M | TODO |
-| 3.2 | Warn when lag features are NaN-filled | `model.py:392–397` | S | TODO |
-| 3.3 | Log active ML engine at startup | `model.py:91–98` | S | TODO |
+| 3.2 | Warn when lag features are NaN-filled | `model.py:428–432` | S | TODO |
+| 3.3 | Log active ML engine at startup | `model.py:112–119` | S | TODO |
 
 ### 3.1 — Specific exception types
 Each catch site needs the right type(s). Keep broad `except Exception` only at
@@ -83,14 +87,15 @@ the outermost AppDaemon callback boundary (`_retrain_cb`, `_update_cb`).
 | `weather.py` fetch | `requests.exceptions.RequestException`, `KeyError`, `ValueError` |
 
 ### 3.2 — NaN lag feature warning
-After building each lag column in `_add_lag_and_rolling_prediction()`, count NaN
-values and log WARNING if >50% are NaN:
+After building each lag column in `_add_lag_and_rolling_prediction()` (currently
+`model.py:428–432`), count NaN values and log WARNING if >50% are NaN:
 ```
 WARNING: lag_168h has 36/48 NaN values — recent_actuals doesn't reach back 168h
 ```
 
 ### 3.3 — ML engine startup log
-One line in `ensure_ml_packages()` after the engine name is determined:
+One line in `ensure_ml_packages()` (currently `model.py:112–119`) after the
+engine name is determined:
 ```python
 _LOGGER.info("ML engine: %s", engine)
 ```
@@ -101,18 +106,18 @@ _LOGGER.info("ML engine: %s", engine)
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
-| 4.1 | Extract magic numbers to constants | `model.py:179,227` → `const.py` | S | TODO |
+| 4.1 | Extract magic numbers to constants | `model.py:200,248` → `const.py` | S | TODO |
 | 4.2 | Make `CACHE_PATH` config-driven; deduplicate constant | `ha_data.py:17`, `energy_forecast.py:58` | M | TODO |
-| 4.3 | Replace `Any` with `pd.DataFrame` in type hints | `model.py:417–421`, `ha_data.py` | S | TODO |
-| 4.4 | Remove redundant `tz_convert` | `model.py:263–264` | S | TODO |
-| 4.5 | Vectorise lag lookups with `reindex` | `model.py:392–397` | S | TODO |
+| 4.3 | Replace `Any` with `pd.DataFrame` in type hints | `model.py:437–441`, `ha_data.py` | S | TODO |
+| 4.4 | Remove redundant `tz_convert` | `model.py:284–285` | S | TODO |
+| 4.5 | Vectorise lag lookups with `reindex` | `model.py:428–432` | S | TODO |
 
 ### 4.1 — Magic numbers
 Add to `const.py`:
 ```python
-MIN_TRAINING_ROWS = 100   # model.py:179
-HOLDOUT_FRACTION  = 0.9   # model.py:227
-MIN_CV_ROWS       = 500   # model.py:227
+MIN_TRAINING_ROWS = 100   # model.py:200
+HOLDOUT_FRACTION  = 0.9   # model.py:248
+MIN_CV_ROWS       = 500   # model.py:248
 ```
 
 ### 4.2 — Hardcoded paths
@@ -125,7 +130,7 @@ and `fetch_recent_energy()` with the current value as default. Pass from
 Use `TYPE_CHECKING` guard for pandas import and replace `Any` with `pd.DataFrame`
 on all public function parameters and return types across `model.py` and `ha_data.py`.
 
-### 4.4 — Redundant tz_convert (model.py:263–264)
+### 4.4 — Redundant tz_convert (model.py:284–285)
 ```python
 # Before
 now_naive = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
@@ -133,7 +138,7 @@ now_naive = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
 now_naive = now_aware.tz_localize(None)
 ```
 
-### 4.5 — Vectorise lag lookups (model.py:392–397)
+### 4.5 — Vectorise lag lookups (model.py:428–432)
 ```python
 # Before
 future_df[f"lag_{lag}h"] = [actuals.get(t, np.nan) for t in lag_times]
@@ -159,12 +164,14 @@ cases before merging.
 ## Sequencing
 
 ```
-M1: 1.1 → 1.2              (no deps — single PR)
-M2: 2.2 → 2.3 → 2.1        (write tests first, then merge logic)
-M3: 3.3 → 3.1 → 3.2        (trivial log, then exception audit)
-M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2   (single-liners first, path refactor last)
-M5: 5.1                     (requires test infra from M2)
+M1: 1.1 → 1.2              ✅ done
+M2: tests → 2.2 → 2.3 → 2.1  ✅ done
+M3: 3.3 → 3.1 → 3.2        ← NEXT
+M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2
+M5: 5.1                     (requires DST test cases first)
 ```
+
+All work is on branch `fix/milestone-1-security`. Tests: 18/18 passing.
 
 ## Additional Recommendation ✅ DONE
 
