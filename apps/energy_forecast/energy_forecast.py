@@ -152,7 +152,7 @@ class EnergyForecast(hass.Hass):
         try:
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date)
             weather_df = _strip_tz(weather_df)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, KeyError, ValueError) as exc:
             self.log(
                 f"Historical weather fetch failed: {exc} — "
                 "temp_c, heating_degree, cooling_degree and temp_rolling_3d will be "
@@ -195,7 +195,7 @@ class EnergyForecast(hass.Hass):
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
             recent_actuals, _ = ha_data.split_ev_charging(full_actuals, self._ev_threshold)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, ValueError, KeyError) as exc:
             self.log(f"Could not fetch recent actuals for lag features: {exc}", level="WARNING")
             recent_actuals = None
             full_actuals   = None
