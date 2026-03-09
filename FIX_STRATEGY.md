@@ -63,46 +63,44 @@ know forecast quality will be reduced.
 
 ---
 
-## Milestone 3 — Observability
-
-**Next milestone to implement. Start here in the next session.**
-Branch: `fix/milestone-1-security` (continue on same branch).
-Suggested order: 3.3 → 3.1 → 3.2.
+## Milestone 3 — Observability ✅ DONE
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
-| 3.1 | Replace broad `except Exception` with specific types (10+ sites) | all files | M | TODO |
-| 3.2 | Warn when lag features are NaN-filled | `model.py:428–432` | S | TODO |
-| 3.3 | Log active ML engine at startup | `model.py:112–119` | S | TODO |
-
-### 3.1 — Specific exception types
-Each catch site needs the right type(s). Keep broad `except Exception` only at
-the outermost AppDaemon callback boundary (`_retrain_cb`, `_update_cb`).
-
-| Location | Specific exceptions |
-|----------|-------------------|
-| `ha_data.py` cache load/save | `OSError`, `pd.errors.ParserError` |
-| `model.py` CV/holdout | `ValueError`, `np.linalg.LinAlgError` |
-| `model.py` pickle load | `pickle.UnpicklingError`, `EOFError`, `OSError` |
-| `weather.py` fetch | `requests.exceptions.RequestException`, `KeyError`, `ValueError` |
-
-### 3.2 — NaN lag feature warning
-After building each lag column in `_add_lag_and_rolling_prediction()` (currently
-`model.py:428–432`), count NaN values and log WARNING if >50% are NaN:
-```
-WARNING: lag_168h has 36/48 NaN values — recent_actuals doesn't reach back 168h
-```
+| 3.1 | Replace broad `except Exception` with specific types (10+ sites) | all files | M | Done |
+| 3.2 | Warn when lag features are NaN-filled | `model.py` | S | Done |
+| 3.3 | Log active ML engine at startup | `model.py` | S | Done |
 
 ### 3.3 — ML engine startup log
-One line in `ensure_ml_packages()` (currently `model.py:112–119`) after the
-engine name is determined:
-```python
-_LOGGER.info("ML engine: %s", engine)
-```
+Added `_LOGGER.info("ML engine: %s", engine)` in `ensure_ml_packages()` after
+the engine name is determined.
+
+### 3.1 — Specific exception types
+Replaced all broad inner catches. Outermost callback boundary (`_retrain_cb`,
+`_update_cb`) retains `except Exception` as intended.
+
+| Location | Specific exceptions used |
+|----------|--------------------------|
+| `ha_data.py` cache load | `(OSError, pd.errors.ParserError)` |
+| `ha_data.py` cache save | `OSError` |
+| `model.py` CV MAE | `(ValueError, np.linalg.LinAlgError)` |
+| `model.py` holdout MAE | `(ValueError, IndexError)` |
+| `model.py` pickle load | `(pickle.UnpicklingError, EOFError, OSError)` |
+| `weather.py` fetches | `(requests.RequestException, KeyError, ValueError)` |
+| `energy_forecast.py` weather/actuals fetch | `(OSError, KeyError, ValueError)` — `requests.RequestException` is a subclass of `OSError` in Python 3 |
+
+### 3.2 — NaN lag feature warning
+After building each lag column in `_add_lag_and_rolling_prediction()`, logs
+WARNING if >50% of the 48 forecast hours are NaN, naming the lag and
+explaining the fallback to training medians.
 
 ---
 
 ## Milestone 4 — Code Quality
+
+**Next milestone to implement.**
+Branch: `fix/milestone-1-security` (continue on same branch).
+Suggested order: 4.4 → 4.1 → 4.3 → 4.5 → 4.2.
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
@@ -166,8 +164,8 @@ cases before merging.
 ```
 M1: 1.1 → 1.2              ✅ done
 M2: tests → 2.2 → 2.3 → 2.1  ✅ done
-M3: 3.3 → 3.1 → 3.2        ← NEXT
-M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2
+M3: 3.3 → 3.1 → 3.2        ✅ done
+M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2  ← NEXT
 M5: 5.1                     (requires DST test cases first)
 ```
 
