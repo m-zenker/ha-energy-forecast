@@ -21,6 +21,7 @@ Changes from original:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
 from datetime import datetime
@@ -62,6 +63,26 @@ _FEATURES_BASE = [
     "is_public_holiday",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
+
+
+def _write_hash(path: Path) -> None:
+    """Write a SHA-256 sidecar file next to *path*."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.with_suffix(path.suffix + ".sha256").write_text(digest)
+
+
+def _verify_hash(path: Path) -> bool:
+    """Return True if the SHA-256 sidecar matches *path*, or if no sidecar exists.
+
+    No sidecar means the file predates integrity checking — allowed to load so
+    existing installations are not broken on upgrade.
+    """
+    hash_path = path.with_suffix(path.suffix + ".sha256")
+    if not hash_path.exists():
+        return True
+    expected = hash_path.read_text().strip()
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    return actual == expected
 
 
 def _try_import_lgbm() -> Any | None:
@@ -300,6 +321,8 @@ class EnergyForecastModel:
     def _save(self) -> None:
         with open(self._model_path, "wb") as fh:
             pickle.dump(self.model, fh)
+        _write_hash(self._model_path)
+
         meta = {
             "feature_cols":     self.feature_cols,
             "last_trained":     self.last_trained,
@@ -310,27 +333,40 @@ class EnergyForecastModel:
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
+        _write_hash(self._meta_path)
 
     def _load(self) -> None:
         if self._model_path.exists():
-            try:
-                with open(self._model_path, "rb") as fh:
-                    self.model = pickle.load(fh)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Could not load saved model: %s", exc)
+            if not _verify_hash(self._model_path):
+                _LOGGER.warning(
+                    "Model file integrity check failed (%s) — discarding, will retrain.",
+                    self._model_path,
+                )
+            else:
+                try:
+                    with open(self._model_path, "rb") as fh:
+                        self.model = pickle.load(fh)
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning("Could not load saved model: %s", exc)
 
         if self._meta_path.exists():
-            try:
-                with open(self._meta_path, "rb") as fh:
-                    meta = pickle.load(fh)
-                self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
-                self.last_trained      = meta.get("last_trained",    datetime.min)
-                self.last_mae          = meta.get("last_mae")
-                self.last_cv_mae       = meta.get("last_cv_mae")
-                self.engine            = meta.get("engine",          "unknown")
-                self._feature_medians  = meta.get("feature_medians", {})
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Could not load model metadata: %s", exc)
+            if not _verify_hash(self._meta_path):
+                _LOGGER.warning(
+                    "Model metadata integrity check failed (%s) — discarding.",
+                    self._meta_path,
+                )
+            else:
+                try:
+                    with open(self._meta_path, "rb") as fh:
+                        meta = pickle.load(fh)
+                    self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
+                    self.last_trained      = meta.get("last_trained",    datetime.min)
+                    self.last_mae          = meta.get("last_mae")
+                    self.last_cv_mae       = meta.get("last_cv_mae")
+                    self.engine            = meta.get("engine",          "unknown")
+                    self._feature_medians  = meta.get("feature_medians", {})
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning("Could not load model metadata: %s", exc)
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
