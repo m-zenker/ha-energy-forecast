@@ -1,3 +1,8 @@
+---
+hello_world:
+  module: hello
+  class: HelloWorld
+
 # HA Energy Forecast — AppDaemon configuration
 #
 # Add this block to your appdaemon/apps/apps.yaml file.
@@ -30,11 +35,24 @@ energy_forecast:
   class: EnergyForecast
 
   # ── Required ────────────────────────────────────────────────────────────────
-  energy_sensor: sensor.grid_import_kwh       # ← change this
-  plz: "8001"                                 # ← change this
-  latitude: 47.3769                           # ← change this
-  longitude: 8.5417                           # ← change this
+  energy_sensor: sensor.gplugk_z_ei # ← change this
+  plz: 4533 # ← change this
+  latitude: 47.22891 # ← change this
+  longitude: 7.57502 # ← change this
+  srg_client_id: Q9mIRAl0RAe0aSNYGKrf0OWoAzVYLEqV
+  srg_client_secret: xhklYFwvXfYDaEV1
 
   # ── Optional ────────────────────────────────────────────────────────────────
-  # outdoor_temp_sensor: sensor.outdoor_temperature
-  # timezone: Europe/Zurich
+  outdoor_temp_sensor: sensor.outdoor_netatmo_temperature
+  timezone: Europe/Zurich
+  
+  
+  # Optional: exponential sample weight half-life in days (default: 90).
+  # Lower = recent data matters more. Set to 0 to disable weighting.
+  weight_halflife_days: 180
+
+#energy_history_backfill:
+#  module: energy_forecast.energy_history_backfill
+#  class: EnergyHistoryBackfill
+#  energy_sensor: sensor.gplugk_z_ei
+#  ha_db_path: /homeassistant/home-assistant_v2.db   # ← was /config/
