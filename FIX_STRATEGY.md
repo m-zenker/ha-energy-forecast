@@ -29,41 +29,37 @@ start. Missing sidecar (pre-upgrade install) is allowed to load.
 
 ---
 
-## Milestone 2 — Correctness
+## Milestone 2 — Correctness ✅ DONE
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
-| 2.1 | Unify CSV merge strategy + shared helper | `ha_data.py:57,114` / `energy_history_backfill.py:169` | M | TODO |
-| 2.2 | Config validation at startup | `energy_forecast.py:45–56` | S | TODO |
-| 2.3 | Guard/warn on empty weather DataFrame before training | `energy_forecast.py:126–131` | S | TODO |
+| 2.1 | Unify CSV merge strategy + shared helper | `ha_data.py:57,114` / `energy_history_backfill.py:169` | M | Done |
+| 2.2 | Config validation at startup | `energy_forecast.py:45–56` | S | Done |
+| 2.3 | Guard/warn on empty weather DataFrame before training | `energy_forecast.py:126–131` | S | Done |
 
 ### 2.1 — CSV merge inconsistency
-`ha_data.py` and `energy_history_backfill.py` both use `drop_duplicates(keep="last")`
-but with reversed `concat` order, making fresh data win in one place and cached
-data win in the other. Decision:
-- Live fetch (`ha_data.py`): fresh HA data wins — `[df_cache, df_new]`, `keep="last"` ✓
-- Backfill (`energy_history_backfill.py`): cached CSV wins — `[df_new, df_cache]`, `keep="last"` ✓
-
-The logic is correct but unintuitive. Extract a `_merge_timeseries(df_primary, df_secondary)`
-helper called from both sites with intent documented in comments. Add minimal
-pytest fixtures that mock `hass.Hass` and exercise the merge with known CSVs
-**before** making this change.
+Added `_merge_energy_frames(df_winner, df_loser)` helper to `ha_data.py`.
+Concatenates loser first so `keep="last"` always selects the winner's row.
+Both `fetch_energy_history()` and `fetch_recent_energy()` now call it with
+`df_winner=df_new` — fresh HA data wins on conflicts. The backfill file
+(`energy_history_backfill.py`) was already correct (cache wins, with a comment)
+and was left unchanged.
 
 ### 2.2 — Config validation
-Add `_validate_config()` called from `initialize()`. Validate:
+Added `_validate_config()` to `EnergyForecast`, called from `initialize()`
+immediately after all config values are assigned. Validates:
 - `-90 ≤ lat ≤ 90`, `-180 ≤ lon ≤ 180`
 - `weight_halflife_days > 0`
 - `ev_charging_threshold_kwh > 0`
 - `ev_charger_kw > 0`
 
-Raise `ValueError` with a human-readable message on failure. Log all confirmed
-values at INFO level on startup.
+Raises `ValueError` with a human-readable message on failure. Logs all
+confirmed values at INFO level on startup.
 
 ### 2.3 — Empty weather DataFrame
-When `weather_df = _empty_weather_df()` fallback is taken, emit a named WARNING
-listing the impaired features (`temp_c`, `heating_degree`, `cooling_degree`, etc.)
-rather than silently proceeding. Consider skipping the training run on first
-startup when no weather data is available at all.
+The weather fetch fallback `WARNING` now names the specific impaired features
+(`temp_c`, `heating_degree`, `cooling_degree`, `temp_rolling_3d`) so operators
+know forecast quality will be reduced.
 
 ---
 
