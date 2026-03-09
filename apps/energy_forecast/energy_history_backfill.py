@@ -162,7 +162,7 @@ class EnergyHistoryBackfill(hass.Hass):
                     ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
                 df_cache["timestamp"] = ts
                 self.log(f"Loaded {len(df_cache)} existing rows from {CACHE_PATH.name}.")
-            except Exception as exc:  # noqa: BLE001
+            except (OSError, pd.errors.ParserError) as exc:
                 self.log(
                     f"Could not read existing CSV ({exc}) — will create fresh.",
                     level="WARNING",
