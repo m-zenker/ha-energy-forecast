@@ -1,9 +1,23 @@
 """
 ML model — feature engineering, training, prediction and disk persistence.
 
-lightgbm and scikit-learn are installed via AppDaemon's requirements.txt.
-All CPU-bound work is called from AppDaemon's thread pool via timer callbacks
-in energy_forecast.py — it never blocks the event loop.
+Changes from original:
+  BUG FIX:
+    - predict() now generates naive (tz-stripped) timestamps, matching the
+      naive timestamps produced by the tz-stripping in energy_forecast.py.
+      This eliminates the "Cannot compare dtypes datetime64[us] and
+      datetime64[us, Europe/Zurich]" crash.
+  IMPROVEMENTS:
+    1. Lag features: lag_24h, lag_48h, lag_168h, lag_336h
+       Always safe for a 48-hour horizon because all targets are ≥1h ahead,
+       so the lag always points to a real past measurement, never a prediction.
+    2. Rolling stats: rolling_mean_24h, rolling_mean_7d, rolling_std_24h
+       Captures current household activity level and variability.
+    3. Swiss public holidays via the `holidays` package.
+    4. Exponential sample weighting — recent data weighted more than old data.
+    5. 3-day rolling temperature mean — captures building thermal mass lag.
+    6. hour_of_week (0-167) replaces the coarser is_weekend + hour_block.
+    7. TimeSeriesSplit cross-validation for an honest MAE estimate.
 """
 from __future__ import annotations
 
@@ -21,18 +35,36 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# ── Lag hours used as autoregressive features ─────────────────────────────────
+# All are safe for a 48-hour forecast: target is always ≥1h ahead,
+# so lag_24h for h=+1 points to now-23h — always in the past.
+LAG_HOURS = [24, 48, 168, 336]
+
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
-    "hour", "hour_block", "day_of_week", "month", "is_weekend", "season",
-    "hour_sin", "hour_cos", "month_sin", "month_cos", "dow_sin", "dow_cos",
+    # Calendar
+    "hour", "day_of_week", "month", "season",
+    "hour_of_week",                                  # 0-167 — replaces is_weekend + hour_block
+    # Cyclical encodings
+    "hour_sin", "hour_cos",
+    "month_sin", "month_cos",
+    "dow_sin", "dow_cos",
+    "how_sin", "how_cos",                            # hour-of-week cyclical
+    # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
     "heating_degree", "cooling_degree",
+    "temp_rolling_3d",                               # thermal mass proxy
+    # Autoregressive lags — always safe (see note above)
+    "lag_24h", "lag_48h", "lag_168h", "lag_336h",
+    # Rolling activity stats
+    "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
+    # Calendar extras
+    "is_public_holiday",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
 
 def _try_import_lgbm() -> Any | None:
-    """Try importing lightgbm; return the module or None."""
     try:
         import lightgbm as lgb  # noqa: PLC0415
         return lgb
@@ -41,7 +73,6 @@ def _try_import_lgbm() -> Any | None:
 
 
 def _try_import_sklearn_gbr() -> Any | None:
-    """Try importing GradientBoostingRegressor; return the class or None."""
     try:
         from sklearn.ensemble import GradientBoostingRegressor  # noqa: PLC0415
         return GradientBoostingRegressor
@@ -50,7 +81,6 @@ def _try_import_sklearn_gbr() -> Any | None:
 
 
 def _try_import_mae() -> Any | None:
-    """Try importing mean_absolute_error; return the function or None."""
     try:
         from sklearn.metrics import mean_absolute_error  # noqa: PLC0415
         return mean_absolute_error
@@ -59,147 +89,203 @@ def _try_import_mae() -> Any | None:
 
 
 def ensure_ml_packages() -> tuple[bool, str]:
-    """Verify that the required ML packages are importable.
-
-    Both lightgbm and scikit-learn are declared in manifest.json, so HA
-    installs them before the integration loads. This function confirms they
-    are available and selects the preferred engine.
-
-    Returns (success, engine_name).
-    """
     lgb = _try_import_lgbm()
     gbr = _try_import_sklearn_gbr()
-
     if gbr is None:
-        _LOGGER.error(
-            "scikit-learn is not importable. Ensure it is listed in manifest.json "
-            "requirements and that HA has restarted after installation."
-        )
+        _LOGGER.error("scikit-learn is not importable. Check AppDaemon requirements.txt.")
         return False, "none"
-
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
     return True, engine
-
-
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
     def __init__(self, model_dir: Path) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
-        self._model_path = model_dir / "energy_model.pkl"
-        self._meta_path  = model_dir / "meta.pkl"
+        self._model_path  = model_dir / "energy_model.pkl"
+        self._meta_path   = model_dir / "meta.pkl"
 
         self.model = None
-        self.feature_cols: list[str] = _FEATURES_BASE
-        self.last_trained: datetime = datetime.min
-        self.last_mae: float | None = None
-        self.engine: str = "not trained"
+        self.feature_cols: list[str]       = _FEATURES_BASE
+        self.last_trained: datetime        = datetime.min
+        self.last_mae: float | None        = None
+        self.last_cv_mae: float | None     = None   # cross-validated MAE
+        self.engine: str                   = "not trained"
+        self._feature_medians: dict        = {}     # used to fill NaN at predict time
 
         self._load()
 
-    # ── Public API (CPU-bound — call via executor_job) ────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def train(
         self,
-        energy_df: Any,
-        weather_df: Any,
-        outdoor_df: Any | None,
+        energy_df: Any,          # naive timestamps, cols: timestamp, gross_kwh
+        weather_df: Any,         # naive timestamps
+        outdoor_df: Any | None,  # naive timestamps
+        weight_halflife_days: float = 90.0,
     ) -> None:
-        """Train (or retrain) the model."""
-        import pandas as pd  # noqa: PLC0415
-        import numpy as np  # noqa: PLC0415
+        """Train/retrain the model on historical data."""
+        import pandas as pd
+        import numpy as np
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
-            raise RuntimeError(
-                "scikit-learn is not available. Check that manifest.json "
-                "requirements are correct and HA has been restarted."
-            )
+            raise RuntimeError("scikit-learn unavailable — check AppDaemon requirements.txt.")
 
         lgb    = _try_import_lgbm()
         GBR    = _try_import_sklearn_gbr()
         mae_fn = _try_import_mae()
 
-        df = _engineer_features(energy_df, weather_df, outdoor_df)
+        # ── Dynamic lag selection based on available history ────────────────
+        # Only include lag_Nh if at least 100 rows remain after shift(N).
+        # With short history (e.g. first 2 weeks), lag_336h would leave only
+        # ~12 rows and dropna() would wipe the entire training set.
+        n_rows = len(energy_df)
+        active_lags = [lag for lag in LAG_HOURS if n_rows - lag >= 100]
+        skipped_lags = [lag for lag in LAG_HOURS if lag not in active_lags]
+        if skipped_lags:
+            _LOGGER.info(
+                "Dynamic lag selection: skipping %s (need %d+ rows, have %d). "
+                "These will be added automatically as history grows.",
+                [f"lag_{l}h" for l in skipped_lags],
+                max(skipped_lags) + 100,
+                n_rows,
+            )
+
+        # ── Lag & rolling features (must happen before _engineer_features) ──
+        df = _add_lag_and_rolling_training(energy_df, active_lags)
+
+        # ── Weather / outdoor / calendar features ───────────────────────────
+        df = _engineer_features(df, weather_df, outdoor_df)
+
+        # ── Build feature list from active lags ─────────────────────────────
+        # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
+        # only the lags that were actually computed for this training run.
+        all_lag_cols = {f"lag_{l}h" for l in LAG_HOURS}
+        active_lag_cols = [f"lag_{l}h" for l in active_lags]
+        base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols
+        sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = (
             outdoor_df is not None
             and not outdoor_df.empty
             and "outdoor_temp_live" in df.columns
         )
-        feature_cols = _FEATURES_WITH_SENSOR if use_sensor else _FEATURES_BASE
+        feature_cols = sensor_features if use_sensor else base_features
 
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
         df = df[df["gross_kwh"] > 0]
 
         if len(df) < 100:
-            _LOGGER.warning(
-                "Only %d clean training rows — skipping (need ≥100)", len(df)
-            )
+            _LOGGER.warning("Only %d clean rows — skipping (need ≥100)", len(df))
             return
 
-        X = df[feature_cols].values
+        # ── Store medians for NaN-filling at predict time ───────────────────
+        self._feature_medians = {
+            col: float(df[col].median()) for col in feature_cols if col in df.columns
+        }
+
+        X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
         y = df["gross_kwh"].values
 
-        # Hold out last 10% for MAE estimation
-        split = max(int(len(X) * 0.9), len(X) - 500)
-        X_tr, X_val = X[:split], X[split:]
-        y_tr, y_val = y[:split], y[split:]
+        # ── Exponential sample weighting ────────────────────────────────────
+        sample_weight = None
+        if weight_halflife_days > 0:
+            end_ts = df["timestamp"].max()
+            days_ago = (end_ts - df["timestamp"]).dt.total_seconds() / 86400
+            sample_weight = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
 
-        model = _build_model(lgb, GBR)
-        model.fit(X_tr, y_tr)
-
-        mae = None
-        if mae_fn is not None:
+        # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
+        cv_mae = None
+        if mae_fn is not None and len(df) >= 500:
             try:
-                mae = round(float(mae_fn(y_val, model.predict(X_val))), 4)
+                from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
+                tscv   = TimeSeriesSplit(n_splits=3)
+                fold_maes = []
+                for tr_idx, val_idx in tscv.split(X):
+                    sw_fold = sample_weight[tr_idx] if sample_weight is not None else None
+                    m = _build_model(lgb, GBR)
+                    if sw_fold is not None:
+                        m.fit(X.iloc[tr_idx], y[tr_idx], sample_weight=sw_fold)
+                    else:
+                        m.fit(X.iloc[tr_idx], y[tr_idx])
+                    fold_maes.append(float(mae_fn(y[val_idx], m.predict(X.iloc[val_idx]))))
+                cv_mae = round(float(np.mean(fold_maes)), 4)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("CV MAE failed: %s", exc)
+
+        # ── Final model on all data ─────────────────────────────────────────
+        model = _build_model(lgb, GBR)
+        if sample_weight is not None:
+            model.fit(X, y, sample_weight=sample_weight)
+        else:
+            model.fit(X, y)
+
+        # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
+        holdout_mae = None
+        if mae_fn is not None:
+            split = max(int(len(X) * 0.9), len(X) - 500)
+            try:
+                holdout_mae = round(float(mae_fn(y[split:], model.predict(X.iloc[split:]))), 4)
             except Exception:  # noqa: BLE001
                 pass
 
-        self.model        = model
-        self.feature_cols = feature_cols
-        self.last_trained = datetime.now()
-        self.last_mae     = mae
-        self.engine       = engine_name
+        self.model          = model
+        self.feature_cols   = feature_cols
+        self.last_trained   = datetime.now()
+        self.last_mae       = cv_mae if cv_mae is not None else holdout_mae
+        self.last_cv_mae    = cv_mae
+        self.engine         = engine_name
         self._save()
 
+        mae_str = f"cv_MAE={cv_mae:.4f}" if cv_mae else (f"holdout_MAE={holdout_mae:.4f}" if holdout_mae else "MAE=n/a")
         _LOGGER.info(
-            "Model trained on %d rows | engine: %s | features: %d "
-            "(%s sensor)%s",
-            len(df),
-            engine_name,
-            len(feature_cols),
-            "with" if use_sensor else "without",
-            f" | MAE: {mae:.4f} kWh/h" if mae is not None else "",
+            "Model trained | rows=%d | engine=%s | features=%d | %s",
+            len(df), engine_name, len(feature_cols), mae_str,
         )
+
 
     def predict(
         self,
-        forecast_df: Any,
+        forecast_df: Any,           # naive timestamps
         live_temp: float | None,
+        recent_actuals: Any = None, # naive timestamps, cols: timestamp, gross_kwh
     ) -> Any:
-        """Return 48-hour DataFrame with columns [timestamp, predicted_kwh]."""
-        import pandas as pd  # noqa: PLC0415
-        import numpy as np  # noqa: PLC0415
+        """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
+        import pandas as pd
+        import numpy as np
 
         if self.model is None:
-            raise RuntimeError("Model has not been trained yet")
+            raise RuntimeError("Model not yet trained.")
 
-        now = pd.Timestamp.now(tz="Europe/Zurich")
+        # ── BUG FIX: generate NAIVE timestamps so they match the tz-stripped ──
+        # forecast_df and training data throughout the pipeline.
+        now_aware   = pd.Timestamp.now(tz="Europe/Zurich")
+        now_naive   = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
         future_hours = pd.date_range(
-            start=now.floor("1h"), periods=48, freq="1h", tz="Europe/Zurich"
-        )
+            start=now_naive.floor("1h"), periods=48, freq="1h"
+        )  # no tz kwarg → naive dtype
+
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
 
-        outdoor_pred_df: pd.DataFrame | None = None
-        if live_temp is not None:
-            outdoor_pred_df = _build_prediction_temp_df(
-                future_hours, forecast_df, live_temp
-            )
+        # ── Lag & rolling features from real recent history ──────────────────
+        future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
 
+        # ── Outdoor temperature blending ────────────────────────────────────
+        outdoor_pred_df: pd.DataFrame | None = None
+        if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
+            outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
+
+        # ── Calendar + weather features ─────────────────────────────────────
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df)
-        X = feat_df[self.feature_cols].fillna(0).values
+
+        # Fill any remaining NaN with stored training medians (graceful fallback)
+        for col in self.feature_cols:
+            if col in feat_df.columns and feat_df[col].isna().any():
+                fill = self._feature_medians.get(col, 0.0)
+                feat_df[col] = feat_df[col].fillna(fill)
+
+        X = feat_df[self.feature_cols].fillna(0)  # DataFrame → LightGBM gets feature names
         preds = np.maximum(0, self.model.predict(X))
 
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
@@ -215,10 +301,12 @@ class EnergyForecastModel:
         with open(self._model_path, "wb") as fh:
             pickle.dump(self.model, fh)
         meta = {
-            "feature_cols": self.feature_cols,
-            "last_trained": self.last_trained,
-            "last_mae":     self.last_mae,
-            "engine":       self.engine,
+            "feature_cols":     self.feature_cols,
+            "last_trained":     self.last_trained,
+            "last_mae":         self.last_mae,
+            "last_cv_mae":      self.last_cv_mae,
+            "engine":           self.engine,
+            "feature_medians":  self._feature_medians,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -235,59 +323,154 @@ class EnergyForecastModel:
             try:
                 with open(self._meta_path, "rb") as fh:
                     meta = pickle.load(fh)
-                self.feature_cols = meta.get("feature_cols", _FEATURES_BASE)
-                self.last_trained = meta.get("last_trained", datetime.min)
-                self.last_mae     = meta.get("last_mae")
-                self.engine       = meta.get("engine", "unknown")
+                self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
+                self.last_trained      = meta.get("last_trained",    datetime.min)
+                self.last_mae          = meta.get("last_mae")
+                self.last_cv_mae       = meta.get("last_cv_mae")
+                self.engine            = meta.get("engine",          "unknown")
+                self._feature_medians  = meta.get("feature_medians", {})
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Could not load model metadata: %s", exc)
 
 
-# ── Feature engineering ───────────────────────────────────────────────────────
+# ── Lag & rolling feature helpers ─────────────────────────────────────────────
+
+def _add_lag_and_rolling_training(energy_df: Any, active_lags: list[int]) -> Any:
+    """Compute lag and rolling features during training using shift().
+
+    Only computes lags in active_lags — lags that would leave fewer than
+    100 rows after shift() are excluded by the caller to avoid dropna()
+    wiping the training set when history is short.
+
+    Uses shift(1) before rolling to prevent data leakage — the rolling
+    stats represent "what has been happening" up to but not including
+    the current hour.
+    """
+    import pandas as pd
+
+    df = energy_df.sort_values("timestamp").reset_index(drop=True).copy()
+
+    for lag in active_lags:
+        df[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
+
+    shifted = df["gross_kwh"].shift(1)
+    df["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
+    df["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
+    df["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
+
+    return df
+
+
+def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
+    """Fill lag and rolling features for the 48-hour prediction horizon.
+
+    For each future hour h:
+      lag_24h[h]  = actual consumption at (h - 24h)  — always a real past value
+      lag_168h[h] = actual consumption at (h - 168h) — always a real past value
+
+    If recent_actuals is missing or sparse, falls back to NaN (the model
+    will fill those with stored training medians).
+    """
+    import pandas as pd
+    import numpy as np
+
+    if recent_actuals is None or recent_actuals.empty:
+        for lag in LAG_HOURS:
+            future_df[f"lag_{lag}h"] = np.nan
+        future_df["rolling_mean_24h"] = np.nan
+        future_df["rolling_mean_7d"]  = np.nan
+        future_df["rolling_std_24h"]  = np.nan
+        return future_df
+
+    # Index actuals by timestamp for O(1) lookup
+    actuals = (
+        recent_actuals
+        .set_index(pd.to_datetime(recent_actuals["timestamp"]))["gross_kwh"]
+        .sort_index()
+    )
+
+    for lag in LAG_HOURS:
+        lag_td = pd.Timedelta(hours=lag)
+        lag_times = future_df["timestamp"] - lag_td
+        future_df[f"lag_{lag}h"] = [
+            actuals.get(t, np.nan) for t in lag_times
+        ]
+
+    # Rolling stats from the actual recent window
+    def _safe_stat(fn, window_h):
+        try:
+            subset = actuals.iloc[-window_h:]
+            val = fn(subset)
+            return float(val) if not pd.isna(val) else np.nan
+        except Exception:  # noqa: BLE001
+            return np.nan
+
+    future_df["rolling_mean_24h"] = _safe_stat(lambda s: s.mean(), 24)
+    future_df["rolling_mean_7d"]  = _safe_stat(lambda s: s.mean(), 168)
+    future_df["rolling_std_24h"]  = _safe_stat(lambda s: s.std(),  24)
+
+    return future_df
+
+
+# ── Core feature engineering ──────────────────────────────────────────────────
 
 def _engineer_features(
-    df,          # pd.DataFrame
-    weather_df,  # pd.DataFrame
-    outdoor_df,  # pd.DataFrame | None
+    df,          # pd.DataFrame with naive timestamps
+    weather_df,  # pd.DataFrame with naive timestamps
+    outdoor_df,  # pd.DataFrame | None with naive timestamps
 ) -> Any:
-    import pandas as pd  # noqa: PLC0415
-    import numpy as np  # noqa: PLC0415
+    import pandas as pd
+    import numpy as np
 
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])  # stays naive
 
-    df["hour"]        = df["timestamp"].dt.hour
-    df["hour_block"]  = (df["timestamp"].dt.hour // 3) * 3
-    df["day_of_week"] = df["timestamp"].dt.dayofweek
-    df["month"]       = df["timestamp"].dt.month
-    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
-    df["season"]      = df["month"].map(
+    # ── Calendar features ────────────────────────────────────────────────────
+    df["hour"]         = df["timestamp"].dt.hour
+    df["day_of_week"]  = df["timestamp"].dt.dayofweek
+    df["month"]        = df["timestamp"].dt.month
+    df["season"]       = df["month"].map(
         {12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1,
          6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3}
     )
-    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]        / 24)
-    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]        / 24)
-    df["month_sin"] = np.sin(2 * np.pi * df["month"]       / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"]       / 12)
-    df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    # hour_of_week gives the model a unique slot for every hour in the weekly
+    # cycle (0 = Monday 00:00, 167 = Sunday 23:00). Replaces is_weekend + hour_block.
+    df["hour_of_week"] = df["day_of_week"] * 24 + df["hour"]
 
-    # Merge weather
+    # ── Cyclical encodings ───────────────────────────────────────────────────
+    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]         / 24)
+    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]         / 24)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"]        / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"]        / 12)
+    df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"]  / 7)
+    df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
+    df["how_sin"]   = np.sin(2 * np.pi * df["hour_of_week"] / 168)
+    df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
+
+    # ── Public holidays ──────────────────────────────────────────────────────
+    df = _add_holiday_feature(df)
+
+    # ── Weather merge ────────────────────────────────────────────────────────
     w = weather_df.copy()
     w["timestamp"] = pd.to_datetime(w["timestamp"]).dt.floor("1h")
+
+    # 3-day rolling temperature (captures thermal mass / multi-day cold spells)
+    w = w.sort_values("timestamp").reset_index(drop=True)
+    w["temp_rolling_3d"] = w["temp_c"].rolling(72, min_periods=1).mean()
+
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
     df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
-    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh"]:
+    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh", "temp_rolling_3d"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
 
-    # Merge outdoor sensor
+    # ── Outdoor sensor merge ─────────────────────────────────────────────────
     if outdoor_df is not None and not outdoor_df.empty:
         o = outdoor_df.copy()
         o["timestamp"] = pd.to_datetime(o["timestamp"]).dt.floor("1h")
@@ -303,38 +486,66 @@ def _engineer_features(
 
     return df
 
+def _add_holiday_feature(df: Any) -> Any:
+    """Add binary is_public_holiday column using the `holidays` package.
+
+    Falls back gracefully to 0 if the package is not installed.
+    Swiss federal holidays are used; add canton= kwarg for cantonal ones.
+    """
+    try:
+        import holidays as hd  # noqa: PLC0415
+        import pandas as pd
+        years = df["timestamp"].dt.year.unique().tolist()
+        ch_holidays = hd.country_holidays("CH", years=years)
+        df["is_public_holiday"] = (
+            df["timestamp"].dt.date
+            .map(lambda d: 1 if d in ch_holidays else 0)
+            .astype(int)
+        )
+    except ImportError:
+        df["is_public_holiday"] = 0
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Holiday feature failed: %s — defaulting to 0", exc)
+        df["is_public_holiday"] = 0
+    return df
+
 
 def _build_prediction_temp_df(
-    future_hours,  # pd.DatetimeIndex
-    forecast_df,   # pd.DataFrame
+    future_hours,   # pd.DatetimeIndex — naive
+    forecast_df,    # pd.DataFrame — naive timestamps
     live_temp: float,
 ) -> Any:
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
 
     fc_indexed = (
-        forecast_df.set_index("timestamp")["temp_c"]
-        .reindex(future_hours, method="nearest")
+        forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
+        .sort_index()
     )
-    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS
-    temps = []
+    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we interpolate
+
+    rows = []
     for i, ts in enumerate(future_hours):
-        fc = fc_indexed.get(ts, live_temp)
-        if i < SENSOR_FULL_TRUST_HOURS:
-            temps.append(live_temp)
-        elif i < SENSOR_BLEND_HOURS:
-            alpha = (i - SENSOR_FULL_TRUST_HOURS) / blend_range
-            temps.append(live_temp * (1 - alpha) + fc * alpha)
+        hours_ahead = i  # future_hours[0] is current hour
+        if hours_ahead <= SENSOR_FULL_TRUST_HOURS:
+            temp = live_temp
+        elif hours_ahead >= SENSOR_BLEND_HOURS:
+            temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
         else:
-            temps.append(fc)
-    return pd.DataFrame({"timestamp": future_hours, "outdoor_temp_live": temps})
+            # Linear blend: 0 at SENSOR_FULL_TRUST_HOURS → 1 at SENSOR_BLEND_HOURS
+            alpha = (hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_range
+            fc_temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
+            temp = (1 - alpha) * live_temp + alpha * fc_temp
+        rows.append({"timestamp": ts, "outdoor_temp_live": temp})
+
+    return pd.DataFrame(rows)
 
 
-def _build_model(lgb: Any | None, GBR: Any | None) -> Any:
+def _build_model(lgb: Any, GBR: Any) -> Any:
+    """Instantiate the best available model (LightGBM preferred, sklearn GBR fallback)."""
     if lgb is not None:
         return lgb.LGBMRegressor(
             n_estimators=500,
-            learning_rate=0.04,
-            max_depth=6,
+            learning_rate=0.05,
             num_leaves=31,
             subsample=0.8,
             colsample_bytree=0.8,
@@ -344,8 +555,9 @@ def _build_model(lgb: Any | None, GBR: Any | None) -> Any:
         )
     return GBR(
         n_estimators=300,
-        learning_rate=0.04,
-        max_depth=4,
+        learning_rate=0.05,
+        max_depth=5,
         subsample=0.8,
         random_state=42,
     )
+

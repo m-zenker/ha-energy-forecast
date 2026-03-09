@@ -1,13 +1,12 @@
 """
-History fetching via AppDaemon's get_history() API.
-
-No HA internals, no HTTP calls, no token. AppDaemon handles the connection
-to HA's WebSocket API and returns state history as plain Python dicts.
+History fetching with Local CSV Caching.
+This version stores data in a local file so you don't lose history
+when Home Assistant purges its database.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -15,82 +14,161 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-HISTORY_MONTHS  = 12
-MAX_HOURLY_KWH  = 50    # Spike / meter-reset filter threshold
+CACHE_PATH = Path(__file__).parent / "energy_history.csv"
+MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
 
 
 def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
-    """Pull cumulative grid-import history and differentiate to hourly gross kWh."""
+    """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
 
-    end   = datetime.now()
-    start = end - timedelta(days=30 * HISTORY_MONTHS)
-    raw   = _fetch_history(app, entity_id, days=HISTORY_MONTHS * 30)
+    # 1. Load existing cache if it exists
+    df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    if CACHE_PATH.exists():
+        try:
+            df_cache = pd.read_csv(CACHE_PATH)
+            ts = pd.to_datetime(df_cache["timestamp"])
+            # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+            app.log(f"Loaded {len(df_cache)} records from local cache.")
+        except Exception as e:
+            app.log(f"Failed to load cache: {e}", level="WARNING")
 
-    if raw.empty:
-        raise ValueError(
-            f"No history returned for {entity_id}. "
-            "Check the entity_id in apps.yaml and that the recorder has data."
-        )
+    # 2. Fetch fresh data from HA
+    raw_ha = _fetch_history(app, entity_id, days=30)
 
-    hourly = raw.set_index("timestamp")["value"].resample("1h").last().ffill()
-    diff   = hourly.diff().clip(lower=0).reset_index()
-    diff.columns = ["timestamp", "gross_kwh"]
-    diff   = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].dropna()
+    if raw_ha.empty and df_cache.empty:
+        raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
-    app.log(f"Energy history: {len(diff)} hourly records for {entity_id}", level="DEBUG")
-    return diff
+    # 3. Process HA data into hourly gross kWh
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
+        diff = hourly.diff().clip(lower=0).reset_index()
+        diff.columns = ["timestamp", "gross_kwh"]
+        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
+        df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+
+    # 4. Merge and de-duplicate
+    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
+    combined = combined.sort_values("timestamp").dropna()
+
+    # 5. Save back to CSV
+    try:
+        combined.to_csv(CACHE_PATH, index=False)
+        app.log(f"Cache updated. Total history: {len(combined)} hours.")
+    except Exception as e:
+        app.log(f"Failed to save cache: {e}", level="ERROR")
+
+    return combined
 
 
-def fetch_outdoor_temp_history(
-    app: "hass.Hass",
-    entity_id: str,
-    start: datetime,
-    end: datetime,
-) -> Any:
-    """Pull outdoor temperature history resampled to hourly means."""
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any:
+    """Lightweight update for hourly sensor refreshes.
+
+    Fetches only the last `hours` of HA history (vs. 30 days in
+    fetch_energy_history), merges into the existing CSV cache, and
+    returns the full cache for lag-feature use.  Keeps _update_cb
+    well within AppDaemon's 10s callback limit.
+
+    _retrain() continues to call fetch_energy_history() for a full
+    30-day resync once a week.
+    """
     import pandas as pd
 
-    days = max(1, (end - start).days + 1)
-    raw  = _fetch_history(app, entity_id, days=days)
+    # 1. Load existing cache — this is the bulk of our history
+    df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    if CACHE_PATH.exists():
+        try:
+            df_cache = pd.read_csv(CACHE_PATH)
+            ts = pd.to_datetime(df_cache["timestamp"])
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except Exception as e:
+            app.log(f"Failed to load cache: {e}", level="WARNING")
 
-    if raw.empty:
-        app.log(f"No outdoor temp history for {entity_id}", level="WARNING")
-        return pd.DataFrame(columns=["timestamp", "outdoor_temp_live"])
+    # 2. Fetch only the last 2 days from HA — enough to cover `hours`
+    #    plus a small overlap buffer for the diff() boundary.
+    raw_ha = _fetch_history(app, entity_id, days=2)
 
-    # Trim to the requested window
-    raw = raw[(raw["timestamp"] >= pd.Timestamp(start, tz="Europe/Zurich")) &
-              (raw["timestamp"] <= pd.Timestamp(end,   tz="Europe/Zurich"))]
+    if raw_ha.empty and df_cache.empty:
+        raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
-    hourly = raw.set_index("timestamp")["value"].resample("1h").mean().reset_index()
-    hourly.columns = ["timestamp", "outdoor_temp_live"]
-    return hourly.dropna()
+    # 3. Process into hourly kWh and keep only the recent window
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
+        diff = hourly.diff().clip(lower=0).reset_index()
+        diff.columns = ["timestamp", "gross_kwh"]
+        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
+        df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+
+    # 4. Merge new hours into cache and save
+    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
+    combined = combined.sort_values("timestamp").dropna()
+
+    try:
+        combined.to_csv(CACHE_PATH, index=False)
+    except Exception as e:
+        app.log(f"Failed to save cache: {e}", level="ERROR")
+
+    return combined
+
+
+def split_ev_charging(df: Any, threshold_kwh: float) -> tuple[Any, Any]:
+    """Split a history DataFrame into baseline and EV charging portions.
+
+    Charging hours are identified by gross_kwh > threshold_kwh.  Your charger
+    runs at ~9 kW (constant), so charging hours cluster tightly above 7 kWh/h.
+    The normal household ceiling is ~3.9 kWh/h, giving a clean gap at 4.5.
+
+    Returns:
+        baseline_df  — all rows retained; EV hours have gross_kwh replaced
+                        with (gross_kwh - 9.0), clipped to ≥ 0.  This keeps
+                        the true household co-load (lighting, cooking etc.)
+                        visible to the model rather than dropping the row, and
+                        preserves shift()-based lag alignment in training.
+        ev_df        — only the rows classified as EV charging, with the
+                        original gross_kwh values, for publishing EV sensors.
+    """
+    import numpy as np
+
+    df = df.copy()
+    ev_mask = df["gross_kwh"] > threshold_kwh
+
+    ev_df = df[ev_mask].copy()
+
+    # Subtract the fixed charger load (~9 kW → 9 kWh/h) from charging hours,
+    # leaving the concurrent household baseline intact.
+    df.loc[ev_mask, "gross_kwh"] = np.maximum(
+        0.0, df.loc[ev_mask, "gross_kwh"] - 9.0
+    )
+
+    return df, ev_df
 
 
 def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> Any:
-    """
-    Call AppDaemon's get_history() and normalise the result into a tidy
-    DataFrame with columns [timestamp, value].
-
-    AppDaemon's get_history() returns a list of lists:
-        [ [ {state, last_updated, ...}, ... ] ]   ← one inner list per entity
-    """
+    """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
-
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         app.log(f"get_history failed for {entity_id}: {exc}", level="ERROR")
-        return pd.DataFrame(columns=["timestamp", "value"])
+        return pd.DataFrame()
 
-    # Normalise: AD may return a list-of-lists or a dict keyed by entity_id
     if isinstance(raw, dict):
         states = raw.get(entity_id, [])
     elif isinstance(raw, list) and raw:
         states = raw[0] if isinstance(raw[0], list) else raw
     else:
-        app.log(f"Unexpected get_history format for {entity_id}: {type(raw)}", level="WARNING")
-        return pd.DataFrame(columns=["timestamp", "value"])
+        return pd.DataFrame()
 
     rows = []
     for state in states:
@@ -101,11 +179,5 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> Any:
         except (ValueError, KeyError, TypeError):
             continue
 
-    if not rows:
-        return pd.DataFrame(columns=["timestamp", "value"])
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
+    return pd.DataFrame(rows)
+    
