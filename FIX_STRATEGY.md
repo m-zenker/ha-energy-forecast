@@ -96,53 +96,39 @@ explaining the fallback to training medians.
 
 ---
 
-## Milestone 4 — Code Quality
-
-**Next milestone to implement.**
-Branch: `fix/milestone-1-security` (continue on same branch).
-Suggested order: 4.4 → 4.1 → 4.3 → 4.5 → 4.2.
+## Milestone 4 — Code Quality ✅ DONE
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
-| 4.1 | Extract magic numbers to constants | `model.py:200,248` → `const.py` | S | TODO |
-| 4.2 | Make `CACHE_PATH` config-driven; deduplicate constant | `ha_data.py:17`, `energy_forecast.py:58` | M | TODO |
-| 4.3 | Replace `Any` with `pd.DataFrame` in type hints | `model.py:437–441`, `ha_data.py` | S | TODO |
-| 4.4 | Remove redundant `tz_convert` | `model.py:284–285` | S | TODO |
-| 4.5 | Vectorise lag lookups with `reindex` | `model.py:428–432` | S | TODO |
+| 4.1 | Extract magic numbers to constants | `const.py` | S | Done |
+| 4.2 | Make `CACHE_PATH` config-driven; deduplicate constant | `const.py`, `ha_data.py`, `energy_forecast.py` | M | Done |
+| 4.3 | Replace `Any` with `pd.DataFrame` in type hints | `model.py`, `ha_data.py` | S | Done |
+| 4.4 | Remove redundant `tz_convert` | `model.py` | S | Done |
+| 4.5 | Vectorise lag lookups with `reindex` | `model.py` | S | Done |
+
+### 4.4 — Redundant tz_convert
+Replaced `now_aware.tz_convert("Europe/Zurich").tz_localize(None)` with
+`now_aware.tz_localize(None)` — `tz_convert` was a no-op since `now_aware`
+is already in Europe/Zurich.
 
 ### 4.1 — Magic numbers
-Add to `const.py`:
-```python
-MIN_TRAINING_ROWS = 100   # model.py:200
-HOLDOUT_FRACTION  = 0.9   # model.py:248
-MIN_CV_ROWS       = 500   # model.py:248
-```
-
-### 4.2 — Hardcoded paths
-`CACHE_PATH` is a module-level constant duplicated in both `ha_data.py` and
-`energy_history_backfill.py`. Move it to a parameter of `fetch_energy_history()`
-and `fetch_recent_energy()` with the current value as default. Pass from
-`initialize()` where it can be overridden via `self.args`. Depends on 2.1.
+Added to `const.py`: `MIN_TRAINING_ROWS = 100`, `HOLDOUT_FRACTION = 0.9`,
+`MIN_CV_ROWS = 500`. All magic numbers in `model.py` replaced.
 
 ### 4.3 — Type hints
-Use `TYPE_CHECKING` guard for pandas import and replace `Any` with `pd.DataFrame`
-on all public function parameters and return types across `model.py` and `ha_data.py`.
+Added `import pandas as pd` under `TYPE_CHECKING` in both `model.py` and
+`ha_data.py`. All `Any` annotations on public function parameters and return
+types replaced with `pd.DataFrame` / `pd.DataFrame | None`.
 
-### 4.4 — Redundant tz_convert (model.py:284–285)
-```python
-# Before
-now_naive = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
-# After — tz_convert is a no-op; now_aware is already in Europe/Zurich
-now_naive = now_aware.tz_localize(None)
-```
+### 4.5 — Vectorised lag lookups
+Replaced Python list-comprehension with `actuals.reindex(lag_times).values`.
 
-### 4.5 — Vectorise lag lookups (model.py:428–432)
-```python
-# Before
-future_df[f"lag_{lag}h"] = [actuals.get(t, np.nan) for t in lag_times]
-# After
-future_df[f"lag_{lag}h"] = actuals.reindex(lag_times).values
-```
+### 4.2 — Config-driven CACHE_PATH
+`CACHE_PATH` centralised in `const.py`; local definitions removed from
+`ha_data.py` and `energy_history_backfill.py`. Added `cache_path: Path = CACHE_PATH`
+parameter to `fetch_energy_history()` and `fetch_recent_energy()`.
+`energy_forecast.py` reads optional `cache_path` from `apps.yaml` and passes
+it through. Tests updated to pass `cache_path=` directly — no monkeypatching.
 
 ---
 
@@ -165,8 +151,8 @@ cases before merging.
 M1: 1.1 → 1.2              ✅ done
 M2: tests → 2.2 → 2.3 → 2.1  ✅ done
 M3: 3.3 → 3.1 → 3.2        ✅ done
-M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2  ← NEXT
-M5: 5.1                     (requires DST test cases first)
+M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2  ✅ done
+M5: 5.1                     ← NEXT (requires DST test cases first)
 ```
 
 All work is on branch `fix/milestone-1-security`. Tests: 18/18 passing.
