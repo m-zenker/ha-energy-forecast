@@ -132,16 +132,29 @@ it through. Tests updated to pass `cache_path=` directly — no monkeypatching.
 
 ---
 
-## Milestone 5 — DST Hardening (Deferred)
+## Milestone 5 — DST Hardening ✅ DONE
 
 | ID  | Fix | File(s) | Effort | Status |
 |-----|-----|---------|--------|--------|
-| 5.1 | Detect and warn on duplicate naive timestamps after DST fall-back | `ha_data.py`, `energy_forecast.py` | M | TODO |
+| 5.1 | Detect and warn on duplicate naive timestamps after DST fall-back | `ha_data.py` | M | Done |
 
-Add `_check_dst_duplicates(df, logger)` that logs WARNING when
-`df["timestamp"].duplicated().any()` after a merge. Document the spring-forward
-gap (filled by `ffill()`) as an accepted behaviour. Requires DST-specific test
-cases before merging.
+### 5.1 — DST fall-back duplicate detection
+Added `_check_dst_duplicates(df, logger)` to `ha_data.py`. Logs a WARNING
+when `df["timestamp"].duplicated(keep=False).any()` after a merge, reporting
+the count of duplicated rows, the number of distinct affected timestamps, and
+an example timestamp so operators can identify the fall-back hour.
+
+Both `fetch_energy_history()` and `fetch_recent_energy()` call it immediately
+after `_merge_energy_frames()`.
+
+Spring-forward gaps (02:00–02:59 missing in March) are filled silently by the
+existing `resample/ffill` pipeline — this is documented as accepted behaviour
+in the docstring and does NOT trigger a warning.
+
+DST-specific tests added to `tests/test_ha_data.py` (`TestCheckDstDuplicates`,
+7 tests): no-duplicate clean path, fall-back duplicate warning, count in
+message, empty/single-row edge cases, spring-forward no-warning, and an
+integration test verifying the warning fires from `fetch_energy_history`.
 
 ---
 
@@ -152,10 +165,10 @@ M1: 1.1 → 1.2              ✅ done
 M2: tests → 2.2 → 2.3 → 2.1  ✅ done
 M3: 3.3 → 3.1 → 3.2        ✅ done
 M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2  ✅ done
-M5: 5.1                     ← NEXT (requires DST test cases first)
+M5: 5.1                     ✅ done
 ```
 
-All work is on branch `fix/milestone-1-security`. Tests: 18/18 passing.
+All work is on branch `fix/milestone-1-security`. Tests: 25/25 passing.
 
 ## Additional Recommendation ✅ DONE
 

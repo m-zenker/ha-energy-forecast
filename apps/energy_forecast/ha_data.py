@@ -20,6 +20,36 @@ _LOGGER = logging.getLogger(__name__)
 MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
 
 
+def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:
+    """Warn if the DataFrame contains duplicate naive timestamps.
+
+    Duplicate naive timestamps arise during the DST fall-back transition
+    (e.g. Europe/Zurich: last Sunday of October, 03:00 CEST → 02:00 CET).
+    After tz_localize(None) the naive hour 02:xx appears twice — once for the
+    summer-time reading, once for the winter-time reading.  The merge keeps
+    both rows, so callers should be aware that downstream aggregations may
+    double-count that hour.
+
+    Spring-forward gaps (e.g. 02:00–02:59 never occurring in March) are filled
+    by the resample/ffill in the fetch functions and do NOT produce duplicates;
+    they are accepted behaviour and are not flagged here.
+    """
+    if df.empty or "timestamp" not in df.columns:
+        return
+    dup_mask = df["timestamp"].duplicated(keep=False)
+    n_dup = int(dup_mask.sum())
+    if n_dup:
+        dup_times = df.loc[dup_mask, "timestamp"].unique()
+        logger.warning(
+            "DST fall-back: %d rows share %d duplicate naive timestamp(s) after merge "
+            "(e.g. %s). The ambiguous hour appears twice — downstream aggregations "
+            "may double-count it.",
+            n_dup,
+            len(dup_times),
+            dup_times[0],
+        )
+
+
 def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
 
@@ -78,6 +108,7 @@ def fetch_energy_history(
 
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    _check_dst_duplicates(combined, _LOGGER)
 
     # 5. Save back to CSV
     try:
@@ -134,6 +165,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6, cache_
 
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    _check_dst_duplicates(combined, _LOGGER)
 
     try:
         combined.to_csv(cache_path, index=False)
