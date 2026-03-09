@@ -166,9 +166,18 @@ M4: 4.4 → 4.1 → 4.3 → 4.5 → 4.2   (single-liners first, path refactor la
 M5: 5.1                     (requires test infra from M2)
 ```
 
-## Additional Recommendation
+## Additional Recommendation ✅ DONE
 
-There is no test suite. Before implementing M2, create a minimal `tests/`
-directory with pytest fixtures that mock AppDaemon's `hass.Hass` and exercise
-`ha_data.fetch_energy_history()` with known input CSVs. This is a prerequisite
-for safe execution of Fix 2.1 and Fix 5.1.
+A test suite has been added:
+- `conftest.py` (repo root) — adds `apps/` to `sys.path` so `energy_forecast`
+  is importable without AppDaemon installed.
+- `tests/test_ha_data.py` — 18 tests across three classes:
+  - `TestMergeEnergyFrames` — winner selection, empty inputs, NaN dropping,
+    sort order, multiple conflicts
+  - `TestFetchEnergyHistory` — HA-only, cache-only, HA wins on conflict, old
+    cache rows preserved, both-empty raises ValueError, spike filter, cache save
+  - `TestFetchRecentEnergy` — same merge contract verified independently
+
+`_fetch_history` is patched in all fetch tests; no AppDaemon or live HA needed.
+Fix 5.1 (DST hardening) should extend this suite with DST-specific test cases
+before merging.
