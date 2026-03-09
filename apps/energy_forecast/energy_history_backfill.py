@@ -37,10 +37,11 @@ from pathlib import Path
 
 import hassapi as hass
 
+from .const import CACHE_PATH
+
 # ── Tunables ──────────────────────────────────────────────────────────────────
 LOOKBACK_YEARS  = 1
 MAX_HOURLY_KWH  = 50.0
-CACHE_PATH      = Path(__file__).parent / "energy_history.csv"
 DEFAULT_DB_PATH = "/config/home-assistant_v2.db"
 
 

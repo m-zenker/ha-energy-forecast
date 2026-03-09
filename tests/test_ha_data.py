@@ -123,9 +123,9 @@ class TestMergeEnergyFrames:
 
 class TestFetchEnergyHistory:
 
-    def test_ha_only_no_cache(self, mock_app, tmp_path, monkeypatch):
+    def test_ha_only_no_cache(self, mock_app, tmp_path):
         """No cache file: HA data is processed and returned."""
-        monkeypatch.setattr(ha_data, "CACHE_PATH", tmp_path / "energy_history.csv")
+        cache_path = tmp_path / "energy_history.csv"
 
         # 08:00 UTC → 09:00 local, 09:00 UTC → 10:00 local (January, UTC+1)
         # diff at 10:00 local = 101.0 - 100.0 = 1.0 kWh
@@ -134,29 +134,27 @@ class TestFetchEnergyHistory:
             [100.0, 101.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            result = ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert len(result) == 1
         assert result.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
-    def test_cache_only_empty_ha(self, mock_app, tmp_path, monkeypatch):
+    def test_cache_only_empty_ha(self, mock_app, tmp_path):
         """HA returns nothing: existing cache is returned."""
         cache_path = tmp_path / "energy_history.csv"
         make_energy_df(["2024-01-01 10:00"], [1.5]).to_csv(cache_path, index=False)
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
-            result = ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert len(result) == 1
         assert result.iloc[0]["gross_kwh"] == pytest.approx(1.5)
 
-    def test_ha_wins_on_conflict(self, mock_app, tmp_path, monkeypatch):
+    def test_ha_wins_on_conflict(self, mock_app, tmp_path):
         """When cache and HA have the same timestamp, fresh HA data wins."""
         cache_path = tmp_path / "energy_history.csv"
         # Cache has 1.0 kWh at local 10:00
         make_energy_df(["2024-01-01 10:00"], [1.0]).to_csv(cache_path, index=False)
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         # HA cumulative: diff at local 10:00 = 102.0 - 100.0 = 2.0 kWh
         ha_raw = make_ha_raw(
@@ -164,20 +162,19 @@ class TestFetchEnergyHistory:
             [100.0, 102.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            result = ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
         assert len(row_10) == 1
         assert row_10.iloc[0]["gross_kwh"] == pytest.approx(2.0)
 
-    def test_cache_row_preserved_when_no_ha_overlap(self, mock_app, tmp_path, monkeypatch):
+    def test_cache_row_preserved_when_no_ha_overlap(self, mock_app, tmp_path):
         """Cache rows for timestamps not covered by HA fetch are preserved."""
         cache_path = tmp_path / "energy_history.csv"
         # Cache has a row from 3 days ago
         make_energy_df(["2023-12-29 10:00", "2024-01-01 10:00"], [0.5, 1.0]).to_csv(
             cache_path, index=False
         )
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         # HA only covers 2024-01-01 — old cache row should survive
         ha_raw = make_ha_raw(
@@ -185,39 +182,38 @@ class TestFetchEnergyHistory:
             [100.0, 101.5],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            result = ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         old_row = result[result["timestamp"] == pd.Timestamp("2023-12-29 10:00")]
         assert len(old_row) == 1
         assert old_row.iloc[0]["gross_kwh"] == pytest.approx(0.5)
 
-    def test_both_empty_raises_value_error(self, mock_app, tmp_path, monkeypatch):
+    def test_both_empty_raises_value_error(self, mock_app, tmp_path):
         """Both empty sources raise ValueError with a descriptive message."""
-        monkeypatch.setattr(ha_data, "CACHE_PATH", tmp_path / "energy_history.csv")
+        cache_path = tmp_path / "energy_history.csv"
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             with pytest.raises(ValueError, match="No history found"):
-                ha_data.fetch_energy_history(mock_app, "sensor.energy")
+                ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-    def test_saves_result_to_cache(self, mock_app, tmp_path, monkeypatch):
+    def test_saves_result_to_cache(self, mock_app, tmp_path):
         """Merged result is written back to the cache CSV file."""
         cache_path = tmp_path / "energy_history.csv"
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         ha_raw = make_ha_raw(
             ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
             [100.0, 101.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert cache_path.exists()
         saved = pd.read_csv(cache_path)
         assert len(saved) == 1
 
-    def test_spikes_filtered_out(self, mock_app, tmp_path, monkeypatch):
+    def test_spikes_filtered_out(self, mock_app, tmp_path):
         """Hourly values >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
-        monkeypatch.setattr(ha_data, "CACHE_PATH", tmp_path / "energy_history.csv")
+        cache_path = tmp_path / "energy_history.csv"
 
         # diff at 10:00 = 999.0 kWh — spike, should be filtered
         ha_raw = make_ha_raw(
@@ -225,7 +221,7 @@ class TestFetchEnergyHistory:
             [100.0, 1099.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            result = ha_data.fetch_energy_history(mock_app, "sensor.energy")
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert len(result) == 0
 
@@ -234,55 +230,52 @@ class TestFetchEnergyHistory:
 
 class TestFetchRecentEnergy:
 
-    def test_ha_wins_on_conflict(self, mock_app, tmp_path, monkeypatch):
+    def test_ha_wins_on_conflict(self, mock_app, tmp_path):
         """fetch_recent_energy applies the same merge contract: fresh HA wins."""
         cache_path = tmp_path / "energy_history.csv"
         make_energy_df(["2024-01-01 10:00"], [1.0]).to_csv(cache_path, index=False)
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         ha_raw = make_ha_raw(
             ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
             [100.0, 102.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy")
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
         row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
         assert len(row_10) == 1
         assert row_10.iloc[0]["gross_kwh"] == pytest.approx(2.0)
 
-    def test_both_empty_raises_value_error(self, mock_app, tmp_path, monkeypatch):
+    def test_both_empty_raises_value_error(self, mock_app, tmp_path):
         """Both empty sources raise ValueError."""
-        monkeypatch.setattr(ha_data, "CACHE_PATH", tmp_path / "energy_history.csv")
+        cache_path = tmp_path / "energy_history.csv"
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             with pytest.raises(ValueError, match="No history found"):
-                ha_data.fetch_recent_energy(mock_app, "sensor.energy")
+                ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
-    def test_cache_returned_when_ha_empty(self, mock_app, tmp_path, monkeypatch):
+    def test_cache_returned_when_ha_empty(self, mock_app, tmp_path):
         """Full cache is returned when HA data is unavailable."""
         cache_path = tmp_path / "energy_history.csv"
         make_energy_df(
             ["2024-01-01 09:00", "2024-01-01 10:00"],
             [1.0, 1.5],
         ).to_csv(cache_path, index=False)
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
-            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy")
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert len(result) == 2
 
-    def test_saves_result_to_cache(self, mock_app, tmp_path, monkeypatch):
+    def test_saves_result_to_cache(self, mock_app, tmp_path):
         """Merged result is written to the cache CSV."""
         cache_path = tmp_path / "energy_history.csv"
-        monkeypatch.setattr(ha_data, "CACHE_PATH", cache_path)
 
         ha_raw = make_ha_raw(
             ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
             [100.0, 101.0],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
-            ha_data.fetch_recent_energy(mock_app, "sensor.energy")
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert cache_path.exists()
