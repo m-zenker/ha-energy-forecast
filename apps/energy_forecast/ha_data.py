@@ -50,7 +50,7 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
             app.log(f"Loaded {len(df_cache)} records from local cache.")
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch fresh data from HA
@@ -77,7 +77,7 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
     try:
         combined.to_csv(CACHE_PATH, index=False)
         app.log(f"Cache updated. Total history: {len(combined)} hours.")
-    except Exception as e:
+    except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined
@@ -105,7 +105,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
@@ -131,7 +131,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
 
     try:
         combined.to_csv(CACHE_PATH, index=False)
-    except Exception as e:
+    except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined

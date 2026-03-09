@@ -63,8 +63,8 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str = None, clie
         df = pd.DataFrame(records)
         return df
 
-    except Exception:
-        # If SRG fails for any reason, use the fallback function below
+    except (requests.RequestException, KeyError, ValueError):
+        # SRG failed — fall back to Open-Meteo
         return fetch_open_meteo(lat, lon)
 
 def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
@@ -81,5 +81,5 @@ def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
             "sunshine_min": 0,  # Open-Meteo free tier doesn't always provide sunshine duration
             "wind_kmh": h["windspeed_10m"]
         })
-    except Exception:
+    except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()

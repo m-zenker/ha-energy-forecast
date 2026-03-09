@@ -116,6 +116,7 @@ def ensure_ml_packages() -> tuple[bool, str]:
         _LOGGER.error("scikit-learn is not importable. Check AppDaemon requirements.txt.")
         return False, "none"
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
+    _LOGGER.info("ML engine: %s", engine)
     return True, engine
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
@@ -232,7 +233,7 @@ class EnergyForecastModel:
                         m.fit(X.iloc[tr_idx], y[tr_idx])
                     fold_maes.append(float(mae_fn(y[val_idx], m.predict(X.iloc[val_idx]))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
 
         # ── Final model on all data ─────────────────────────────────────────
@@ -248,7 +249,7 @@ class EnergyForecastModel:
             split = max(int(len(X) * 0.9), len(X) - 500)
             try:
                 holdout_mae = round(float(mae_fn(y[split:], model.predict(X.iloc[split:]))), 4)
-            except Exception:  # noqa: BLE001
+            except (ValueError, IndexError):
                 pass
 
         self.model          = model
@@ -346,7 +347,7 @@ class EnergyForecastModel:
                 try:
                     with open(self._model_path, "rb") as fh:
                         self.model = pickle.load(fh)
-                except Exception as exc:  # noqa: BLE001
+                except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load saved model: %s", exc)
 
         if self._meta_path.exists():
@@ -365,7 +366,7 @@ class EnergyForecastModel:
                     self.last_cv_mae       = meta.get("last_cv_mae")
                     self.engine            = meta.get("engine",          "unknown")
                     self._feature_medians  = meta.get("feature_medians", {})
-                except Exception as exc:  # noqa: BLE001
+                except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
 
@@ -431,6 +432,13 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
         future_df[f"lag_{lag}h"] = [
             actuals.get(t, np.nan) for t in lag_times
         ]
+        nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
+        if nan_count > len(future_df) * 0.5:
+            _LOGGER.warning(
+                "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
+                "back %dh; these will be filled with training medians.",
+                lag, nan_count, len(future_df), lag,
+            )
 
     # Rolling stats from the actual recent window
     def _safe_stat(fn, window_h):
