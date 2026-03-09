@@ -13,11 +13,9 @@ if TYPE_CHECKING:
     import pandas as pd
     import hassapi as hass
 
-from .const import CACHE_PATH
+from .const import CACHE_PATH, MAX_HOURLY_KWH
 
 _LOGGER = logging.getLogger(__name__)
-
-MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
 
 
 def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:

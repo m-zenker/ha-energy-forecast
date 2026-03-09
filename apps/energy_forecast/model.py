@@ -124,6 +124,8 @@ def ensure_ml_packages() -> tuple[bool, str]:
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
     _LOGGER.info("ML engine: %s", engine)
     return True, engine
+
+
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
@@ -450,7 +452,7 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
             subset = actuals.iloc[-window_h:]
             val = fn(subset)
             return float(val) if not pd.isna(val) else np.nan
-        except Exception:  # noqa: BLE001
+        except (ValueError, TypeError, IndexError):
             return np.nan
 
     future_df["rolling_mean_24h"] = _safe_stat(lambda s: s.mean(), 24)
