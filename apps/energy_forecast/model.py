@@ -21,14 +21,21 @@ Changes from original:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from .const import (
+    HOLDOUT_FRACTION,
     MAX_HOURLY_KWH,
+    MIN_CV_ROWS,
+    MIN_TRAINING_ROWS,
     SENSOR_BLEND_HOURS,
     SENSOR_FULL_TRUST_HOURS,
 )
@@ -64,6 +71,26 @@ _FEATURES_BASE = [
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
 
+def _write_hash(path: Path) -> None:
+    """Write a SHA-256 sidecar file next to *path*."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.with_suffix(path.suffix + ".sha256").write_text(digest)
+
+
+def _verify_hash(path: Path) -> bool:
+    """Return True if the SHA-256 sidecar matches *path*, or if no sidecar exists.
+
+    No sidecar means the file predates integrity checking — allowed to load so
+    existing installations are not broken on upgrade.
+    """
+    hash_path = path.with_suffix(path.suffix + ".sha256")
+    if not hash_path.exists():
+        return True
+    expected = hash_path.read_text().strip()
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    return actual == expected
+
+
 def _try_import_lgbm() -> Any | None:
     try:
         import lightgbm as lgb  # noqa: PLC0415
@@ -95,7 +122,10 @@ def ensure_ml_packages() -> tuple[bool, str]:
         _LOGGER.error("scikit-learn is not importable. Check AppDaemon requirements.txt.")
         return False, "none"
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
+    _LOGGER.info("ML engine: %s", engine)
     return True, engine
+
+
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
@@ -119,9 +149,9 @@ class EnergyForecastModel:
 
     def train(
         self,
-        energy_df: Any,          # naive timestamps, cols: timestamp, gross_kwh
-        weather_df: Any,         # naive timestamps
-        outdoor_df: Any | None,  # naive timestamps
+        energy_df: pd.DataFrame,          # naive timestamps, cols: timestamp, gross_kwh
+        weather_df: pd.DataFrame,         # naive timestamps
+        outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
     ) -> None:
         """Train/retrain the model on historical data."""
@@ -176,8 +206,8 @@ class EnergyForecastModel:
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
         df = df[df["gross_kwh"] > 0]
 
-        if len(df) < 100:
-            _LOGGER.warning("Only %d clean rows — skipping (need ≥100)", len(df))
+        if len(df) < MIN_TRAINING_ROWS:
+            _LOGGER.warning("Only %d clean rows — skipping (need ≥%d)", len(df), MIN_TRAINING_ROWS)
             return
 
         # ── Store medians for NaN-filling at predict time ───────────────────
@@ -197,7 +227,7 @@ class EnergyForecastModel:
 
         # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
         cv_mae = None
-        if mae_fn is not None and len(df) >= 500:
+        if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
                 tscv   = TimeSeriesSplit(n_splits=3)
@@ -211,7 +241,7 @@ class EnergyForecastModel:
                         m.fit(X.iloc[tr_idx], y[tr_idx])
                     fold_maes.append(float(mae_fn(y[val_idx], m.predict(X.iloc[val_idx]))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
 
         # ── Final model on all data ─────────────────────────────────────────
@@ -224,10 +254,10 @@ class EnergyForecastModel:
         # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
         holdout_mae = None
         if mae_fn is not None:
-            split = max(int(len(X) * 0.9), len(X) - 500)
+            split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
                 holdout_mae = round(float(mae_fn(y[split:], model.predict(X.iloc[split:]))), 4)
-            except Exception:  # noqa: BLE001
+            except (ValueError, IndexError):
                 pass
 
         self.model          = model
@@ -247,10 +277,10 @@ class EnergyForecastModel:
 
     def predict(
         self,
-        forecast_df: Any,           # naive timestamps
+        forecast_df: pd.DataFrame,                    # naive timestamps
         live_temp: float | None,
-        recent_actuals: Any = None, # naive timestamps, cols: timestamp, gross_kwh
-    ) -> Any:
+        recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
+    ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
         import numpy as np
@@ -261,7 +291,7 @@ class EnergyForecastModel:
         # ── BUG FIX: generate NAIVE timestamps so they match the tz-stripped ──
         # forecast_df and training data throughout the pipeline.
         now_aware   = pd.Timestamp.now(tz="Europe/Zurich")
-        now_naive   = now_aware.tz_convert("Europe/Zurich").tz_localize(None)
+        now_naive   = now_aware.tz_localize(None)  # already Europe/Zurich — strip only
         future_hours = pd.date_range(
             start=now_naive.floor("1h"), periods=48, freq="1h"
         )  # no tz kwarg → naive dtype
@@ -300,6 +330,8 @@ class EnergyForecastModel:
     def _save(self) -> None:
         with open(self._model_path, "wb") as fh:
             pickle.dump(self.model, fh)
+        _write_hash(self._model_path)
+
         meta = {
             "feature_cols":     self.feature_cols,
             "last_trained":     self.last_trained,
@@ -310,32 +342,45 @@ class EnergyForecastModel:
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
+        _write_hash(self._meta_path)
 
     def _load(self) -> None:
         if self._model_path.exists():
-            try:
-                with open(self._model_path, "rb") as fh:
-                    self.model = pickle.load(fh)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Could not load saved model: %s", exc)
+            if not _verify_hash(self._model_path):
+                _LOGGER.warning(
+                    "Model file integrity check failed (%s) — discarding, will retrain.",
+                    self._model_path,
+                )
+            else:
+                try:
+                    with open(self._model_path, "rb") as fh:
+                        self.model = pickle.load(fh)
+                except (pickle.UnpicklingError, EOFError, OSError) as exc:
+                    _LOGGER.warning("Could not load saved model: %s", exc)
 
         if self._meta_path.exists():
-            try:
-                with open(self._meta_path, "rb") as fh:
-                    meta = pickle.load(fh)
-                self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
-                self.last_trained      = meta.get("last_trained",    datetime.min)
-                self.last_mae          = meta.get("last_mae")
-                self.last_cv_mae       = meta.get("last_cv_mae")
-                self.engine            = meta.get("engine",          "unknown")
-                self._feature_medians  = meta.get("feature_medians", {})
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Could not load model metadata: %s", exc)
+            if not _verify_hash(self._meta_path):
+                _LOGGER.warning(
+                    "Model metadata integrity check failed (%s) — discarding.",
+                    self._meta_path,
+                )
+            else:
+                try:
+                    with open(self._meta_path, "rb") as fh:
+                        meta = pickle.load(fh)
+                    self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
+                    self.last_trained      = meta.get("last_trained",    datetime.min)
+                    self.last_mae          = meta.get("last_mae")
+                    self.last_cv_mae       = meta.get("last_cv_mae")
+                    self.engine            = meta.get("engine",          "unknown")
+                    self._feature_medians  = meta.get("feature_medians", {})
+                except (pickle.UnpicklingError, EOFError, OSError) as exc:
+                    _LOGGER.warning("Could not load model metadata: %s", exc)
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
 
-def _add_lag_and_rolling_training(energy_df: Any, active_lags: list[int]) -> Any:
+def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int]) -> pd.DataFrame:
     """Compute lag and rolling features during training using shift().
 
     Only computes lags in active_lags — lags that would leave fewer than
@@ -361,7 +406,7 @@ def _add_lag_and_rolling_training(energy_df: Any, active_lags: list[int]) -> Any
     return df
 
 
-def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
+def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.DataFrame | None) -> pd.DataFrame:
     """Fill lag and rolling features for the 48-hour prediction horizon.
 
     For each future hour h:
@@ -392,9 +437,14 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
     for lag in LAG_HOURS:
         lag_td = pd.Timedelta(hours=lag)
         lag_times = future_df["timestamp"] - lag_td
-        future_df[f"lag_{lag}h"] = [
-            actuals.get(t, np.nan) for t in lag_times
-        ]
+        future_df[f"lag_{lag}h"] = actuals.reindex(lag_times).values
+        nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
+        if nan_count > len(future_df) * 0.5:
+            _LOGGER.warning(
+                "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
+                "back %dh; these will be filled with training medians.",
+                lag, nan_count, len(future_df), lag,
+            )
 
     # Rolling stats from the actual recent window
     def _safe_stat(fn, window_h):
@@ -402,7 +452,7 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
             subset = actuals.iloc[-window_h:]
             val = fn(subset)
             return float(val) if not pd.isna(val) else np.nan
-        except Exception:  # noqa: BLE001
+        except (ValueError, TypeError, IndexError):
             return np.nan
 
     future_df["rolling_mean_24h"] = _safe_stat(lambda s: s.mean(), 24)
@@ -415,10 +465,10 @@ def _add_lag_and_rolling_prediction(future_df: Any, recent_actuals: Any) -> Any:
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 def _engineer_features(
-    df,          # pd.DataFrame with naive timestamps
-    weather_df,  # pd.DataFrame with naive timestamps
-    outdoor_df,  # pd.DataFrame | None with naive timestamps
-) -> Any:
+    df: pd.DataFrame,                   # naive timestamps
+    weather_df: pd.DataFrame,           # naive timestamps
+    outdoor_df: pd.DataFrame | None,    # naive timestamps
+) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
 
@@ -486,7 +536,7 @@ def _engineer_features(
 
     return df
 
-def _add_holiday_feature(df: Any) -> Any:
+def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
     """Add binary is_public_holiday column using the `holidays` package.
 
     Falls back gracefully to 0 if the package is not installed.

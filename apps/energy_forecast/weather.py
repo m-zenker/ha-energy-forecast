@@ -30,7 +30,7 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
     })
 
 
-def fetch_forecast(plz: str, lat: float, lon: float, client_id: str = None, client_secret: str = None) -> pd.DataFrame:
+def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None) -> pd.DataFrame:
     """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback."""
     if not client_id or not client_secret:
         return fetch_open_meteo(lat, lon)
@@ -63,13 +63,13 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str = None, clie
         df = pd.DataFrame(records)
         return df
 
-    except Exception:
-        # If SRG fails for any reason, use the fallback function below
+    except (requests.RequestException, KeyError, ValueError):
+        # SRG failed — fall back to Open-Meteo
         return fetch_open_meteo(lat, lon)
 
 def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
     """Fallback forecast using the free Open-Meteo API."""
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,precipitation,windspeed_10m&timezone=Europe%2FBerlin"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,precipitation,windspeed_10m&timezone=Europe%2FZurich"
     try:
         res = requests.get(url, timeout=10)
         res.raise_for_status()
@@ -81,5 +81,5 @@ def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
             "sunshine_min": 0,  # Open-Meteo free tier doesn't always provide sunshine duration
             "wind_kmh": h["windspeed_10m"]
         })
-    except Exception:
+    except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()

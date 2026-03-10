@@ -1,12 +1,8 @@
 ---
-hello_world:
-  module: hello
-  class: HelloWorld
-
 # HA Energy Forecast — AppDaemon configuration
 #
-# Add this block to your appdaemon/apps/apps.yaml file.
-# Replace the values below with your own entity IDs and location.
+# Copy this file to apps.yaml and fill in your own values.
+# apps.yaml is gitignored because it contains API credentials.
 #
 # ── Required ──────────────────────────────────────────────────────────────────
 #
@@ -26,6 +22,11 @@ hello_world:
 #                         When provided, it is blended with the MeteoSwiss
 #                         forecast for the first 12 hours to improve accuracy.
 #
+#   srg_client_id / srg_client_secret
+#                         SRG-SSR API credentials for high-quality Swiss
+#                         weather forecasts. Obtain from developer.srgssr.ch.
+#                         If omitted, Open-Meteo is used automatically.
+#
 #   timezone          Timezone for all forecasts. Default: Europe/Zurich
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,24 +36,26 @@ energy_forecast:
   class: EnergyForecast
 
   # ── Required ────────────────────────────────────────────────────────────────
-  energy_sensor: sensor.gplugk_z_ei # ← change this
-  plz: 4533 # ← change this
-  latitude: 47.22891 # ← change this
-  longitude: 7.57502 # ← change this
-  srg_client_id: REDACTED_CLIENT_ID
-  srg_client_secret: REDACTED_CLIENT_SECRET
+  energy_sensor: sensor.your_grid_import_sensor  # ← change this
+  plz: 1234                                       # ← change this
+  latitude: 47.0                                  # ← change this
+  longitude: 8.0                                  # ← change this
+
+  # ── SRG-SSR weather API (optional — falls back to Open-Meteo if absent) ────
+  # srg_client_id: YOUR_CLIENT_ID
+  # srg_client_secret: YOUR_CLIENT_SECRET
 
   # ── Optional ────────────────────────────────────────────────────────────────
-  outdoor_temp_sensor: sensor.outdoor_netatmo_temperature
+  # outdoor_temp_sensor: sensor.outdoor_temperature
   timezone: Europe/Zurich
-  
-  
+
   # Optional: exponential sample weight half-life in days (default: 90).
   # Lower = recent data matters more. Set to 0 to disable weighting.
-  weight_halflife_days: 180
+  weight_halflife_days: 90
 
+# ── One-off backfill (uncomment only when needed) ────────────────────────────
 #energy_history_backfill:
 #  module: energy_forecast.energy_history_backfill
 #  class: EnergyHistoryBackfill
-#  energy_sensor: sensor.gplugk_z_ei
-#  ha_db_path: /homeassistant/home-assistant_v2.db   # ← was /config/
+#  energy_sensor: sensor.your_grid_import_sensor
+#  ha_db_path: /homeassistant/home-assistant_v2.db

@@ -25,7 +25,7 @@ from typing import Any
 import hassapi as hass
 
 from . import ha_data, weather
-from .const import EV_CHARGING_THRESHOLD_KWH
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH
 from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
@@ -54,6 +54,9 @@ class EnergyForecast(hass.Hass):
         # Fixed charger power in kW — subtracted from charging hours so the
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
+        self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
+
+        self._validate_config()
 
         model_dir = Path(__file__).parent / "models"
         self._ml_model = EnergyForecastModel(model_dir)
@@ -71,6 +74,30 @@ class EnergyForecast(hass.Hass):
             f"HA Energy Forecast ready. "
             f"EV threshold: {self._ev_threshold} kWh/h, "
             f"charger: {self._ev_charger_kw} kW"
+        )
+
+    # ── Config validation ─────────────────────────────────────────────────────
+
+    def _validate_config(self) -> None:
+        """Validate configuration values at startup; raises ValueError on bad input."""
+        if not (-90 <= self._lat <= 90):
+            raise ValueError(f"latitude must be between -90 and 90, got {self._lat}")
+        if not (-180 <= self._lon <= 180):
+            raise ValueError(f"longitude must be between -180 and 180, got {self._lon}")
+        if self._weight_halflife <= 0:
+            raise ValueError(
+                f"weight_halflife_days must be positive, got {self._weight_halflife}"
+            )
+        if self._ev_threshold <= 0:
+            raise ValueError(
+                f"ev_charging_threshold_kwh must be positive, got {self._ev_threshold}"
+            )
+        if self._ev_charger_kw <= 0:
+            raise ValueError(f"ev_charger_kw must be positive, got {self._ev_charger_kw}")
+        self.log(
+            f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
+            f"weight_halflife={self._weight_halflife}d, "
+            f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW"
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -103,7 +130,7 @@ class EnergyForecast(hass.Hass):
 
     def _retrain(self) -> None:
         self.log("Starting model retraining…")
-        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor)
+        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path)
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             self.log(f"Insufficient history ({len(energy_df)} h). Skipping.", level="WARNING")
@@ -126,8 +153,13 @@ class EnergyForecast(hass.Hass):
         try:
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date)
             weather_df = _strip_tz(weather_df)
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"Historical weather fetch failed: {exc}", level="WARNING")
+        except (OSError, KeyError, ValueError) as exc:
+            self.log(
+                f"Historical weather fetch failed: {exc} — "
+                "temp_c, heating_degree, cooling_degree and temp_rolling_3d will be "
+                "imputed from training-set medians; forecast quality will be reduced.",
+                level="WARNING",
+            )
             weather_df = _empty_weather_df()
 
         self._ml_model.train(
@@ -159,12 +191,12 @@ class EnergyForecast(hass.Hass):
         # Uses the lightweight fetch (last 2 days only) to stay well within
         # AppDaemon's 10s callback limit. Full 30-day resync happens in _retrain().
         try:
-            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor)
+            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor, cache_path=self._cache_path)
             full_actuals = _strip_tz(full_actuals)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
             recent_actuals, _ = ha_data.split_ev_charging(full_actuals, self._ev_threshold)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, ValueError, KeyError) as exc:
             self.log(f"Could not fetch recent actuals for lag features: {exc}", level="WARNING")
             recent_actuals = None
             full_actuals   = None

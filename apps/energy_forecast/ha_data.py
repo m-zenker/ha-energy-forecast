@@ -10,30 +10,81 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import pandas as pd
     import hassapi as hass
+
+from .const import CACHE_PATH, MAX_HOURLY_KWH
 
 _LOGGER = logging.getLogger(__name__)
 
-CACHE_PATH = Path(__file__).parent / "energy_history.csv"
-MAX_HOURLY_KWH = 50    # Spike / meter-reset filter threshold
+
+def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:
+    """Warn if the DataFrame contains duplicate naive timestamps.
+
+    Duplicate naive timestamps arise during the DST fall-back transition
+    (e.g. Europe/Zurich: last Sunday of October, 03:00 CEST → 02:00 CET).
+    After tz_localize(None) the naive hour 02:xx appears twice — once for the
+    summer-time reading, once for the winter-time reading.  The merge keeps
+    both rows, so callers should be aware that downstream aggregations may
+    double-count that hour.
+
+    Spring-forward gaps (e.g. 02:00–02:59 never occurring in March) are filled
+    by the resample/ffill in the fetch functions and do NOT produce duplicates;
+    they are accepted behaviour and are not flagged here.
+    """
+    if df.empty or "timestamp" not in df.columns:
+        return
+    dup_mask = df["timestamp"].duplicated(keep=False)
+    n_dup = int(dup_mask.sum())
+    if n_dup:
+        dup_times = df.loc[dup_mask, "timestamp"].unique()
+        logger.warning(
+            "DST fall-back: %d rows share %d duplicate naive timestamp(s) after merge "
+            "(e.g. %s). The ambiguous hour appears twice — downstream aggregations "
+            "may double-count it.",
+            n_dup,
+            len(dup_times),
+            dup_times[0],
+        )
 
 
-def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
+def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
+    """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
+
+    Concatenates loser first so that keep="last" in drop_duplicates() always
+    selects the winner's row.  Sorts by timestamp and drops rows with NaN in
+    either key column.
+    """
+    import pandas as pd
+    return (
+        pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp", "gross_kwh"])
+        .reset_index(drop=True)
+    )
+
+
+def fetch_energy_history(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path = CACHE_PATH,
+) -> pd.DataFrame:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
 
     # 1. Load existing cache if it exists
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-    if CACHE_PATH.exists():
+    if cache_path.exists():
         try:
-            df_cache = pd.read_csv(CACHE_PATH)
+            df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"])
             # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
             app.log(f"Loaded {len(df_cache)} records from local cache.")
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch fresh data from HA
@@ -53,21 +104,21 @@ def fetch_energy_history(app: "hass.Hass", entity_id: str) -> Any:
     else:
         df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
 
-    # 4. Merge and de-duplicate
-    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
-    combined = combined.sort_values("timestamp").dropna()
+    # 4. Merge — fresh HA data wins on timestamp conflicts
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    _check_dst_duplicates(combined, _LOGGER)
 
     # 5. Save back to CSV
     try:
-        combined.to_csv(CACHE_PATH, index=False)
+        combined.to_csv(cache_path, index=False)
         app.log(f"Cache updated. Total history: {len(combined)} hours.")
-    except Exception as e:
+    except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any:
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
     Fetches only the last `hours` of HA history (vs. 30 days in
@@ -82,14 +133,14 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
 
     # 1. Load existing cache — this is the bulk of our history
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-    if CACHE_PATH.exists():
+    if cache_path.exists():
         try:
-            df_cache = pd.read_csv(CACHE_PATH)
+            df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"])
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
@@ -110,19 +161,19 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6) -> Any
     else:
         df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
 
-    # 4. Merge new hours into cache and save
-    combined = pd.concat([df_cache, df_new]).drop_duplicates(subset=["timestamp"], keep="last")
-    combined = combined.sort_values("timestamp").dropna()
+    # 4. Merge — fresh HA data wins on timestamp conflicts
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    _check_dst_duplicates(combined, _LOGGER)
 
     try:
-        combined.to_csv(CACHE_PATH, index=False)
-    except Exception as e:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined
 
 
-def split_ev_charging(df: Any, threshold_kwh: float) -> tuple[Any, Any]:
+def split_ev_charging(df: pd.DataFrame, threshold_kwh: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a history DataFrame into baseline and EV charging portions.
 
     Charging hours are identified by gross_kwh > threshold_kwh.  Your charger
@@ -154,7 +205,7 @@ def split_ev_charging(df: Any, threshold_kwh: float) -> tuple[Any, Any]:
     return df, ev_df
 
 
-def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> Any:
+def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:

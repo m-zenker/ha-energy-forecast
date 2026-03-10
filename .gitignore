@@ -1,3 +1,6 @@
+# apps.yaml may contain API credentials — keep a local copy only
+apps/apps.yaml
+
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
 __pycache__/
