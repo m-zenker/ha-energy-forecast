@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.1] — 2026-03-10
+
 ### Added
 - `LICENSE` file (MIT)
 - `ha_appdaemon_config.yaml` — ready-to-paste AppDaemon add-on dependency config
@@ -54,6 +58,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.0...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.1...HEAD
+[0.2.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.0...v0.2.1
 [0.2.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.1.0...v0.2.0
 [0.1.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/releases/tag/v0.1.0
