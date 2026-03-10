@@ -47,6 +47,8 @@ init_commands:
 
 > If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove `lightgbm` from the `init_commands` line. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
 
+The above configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root for easy copy-paste.
+
 ### Python packages reference
 
 | Package | Notes |
@@ -62,12 +64,26 @@ init_commands:
 
 ## Installation
 
-1. **Copy the app** into your AppDaemon apps directory:
+1. **Install the AppDaemon add-on** if you haven't already:
+   - Go to **Settings → Add-ons → Add-on Store**, search for **AppDaemon**, install and start it.
+   - Configure dependencies as shown in the [Requirements](#appdaemon-add-on-configuration) section above, then restart the add-on.
+
+2. **Copy the app** into your AppDaemon apps directory so the structure looks like this:
    ```
-   /config/appdaemon/apps/energy_forecast/   ← all files from apps/energy_forecast/
+   <config>/
+   └── appdaemon/
+       └── apps/
+           ├── apps.yaml                    ← create from apps.yaml.example
+           └── energy_forecast/
+               ├── __init__.py
+               ├── energy_forecast.py
+               ├── ha_data.py
+               ├── model.py
+               ├── weather.py
+               └── const.py
    ```
 
-2. **Create `apps.yaml`** from the provided example:
+3. **Create `apps.yaml`** from the provided example:
    ```bash
    cp apps/apps.yaml.example /config/appdaemon/apps/apps.yaml
    ```
@@ -123,6 +139,8 @@ energy_forecast:
   # Path override for the energy history CSV (default: next to energy_forecast.py).
   # cache_path: /config/appdaemon/apps/energy_forecast/energy_history.csv
 ```
+
+> **Finding your `energy_sensor` entity ID:** In HA go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for your grid-import meter. It should be a sensor whose state increases continuously (never resets to zero each day).
 
 ### Parameter reference
 
@@ -335,4 +353,4 @@ Tune the threshold in `apps.yaml` to match your charger and household ceiling. T
 
 ## Licence
 
-MIT
+[MIT](LICENSE) © 2026 Martin Zenker
