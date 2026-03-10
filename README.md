@@ -47,6 +47,8 @@ init_commands:
 
 > If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove `lightgbm` from the `init_commands` line. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
 
+The above configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root for easy copy-paste.
+
 ### Python packages reference
 
 | Package | Notes |

@@ -1,0 +1,12 @@
+system_packages:
+  - build-base
+  - gfortran
+  - openblas-dev
+  - python3-dev
+python_packages:
+  - requests>=2.31.0
+  - holidays>=0.46
+init_commands:
+  - >-
+    pip install --extra-index-url https://alpine-wheels.github.io/index pandas
+    numpy scikit-learn lightgbm
