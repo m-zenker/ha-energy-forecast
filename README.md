@@ -26,45 +26,37 @@ Forecasts are published as native Home Assistant sensor entities and update ever
 - [AppDaemon 4.x](https://github.com/AppDaemon/appdaemon) installed as an HA add-on or standalone
 
 ### AppDaemon add-on configuration
-AppDaemon requires its own configuration file **`appdaemon.yaml`** (separate from `apps.yaml`). In the HA AppDaemon add-on this lives at `/config/appdaemon/appdaemon.yaml`. A minimal working configuration:
+The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must be declared in the add-on's own configuration, which is edited via the HA UI under **Settings → Add-ons → AppDaemon → Configuration**:
 
 ```yaml
-# /config/appdaemon/appdaemon.yaml
-appdaemon:
-  latitude: 47.0          # your location (used by AppDaemon itself)
-  longitude: 8.0
-  elevation: 450
-  time_zone: Europe/Zurich
-  plugins:
-    HASS:
-      type: hass
-      ha_url: http://homeassistant:8123
-      token: YOUR_LONG_LIVED_ACCESS_TOKEN
-
-http:
-  url: http://0.0.0.0:5050
-
-logs:
-  main_log:
-    filename: /config/appdaemon/logs/appdaemon.log
-  error_log:
-    filename: /config/appdaemon/logs/error.log
+system_packages:
+  - build-base
+  - gfortran
+  - openblas-dev
+  - python3-dev
+python_packages:
+  - requests>=2.31.0
+  - holidays>=0.46
+init_commands:
+  - >-
+    pip install --extra-index-url https://alpine-wheels.github.io/index pandas
+    numpy scikit-learn lightgbm
 ```
 
-> **Note:** `ha_url` and `token` are required for AppDaemon to connect to Home Assistant. Generate a long-lived access token in your HA profile page.
+`system_packages` provides the Alpine build toolchain needed to compile numpy/scipy extensions. `python_packages` handles pure-Python packages. `init_commands` runs the pip install with the extra index URL required for pre-built Alpine/ARM wheels of pandas, numpy, scikit-learn, and LightGBM.
 
-### Python packages
-AppDaemon installs these automatically from `apps/energy_forecast/requirements.txt` on startup:
+> If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove `lightgbm` from the `init_commands` line. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
 
-| Package | Version | Notes |
-|---------|---------|-------|
-| `pandas` | ≥ 2.0.0 | |
-| `numpy` | ≥ 1.24.0 | |
-| `requests` | ≥ 2.31.0 | |
-| `scikit-learn` | == 1.8.0 | Required — GBR fallback engine |
-| `lightgbm` | ≥ 4.0.0 | Optional — primary engine; comment out if no C compiler |
+### Python packages reference
 
-`--extra-index-url https://alpine-wheels.github.io/index` is included for Alpine/ARM installs.
+| Package | Notes |
+|---------|-------|
+| `pandas` ≥ 2.0.0 | |
+| `numpy` ≥ 1.24.0 | |
+| `requests` ≥ 2.31.0 | |
+| `holidays` ≥ 0.46 | Swiss public holiday feature |
+| `scikit-learn` == 1.8.0 | Required — GBR fallback engine |
+| `lightgbm` ≥ 4.0.0 | Optional — primary engine |
 
 ---
 
@@ -83,7 +75,7 @@ AppDaemon installs these automatically from `apps/energy_forecast/requirements.t
 
    > `apps.yaml` is **gitignored** in this repo because it contains API credentials. Never commit it.
 
-3. **Restart AppDaemon.** It will install Python dependencies and start the app automatically. Watch the AppDaemon log for:
+3. **Restart AppDaemon.** The add-on will run the `init_commands` to install dependencies, then start the app. Watch the AppDaemon log for:
    ```
    HA Energy Forecast initialising…
    ML engine: LightGBM
@@ -318,8 +310,8 @@ Tune the threshold in `apps.yaml` to match your charger and household ceiling. T
 
 **`ML engine: sklearn GBR` instead of LightGBM**
 - LightGBM failed to install (no C compiler on the host, e.g. armv7).
-- The sklearn fallback is fully functional. If you want LightGBM, install a compiler or use pre-built wheels.
-- On Alpine ARM: comment out `lightgbm` from `requirements.txt` to avoid a failed install attempt.
+- The sklearn fallback is fully functional. If you want LightGBM, ensure the build toolchain system packages are present in the add-on configuration.
+- On Alpine ARM without a C compiler: remove `lightgbm` from the `init_commands` line in the add-on configuration to avoid a failed install attempt.
 
 **Forecast accuracy is poor in the first few weeks**
 - The model needs at least a few weeks of data to learn daily and weekly patterns. Use the backfill tool to give it a head start.
