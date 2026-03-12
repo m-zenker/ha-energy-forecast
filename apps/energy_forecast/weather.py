@@ -63,7 +63,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
                 auth_res.status_code, auth_res.text,
             )
             return fetch_open_meteo(lat, lon)
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         # 2. Get Forecast (60min intervals)
         forecast_url = f"https://api.srgssr.ch/forecasts/v1.0/weather/7day?latitude={lat}&longitude={lon}"
