@@ -246,7 +246,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 
 ### Features used
 
-Calendar, cyclical encodings (hour, day-of-week, month, hour-of-week), weather (temp, precipitation, sunshine, wind, heating/cooling degree hours, 3-day rolling temperature), autoregressive lags (24 h, 48 h, 168 h, 336 h), rolling consumption stats (24 h mean/std, 7-day mean), Swiss public holidays.
+Calendar, cyclical encodings (hour, day-of-week, month, hour-of-week), weather (temp, precipitation, sunshine, wind, heating/cooling degree hours, 3-day rolling temperature), autoregressive lags (24 h, 48 h, 72 h, 168 h, 336 h), rolling consumption stats (24 h mean/std, 7-day mean), Swiss public holidays, bridge-day proximity (days to/since nearest holiday, capped at 3).
 
 Lag features are dynamically enabled as history grows — the full feature set is active once you have ≥ 436 hours (≈18 days) of data.
 

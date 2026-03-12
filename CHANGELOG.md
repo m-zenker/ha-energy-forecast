@@ -23,10 +23,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it stabilises at the recent household baseline.
 
 ### Added
+- **`lag_72h`** autoregressive feature — captures the same-time-3-days-ago pattern,
+  useful for weekend/holiday bridge transitions. Activates dynamically once ≥172 h
+  of history is available, consistent with the existing dynamic lag selection logic.
+- **Bridge-day holiday features** — `days_to_next_holiday` and `days_since_last_holiday`
+  (integers, capped at 3). Both are 0 on a holiday itself; fallback to 3 if the
+  `holidays` package is unavailable. Holiday years extended by ±1 to handle dates
+  near year boundaries (e.g. Dec 31 seeing Jan 1).
 - `tests/test_weather.py` — 6 tests covering `fetch_open_meteo` sunshine parsing,
   unit conversion, missing-key fallback, column contract, and network errors
-- `tests/test_model.py` — 12 tests covering rolling feature variance, exact h=0
-  boundary semantics, smooth transition at h=24, and short/empty actuals edge cases
+- `tests/test_model.py` — 23 tests covering rolling feature variance, exact h=0
+  boundary semantics, smooth transition at h=24, short/empty actuals edge cases,
+  lag_72h correctness, and bridge-day feature range/values/fallback
 - `ROADMAP.md` — forecast accuracy improvement roadmap (15 items across 4 tiers)
 
 ---

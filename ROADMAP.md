@@ -22,7 +22,7 @@ temperatures. Add a forward-projection of this feature using forecast `temp_c`
 so the model sees the *incoming* thermal trend, not just the past one. Particularly
 impactful at the start of cold spells and thaws.
 
-### 3. Pre/post-holiday bridge day features
+### ~~3. Pre/post-holiday bridge day features~~ ✓ done (d47477f)
 The model uses only a binary `is_public_holiday` flag. Adding
 `days_to_next_holiday` and `days_since_last_holiday` (capped at ±3) captures the
 Brückentag (bridging day) pattern common in Swiss households — consumption
@@ -83,7 +83,7 @@ school holidays household daytime consumption rises (children at home). None of
 the current features capture this. Implement a static lookup table per canton,
 configurable via `apps.yaml`, and add `is_school_holiday` to `_FEATURES_BASE`.
 
-### 11. Additional lag: `lag_72h`
+### ~~11. Additional lag: `lag_72h`~~ ✓ done (d47477f)
 A 72 h lag captures the "same-time-3-days-ago" pattern, useful for transitions
 at the start/end of weekends and public-holiday bridges. It slots between the
 existing `lag_48h` and `lag_168h` with no impact on data-volume requirements
@@ -127,7 +127,7 @@ cannot capture.
 |---|--------|--------------------:|--------|--------|
 | 1 | Fix Open-Meteo sunshine | high (non-SRG installs) | 15 min | ✓ done |
 | 2 | Forward-roll `temp_rolling_3d` | medium | 1 h | |
-| 3 | Pre/post holiday bridge features | medium | 1 h | |
+| 3 | Pre/post holiday bridge features | medium | 1 h | ✓ done |
 | 4 | Cloud cover / radiation feature | medium | 2 h | |
 | 5 | Per-hour rolling prediction features | **high** | 3 h | ✓ done |
 | 6 | LightGBM early stopping | medium | 2 h | |
@@ -135,7 +135,7 @@ cannot capture.
 | 8 | Adaptive retraining trigger | medium | 3 h | |
 | 9 | Cantonal holidays config | low | 30 min | |
 | 10 | School holiday feature | medium | 4 h | |
-| 11 | `lag_72h` | low | 30 min | |
+| 11 | `lag_72h` | low | 30 min | ✓ done |
 | 12 | EV session probability feature | medium | 4 h | |
 | 13 | Prediction intervals (HA sensors) | UX value | 4 h | |
 | 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | |
