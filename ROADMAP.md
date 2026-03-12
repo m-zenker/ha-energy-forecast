@@ -77,7 +77,7 @@ Most impactful after seasonal transitions or household behaviour changes.~~
 key in `apps.yaml` is a one-line change in `_add_holiday_feature` but captures
 cantonal school and bank holidays that differ significantly from federal ones.~~
 
-### 10. School holiday feature
+### 10. School holiday feature *(long-term backlog)*
 Swiss Schulferien dates are canton-specific but stable year-to-year. During
 school holidays household daytime consumption rises (children at home). None of
 the current features capture this. Implement a static lookup table per canton,
@@ -101,11 +101,11 @@ hour. Improvements:
 
 ## Tier 4 — Longer-term / architectural
 
-### 13. Prediction intervals as HA sensors
-Publish `sensor.energy_forecast_today_low` / `_high` using LightGBM quantile
+### ~~13. Prediction intervals as HA sensors~~ ✓ done
+~~Publish `sensor.energy_forecast_today_low` / `_high` using LightGBM quantile
 regression (`objective='quantile'`, `alpha=0.1/0.9`). Enables automations like
 "charge EV only if forecast upper bound is below 15 kWh" — higher end-user value
-than marginal point-estimate MAE improvement.
+than marginal point-estimate MAE improvement.~~
 
 ### ~~14. Intra-day actuals substitution~~ ✓ done
 ~~As today's hours tick by, `_aggregate()` should replace predicted values for
@@ -113,7 +113,7 @@ elapsed hours with actuals from the CSV cache. Currently the `today` sensor sums
 raw predictions across the full day including already-elapsed hours. Substituting
 actuals makes the `today` total significantly more accurate as the day progresses.~~
 
-### 15. HVAC / boiler state feature
+### 15. HVAC / boiler state feature *(long-term backlog)*
 If a thermostat or boiler entity is available in HA (configurable via `apps.yaml`
 as `hvac_sensor`), including its current setpoint or on/off state as a feature
 directly explains heating/cooling load variance that outdoor temperature alone
@@ -134,9 +134,9 @@ cannot capture.
 | 7 | Log-transform target | medium | 1 h | ✓ done |
 | 8 | Adaptive retraining trigger | medium | 3 h | ✓ done |
 | 9 | Cantonal holidays config | low | 30 min | ✓ done |
-| 10 | School holiday feature | medium | 4 h | |
+| 10 | School holiday feature | medium | 4 h | long-term backlog |
 | 11 | `lag_72h` | low | 30 min | ✓ done |
 | 12 | EV session probability feature | medium | 4 h | |
-| 13 | Prediction intervals (HA sensors) | UX value | 4 h | |
+| 13 | Prediction intervals (HA sensors) | UX value | 4 h | ✓ done |
 | 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | ✓ done |
-| 15 | HVAC state feature | high (if available) | 3 h | |
+| 15 | HVAC state feature | high (if available) | 3 h | long-term backlog |

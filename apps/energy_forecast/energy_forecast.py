@@ -214,6 +214,10 @@ class EnergyForecast(hass.Hass):
         predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals)
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
+        intervals = self._ml_model.predict_intervals(forecast_df, live_temp, recent_actuals)
+        if intervals is not None:
+            intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
+
         # ── Store predictions for adaptive retrain tracking ───────────────────
         # Keep-first: only store a prediction for each target hour the first time
         # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
@@ -229,7 +233,7 @@ class EnergyForecast(hass.Hass):
 
         self._maybe_adaptive_retrain(recent_actuals)
 
-        aggregated = self._aggregate(predictions, full_actuals, live_temp)
+        aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
         self._publish(aggregated)
 
     def _read_live_temp(self) -> float | None:
@@ -325,6 +329,14 @@ class EnergyForecast(hass.Hass):
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}")
 
+        # ── Prediction intervals (only published when quantile models trained) ─
+        for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+            low  = data.get(f"{key}_low")
+            high = data.get(f"{key}_high")
+            if low is not None and high is not None:
+                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)")
+                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)")
+
         # ── Forecast 3-hour blocks ────────────────────────────────────────────
         for day in ("today", "tomorrow"):
             blocks = data.get(f"blocks_{day}", {})
@@ -372,7 +384,7 @@ class EnergyForecast(hass.Hass):
 
     # ── Aggregation ───────────────────────────────────────────────────────────
 
-    def _aggregate(self, predictions: Any, full_actuals: Any, live_temp: float | None) -> dict:
+    def _aggregate(self, predictions: Any, full_actuals: Any, live_temp: float | None, intervals: Any = None) -> dict:
         import numpy as np
         import pandas as pd
 
@@ -413,6 +425,27 @@ class EnergyForecast(hass.Hass):
             "ev_today":        0.0,
             "ev_yesterday":    0.0,
         }
+
+        # ── Prediction intervals ─────────────────────────────────────────────
+        if intervals is not None:
+            iv_times = pd.to_datetime(intervals["timestamp"]).values.astype("datetime64[ns]")
+            iv_low   = intervals["low_kwh"].values.astype(float)
+            iv_high  = intervals["high_kwh"].values.astype(float)
+
+            def _isum(vals, s, e):
+                return round(float(np.sum(vals[(iv_times >= s) & (iv_times < e)])), 3)
+
+            today_low,  _ = _blend_today_totals(iv_times, iv_low,  full_actuals, today_np, tomorrow_np, now_np)
+            today_high, _ = _blend_today_totals(iv_times, iv_high, full_actuals, today_np, tomorrow_np, now_np)
+
+            result.update({
+                "next_3h_low":   _isum(iv_low,  now_np,      now_np + np.timedelta64(3, "h")),
+                "next_3h_high":  _isum(iv_high, now_np,      now_np + np.timedelta64(3, "h")),
+                "today_low":     today_low,
+                "today_high":    today_high,
+                "tomorrow_low":  _isum(iv_low,  tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
+                "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
+            })
 
         # ── EV kWh from actuals: sum (gross - threshold) for charging hours ───
         # This gives net charger energy, excluding the household co-load.

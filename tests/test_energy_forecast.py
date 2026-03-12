@@ -144,3 +144,48 @@ class TestComputeLiveMae:
         mae, n = _compute_live_mae(pred_history, actuals)
         assert n == 12
         assert abs(mae - 2.0) < 1e-6   # |3.0 - 1.0| = 2.0 for each of the 12 matched
+
+
+# ── Interval blending (#13) ───────────────────────────────────────────────────
+
+class TestIntervalBlend:
+
+    def _nts(self, ts: pd.Timestamp) -> np.datetime64:
+        return np.datetime64(ts, "ns")
+
+    def test_low_total_less_than_high_total(self):
+        """Blending q10 vals gives today_low < today_high when q10 < q90 for future hours."""
+        today  = pd.Timestamp("2026-03-12 00:00")
+        now    = pd.Timestamp("2026-03-12 00:00")  # nothing elapsed
+        tmrw   = today + pd.Timedelta(days=1)
+
+        ts = pd.date_range(today, periods=48, freq="1h")
+        p_times = ts.values.astype("datetime64[ns]")
+
+        low_vals  = np.full(48, 1.0)   # q10 = 1.0 kWh/h
+        high_vals = np.full(48, 3.0)   # q90 = 3.0 kWh/h
+
+        today_low,  _ = _blend_today_totals(p_times, low_vals,  None, self._nts(today), self._nts(tmrw), self._nts(now))
+        today_high, _ = _blend_today_totals(p_times, high_vals, None, self._nts(today), self._nts(tmrw), self._nts(now))
+
+        assert today_low < today_high
+
+    def test_fully_elapsed_window_interval_collapses_to_actuals(self):
+        """When all hours are elapsed, both low and high equal the actuals sum."""
+        today  = pd.Timestamp("2026-03-12 00:00")
+        now    = pd.Timestamp("2026-03-12 06:00")  # 6h elapsed
+        tmrw   = today + pd.Timedelta(days=1)
+
+        p_times   = pd.date_range(now, periods=48, freq="1h").values.astype("datetime64[ns]")
+        low_vals  = np.full(48, 1.0)
+        high_vals = np.full(48, 5.0)
+        actuals   = pd.DataFrame({
+            "timestamp": pd.date_range(today, periods=6, freq="1h"),
+            "gross_kwh": [2.0] * 6,
+        })
+        # Block 00_03 is fully elapsed → both bounds must equal 3×2.0 = 6.0
+        _, blocks_low  = _blend_today_totals(p_times, low_vals,  actuals, self._nts(today), self._nts(tmrw), self._nts(now))
+        _, blocks_high = _blend_today_totals(p_times, high_vals, actuals, self._nts(today), self._nts(tmrw), self._nts(now))
+
+        assert abs(blocks_low["00_03"]  - 6.0) < 1e-6
+        assert abs(blocks_high["00_03"] - 6.0) < 1e-6

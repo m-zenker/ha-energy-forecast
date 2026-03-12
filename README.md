@@ -175,6 +175,19 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 | `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
+### Prediction intervals (80% confidence)
+
+Published once quantile models are trained (first retrain cycle after install). Elapsed hours use actuals for both bounds; the interval applies only to the forecast portion.
+
+| Entity ID | Description |
+|-----------|-------------|
+| `sensor.energy_forecast_next_3h_low` | 10th-percentile forecast for the next 3 hours |
+| `sensor.energy_forecast_next_3h_high` | 90th-percentile forecast for the next 3 hours |
+| `sensor.energy_forecast_today_low` | 10th-percentile total for today |
+| `sensor.energy_forecast_today_high` | 90th-percentile total for today |
+| `sensor.energy_forecast_tomorrow_low` | 10th-percentile total for tomorrow |
+| `sensor.energy_forecast_tomorrow_high` | 90th-percentile total for tomorrow |
+
 ### 3-hour block forecasts
 
 One sensor per 3-hour block, for both today and tomorrow:

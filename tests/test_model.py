@@ -32,6 +32,40 @@ from energy_forecast.model import (
     LAG_HOURS,
 )
 
+# ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
+
+def _make_trained_model(tmp_path, n: int = 600) -> tuple:
+    """Return (model, forecast_df) after a full train() call."""
+    rng = np.random.default_rng(0)
+    ts  = pd.date_range("2024-01-01", periods=n, freq="1h")
+    energy = pd.DataFrame({
+        "timestamp": ts,
+        "gross_kwh": rng.uniform(0.5, 5.0, size=n),
+    })
+    weather = pd.DataFrame({
+        "timestamp":            ts,
+        "temp_c":               rng.uniform(-5, 25, size=n),
+        "precipitation_mm":     [0.0]   * n,
+        "sunshine_min":         [30.0]  * n,
+        "wind_kmh":             [10.0]  * n,
+        "cloud_cover_pct":      [50.0]  * n,
+        "direct_radiation_wm2": [100.0] * n,
+    })
+    m = EnergyForecastModel(tmp_path)
+    m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+    # Build a minimal forecast_df covering the next 48h
+    future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+    forecast = pd.DataFrame({
+        "timestamp":            future_ts,
+        "temp_c":               [10.0]  * 48,
+        "precipitation_mm":     [0.0]   * 48,
+        "sunshine_min":         [30.0]  * 48,
+        "wind_kmh":             [10.0]  * 48,
+        "cloud_cover_pct":      [50.0]  * 48,
+        "direct_radiation_wm2": [100.0] * 48,
+    })
+    return m, forecast
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -347,41 +381,14 @@ class TestNewWeatherFeatures:
 
 class TestLogTransform:
 
-    def _make_train_data(self, n: int = 600):
-        """Minimal energy + weather DataFrames suitable for EnergyForecastModel.train()."""
-        rng = np.random.default_rng(0)
-        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
-        energy = pd.DataFrame({
-            "timestamp": ts,
-            "gross_kwh": rng.uniform(0.5, 5.0, size=n),
-        })
-        weather = pd.DataFrame({
-            "timestamp":            ts,
-            "temp_c":               rng.uniform(-5, 25, size=n),
-            "precipitation_mm":     [0.0] * n,
-            "sunshine_min":         [30.0] * n,
-            "wind_kmh":             [10.0] * n,
-            "cloud_cover_pct":      [50.0] * n,
-            "direct_radiation_wm2": [100.0] * n,
-        })
-        return energy, weather
-
     def test_log_transform_flag_set_after_training(self, tmp_path):
         """_log_transform must be True after a successful train()."""
-        energy, weather = self._make_train_data()
-        m = EnergyForecastModel(tmp_path)
-        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        m, _ = _make_trained_model(tmp_path)
         assert m._log_transform is True
 
     def test_predict_gives_nonnegative_finite_values(self, tmp_path):
         """predict() must return non-negative, finite kWh values with log-transform active."""
-        energy, weather = self._make_train_data()
-        m = EnergyForecastModel(tmp_path)
-        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
-        forecast = weather.iloc[-48:].copy().reset_index(drop=True)
-        forecast["timestamp"] = pd.date_range(
-            pd.Timestamp.now().floor("1h"), periods=48, freq="1h"
-        )
+        m, forecast = _make_trained_model(tmp_path)
         result = m.predict(forecast, live_temp=None)
         assert result["predicted_kwh"].ge(0).all()
         assert result["predicted_kwh"].notna().all()
@@ -461,3 +468,34 @@ class TestCantonalHolidays:
         result = _add_holiday_feature(self._ts_df(["2026-03-15"]), canton="INVALID")
         for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
             assert col in result.columns
+
+
+# ── Prediction intervals (#13) ────────────────────────────────────────────────
+
+class TestPredictIntervals:
+
+    def test_quantile_models_trained(self, tmp_path):
+        """After train(), _model_q10 and _model_q90 must not be None."""
+        m, _ = _make_trained_model(tmp_path)
+        assert m._model_q10 is not None
+        assert m._model_q90 is not None
+
+    def test_predict_intervals_columns_and_nonnegative(self, tmp_path):
+        """predict_intervals() returns DataFrame with expected columns, non-negative, finite."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.predict_intervals(forecast, live_temp=None)
+        assert result is not None
+        assert "low_kwh"  in result.columns
+        assert "high_kwh" in result.columns
+        assert len(result) == 48
+        assert result["low_kwh"].ge(0).all()
+        assert result["high_kwh"].ge(0).all()
+        assert np.isfinite(result["low_kwh"].values).all()
+        assert np.isfinite(result["high_kwh"].values).all()
+
+    def test_low_le_high(self, tmp_path):
+        """low_kwh must be ≤ high_kwh for every row (quantile ordering enforced)."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.predict_intervals(forecast, live_temp=None)
+        assert result is not None
+        assert (result["low_kwh"] <= result["high_kwh"]).all()

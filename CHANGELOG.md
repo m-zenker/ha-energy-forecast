@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Prediction intervals** (#13): two quantile regression models (α=0.1, α=0.9)
+  are trained alongside the point-estimate model using the same feature matrix,
+  log-transformed target, and n_estimators from early stopping. Quantile training
+  is wrapped in a broad `try/except` so a failure never interrupts normal operation.
+  Six new HA sensors are published once quantile models are available:
+  `sensor.energy_forecast_{next_3h,today,tomorrow}_{low,high}`. Today's bounds
+  blend actuals for elapsed hours with quantile forecasts for remaining hours —
+  the interval collapses to zero width for hours that have already passed.
+  Models are persisted as `energy_model_q10.pkl` / `energy_model_q90.pkl` with
+  SHA-256 sidecars (same integrity pattern as the main model). A new
+  `_prepare_prediction_X()` helper eliminates the shared feature-engineering
+  duplication between `predict()` and `predict_intervals()`.
 - **Intra-day actuals substitution** (#14): `sensor.energy_forecast_today` and
   the `today_HH_HH` block sensors now blend measured actuals (elapsed hours) with
   model predictions (remaining hours). Previously the today total was based on

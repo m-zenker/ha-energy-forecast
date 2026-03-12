@@ -147,6 +147,11 @@ class EnergyForecastModel:
         self._feature_medians: dict        = {}     # used to fill NaN at predict time
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
+        # Quantile models for prediction intervals (α=0.1, α=0.9)
+        self._model_q10 = None
+        self._model_q90 = None
+        self._model_q10_path = model_dir / "energy_model_q10.pkl"
+        self._model_q90_path = model_dir / "energy_model_q90.pkl"
 
         self._load()
 
@@ -305,6 +310,62 @@ class EnergyForecastModel:
             len(df), engine_name, len(feature_cols), mae_str,
         )
 
+        # ── Quantile models for prediction intervals ─────────────────────────
+        # Trained on same X/y_fit/sample_weight; n_estimators from early stopping.
+        # Wrapped so a quantile failure never interrupts normal operation.
+        try:
+            q10 = _build_quantile_model(lgb, GBR, alpha=0.1, n_estimators=best_n_est)
+            q90 = _build_quantile_model(lgb, GBR, alpha=0.9, n_estimators=best_n_est)
+            if sample_weight is not None:
+                q10.fit(X, y_fit, sample_weight=sample_weight)
+                q90.fit(X, y_fit, sample_weight=sample_weight)
+            else:
+                q10.fit(X, y_fit)
+                q90.fit(X, y_fit)
+            self._model_q10 = q10
+            self._model_q90 = q90
+            self._save_quantile_models()
+            _LOGGER.info("Quantile models trained (q10, q90) — prediction intervals available")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Quantile model training failed: %s — prediction intervals unavailable", exc)
+            self._model_q10 = None
+            self._model_q90 = None
+
+
+    def _prepare_prediction_X(
+        self,
+        forecast_df: pd.DataFrame,
+        live_temp: float | None,
+        recent_actuals: pd.DataFrame | None,
+    ):
+        """Build the 48-hour feature matrix shared by predict() and predict_intervals().
+
+        Returns (future_hours, X) where future_hours is a naive DatetimeIndex
+        and X is the filled DataFrame ready for model.predict().
+        """
+        import pandas as pd
+        import numpy as np
+
+        now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+        future_hours = pd.date_range(
+            start=now_naive.floor("1h"), periods=48, freq="1h"
+        )
+
+        future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
+        future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
+
+        outdoor_pred_df: pd.DataFrame | None = None
+        if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
+            outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
+
+        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton)
+
+        for col in self.feature_cols:
+            if col in feat_df.columns and feat_df[col].isna().any():
+                feat_df[col] = feat_df[col].fillna(self._feature_medians.get(col, 0.0))
+
+        X = feat_df[self.feature_cols].fillna(0)
+        return future_hours, X
 
     def predict(
         self,
@@ -319,40 +380,41 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        # ── BUG FIX: generate NAIVE timestamps so they match the tz-stripped ──
-        # forecast_df and training data throughout the pipeline.
-        now_aware   = pd.Timestamp.now(tz="Europe/Zurich")
-        now_naive   = now_aware.tz_localize(None)  # already Europe/Zurich — strip only
-        future_hours = pd.date_range(
-            start=now_naive.floor("1h"), periods=48, freq="1h"
-        )  # no tz kwarg → naive dtype
-
-        future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
-
-        # ── Lag & rolling features from real recent history ──────────────────
-        future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
-
-        # ── Outdoor temperature blending ────────────────────────────────────
-        outdoor_pred_df: pd.DataFrame | None = None
-        if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
-            outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
-
-        # ── Calendar + weather features ─────────────────────────────────────
-        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton)
-
-        # Fill any remaining NaN with stored training medians (graceful fallback)
-        for col in self.feature_cols:
-            if col in feat_df.columns and feat_df[col].isna().any():
-                fill = self._feature_medians.get(col, 0.0)
-                feat_df[col] = feat_df[col].fillna(fill)
-
-        X = feat_df[self.feature_cols].fillna(0)  # DataFrame → LightGBM gets feature names
+        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals)
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
         preds = np.maximum(0, preds)
-
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
+
+    def predict_intervals(
+        self,
+        forecast_df: pd.DataFrame,
+        live_temp: float | None,
+        recent_actuals: pd.DataFrame | None = None,
+    ) -> pd.DataFrame | None:
+        """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
+
+        Returns None when quantile models are not yet trained.  low_kwh and
+        high_kwh are guaranteed non-negative and ordered (low ≤ high).
+        """
+        import pandas as pd
+        import numpy as np
+
+        if self._model_q10 is None or self._model_q90 is None:
+            return None
+
+        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals)
+        low  = self._model_q10.predict(X)
+        high = self._model_q90.predict(X)
+        if self._log_transform:
+            low  = np.expm1(low)
+            high = np.expm1(high)
+        low  = np.maximum(0, low)
+        high = np.maximum(0, high)
+        # Enforce ordering in case of quantile crossing
+        low, high = np.minimum(low, high), np.maximum(low, high)
+        return pd.DataFrame({"timestamp": future_hours, "low_kwh": low, "high_kwh": high})
 
     def hours_since_trained(self) -> float:
         if self.last_trained == datetime.min:
@@ -379,6 +441,34 @@ class EnergyForecastModel:
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
         _write_hash(self._meta_path)
+
+    def _save_quantile_models(self) -> None:
+        for path, mdl in [
+            (self._model_q10_path, self._model_q10),
+            (self._model_q90_path, self._model_q90),
+        ]:
+            if mdl is not None:
+                with open(path, "wb") as fh:
+                    pickle.dump(mdl, fh)
+                _write_hash(path)
+
+    def _load_quantile_models(self) -> None:
+        for path, attr in [
+            (self._model_q10_path, "_model_q10"),
+            (self._model_q90_path, "_model_q90"),
+        ]:
+            if not path.exists():
+                continue
+            if not _verify_hash(path):
+                _LOGGER.warning(
+                    "Quantile model integrity check failed (%s) — discarding.", path
+                )
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    setattr(self, attr, pickle.load(fh))
+            except (pickle.UnpicklingError, EOFError, OSError) as exc:
+                _LOGGER.warning("Could not load quantile model %s: %s", path.name, exc)
 
     def _load(self) -> None:
         if self._model_path.exists():
@@ -414,6 +504,8 @@ class EnergyForecastModel:
                     self._canton           = meta.get("canton",          None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
+
+        self._load_quantile_models()
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
@@ -713,6 +805,32 @@ def _build_prediction_temp_df(
         rows.append({"timestamp": ts, "outdoor_temp_live": temp})
 
     return pd.DataFrame(rows)
+
+
+def _build_quantile_model(lgb: Any, GBR: Any, alpha: float, n_estimators: int | None = None) -> Any:
+    """Instantiate a quantile regression model for prediction intervals."""
+    if lgb is not None:
+        return lgb.LGBMRegressor(
+            objective="quantile",
+            alpha=alpha,
+            n_estimators=n_estimators or 500,
+            learning_rate=0.05,
+            num_leaves=31,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_samples=20,
+            random_state=42,
+            verbose=-1,
+        )
+    return GBR(
+        loss="quantile",
+        alpha=alpha,
+        n_estimators=n_estimators or 300,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        random_state=42,
+    )
 
 
 def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None) -> Any:
