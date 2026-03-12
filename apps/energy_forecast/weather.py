@@ -55,14 +55,28 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         auth_url = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
         auth_res = requests.post(auth_url, auth=(client_id, client_secret), timeout=10)
         auth_res.raise_for_status()
-        token = auth_res.json()["access_token"]
+        try:
+            token = auth_res.json()["access_token"]
+        except (ValueError, KeyError) as exc:
+            _LOGGER.warning(
+                "SRG-SSR auth failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
+                auth_res.status_code, auth_res.text,
+            )
+            return fetch_open_meteo(lat, lon)
         headers = {"Authorization": f"Bearer {token}"}
 
         # 2. Get Forecast (60min intervals)
         forecast_url = f"https://api.srgssr.ch/forecasts/v1.0/weather/7day?latitude={lat}&longitude={lon}"
         res = requests.get(forecast_url, headers=headers, timeout=10)
         res.raise_for_status()
-        data = res.json()
+        try:
+            data = res.json()
+        except ValueError as exc:
+            _LOGGER.warning(
+                "SRG-SSR forecast parse failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
+                res.status_code, res.text,
+            )
+            return fetch_open_meteo(lat, lon)
 
         records = []
         for day in data.get("forecast", []):
