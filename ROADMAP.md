@@ -15,7 +15,7 @@ and daylighting-driven consumption patterns become invisible to the model for al
 48 prediction hours. Fix: add `sunshine_duration` to the Open-Meteo forecast URL
 and convert from seconds to minutes, matching the archive fetcher.~~
 
-### 2. Add `temp_rolling_3d` to the prediction horizon
+### ~~2. Add `temp_rolling_3d` to the prediction horizon~~ ✓ done (c9513b8)
 `temp_rolling_3d` is computed only over historical weather. During prediction it
 is populated at the current timestamp but never rolled forward using forecast
 temperatures. Add a forward-projection of this feature using forecast `temp_c`
@@ -28,7 +28,7 @@ The model uses only a binary `is_public_holiday` flag. Adding
 Brückentag (bridging day) pattern common in Swiss households — consumption
 typically drops the day before a multi-day break and recovers the day after.
 
-### 4. Cloud cover / solar irradiance feature
+### ~~4. Cloud cover / solar irradiance feature~~ ✓ done (c9513b8)
 Open-Meteo provides `cloudcover` and `direct_radiation` at no extra cost.
 Direct solar radiation is a stronger predictor of cooling load than sunshine
 minutes, and cloud cover captures gloom-driven lighting load that the current
@@ -126,9 +126,9 @@ cannot capture.
 | # | Change | Expected MAE impact | Effort | Status |
 |---|--------|--------------------:|--------|--------|
 | 1 | Fix Open-Meteo sunshine | high (non-SRG installs) | 15 min | ✓ done |
-| 2 | Forward-roll `temp_rolling_3d` | medium | 1 h | |
+| 2 | Forward-roll `temp_rolling_3d` | medium | 1 h | ✓ done |
 | 3 | Pre/post holiday bridge features | medium | 1 h | ✓ done |
-| 4 | Cloud cover / radiation feature | medium | 2 h | |
+| 4 | Cloud cover / radiation feature | medium | 2 h | ✓ done |
 | 5 | Per-hour rolling prediction features | **high** | 3 h | ✓ done |
 | 6 | LightGBM early stopping | medium | 2 h | |
 | 7 | Log-transform target | medium | 1 h | |

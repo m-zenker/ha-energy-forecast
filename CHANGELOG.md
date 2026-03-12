@@ -23,6 +23,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it stabilises at the recent household baseline.
 
 ### Added
+- **Cloud cover and direct radiation features** (`cloud_cover_pct`, `direct_radiation_wm2`)
+  added to archive fetcher, Open-Meteo forecast fetcher, and `_FEATURES_BASE`. SRG users
+  receive these from an automatic Open-Meteo supplement call (`_supplement_from_open_meteo`),
+  so the full feature set is available regardless of weather source.
+- **`fetch_open_meteo` now includes `past_days=3`**, returning 72 h of measured history
+  alongside the 7-day forecast. This anchors `temp_rolling_3d` in real observations for
+  both Open-Meteo and SRG users, eliminating the single-value initialisation that
+  previously caused the 3-day rolling mean to be based on forecast-only data.
+- **`_supplement_from_open_meteo` helper** in `weather.py`: merges the Open-Meteo
+  historical tail and cloud/radiation columns into SRG forecast results, preserving
+  SRG values for all fields it provides.
 - **`lag_72h`** autoregressive feature — captures the same-time-3-days-ago pattern,
   useful for weekend/holiday bridge transitions. Activates dynamically once ≥172 h
   of history is available, consistent with the existing dynamic lag selection logic.
