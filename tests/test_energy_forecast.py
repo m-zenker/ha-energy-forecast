@@ -3,10 +3,12 @@
 Covers:
   - _blend_today_totals: actuals substituted for elapsed hours, predictions for future
   - _compute_live_mae: correct MAE over matched pairs, nan on no overlap
+  - EnergyForecast._retrain_cb / _update_cb: callable from both timer and event contexts
 """
 from __future__ import annotations
 
 import math
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -189,3 +191,169 @@ class TestIntervalBlend:
 
         assert abs(blocks_low["00_03"]  - 6.0) < 1e-6
         assert abs(blocks_high["00_03"] - 6.0) < 1e-6
+
+
+# ── _aggregate ────────────────────────────────────────────────────────────────
+
+def _fake_self_for_aggregate(ev_threshold: float = 4.5, ev_charger_kw: float = 9.0) -> "_FakeSelf":
+    app = _FakeSelf()
+    app._ev_threshold  = ev_threshold
+    app._ev_charger_kw = ev_charger_kw
+    return app
+
+
+def _pred_df(start: pd.Timestamp, n: int = 48, kwh: float = 1.0) -> pd.DataFrame:
+    ts = pd.date_range(start, periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "predicted_kwh": np.full(n, kwh)})
+
+
+class TestAggregate:
+    """_aggregate wires predictions + actuals into the sensor value dict."""
+
+    def _run(self, today, now, predictions, actuals=None, intervals=None):
+        from energy_forecast.energy_forecast import EnergyForecast
+        return EnergyForecast._aggregate(
+            _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
+        )
+
+    def test_next_3h_sums_only_three_future_hours(self):
+        """next_3h must equal exactly 3 × per-hour prediction, not more."""
+        today = pd.Timestamp.now().normalize()
+        now   = pd.Timestamp.now().floor("1h")
+        preds = _pred_df(now, n=48, kwh=2.0)
+        result = self._run(today, now, preds)
+        assert abs(result["next_3h"] - 6.0) < 1e-3
+
+    def test_tomorrow_uses_predictions_only(self):
+        """tomorrow must equal 24 × per-hour prediction for the following calendar day."""
+        today = pd.Timestamp.now().normalize()
+        tmrw  = today + pd.Timedelta(days=1)
+        preds = _pred_df(today, n=48, kwh=3.0)
+        result = self._run(today, today, preds)
+        assert abs(result["tomorrow"] - 72.0) < 1e-3   # 24 × 3.0
+
+    def test_ev_sensors_zero_when_no_actuals(self):
+        """ev_today and ev_yesterday must be 0.0 when full_actuals is None."""
+        today = pd.Timestamp.now().normalize()
+        preds = _pred_df(today, n=48, kwh=1.0)
+        result = self._run(today, today, preds, actuals=None)
+        assert result["ev_today"]     == 0.0
+        assert result["ev_yesterday"] == 0.0
+
+    def test_interval_keys_present_when_intervals_supplied(self):
+        """When intervals DataFrame is provided, *_low/*_high keys appear in result."""
+        today = pd.Timestamp.now().normalize()
+        now   = today
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts    = pd.date_range(today, periods=48, freq="1h")
+        ivs   = pd.DataFrame({
+            "timestamp": ts,
+            "low_kwh":   np.full(48, 0.5),
+            "high_kwh":  np.full(48, 2.0),
+        })
+        result = self._run(today, now, preds, intervals=ivs)
+        for key in ("next_3h_low", "next_3h_high", "today_low", "today_high",
+                    "tomorrow_low", "tomorrow_high"):
+            assert key in result, f"missing key: {key}"
+
+    def test_interval_keys_absent_when_intervals_is_none(self):
+        """Without quantile models, no *_low/*_high keys should appear."""
+        today = pd.Timestamp.now().normalize()
+        preds = _pred_df(today, n=48, kwh=1.0)
+        result = self._run(today, today, preds, intervals=None)
+        for key in ("next_3h_low", "next_3h_high", "today_low", "today_high"):
+            assert key not in result, f"unexpected key: {key}"
+
+    def test_blocks_today_has_eight_slots(self):
+        """blocks_today must contain exactly 8 slots (00_03 … 21_24)."""
+        today = pd.Timestamp.now().normalize()
+        preds = _pred_df(today, n=48, kwh=1.0)
+        result = self._run(today, today, preds)
+        assert len(result["blocks_today"]) == 8
+        assert "00_03" in result["blocks_today"]
+        assert "21_24" in result["blocks_today"]
+
+
+# ── EV kWh sensor calculation ────────────────────────────────────────────────
+
+class TestEvKwhSensorCalc:
+    """EV kWh values published to HA sensors use charger_kw, not threshold."""
+
+    def _nts(self, ts: pd.Timestamp) -> np.datetime64:
+        return np.datetime64(ts, "ns")
+
+    def _run_aggregate(self, ev_charger_kw: float, ev_threshold: float) -> dict:
+        """Run _aggregate with synthetic actuals containing one EV hour."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        today = pd.Timestamp("2026-03-12 00:00")
+        tmrw  = today + pd.Timedelta(days=1)
+        now   = today  # start of day — nothing elapsed yet
+
+        # Predictions: 48h at 1.0 kWh/h
+        ts     = pd.date_range(today, periods=48, freq="1h")
+        p_df   = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
+
+        # Actuals: one EV-level hour today (gross=12 kWh, clearly above any threshold)
+        actuals = pd.DataFrame({
+            "timestamp": [today + pd.Timedelta(hours=2)],
+            "gross_kwh": [12.0],
+        })
+
+        app = _FakeSelf()
+        app._ev_threshold  = ev_threshold
+        app._ev_charger_kw = ev_charger_kw
+
+        return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
+
+    def test_ev_today_uses_charger_kw_not_threshold(self):
+        """ev_today must equal gross − charger_kw, not gross − threshold."""
+        result = self._run_aggregate(ev_charger_kw=7.4, ev_threshold=4.5)
+        # 12.0 − 7.4 = 4.6 (not 12.0 − 4.5 = 7.5)
+        assert abs(result["ev_today"] - 4.6) < 1e-6
+
+    def test_ev_today_default_charger_kw(self):
+        """Default charger_kw=9.0: ev_today = gross − 9.0."""
+        result = self._run_aggregate(ev_charger_kw=9.0, ev_threshold=4.5)
+        assert abs(result["ev_today"] - 3.0) < 1e-6
+
+
+# ── Callback signature compatibility ─────────────────────────────────────────
+
+class _FakeSelf:
+    """Minimal stand-in for EnergyForecast used in callback / aggregate tests.
+
+    EnergyForecast inherits from MagicMock (via the hassapi stub) so
+    object.__new__ leaves mock internals uninitialized.  A plain class with
+    the attributes touched by the tested methods is sufficient.
+    """
+    def __init__(self):
+        self._ml_model = MagicMock()
+        self._ml_model.model = None  # prevents _update_sensors execution
+        self._lock = MagicMock()
+        self._lock.acquire.return_value = False  # always "busy" → immediate return
+
+    def log(self, msg, level="INFO"):  # AppDaemon log stub
+        pass
+
+
+class TestCallbackSignature:
+    """_retrain_cb and _update_cb must accept both timer and event calling conventions."""
+
+    def test_retrain_cb_timer_style(self):
+        """Timer callbacks pass a single positional dict — must not raise TypeError."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._retrain_cb(_FakeSelf(), {})
+
+    def test_retrain_cb_event_style(self):
+        """listen_event callbacks pass (event_name, data, kwargs) — must not raise TypeError."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._retrain_cb(_FakeSelf(), "RELOAD_ENERGY_MODEL", {}, {})
+
+    def test_update_cb_timer_style(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._update_cb(_FakeSelf(), {})
+
+    def test_update_cb_event_style(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._update_cb(_FakeSelf(), "some_event", {}, {})

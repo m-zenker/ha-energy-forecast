@@ -102,6 +102,10 @@ class EnergyForecast(hass.Hass):
             )
         if self._ev_charger_kw <= 0:
             raise ValueError(f"ev_charger_kw must be positive, got {self._ev_charger_kw}")
+        if self._adaptive_retrain_threshold < 0:
+            raise ValueError(
+                f"adaptive_retrain_threshold must be ≥ 0, got {self._adaptive_retrain_threshold}"
+            )
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
             f"weight_halflife={self._weight_halflife}d, "
@@ -110,8 +114,11 @@ class EnergyForecast(hass.Hass):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _retrain_cb(self, kwargs: dict) -> None:
+    def _retrain_cb(self, event_name=None, data=None, kwargs=None) -> None:
+        # Accepts both timer callbacks (single positional arg) and
+        # listen_event callbacks (event_name, data, kwargs).
         if not self._lock.acquire(blocking=False):
+            self.log("Retrain skipped — another operation is running.", level="DEBUG")
             return
         try:
             self._retrain()
@@ -122,10 +129,11 @@ class EnergyForecast(hass.Hass):
         finally:
             self._lock.release()
 
-    def _update_cb(self, kwargs: dict) -> None:
+    def _update_cb(self, event_name=None, data=None, kwargs=None) -> None:
         if self._ml_model.model is None:
             return
         if not self._lock.acquire(blocking=False):
+            self.log("Sensor update skipped — another operation is running.", level="DEBUG")
             return
         try:
             self._update_sensors()
@@ -207,7 +215,9 @@ class EnergyForecast(hass.Hass):
             full_actuals = _strip_tz(full_actuals)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
-            recent_actuals, _ = ha_data.split_ev_charging(full_actuals, self._ev_threshold)
+            recent_actuals, _ = ha_data.split_ev_charging(
+                full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+            )
         except (OSError, ValueError, KeyError) as exc:
             self.log(f"Could not fetch recent actuals for lag features: {exc}", level="WARNING")
             recent_actuals = None
@@ -450,13 +460,18 @@ class EnergyForecast(hass.Hass):
                 "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
             })
 
-        # ── EV kWh from actuals: sum (gross - threshold) for charging hours ───
-        # This gives net charger energy, excluding the household co-load.
+        # ── EV kWh from actuals: sum (gross - charger_kw) for charging hours ──
+        # Subtracts the configured charger power to get the household co-load
+        # contribution; the remainder is the estimated EV energy.  Clipped at 0
+        # for hours where gross < charger_kw (partial sessions or EV not home).
         if full_actuals is not None and not full_actuals.empty:
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
             if not ev_rows.empty:
-                ev_rows["ev_kwh"] = ev_rows["gross_kwh"] - self._ev_threshold
+                import numpy as np
+                ev_rows["ev_kwh"] = np.maximum(
+                    0.0, ev_rows["gross_kwh"] - self._ev_charger_kw
+                )
                 ev_times = ev_rows["timestamp"].values.astype("datetime64[ns]")
                 ev_vals  = ev_rows["ev_kwh"].values.astype(float)
 
@@ -486,7 +501,10 @@ def _strip_tz(df: Any) -> Any:
 def _empty_weather_df() -> Any:
     import pandas as pd
     return pd.DataFrame(
-        columns=["timestamp", "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh"]
+        columns=[
+            "timestamp", "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+            "cloud_cover_pct", "direct_radiation_wm2",
+        ]
     )
 
 

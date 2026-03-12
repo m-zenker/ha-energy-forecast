@@ -2,11 +2,6 @@
 
 from pathlib import Path
 
-# API URLs
-METEOSWISS_URL = "https://app-prod-ws.meteoswiss-app.ch/v1/forecast"
-OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-
 # Data Validation
 MAX_HOURLY_KWH = 50.0  # Filters out meter resets or spikes
 

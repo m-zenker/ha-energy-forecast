@@ -1,23 +1,31 @@
 """
 ML model — feature engineering, training, prediction and disk persistence.
 
-Changes from original:
-  BUG FIX:
-    - predict() now generates naive (tz-stripped) timestamps, matching the
-      naive timestamps produced by the tz-stripping in energy_forecast.py.
-      This eliminates the "Cannot compare dtypes datetime64[us] and
-      datetime64[us, Europe/Zurich]" crash.
-  IMPROVEMENTS:
-    1. Lag features: lag_24h, lag_48h, lag_168h, lag_336h
-       Always safe for a 48-hour horizon because all targets are ≥1h ahead,
-       so the lag always points to a real past measurement, never a prediction.
-    2. Rolling stats: rolling_mean_24h, rolling_mean_7d, rolling_std_24h
-       Captures current household activity level and variability.
-    3. Swiss public holidays via the `holidays` package.
-    4. Exponential sample weighting — recent data weighted more than old data.
-    5. 3-day rolling temperature mean — captures building thermal mass lag.
-    6. hour_of_week (0-167) replaces the coarser is_weekend + hour_block.
-    7. TimeSeriesSplit cross-validation for an honest MAE estimate.
+Feature set:
+  - Calendar: hour, day_of_week, month, season, hour_of_week (0-167),
+    cyclical encodings (sin/cos) for hour, month, day-of-week, hour-of-week
+  - Weather: temp_c, precipitation_mm, sunshine_min, wind_kmh,
+    cloud_cover_pct, direct_radiation_wm2, heating_degree, cooling_degree,
+    temp_rolling_3d (3-day thermal mass proxy)
+  - Autoregressive lags: lag_24h, lag_48h, lag_72h, lag_168h, lag_336h
+    (dynamically selected based on available history)
+  - Rolling activity: rolling_mean_24h, rolling_mean_7d, rolling_std_24h
+    (per-hour sliding projection at predict time to match training semantics)
+  - Calendar extras: is_public_holiday, days_to_next_holiday,
+    days_since_last_holiday (Swiss federal + optional cantonal)
+  - EV charging pattern: likely_ev_hour binary flag
+
+Model:
+  LightGBM preferred; scikit-learn GBR automatic fallback (e.g. armv7).
+  Target is log1p(gross_kwh); predictions are expm1-inverted.
+  Exponential sample weighting (weight_halflife_days, default 90 days).
+  LightGBM early stopping against CV fold validation set.
+  TimeSeriesSplit CV MAE (≥500 rows) or holdout MAE reported.
+  Two quantile models (α=0.1, α=0.9) trained for prediction intervals.
+
+Persistence:
+  energy_model.pkl + meta.pkl, each with a SHA-256 sidecar.
+  Integrity mismatch → warning + cold-start retrain.
 """
 from __future__ import annotations
 
@@ -356,7 +364,7 @@ class EnergyForecastModel:
         import pandas as pd
         import numpy as np
 
-        now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+        now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None)
         future_hours = pd.date_range(
             start=now_naive.floor("1h"), periods=48, freq="1h"
         )
@@ -764,9 +772,7 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
 
         dates = df["timestamp"].dt.date
 
-        df["is_public_holiday"] = dates.map(
-            lambda d: 1 if d in ch_holidays else 0
-        ).astype(int)
+        df["is_public_holiday"] = dates.isin(set(ch_holidays.keys())).astype(int)
 
         def _days_to_next(d):
             # bisect_left: if d is a holiday, idx points to d → distance 0

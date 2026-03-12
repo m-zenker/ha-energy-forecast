@@ -8,6 +8,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **`_retrain_cb` / `_update_cb` event-callback signature** (#review-1): Both callbacks
+  now accept `(event_name=None, data=None, kwargs=None)` so they work correctly when
+  triggered via `listen_event` (which passes three positional args) as well as from
+  timer callbacks (which pass one). Previously a `RELOAD_ENERGY_MODEL` event raised
+  `TypeError` before the fault-boundary `except Exception` was reached.
+- **EV charger power used in `_update_sensors` lag features** (#review-2): The hourly
+  sensor update path now passes `charger_kw=self._ev_charger_kw` to
+  `split_ev_charging`, consistent with the weekly retrain path. Previously the default
+  9.0 kW was hardcoded regardless of `ev_charger_kw` configuration, causing
+  lag-feature drift for custom charger powers.
+- **EV kWh sensor reports charger energy, not threshold energy** (#review-10): The
+  `ev_today` / `ev_yesterday` sensors now subtract `ev_charger_kw` from gross import
+  (clipped at 0) rather than the detection `ev_charging_threshold_kwh`. This gives the
+  correct net charger energy estimate.
+- **`adaptive_retrain_threshold` validated at startup** (#review-7): A negative value
+  would have triggered retraining on every hourly update; `_validate_config` now
+  raises `ValueError` for values < 0.
+- **SRG-SSR fallback now logged** (#review-6): When the SRG API call fails and the
+  forecast falls back to Open-Meteo, a `WARNING` is emitted so operators know forecast
+  quality may be reduced.
+- **Lock contention logged at DEBUG** (#review-8): Skipped retrain and sensor-update
+  cycles (normal during long retrains) are now visible at DEBUG level instead of being
+  silently swallowed.
+
+### Changed
+- **`_empty_weather_df` column set extended** (#review-5): Now includes
+  `cloud_cover_pct` and `direct_radiation_wm2`, matching the full column contract of
+  the real fetchers. The `_engineer_features` safety-net NaN fill remains in place.
+- **`fetch_recent_energy` signature cleaned up** (#review-3): Removed the unused
+  `hours: int = 6` parameter which was never read by the function body.
+- **Dead URL constants removed from `const.py`** (#review-4): `METEOSWISS_URL`,
+  `OPENMETEO_FORECAST_URL`, and `OPENMETEO_ARCHIVE_URL` were defined but never
+  imported; actual URLs are hardcoded inline in `weather.py`.
+- **`model.py` module docstring rewritten** (#review-11): Replaced the "Changes from
+  original" framing (git-history content) with a description of the current feature
+  set, model architecture, and persistence scheme.
+- **`is_public_holiday` flag vectorised** (#review-9): Replaced per-row
+  `dates.map(lambda d: ...)` with `dates.isin(set(...)).astype(int)` in
+  `_add_holiday_feature`.
+- **`tz_convert(None)` replaces `tz_localize(None)`** (#review-12): Both work in
+  pandas but `tz_convert` better expresses "convert tz-aware timestamp to wall time,
+  drop tz annotation".
+
+### Added
+- 12 new tests across `test_energy_forecast.py`:
+  `TestAggregate` (6) — next_3h sum, tomorrow sum, EV sensors zero without actuals,
+  interval keys present/absent, 8 block slots; `TestEvKwhSensorCalc` (2) — charger_kw
+  vs threshold subtraction; `TestCallbackSignature` (4) — timer and event calling
+  conventions for both callbacks.
+
+
+
 ### Added
 - **EV session probability feature** (#12): `likely_ev_hour` binary feature added to
   `_FEATURES_BASE`. After training, `_compute_likely_ev_hours()` inspects which

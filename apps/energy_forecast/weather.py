@@ -1,6 +1,10 @@
+import logging
+
 import requests
 import pandas as pd
 from datetime import datetime, date
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date: date) -> pd.DataFrame:
@@ -77,8 +81,8 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         om_df = fetch_open_meteo(lat, lon)
         return _supplement_from_open_meteo(srg_df, om_df)
 
-    except (requests.RequestException, KeyError, ValueError):
-        # SRG failed — fall back to Open-Meteo
+    except (requests.RequestException, KeyError, ValueError) as exc:
+        _LOGGER.warning("SRG-SSR forecast failed (%s) — falling back to Open-Meteo.", exc)
         return fetch_open_meteo(lat, lon)
 
 
@@ -117,6 +121,7 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
     # Stack historical tail above SRG future rows
     combined = pd.concat([om_hist, srg_df], ignore_index=True)
     return combined.sort_values("timestamp").reset_index(drop=True)
+
 
 def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
     """Forecast (+ 3-day historical tail) using the free Open-Meteo API.

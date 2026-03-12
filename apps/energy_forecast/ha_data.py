@@ -118,10 +118,10 @@ def fetch_energy_history(
     return combined
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
-    Fetches only the last `hours` of HA history (vs. 30 days in
+    Fetches only the last 2 days of HA history (vs. 30 days in
     fetch_energy_history), merges into the existing CSV cache, and
     returns the full cache for lag-feature use.  Keeps _update_cb
     well within AppDaemon's 10s callback limit.
