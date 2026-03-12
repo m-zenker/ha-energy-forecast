@@ -9,6 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **EV session probability feature** (#12): `likely_ev_hour` binary feature added to
+  `_FEATURES_BASE`. After training, `_compute_likely_ev_hours()` inspects which
+  `hour_of_week` slots (0-167) appeared as EV charging hours in ≥ 15% of their
+  historical occurrences and stores the result as `self._likely_ev_hours` (persisted
+  in `meta.pkl`). The feature lets the model explicitly account for recurring EV
+  charging windows when predicting household baseline consumption. `ev_df` is now
+  passed from `_retrain()` to `train()` to enable this computation.
+- **Fix `split_ev_charging` charger power** (#12): `ev_charger_kw` configured in
+  `apps.yaml` is now correctly forwarded to `ha_data.split_ev_charging()` via a
+  new `charger_kw` parameter. Previously the function hardcoded 9.0 regardless of
+  configuration.
+- `tests/test_ha_data.py` — 2 new tests: `TestSplitEvCharging` (custom charger_kw
+  subtracted, default 9.0 preserved)
+- `tests/test_model.py` — 3 new tests: `TestLikelyEvHour` (hours identified after
+  train, binary column, empty set without ev_df)
+
 - **Prediction intervals** (#13): two quantile regression models (α=0.1, α=0.9)
   are trained alongside the point-estimate model using the same feature matrix,
   log-transformed target, and n_estimators from early stopping. Quantile training

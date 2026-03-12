@@ -173,19 +173,23 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, hours: int = 6, cache_
     return combined
 
 
-def split_ev_charging(df: pd.DataFrame, threshold_kwh: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def split_ev_charging(
+    df: pd.DataFrame,
+    threshold_kwh: float,
+    charger_kw: float = 9.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a history DataFrame into baseline and EV charging portions.
 
-    Charging hours are identified by gross_kwh > threshold_kwh.  Your charger
-    runs at ~9 kW (constant), so charging hours cluster tightly above 7 kWh/h.
-    The normal household ceiling is ~3.9 kWh/h, giving a clean gap at 4.5.
+    Charging hours are identified by gross_kwh > threshold_kwh.  The charger
+    load (charger_kw, default 9 kW) is subtracted from those hours, leaving
+    the concurrent household co-load intact.
 
     Returns:
         baseline_df  — all rows retained; EV hours have gross_kwh replaced
-                        with (gross_kwh - 9.0), clipped to ≥ 0.  This keeps
-                        the true household co-load (lighting, cooking etc.)
-                        visible to the model rather than dropping the row, and
-                        preserves shift()-based lag alignment in training.
+                        with (gross_kwh - charger_kw), clipped to ≥ 0.  This
+                        keeps the true household co-load (lighting, cooking
+                        etc.) visible to the model rather than dropping the
+                        row, and preserves shift()-based lag alignment.
         ev_df        — only the rows classified as EV charging, with the
                         original gross_kwh values, for publishing EV sensors.
     """
@@ -196,10 +200,8 @@ def split_ev_charging(df: pd.DataFrame, threshold_kwh: float) -> tuple[pd.DataFr
 
     ev_df = df[ev_mask].copy()
 
-    # Subtract the fixed charger load (~9 kW → 9 kWh/h) from charging hours,
-    # leaving the concurrent household baseline intact.
     df.loc[ev_mask, "gross_kwh"] = np.maximum(
-        0.0, df.loc[ev_mask, "gross_kwh"] - 9.0
+        0.0, df.loc[ev_mask, "gross_kwh"] - charger_kw
     )
 
     return df, ev_df

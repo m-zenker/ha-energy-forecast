@@ -388,3 +388,33 @@ class TestCheckDstDuplicates:
 # Module-level logger used directly in DST tests (mirrors ha_data's own logger)
 import logging as _logging
 _LOGGER = _logging.getLogger("energy_forecast.ha_data")
+
+
+# ── split_ev_charging ─────────────────────────────────────────────────────────
+
+class TestSplitEvCharging:
+
+    def _make_df(self) -> pd.DataFrame:
+        """Four rows: two below threshold (3 kWh), two above (10 kWh)."""
+        return pd.DataFrame({
+            "timestamp": pd.date_range("2026-03-12 00:00", periods=4, freq="1h"),
+            "gross_kwh": [3.0, 3.0, 10.0, 10.0],
+        })
+
+    def test_custom_charger_kw_subtracted(self):
+        """charger_kw=7.4 is subtracted from charging hours, not the default 9.0."""
+        df = self._make_df()
+        baseline, ev = ha_data.split_ev_charging(df, threshold_kwh=4.5, charger_kw=7.4)
+        # EV hours: 10.0 - 7.4 = 2.6
+        assert abs(baseline.iloc[2]["gross_kwh"] - 2.6) < 1e-6
+        assert abs(baseline.iloc[3]["gross_kwh"] - 2.6) < 1e-6
+
+    def test_default_charger_kw_is_nine(self):
+        """Default charger_kw=9.0 subtracts 9 from charging hours."""
+        df = self._make_df()
+        baseline, ev = ha_data.split_ev_charging(df, threshold_kwh=4.5)
+        # EV hours: 10.0 - 9.0 = 1.0
+        assert abs(baseline.iloc[2]["gross_kwh"] - 1.0) < 1e-6
+        # Non-EV hours are unchanged
+        assert abs(baseline.iloc[0]["gross_kwh"] - 3.0) < 1e-6
+        assert len(ev) == 2

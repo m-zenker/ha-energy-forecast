@@ -89,13 +89,13 @@ at the start/end of weekends and public-holiday bridges. It slots between the
 existing `lag_48h` and `lag_168h` with no impact on data-volume requirements
 (comparable to `lag_48h`).
 
-### 12. EV charge session probability feature
-The current EV subtraction assumes a fixed 9 kW charger load for every detected
-hour. Improvements:
-- Detect EV session start and compute session-average power from actuals.
-- Add a `likely_ev_hour` binary feature derived from recurring time-of-use
+### ~~12. EV charge session probability feature~~ ✓ done
+~~The current EV subtraction assumes a fixed 9 kW charger load for every detected
+hour. Improvements:~~
+~~- Detect EV session start and compute session-average power from actuals.~~
+~~- Add a `likely_ev_hour` binary feature derived from recurring time-of-use
   patterns so the model can adjust the household-baseline prediction for known
-  charging windows.
+  charging windows.~~
 
 ---
 
@@ -136,7 +136,7 @@ cannot capture.
 | 9 | Cantonal holidays config | low | 30 min | ✓ done |
 | 10 | School holiday feature | medium | 4 h | long-term backlog |
 | 11 | `lag_72h` | low | 30 min | ✓ done |
-| 12 | EV session probability feature | medium | 4 h | |
+| 12 | EV session probability feature | medium | 4 h | ✓ done |
 | 13 | Prediction intervals (HA sensors) | UX value | 4 h | ✓ done |
 | 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | ✓ done |
 | 15 | HVAC state feature | high (if available) | 3 h | long-term backlog |

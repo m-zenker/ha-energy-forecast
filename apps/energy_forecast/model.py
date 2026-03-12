@@ -70,6 +70,8 @@ _FEATURES_BASE = [
     "is_public_holiday",
     "days_to_next_holiday",
     "days_since_last_holiday",
+    # EV charging pattern
+    "likely_ev_hour",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -147,6 +149,8 @@ class EnergyForecastModel:
         self._feature_medians: dict        = {}     # used to fill NaN at predict time
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
+        # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
+        self._likely_ev_hours: set[int]    = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)
         self._model_q10 = None
         self._model_q90 = None
@@ -164,6 +168,7 @@ class EnergyForecastModel:
         outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
         canton: str | None = None,
+        ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -196,8 +201,13 @@ class EnergyForecastModel:
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
 
+        # ── EV session probability: which hour_of_week slots charge regularly ─
+        likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
+        self._likely_ev_hours = likely_ev_hours
+
         # ── Weather / outdoor / calendar features ───────────────────────────
-        df = _engineer_features(df, weather_df, outdoor_df, canton=canton)
+        df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
+                                likely_ev_hours=likely_ev_hours)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -358,7 +368,8 @@ class EnergyForecastModel:
         if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
-        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton)
+        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
+                                     likely_ev_hours=self._likely_ev_hours)
 
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
@@ -437,6 +448,7 @@ class EnergyForecastModel:
             "feature_medians":  self._feature_medians,
             "log_transform":    self._log_transform,
             "canton":           self._canton,
+            "likely_ev_hours":  self._likely_ev_hours,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -502,6 +514,7 @@ class EnergyForecastModel:
                     self._feature_medians  = meta.get("feature_medians", {})
                     self._log_transform    = meta.get("log_transform",   False)
                     self._canton           = meta.get("canton",          None)
+                    self._likely_ev_hours  = meta.get("likely_ev_hours", set())
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -624,6 +637,7 @@ def _engineer_features(
     weather_df: pd.DataFrame,           # naive timestamps
     outdoor_df: pd.DataFrame | None,    # naive timestamps
     canton: str | None = None,
+    likely_ev_hours: set | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -652,6 +666,12 @@ def _engineer_features(
     df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
     df["how_sin"]   = np.sin(2 * np.pi * df["hour_of_week"] / 168)
     df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
+
+    # ── EV charging pattern ───────────────────────────────────────────────────
+    if likely_ev_hours:
+        df["likely_ev_hour"] = df["hour_of_week"].isin(likely_ev_hours).astype(int)
+    else:
+        df["likely_ev_hour"] = 0
 
     # ── Public holidays ──────────────────────────────────────────────────────
     df = _add_holiday_feature(df, canton=canton)
@@ -775,6 +795,44 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
         df["days_to_next_holiday"]    = _BRIDGE_CAP
         df["days_since_last_holiday"] = _BRIDGE_CAP
     return df
+
+
+_EV_HOW_MIN_FRACTION = 0.15   # an hour_of_week slot is "likely EV" if it was a
+                               # charging hour in ≥ 15% of its historical occurrences
+
+
+def _compute_likely_ev_hours(
+    baseline_df: Any,           # all training rows (EV hours have kwh already subtracted)
+    ev_df: Any,                 # rows classified as EV charging (original kwh)
+) -> set[int]:
+    """Return the set of hour_of_week values (0-167) that regularly see EV charging.
+
+    For each slot, we compare the number of EV occurrences against total
+    training occurrences.  Slots at or above _EV_HOW_MIN_FRACTION are returned.
+    Returns an empty set when ev_df is None, empty, or no slot clears the bar.
+    """
+    import pandas as pd
+
+    if ev_df is None or (hasattr(ev_df, "empty") and ev_df.empty):
+        return set()
+
+    def _how(df: Any) -> Any:
+        ts = pd.to_datetime(df["timestamp"])
+        return ts.dt.dayofweek * 24 + ts.dt.hour
+
+    total_counts = _how(baseline_df).value_counts()
+    ev_counts    = _how(ev_df).value_counts()
+
+    # Align on the same index; missing slots in ev_counts → 0
+    fractions = ev_counts.reindex(total_counts.index, fill_value=0) / total_counts
+    likely = fractions[fractions >= _EV_HOW_MIN_FRACTION].index.tolist()
+    if likely:
+        _LOGGER.info(
+            "EV pattern: %d hour_of_week slots flagged as likely charging windows "
+            "(fraction ≥ %.0f%%).",
+            len(likely), _EV_HOW_MIN_FRACTION * 100,
+        )
+    return set(likely)
 
 
 def _build_prediction_temp_df(

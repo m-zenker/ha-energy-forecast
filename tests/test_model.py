@@ -26,6 +26,7 @@ from energy_forecast.model import (
     _add_lag_and_rolling_prediction,
     _BRIDGE_CAP,
     _build_model,
+    _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
     EnergyForecastModel,
@@ -499,3 +500,74 @@ class TestPredictIntervals:
         result = m.predict_intervals(forecast, live_temp=None)
         assert result is not None
         assert (result["low_kwh"] <= result["high_kwh"]).all()
+
+
+# ── EV session probability feature (#12) ─────────────────────────────────────
+
+class TestLikelyEvHour:
+
+    def _make_ev_df(self, n: int = 200) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Return (baseline_df, ev_df) where Monday 22:00 is always a charging hour."""
+        rng = np.random.default_rng(1)
+        ts  = pd.date_range("2025-01-06 00:00", periods=n * 24, freq="1h")  # starts Monday
+        kwh = rng.uniform(0.5, 3.0, size=len(ts))
+        baseline = pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+        # Mark Monday 22:00 (hour_of_week = 0*24+22 = 22) as EV in every week
+        how = ts.dayofweek * 24 + ts.hour
+        ev_mask = how == 22   # Monday 22:00
+        ev_df = baseline[ev_mask].copy()
+        return baseline, ev_df
+
+    def test_likely_hours_identified_after_train(self, tmp_path):
+        """After train() with ev_df, _likely_ev_hours must be non-empty and
+        contain the known charging slot (Monday 22:00 = how 22)."""
+        baseline, ev_df = self._make_ev_df(n=200)
+        weather = pd.DataFrame({
+            "timestamp":            baseline["timestamp"],
+            "temp_c":               [10.0] * len(baseline),
+            "precipitation_mm":     [0.0]  * len(baseline),
+            "sunshine_min":         [30.0] * len(baseline),
+            "wind_kmh":             [10.0] * len(baseline),
+            "cloud_cover_pct":      [50.0] * len(baseline),
+            "direct_radiation_wm2": [100.0]* len(baseline),
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(baseline, weather, outdoor_df=None, weight_halflife_days=0, ev_df=ev_df)
+        assert len(m._likely_ev_hours) > 0
+        assert 22 in m._likely_ev_hours
+
+    def test_likely_ev_hour_column_is_binary(self, tmp_path):
+        """likely_ev_hour in trained feature matrix must be strictly 0 or 1."""
+        m, _ = _make_trained_model(tmp_path)
+        # Feature is in _FEATURES_BASE
+        assert "likely_ev_hour" in _FEATURES_BASE
+        # Values in a freshly engineered df must be 0/1
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [10.0] * 24,
+            "precipitation_mm":     [0.0]  * 24,
+            "sunshine_min":         [30.0] * 24,
+            "wind_kmh":             [10.0] * 24,
+            "cloud_cover_pct":      [50.0] * 24,
+            "direct_radiation_wm2": [100.0]* 24,
+        })
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 24})
+        feat = _engineer_features(df, weather, None, likely_ev_hours={0, 5, 10})
+        vals = feat["likely_ev_hour"].unique()
+        assert set(vals).issubset({0, 1})
+
+    def test_no_ev_df_gives_empty_hours_and_zero_feature(self, tmp_path):
+        """Without ev_df, _likely_ev_hours is empty and likely_ev_hour is 0 everywhere."""
+        m, _ = _make_trained_model(tmp_path)
+        # _make_trained_model calls train() without ev_df
+        assert m._likely_ev_hours == set()
+        # _compute_likely_ev_hours with no ev_df must return empty set
+        baseline = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=48, freq="1h"),
+            "gross_kwh": [1.0] * 48,
+        })
+        assert _compute_likely_ev_hours(baseline, None) == set()
+        assert _compute_likely_ev_hours(baseline, pd.DataFrame()) == set()
+

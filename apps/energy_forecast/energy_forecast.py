@@ -147,7 +147,9 @@ class EnergyForecast(hass.Hass):
         energy_df = _strip_tz(energy_df)
 
         # ── Subtract EV charging from gross import ────────────────────────────
-        baseline_df, ev_df = ha_data.split_ev_charging(energy_df, self._ev_threshold)
+        baseline_df, ev_df = ha_data.split_ev_charging(
+            energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+        )
         if len(ev_df):
             self.log(
                 f"EV filter: {len(ev_df)} charging hours detected "
@@ -176,6 +178,7 @@ class EnergyForecast(hass.Hass):
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
+            ev_df=ev_df,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
