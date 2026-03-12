@@ -45,7 +45,7 @@ _LOGGER = logging.getLogger(__name__)
 # ── Lag hours used as autoregressive features ─────────────────────────────────
 # All are safe for a 48-hour forecast: target is always ≥1h ahead,
 # so lag_24h for h=+1 points to now-23h — always in the past.
-LAG_HOURS = [24, 48, 168, 336]
+LAG_HOURS = [24, 48, 72, 168, 336]
 
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
@@ -62,11 +62,13 @@ _FEATURES_BASE = [
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy
     # Autoregressive lags — always safe (see note above)
-    "lag_24h", "lag_48h", "lag_168h", "lag_336h",
+    "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
     # Calendar extras
     "is_public_holiday",
+    "days_to_next_holiday",
+    "days_since_last_holiday",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -561,27 +563,68 @@ def _engineer_features(
 
     return df
 
-def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
-    """Add binary is_public_holiday column using the `holidays` package.
+_BRIDGE_CAP = 3   # days — bridge-day effect beyond this distance is negligible
 
-    Falls back gracefully to 0 if the package is not installed.
-    Swiss federal holidays are used; add canton= kwarg for cantonal ones.
+
+def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
+    """Add holiday proximity columns using the `holidays` package.
+
+    Columns added:
+      is_public_holiday       — 1 on a Swiss federal holiday, else 0
+      days_to_next_holiday    — calendar days until the next holiday, capped at _BRIDGE_CAP
+      days_since_last_holiday — calendar days since the last holiday, capped at _BRIDGE_CAP
+
+    Both distance columns are 0 on a holiday itself.  The cap keeps the feature
+    range tight so the model focuses on the bridging-day window where consumption
+    patterns actually differ.
+
+    Falls back gracefully (is_public_holiday=0, distances=_BRIDGE_CAP) if the
+    `holidays` package is not installed.
     """
     try:
+        import bisect  # noqa: PLC0415
         import holidays as hd  # noqa: PLC0415
         import pandas as pd
-        years = df["timestamp"].dt.year.unique().tolist()
+
+        # Extend by ±1 year so dates near year boundaries (e.g. Dec 31)
+        # can see the next/previous holiday across the year boundary.
+        years_in_data = df["timestamp"].dt.year.unique()
+        years = sorted({y + d for y in years_in_data for d in (-1, 0, 1)})
         ch_holidays = hd.country_holidays("CH", years=years)
-        df["is_public_holiday"] = (
-            df["timestamp"].dt.date
-            .map(lambda d: 1 if d in ch_holidays else 0)
-            .astype(int)
-        )
+        holiday_dates = sorted(ch_holidays.keys())
+
+        dates = df["timestamp"].dt.date
+
+        df["is_public_holiday"] = dates.map(
+            lambda d: 1 if d in ch_holidays else 0
+        ).astype(int)
+
+        def _days_to_next(d):
+            # bisect_left: if d is a holiday, idx points to d → distance 0
+            idx = bisect.bisect_left(holiday_dates, d)
+            if idx >= len(holiday_dates):
+                return _BRIDGE_CAP
+            return min(_BRIDGE_CAP, (holiday_dates[idx] - d).days)
+
+        def _days_since_last(d):
+            # bisect_right - 1: if d is a holiday, idx points to d → distance 0
+            idx = bisect.bisect_right(holiday_dates, d) - 1
+            if idx < 0:
+                return _BRIDGE_CAP
+            return min(_BRIDGE_CAP, (d - holiday_dates[idx]).days)
+
+        df["days_to_next_holiday"]    = dates.map(_days_to_next).astype(int)
+        df["days_since_last_holiday"] = dates.map(_days_since_last).astype(int)
+
     except ImportError:
-        df["is_public_holiday"] = 0
+        df["is_public_holiday"]       = 0
+        df["days_to_next_holiday"]    = _BRIDGE_CAP
+        df["days_since_last_holiday"] = _BRIDGE_CAP
     except Exception as exc:  # noqa: BLE001
-        _LOGGER.warning("Holiday feature failed: %s — defaulting to 0", exc)
-        df["is_public_holiday"] = 0
+        _LOGGER.warning("Holiday feature failed: %s — defaulting to 0 / %d", exc, _BRIDGE_CAP)
+        df["is_public_holiday"]       = 0
+        df["days_to_next_holiday"]    = _BRIDGE_CAP
+        df["days_since_last_holiday"] = _BRIDGE_CAP
     return df
 
 
