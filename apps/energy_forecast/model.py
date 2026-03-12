@@ -59,6 +59,7 @@ _FEATURES_BASE = [
     "how_sin", "how_cos",                            # hour-of-week cyclical
     # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+    "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy
     # Autoregressive lags — always safe (see note above)
@@ -540,9 +541,17 @@ def _engineer_features(
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
-    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh", "temp_rolling_3d"]:
+    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
+
+    # Safety net: ensure new weather columns always exist even when weather_df
+    # doesn't include them (e.g. unexpected API response gaps). The model's
+    # _feature_medians fill in predict() handles the resulting NaN values.
+    for col in ["cloud_cover_pct", "direct_radiation_wm2"]:
+        if col not in df.columns:
+            df[col] = np.nan
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)

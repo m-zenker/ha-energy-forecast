@@ -8,30 +8,41 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
 
     Returns a DataFrame with columns:
         timestamp (naive, UTC+local via timezone param), temp_c,
-        precipitation_mm, sunshine_min, wind_kmh
+        precipitation_mm, sunshine_min, wind_kmh,
+        cloud_cover_pct, direct_radiation_wm2
     """
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}"
         f"&start_date={start_date.isoformat()}&end_date={end_date.isoformat()}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
+        ",cloud_cover,direct_radiation"
         "&timezone=Europe%2FZurich"
     )
     res = requests.get(url, timeout=30)
     res.raise_for_status()
     h = res.json()["hourly"]
+    n = len(h["time"])
     return pd.DataFrame({
-        "timestamp":         pd.to_datetime(h["time"]),
-        "temp_c":            h["temperature_2m"],
-        "precipitation_mm":  h["precipitation"],
+        "timestamp":             pd.to_datetime(h["time"]),
+        "temp_c":                h["temperature_2m"],
+        "precipitation_mm":      h["precipitation"],
         # Open-Meteo returns sunshine_duration in seconds; model expects minutes
-        "sunshine_min":      [s / 60.0 for s in h["sunshine_duration"]],
-        "wind_kmh":          h["windspeed_10m"],
+        "sunshine_min":          [s / 60.0 for s in h["sunshine_duration"]],
+        "wind_kmh":              h["windspeed_10m"],
+        "cloud_cover_pct":       h.get("cloud_cover",      [0] * n),
+        "direct_radiation_wm2":  h.get("direct_radiation", [0] * n),
     })
 
 
 def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None) -> pd.DataFrame:
-    """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback."""
+    """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback.
+
+    When SRG credentials are provided and the fetch succeeds, Open-Meteo is
+    called as a supplement to fill in cloud_cover_pct, direct_radiation_wm2,
+    and the 3-day historical tail needed to anchor temp_rolling_3d.  SRG
+    values for temp_c, precipitation_mm, sunshine_min, wind_kmh are preserved.
+    """
     if not client_id or not client_secret:
         return fetch_open_meteo(lat, lon)
 
@@ -53,25 +64,72 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         for day in data.get("forecast", []):
             for hour in day.get("hours", []):
                 records.append({
-                    "timestamp": hour.get("date_time"),
-                    "temp_c": float(hour.get("TTT_C", 0)),
+                    "timestamp":        hour.get("date_time"),
+                    "temp_c":           float(hour.get("TTT_C", 0)),
                     "precipitation_mm": float(hour.get("PRP_MM", 0)),
-                    "sunshine_min": float(hour.get("SUN_MIN", 0)),
-                    "wind_kmh": float(hour.get("FF_KMH", 0))
+                    "sunshine_min":     float(hour.get("SUN_MIN", 0)),
+                    "wind_kmh":         float(hour.get("FF_KMH", 0)),
                 })
-        
-        df = pd.DataFrame(records)
-        return df
+
+        srg_df = pd.DataFrame(records)
+
+        # 3. Supplement with Open-Meteo: cloud/radiation + 3-day historical tail
+        om_df = fetch_open_meteo(lat, lon)
+        return _supplement_from_open_meteo(srg_df, om_df)
 
     except (requests.RequestException, KeyError, ValueError):
         # SRG failed — fall back to Open-Meteo
         return fetch_open_meteo(lat, lon)
 
+
+def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge Open-Meteo data into an SRG forecast DataFrame.
+
+    Combines two sources into one DataFrame:
+      - Historical rows (timestamps before the SRG window) from Open-Meteo only,
+        providing the 3-day tail needed to anchor temp_rolling_3d.
+      - Future rows (SRG timestamps): SRG values for temp_c, precipitation_mm,
+        sunshine_min, wind_kmh; cloud_cover_pct and direct_radiation_wm2 from
+        Open-Meteo (joined by timestamp, NaN where OM has no matching row).
+
+    If om_df is empty (Open-Meteo call failed), returns srg_df unchanged.
+    """
+    if om_df.empty:
+        return srg_df
+
+    srg_df = srg_df.copy()
+    srg_df["timestamp"] = pd.to_datetime(srg_df["timestamp"])
+    om_df  = om_df.copy()
+    om_df["timestamp"]  = pd.to_datetime(om_df["timestamp"])
+
+    srg_start = srg_df["timestamp"].min()
+
+    # Historical tail: Open-Meteo rows before the SRG window
+    om_hist = om_df[om_df["timestamp"] < srg_start].copy()
+
+    # Cloud/radiation columns to pull from Open-Meteo for future rows
+    om_supplement_cols = ["timestamp", "cloud_cover_pct", "direct_radiation_wm2"]
+    om_future = om_df[om_df["timestamp"] >= srg_start][om_supplement_cols]
+
+    # Join cloud/radiation onto SRG future rows
+    srg_df = srg_df.merge(om_future, on="timestamp", how="left")
+
+    # Stack historical tail above SRG future rows
+    combined = pd.concat([om_hist, srg_df], ignore_index=True)
+    return combined.sort_values("timestamp").reset_index(drop=True)
+
 def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
-    """Fallback forecast using the free Open-Meteo API."""
+    """Forecast (+ 3-day historical tail) using the free Open-Meteo API.
+
+    past_days=3 adds ~72 h of measured history before the forecast window.
+    This anchors the temp_rolling_3d feature in _engineer_features so the
+    3-day rolling mean is based on real observations, not forecast values.
+    """
     url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
+        ",cloud_cover,direct_radiation"
+        "&past_days=3"
         "&timezone=Europe%2FZurich"
     )
     try:
@@ -80,14 +138,16 @@ def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
         h = res.json()["hourly"]
         n = len(h["time"])
         # Open-Meteo returns sunshine_duration in seconds; model expects minutes.
-        # Use .get() with a zero-filled fallback in case the field is absent.
+        # Use .get() with zero-filled fallbacks in case any field is absent.
         sunshine_s = h.get("sunshine_duration", [0] * n)
         return pd.DataFrame({
-            "timestamp":        pd.to_datetime(h["time"]),
-            "temp_c":           h["temperature_2m"],
-            "precipitation_mm": h["precipitation"],
-            "sunshine_min":     [s / 60.0 for s in sunshine_s],
-            "wind_kmh":         h["windspeed_10m"],
+            "timestamp":            pd.to_datetime(h["time"]),
+            "temp_c":               h["temperature_2m"],
+            "precipitation_mm":     h["precipitation"],
+            "sunshine_min":         [s / 60.0 for s in sunshine_s],
+            "wind_kmh":             h["windspeed_10m"],
+            "cloud_cover_pct":      h.get("cloud_cover",      [0] * n),
+            "direct_radiation_wm2": h.get("direct_radiation", [0] * n),
         })
     except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()

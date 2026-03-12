@@ -8,6 +8,8 @@ Covers:
   - None / empty actuals fall back to NaN (existing contract preserved)
   - lag_72h present in LAG_HOURS, values correct, NaN when history too short
   - Bridge-day features: range, zero on holiday, correct distances, fallback
+  - cloud_cover_pct and direct_radiation_wm2 in _FEATURES_BASE and _engineer_features
+  - temp_rolling_3d anchored by historical tail in weather_df
 """
 from __future__ import annotations
 from unittest.mock import patch
@@ -20,6 +22,8 @@ from energy_forecast.model import (
     _add_holiday_feature,
     _add_lag_and_rolling_prediction,
     _BRIDGE_CAP,
+    _FEATURES_BASE,
+    _engineer_features,
     LAG_HOURS,
 )
 
@@ -249,3 +253,86 @@ class TestBridgeDayFeatures:
         assert result["days_to_next_holiday"].iloc[0] == _BRIDGE_CAP
         assert result["days_since_last_holiday"].iloc[0] == _BRIDGE_CAP
         assert result["is_public_holiday"].iloc[0] == 0
+
+
+# ── Cloud cover, direct radiation, temp_rolling_3d ────────────────────────────
+
+def _make_weather_df(timestamps, temp: float = 5.0, cloud: float = 50.0, rad: float = 200.0) -> pd.DataFrame:
+    n = len(timestamps)
+    return pd.DataFrame({
+        "timestamp":            pd.to_datetime(timestamps),
+        "temp_c":               [temp]  * n,
+        "precipitation_mm":     [0.0]   * n,
+        "sunshine_min":         [30.0]  * n,
+        "wind_kmh":             [10.0]  * n,
+        "cloud_cover_pct":      [cloud] * n,
+        "direct_radiation_wm2": [rad]   * n,
+    })
+
+
+def _make_bare_df(timestamps) -> pd.DataFrame:
+    """Minimal energy df with gross_kwh for _engineer_features input."""
+    n = len(timestamps)
+    return pd.DataFrame({
+        "timestamp": pd.to_datetime(timestamps),
+        "gross_kwh": [1.5] * n,
+    })
+
+
+class TestNewWeatherFeatures:
+
+    def test_features_in_features_base(self):
+        assert "cloud_cover_pct"      in _FEATURES_BASE
+        assert "direct_radiation_wm2" in _FEATURES_BASE
+
+    def test_engineer_features_new_cols_populated(self):
+        """When weather_df contains cloud/radiation, they appear in output."""
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, cloud=42.0, rad=180.0)
+        result = _engineer_features(df, w, None)
+        assert "cloud_cover_pct"      in result.columns
+        assert "direct_radiation_wm2" in result.columns
+        assert (result["cloud_cover_pct"] == 42.0).all()
+        assert (result["direct_radiation_wm2"] == 180.0).all()
+
+    def test_engineer_features_missing_weather_cols_filled_as_nan(self):
+        """Safety net: if weather_df has no cloud/radiation, columns are NaN."""
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        # Weather without new columns (simulates SRG-only response gap)
+        w = pd.DataFrame({
+            "timestamp":        pd.to_datetime(ts),
+            "temp_c":           [5.0] * 4,
+            "precipitation_mm": [0.0] * 4,
+            "sunshine_min":     [30.0] * 4,
+            "wind_kmh":         [10.0] * 4,
+        })
+        result = _engineer_features(df, w, None)
+        assert "cloud_cover_pct"      in result.columns
+        assert "direct_radiation_wm2" in result.columns
+        assert result["cloud_cover_pct"].isna().all()
+        assert result["direct_radiation_wm2"].isna().all()
+
+    def test_temp_rolling_3d_anchored_by_historical_tail(self):
+        """With 72h of history prepended to a 4h forecast, temp_rolling_3d at h=0
+        must equal the mean of all 72 historical temps, not just the first value."""
+        hist_ts   = pd.date_range("2026-03-09 08:00", periods=72, freq="1h")
+        future_ts = pd.date_range("2026-03-12 08:00", periods=4,  freq="1h")
+        all_ts    = hist_ts.append(future_ts)
+
+        # Historical temp = 2.0, forecast temp = 10.0
+        w = _make_weather_df(all_ts,
+                             temp=2.0)  # constant — simplifies expected value
+        # Override forecast temps to 10.0 so we can detect if only those were used
+        w.loc[w["timestamp"].isin(future_ts), "temp_c"] = 10.0
+
+        df = _make_bare_df(future_ts)
+        result = _engineer_features(df, w, None)
+
+        # rolling(72) at the first future row (index 72) covers rows [1..72]:
+        # 71 historical rows at 2.0 + the current future row at 10.0.
+        # Expected mean = (71*2.0 + 1*10.0) / 72.
+        # Without the historical tail (min_periods=1), it would just be 10.0.
+        expected = (71 * 2.0 + 1 * 10.0) / 72
+        assert abs(float(result["temp_rolling_3d"].iloc[0]) - expected) < 1e-6
