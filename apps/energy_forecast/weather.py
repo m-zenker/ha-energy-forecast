@@ -73,7 +73,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
             data = res.json()
         except ValueError as exc:
             _LOGGER.warning(
-                "SRG-SSR forecast parse failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
+                "SRG-SSR forecast parse failed — HTTP %s, body: %.500r — falling back to Open-Meteo.",
                 res.status_code, res.text,
             )
             return fetch_open_meteo(lat, lon)
