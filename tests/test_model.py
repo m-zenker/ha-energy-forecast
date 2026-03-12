@@ -10,6 +10,9 @@ Covers:
   - Bridge-day features: range, zero on holiday, correct distances, fallback
   - cloud_cover_pct and direct_radiation_wm2 in _FEATURES_BASE and _engineer_features
   - temp_rolling_3d anchored by historical tail in weather_df
+  - Log-transform: flag set after training, expm1 applied in predict, backward compat
+  - _build_model: n_estimators override accepted
+  - Cantonal holidays: canton param threaded to country_holidays, invalid falls back
 """
 from __future__ import annotations
 from unittest.mock import patch
@@ -22,8 +25,10 @@ from energy_forecast.model import (
     _add_holiday_feature,
     _add_lag_and_rolling_prediction,
     _BRIDGE_CAP,
+    _build_model,
     _FEATURES_BASE,
     _engineer_features,
+    EnergyForecastModel,
     LAG_HOURS,
 )
 
@@ -336,3 +341,123 @@ class TestNewWeatherFeatures:
         # Without the historical tail (min_periods=1), it would just be 10.0.
         expected = (71 * 2.0 + 1 * 10.0) / 72
         assert abs(float(result["temp_rolling_3d"].iloc[0]) - expected) < 1e-6
+
+
+# ── Log-transform (#7) ────────────────────────────────────────────────────────
+
+class TestLogTransform:
+
+    def _make_train_data(self, n: int = 600):
+        """Minimal energy + weather DataFrames suitable for EnergyForecastModel.train()."""
+        rng = np.random.default_rng(0)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=n),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=n),
+            "precipitation_mm":     [0.0] * n,
+            "sunshine_min":         [30.0] * n,
+            "wind_kmh":             [10.0] * n,
+            "cloud_cover_pct":      [50.0] * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        return energy, weather
+
+    def test_log_transform_flag_set_after_training(self, tmp_path):
+        """_log_transform must be True after a successful train()."""
+        energy, weather = self._make_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        assert m._log_transform is True
+
+    def test_predict_gives_nonnegative_finite_values(self, tmp_path):
+        """predict() must return non-negative, finite kWh values with log-transform active."""
+        energy, weather = self._make_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        forecast = weather.iloc[-48:].copy().reset_index(drop=True)
+        forecast["timestamp"] = pd.date_range(
+            pd.Timestamp.now().floor("1h"), periods=48, freq="1h"
+        )
+        result = m.predict(forecast, live_temp=None)
+        assert result["predicted_kwh"].ge(0).all()
+        assert result["predicted_kwh"].notna().all()
+        assert np.isfinite(result["predicted_kwh"].values).all()
+
+    def test_backward_compat_old_meta_defaults_to_false(self, tmp_path):
+        """meta.pkl without 'log_transform' key must load as False (no crash on old installs)."""
+        import pickle, hashlib
+        # Write a meta dict that doesn't contain log_transform
+        meta_path = tmp_path / "meta.pkl"
+        meta = {
+            "feature_cols":    _FEATURES_BASE,
+            "last_trained":    __import__("datetime").datetime.min,
+            "last_mae":        None,
+            "last_cv_mae":     None,
+            "engine":          "test",
+            "feature_medians": {},
+            # intentionally omit "log_transform" and "canton"
+        }
+        with open(meta_path, "wb") as fh:
+            pickle.dump(meta, fh)
+        digest = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+        meta_path.with_suffix(".pkl.sha256").write_text(digest)
+
+        m = EnergyForecastModel(tmp_path)
+        assert m._log_transform is False
+        assert m._canton is None
+
+
+# ── _build_model n_estimators override (#6) ───────────────────────────────────
+
+class TestBuildModel:
+
+    def _gbr(self):
+        from sklearn.ensemble import GradientBoostingRegressor
+        return GradientBoostingRegressor
+
+    def test_n_estimators_override_applied(self):
+        """_build_model with n_estimators=100 must produce a model with that count."""
+        GBR = self._gbr()
+        model = _build_model(None, GBR, n_estimators=100)
+        assert model.n_estimators == 100
+
+    def test_default_n_estimators_when_none(self):
+        """_build_model with n_estimators=None uses the hardcoded default (300 for GBR)."""
+        GBR = self._gbr()
+        model = _build_model(None, GBR, n_estimators=None)
+        assert model.n_estimators == 300
+
+
+# ── Cantonal holidays (#9) ────────────────────────────────────────────────────
+
+class TestCantonalHolidays:
+
+    def _ts_df(self, dates):
+        return pd.DataFrame({
+            "timestamp": pd.to_datetime([f"{d} 12:00" for d in dates])
+        })
+
+    def test_canton_zh_returns_correct_columns(self):
+        """canton='ZH' must return all three holiday columns with int dtype."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-04-15"]), canton="ZH")
+        for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
+            assert col in result.columns
+            assert result[col].dtype in (np.int32, np.int64, int, "int64", "int32")
+
+    def test_canton_none_gives_federal_only(self):
+        """With canton=None, result columns are still present and values are valid ints."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-01-01"]), canton=None)
+        assert result["is_public_holiday"].iloc[0] == 1  # Jan 1 is federal
+
+    def test_invalid_canton_falls_back_gracefully(self):
+        """An unrecognised canton code must not crash; columns must still be present."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-03-15"]), canton="INVALID")
+        for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
+            assert col in result.columns

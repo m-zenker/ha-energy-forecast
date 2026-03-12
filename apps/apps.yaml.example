@@ -53,6 +53,10 @@ energy_forecast:
   # Lower = recent data matters more. Set to 0 to disable weighting.
   weight_halflife_days: 90
 
+  # Optional: two-letter Swiss canton code for cantonal holidays (e.g. ZH, BE, GE).
+  # If omitted, only federal public holidays are used.
+  # holiday_canton: ZH
+
 # ── One-off backfill (uncomment only when needed) ────────────────────────────
 #energy_history_backfill:
 #  module: energy_forecast.energy_history_backfill

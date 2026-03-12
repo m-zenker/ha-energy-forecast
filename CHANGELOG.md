@@ -8,6 +8,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Log-transform target** (#7): `gross_kwh` is now `log1p`-transformed before
+  training and `expm1`-inverted at prediction time. Reduces the outsized influence
+  of rare high-energy hours on the loss, improving MAE on typical hours. MAE
+  continues to be reported in kWh (not log space). A `log_transform` flag is
+  persisted in `meta.pkl`; old installs without the key default to False (no
+  behaviour change until the next retrain).
+- **LightGBM early stopping** (#6): CV fold fits now use
+  `lgb.early_stopping(stopping_rounds=50)` with the fold's validation set as
+  `eval_set`. The `best_iteration_` from the last fold is used as `n_estimators`
+  for the final model, eliminating fixed-count under/over-fitting. Falls back to
+  the default 500 estimators if early stopping raises an exception or LightGBM is
+  unavailable. `_build_model` accepts an `n_estimators` override.
+- **Cantonal holidays** (#9): `_add_holiday_feature` accepts a `canton` keyword
+  (e.g. `"ZH"`, `"BE"`) passed as `subdiv` to `holidays.country_holidays`. Invalid
+  codes fall back to federal-only with a warning. Configure via `holiday_canton`
+  in `apps.yaml`; defaults to federal holidays only if omitted.
+- `tests/test_model.py` — 8 new tests: `TestLogTransform` (3), `TestBuildModel`
+  (2), `TestCantonalHolidays` (3)
+
 ### Fixed
 - **Open-Meteo fallback sunshine**: `fetch_open_meteo` previously hardcoded
   `sunshine_min = 0`, silently degrading forecasts for all installations without

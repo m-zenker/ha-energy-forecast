@@ -158,6 +158,7 @@ energy_forecast:
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
 | `cache_path` | No | Next to `energy_forecast.py` | Override path for the energy history CSV file |
+| `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 
 ---
 

@@ -145,6 +145,8 @@ class EnergyForecastModel:
         self.last_cv_mae: float | None     = None   # cross-validated MAE
         self.engine: str                   = "not trained"
         self._feature_medians: dict        = {}     # used to fill NaN at predict time
+        self._log_transform: bool          = False  # log1p target; False = backward compat
+        self._canton: str | None           = None   # cantonal holiday subdivision
 
         self._load()
 
@@ -156,6 +158,7 @@ class EnergyForecastModel:
         weather_df: pd.DataFrame,         # naive timestamps
         outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
+        canton: str | None = None,
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -189,7 +192,7 @@ class EnergyForecastModel:
         df = _add_lag_and_rolling_training(energy_df, active_lags)
 
         # ── Weather / outdoor / calendar features ───────────────────────────
-        df = _engineer_features(df, weather_df, outdoor_df)
+        df = _engineer_features(df, weather_df, outdoor_df, canton=canton)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -220,6 +223,7 @@ class EnergyForecastModel:
 
         X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
         y = df["gross_kwh"].values
+        y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
         # ── Exponential sample weighting ────────────────────────────────────
         sample_weight = None
@@ -229,37 +233,59 @@ class EnergyForecastModel:
             sample_weight = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
 
         # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
+        # Also used to determine optimal n_estimators via LightGBM early stopping.
         cv_mae = None
+        best_n_est: int | None = None
         if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
-                tscv   = TimeSeriesSplit(n_splits=3)
+                tscv      = TimeSeriesSplit(n_splits=3)
                 fold_maes = []
                 for tr_idx, val_idx in tscv.split(X):
                     sw_fold = sample_weight[tr_idx] if sample_weight is not None else None
                     m = _build_model(lgb, GBR)
+                    fit_kwargs: dict = {}
                     if sw_fold is not None:
-                        m.fit(X.iloc[tr_idx], y[tr_idx], sample_weight=sw_fold)
+                        fit_kwargs["sample_weight"] = sw_fold
+                    if lgb is not None:
+                        try:
+                            m.fit(
+                                X.iloc[tr_idx], y_fit[tr_idx],
+                                eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                callbacks=[
+                                    lgb.early_stopping(50, verbose=False),
+                                    lgb.log_evaluation(-1),
+                                ],
+                                **fit_kwargs,
+                            )
+                            best_n_est = getattr(m, "best_iteration_", best_n_est)
+                        except Exception as _es_exc:  # noqa: BLE001
+                            _LOGGER.debug("Early stopping failed for fold: %s — using fixed estimators", _es_exc)
+                            m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                     else:
-                        m.fit(X.iloc[tr_idx], y[tr_idx])
-                    fold_maes.append(float(mae_fn(y[val_idx], m.predict(X.iloc[val_idx]))))
+                        m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                    # MAE reported in original kWh space (expm1 undoes log1p)
+                    fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
 
+        if best_n_est is not None:
+            _LOGGER.info("LightGBM early stopping: using %d estimators (from last CV fold)", best_n_est)
+
         # ── Final model on all data ─────────────────────────────────────────
-        model = _build_model(lgb, GBR)
+        model = _build_model(lgb, GBR, n_estimators=best_n_est)
         if sample_weight is not None:
-            model.fit(X, y, sample_weight=sample_weight)
+            model.fit(X, y_fit, sample_weight=sample_weight)
         else:
-            model.fit(X, y)
+            model.fit(X, y_fit)
 
         # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
         holdout_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
-                holdout_mae = round(float(mae_fn(y[split:], model.predict(X.iloc[split:]))), 4)
+                holdout_mae = round(float(mae_fn(y[split:], np.expm1(model.predict(X.iloc[split:])))), 4)
             except (ValueError, IndexError):
                 pass
 
@@ -269,6 +295,8 @@ class EnergyForecastModel:
         self.last_mae       = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae    = cv_mae
         self.engine         = engine_name
+        self._log_transform = True
+        self._canton        = canton
         self._save()
 
         mae_str = f"cv_MAE={cv_mae:.4f}" if cv_mae else (f"holdout_MAE={holdout_mae:.4f}" if holdout_mae else "MAE=n/a")
@@ -310,7 +338,7 @@ class EnergyForecastModel:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
         # ── Calendar + weather features ─────────────────────────────────────
-        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df)
+        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton)
 
         # Fill any remaining NaN with stored training medians (graceful fallback)
         for col in self.feature_cols:
@@ -319,7 +347,10 @@ class EnergyForecastModel:
                 feat_df[col] = feat_df[col].fillna(fill)
 
         X = feat_df[self.feature_cols].fillna(0)  # DataFrame → LightGBM gets feature names
-        preds = np.maximum(0, self.model.predict(X))
+        preds = self.model.predict(X)
+        if self._log_transform:
+            preds = np.expm1(preds)
+        preds = np.maximum(0, preds)
 
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
 
@@ -342,6 +373,8 @@ class EnergyForecastModel:
             "last_cv_mae":      self.last_cv_mae,
             "engine":           self.engine,
             "feature_medians":  self._feature_medians,
+            "log_transform":    self._log_transform,
+            "canton":           self._canton,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -377,6 +410,8 @@ class EnergyForecastModel:
                     self.last_cv_mae       = meta.get("last_cv_mae")
                     self.engine            = meta.get("engine",          "unknown")
                     self._feature_medians  = meta.get("feature_medians", {})
+                    self._log_transform    = meta.get("log_transform",   False)
+                    self._canton           = meta.get("canton",          None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -496,6 +531,7 @@ def _engineer_features(
     df: pd.DataFrame,                   # naive timestamps
     weather_df: pd.DataFrame,           # naive timestamps
     outdoor_df: pd.DataFrame | None,    # naive timestamps
+    canton: str | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -526,7 +562,7 @@ def _engineer_features(
     df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
 
     # ── Public holidays ──────────────────────────────────────────────────────
-    df = _add_holiday_feature(df)
+    df = _add_holiday_feature(df, canton=canton)
 
     # ── Weather merge ────────────────────────────────────────────────────────
     w = weather_df.copy()
@@ -575,17 +611,20 @@ def _engineer_features(
 _BRIDGE_CAP = 3   # days — bridge-day effect beyond this distance is negligible
 
 
-def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
+def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.DataFrame:
     """Add holiday proximity columns using the `holidays` package.
 
     Columns added:
-      is_public_holiday       — 1 on a Swiss federal holiday, else 0
+      is_public_holiday       — 1 on a Swiss federal (or cantonal) holiday, else 0
       days_to_next_holiday    — calendar days until the next holiday, capped at _BRIDGE_CAP
       days_since_last_holiday — calendar days since the last holiday, capped at _BRIDGE_CAP
 
     Both distance columns are 0 on a holiday itself.  The cap keeps the feature
     range tight so the model focuses on the bridging-day window where consumption
     patterns actually differ.
+
+    Pass canton (e.g. "ZH", "BE") to include cantonal holidays in addition to
+    federal ones.  Falls back to federal-only if the canton code is unrecognised.
 
     Falls back gracefully (is_public_holiday=0, distances=_BRIDGE_CAP) if the
     `holidays` package is not installed.
@@ -599,7 +638,16 @@ def _add_holiday_feature(df: pd.DataFrame) -> pd.DataFrame:
         # can see the next/previous holiday across the year boundary.
         years_in_data = df["timestamp"].dt.year.unique()
         years = sorted({y + d for y in years_in_data for d in (-1, 0, 1)})
-        ch_holidays = hd.country_holidays("CH", years=years)
+        if canton:
+            try:
+                ch_holidays = hd.country_holidays("CH", years=years, subdiv=canton)
+            except (NotImplementedError, KeyError):
+                _LOGGER.warning(
+                    "Unknown canton code %r — falling back to federal holidays.", canton
+                )
+                ch_holidays = hd.country_holidays("CH", years=years)
+        else:
+            ch_holidays = hd.country_holidays("CH", years=years)
         holiday_dates = sorted(ch_holidays.keys())
 
         dates = df["timestamp"].dt.date
@@ -667,11 +715,14 @@ def _build_prediction_temp_df(
     return pd.DataFrame(rows)
 
 
-def _build_model(lgb: Any, GBR: Any) -> Any:
-    """Instantiate the best available model (LightGBM preferred, sklearn GBR fallback)."""
+def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None) -> Any:
+    """Instantiate the best available model (LightGBM preferred, sklearn GBR fallback).
+
+    n_estimators overrides the default when provided (e.g. from early stopping).
+    """
     if lgb is not None:
         return lgb.LGBMRegressor(
-            n_estimators=500,
+            n_estimators=n_estimators or 500,
             learning_rate=0.05,
             num_leaves=31,
             subsample=0.8,
@@ -681,7 +732,7 @@ def _build_model(lgb: Any, GBR: Any) -> Any:
             verbose=-1,
         )
     return GBR(
-        n_estimators=300,
+        n_estimators=n_estimators or 300,
         learning_rate=0.05,
         max_depth=5,
         subsample=0.8,

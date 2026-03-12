@@ -49,18 +49,18 @@ Fix: project these features forward hour-by-hour using the predicted values for
 intermediate hours (auto-regressive unrolling), or at minimum decay them toward
 the training-set median as `hours_ahead` increases.~~
 
-### 6. LightGBM early stopping + validation-set tuning
-Fixed hyperparameters (`n_estimators=500`, `learning_rate=0.05`, `num_leaves=31`)
+### ~~6. LightGBM early stopping + validation-set tuning~~ ✓ done
+~~Fixed hyperparameters (`n_estimators=500`, `learning_rate=0.05`, `num_leaves=31`)
 cause the model to under-fit or over-fit depending on data volume. Adding early
 stopping against the last CV fold (already computed during training) gives the
 right tree count for free without grid search. Also consider a narrow sweep of
-`num_leaves` (16 / 31 / 63) on the final CV split.
+`num_leaves` (16 / 31 / 63) on the final CV split.~~
 
-### 7. Log-transform the target
-Household energy consumption is right-skewed (heating peaks, near-threshold EV
+### ~~7. Log-transform the target~~ ✓ done
+~~Household energy consumption is right-skewed (heating peaks, near-threshold EV
 hours). Training on `log1p(gross_kwh)` and exponentiating predictions reduces the
 outsized influence of rare high-energy hours on the loss, typically improving MAE
-on typical hours at the cost of negligible degradation on peaks.
+on typical hours at the cost of negligible degradation on peaks.~~
 
 ### 8. Adaptive retraining trigger
 Weekly retraining ignores model drift. A rolling MAPE computed on the last 24
@@ -72,10 +72,10 @@ Most impactful after seasonal transitions or household behaviour changes.
 
 ## Tier 3 — Medium impact, higher effort
 
-### 9. Cantonal public holidays
-The `holidays` package supports `canton=`. Exposing this as a `holiday_canton`
+### ~~9. Cantonal public holidays~~ ✓ done
+~~The `holidays` package supports `canton=`. Exposing this as a `holiday_canton`
 key in `apps.yaml` is a one-line change in `_add_holiday_feature` but captures
-cantonal school and bank holidays that differ significantly from federal ones.
+cantonal school and bank holidays that differ significantly from federal ones.~~
 
 ### 10. School holiday feature
 Swiss Schulferien dates are canton-specific but stable year-to-year. During
@@ -130,10 +130,10 @@ cannot capture.
 | 3 | Pre/post holiday bridge features | medium | 1 h | ✓ done |
 | 4 | Cloud cover / radiation feature | medium | 2 h | ✓ done |
 | 5 | Per-hour rolling prediction features | **high** | 3 h | ✓ done |
-| 6 | LightGBM early stopping | medium | 2 h | |
-| 7 | Log-transform target | medium | 1 h | |
+| 6 | LightGBM early stopping | medium | 2 h | ✓ done |
+| 7 | Log-transform target | medium | 1 h | ✓ done |
 | 8 | Adaptive retraining trigger | medium | 3 h | |
-| 9 | Cantonal holidays config | low | 30 min | |
+| 9 | Cantonal holidays config | low | 30 min | ✓ done |
 | 10 | School holiday feature | medium | 4 h | |
 | 11 | `lag_72h` | low | 30 min | ✓ done |
 | 12 | EV session probability feature | medium | 4 h | |

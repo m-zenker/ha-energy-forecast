@@ -55,6 +55,7 @@ class EnergyForecast(hass.Hass):
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
         self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
+        self._holiday_canton: str | None = self.args.get("holiday_canton") or None
 
         self._validate_config()
 
@@ -167,6 +168,7 @@ class EnergyForecast(hass.Hass):
             weather_df,
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
+            canton=self._holiday_canton,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
