@@ -159,6 +159,7 @@ energy_forecast:
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
 | `cache_path` | No | Next to `energy_forecast.py` | Override path for the energy history CSV file |
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
+| `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 
 ---
 
@@ -171,7 +172,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 | Entity ID | Description |
 |-----------|-------------|
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Predicted total for today (midnight to midnight) |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
 ### 3-hour block forecasts
@@ -244,6 +245,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Sensor update | 130 seconds after startup |
 | Retrain | Every 7 days (168 hours) |
 | Sensor update | Every hour |
+| Adaptive retrain | Any hourly update where live day-ahead MAE exceeds `adaptive_retrain_threshold` × CV MAE (≥ 24 matched pairs required; 24h cooldown between triggers) |
 
 ### Features used
 

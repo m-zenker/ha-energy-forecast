@@ -9,6 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Intra-day actuals substitution** (#14): `sensor.energy_forecast_today` and
+  the `today_HH_HH` block sensors now blend measured actuals (elapsed hours) with
+  model predictions (remaining hours). Previously the today total was based on
+  predictions alone, which missed all consumption before the current hour. A new
+  module-level helper `_blend_today_totals` handles the blending; `"tomorrow"` and
+  `"next_3h"` sensors are unchanged.
+- **Adaptive retraining trigger** (#8): each hourly sensor update stores the
+  48-hour prediction in an in-memory prediction history (keep-first semantics,
+  preserving the ≈24h-ahead prediction for each future hour). After every update
+  the live day-ahead MAE is compared against `adaptive_retrain_threshold × cv_MAE`;
+  if exceeded with ≥ 24 matched pairs and a 24h cooldown has elapsed, an early
+  retrain is triggered and logged at WARNING level. Configurable via
+  `adaptive_retrain_threshold` in `apps.yaml` (default 2.0; 0 disables).
+- `conftest.py`: `hassapi` stub so `energy_forecast.py` module-level helpers are
+  importable in the test environment without AppDaemon installed.
+- `tests/test_energy_forecast.py` — 7 new tests: `TestBlendTodayTotals` (4),
+  `TestComputeLiveMae` (3)
 - **Log-transform target** (#7): `gross_kwh` is now `log1p`-transformed before
   training and `expm1`-inverted at prediction time. Reduces the outsized influence
   of rare high-energy hours on the loss, improving MAE on typical hours. MAE

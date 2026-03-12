@@ -56,6 +56,13 @@ class EnergyForecast(hass.Hass):
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
         self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
+        self._adaptive_retrain_threshold: float = float(
+            self.args.get("adaptive_retrain_threshold", 2.0)
+        )
+        # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
+        # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
+        self._pred_history: dict        = {}
+        self._last_adaptive_retrain: datetime = datetime.min
 
         self._validate_config()
 
@@ -207,6 +214,21 @@ class EnergyForecast(hass.Hass):
         predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals)
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
+        # ── Store predictions for adaptive retrain tracking ───────────────────
+        # Keep-first: only store a prediction for each target hour the first time
+        # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        self._pred_history = {
+            ts: kwh for ts, kwh in self._pred_history.items()
+            if pd.Timestamp(ts) >= cutoff
+        }
+        for _, row in predictions.iterrows():
+            ts = pd.Timestamp(row["timestamp"])
+            if ts not in self._pred_history:
+                self._pred_history[ts] = float(row["predicted_kwh"])
+
+        self._maybe_adaptive_retrain(recent_actuals)
+
         aggregated = self._aggregate(predictions, full_actuals, live_temp)
         self._publish(aggregated)
 
@@ -220,6 +242,27 @@ class EnergyForecast(hass.Hass):
             return float(state)
         except (ValueError, TypeError):
             return None
+
+    def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
+        """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""
+        cv_mae = self._ml_model.last_cv_mae
+        if cv_mae is None:
+            return
+        hours_since = (datetime.now() - self._last_adaptive_retrain).total_seconds() / 3600
+        if hours_since < 24:
+            return
+        live_mae, n_pairs = _compute_live_mae(self._pred_history, actuals_df)
+        if n_pairs < 24:
+            return
+        if live_mae > self._adaptive_retrain_threshold * cv_mae:
+            self.log(
+                f"Adaptive retrain triggered: live_MAE={live_mae:.4f} > "
+                f"{self._adaptive_retrain_threshold}× cv_MAE={cv_mae:.4f} "
+                f"(over {n_pairs} matched hours)",
+                level="WARNING",
+            )
+            self._last_adaptive_retrain = datetime.now()
+            self._retrain()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
 
@@ -354,11 +397,17 @@ class EnergyForecast(hass.Hass):
                 for h in range(0, 24, 3)
             }
 
+        # Today: substitute actuals for elapsed hours so the sensor reflects
+        # measured consumption for the past and forecast for the remainder.
+        today_total, blocks_today = _blend_today_totals(
+            p_times, p_vals, full_actuals, today_np, tomorrow_np, now_np
+        )
+
         result = {
             "next_3h":         _sum(now_np, now_np + np.timedelta64(3, "h")),
-            "today":           _sum(today_np, tomorrow_np),
+            "today":           today_total,
             "tomorrow":        _sum(tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
-            "blocks_today":    _blocks(today_np),
+            "blocks_today":    blocks_today,
             "blocks_tomorrow": _blocks(tomorrow_np),
             "live_temp":       live_temp,
             "ev_today":        0.0,
@@ -403,4 +452,85 @@ def _empty_weather_df() -> Any:
     return pd.DataFrame(
         columns=["timestamp", "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh"]
     )
-    
+
+
+def _blend_today_totals(
+    p_times: Any,       # np.ndarray of datetime64[ns] — prediction timestamps
+    p_vals: Any,        # np.ndarray of float — predicted kWh per hour
+    full_actuals: Any,  # pd.DataFrame | None — cols: timestamp, gross_kwh
+    today_np: Any,      # np.datetime64 — midnight today
+    tomorrow_np: Any,   # np.datetime64 — midnight tomorrow
+    now_np: Any,        # np.datetime64 — current hour (floored)
+) -> tuple[float, dict]:
+    """Compute today's blended total and 3h blocks.
+
+    Elapsed hours (< now_np) use actuals from full_actuals where available;
+    future hours (>= now_np) use model predictions.  Falls back to predictions
+    only when full_actuals is None or empty.
+    """
+    import numpy as np
+
+    fa_times = None
+    fa_vals  = None
+    if full_actuals is not None and not getattr(full_actuals, "empty", True):
+        fa_times = full_actuals["timestamp"].values.astype("datetime64[ns]")
+        fa_vals  = full_actuals["gross_kwh"].values.astype(float)
+
+    def _pred_sum(s: Any, e: Any) -> float:
+        return float(np.sum(p_vals[(p_times >= s) & (p_times < e)]))
+
+    def _actual_sum(s: Any, e: Any) -> float:
+        if fa_times is None:
+            return 0.0
+        return float(np.sum(fa_vals[(fa_times >= s) & (fa_times < e)]))
+
+    def _blended(s: Any, e: Any) -> float:
+        elapsed_end  = min(e, now_np)
+        future_start = max(s, now_np)
+        total = 0.0
+        if elapsed_end > s:
+            total += _actual_sum(s, elapsed_end)
+        if future_start < e:
+            total += _pred_sum(future_start, e)
+        return round(total, 3)
+
+    today_total = _blended(today_np, tomorrow_np)
+    blocks = {
+        f"{h:02d}_{h+3:02d}": _blended(
+            today_np + np.timedelta64(h, "h"),
+            today_np + np.timedelta64(h + 3, "h"),
+        )
+        for h in range(0, 24, 3)
+    }
+    return today_total, blocks
+
+
+def _compute_live_mae(
+    pred_history: dict,  # {timestamp-like: predicted_kwh}
+    actuals_df: Any,     # pd.DataFrame | None — cols: timestamp, gross_kwh
+) -> tuple[float, int]:
+    """Compute MAE between stored predictions and actuals for matched timestamps.
+
+    Returns (mae, n_pairs).  mae is float('nan') when n_pairs == 0.
+    Only hours present in both pred_history and actuals_df are included.
+    """
+    import pandas as pd
+
+    if actuals_df is None or getattr(actuals_df, "empty", True) or not pred_history:
+        return float("nan"), 0
+
+    actuals_map = {
+        pd.Timestamp(ts).floor("1h"): float(kwh)
+        for ts, kwh in zip(actuals_df["timestamp"], actuals_df["gross_kwh"])
+    }
+
+    errors = []
+    for ts, pred in pred_history.items():
+        key = pd.Timestamp(ts).floor("1h")
+        if key in actuals_map:
+            errors.append(abs(actuals_map[key] - pred))
+
+    n = len(errors)
+    if n == 0:
+        return float("nan"), 0
+    return round(sum(errors) / n, 4), n

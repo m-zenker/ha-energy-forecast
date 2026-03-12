@@ -62,11 +62,11 @@ hours). Training on `log1p(gross_kwh)` and exponentiating predictions reduces th
 outsized influence of rare high-energy hours on the loss, typically improving MAE
 on typical hours at the cost of negligible degradation on peaks.~~
 
-### 8. Adaptive retraining trigger
-Weekly retraining ignores model drift. A rolling MAPE computed on the last 24
+### ~~8. Adaptive retraining trigger~~ ✓ done
+~~Weekly retraining ignores model drift. A rolling MAPE computed on the last 24
 hourly actuals vs. predictions made 24 h earlier (trackable cheaply in the CSV
 cache) would trigger an early retrain when live error exceeds ~2× the CV MAE.
-Most impactful after seasonal transitions or household behaviour changes.
+Most impactful after seasonal transitions or household behaviour changes.~~
 
 ---
 
@@ -107,11 +107,11 @@ regression (`objective='quantile'`, `alpha=0.1/0.9`). Enables automations like
 "charge EV only if forecast upper bound is below 15 kWh" — higher end-user value
 than marginal point-estimate MAE improvement.
 
-### 14. Intra-day actuals substitution
-As today's hours tick by, `_aggregate()` should replace predicted values for
+### ~~14. Intra-day actuals substitution~~ ✓ done
+~~As today's hours tick by, `_aggregate()` should replace predicted values for
 elapsed hours with actuals from the CSV cache. Currently the `today` sensor sums
 raw predictions across the full day including already-elapsed hours. Substituting
-actuals makes the `today` total significantly more accurate as the day progresses.
+actuals makes the `today` total significantly more accurate as the day progresses.~~
 
 ### 15. HVAC / boiler state feature
 If a thermostat or boiler entity is available in HA (configurable via `apps.yaml`
@@ -132,11 +132,11 @@ cannot capture.
 | 5 | Per-hour rolling prediction features | **high** | 3 h | ✓ done |
 | 6 | LightGBM early stopping | medium | 2 h | ✓ done |
 | 7 | Log-transform target | medium | 1 h | ✓ done |
-| 8 | Adaptive retraining trigger | medium | 3 h | |
+| 8 | Adaptive retraining trigger | medium | 3 h | ✓ done |
 | 9 | Cantonal holidays config | low | 30 min | ✓ done |
 | 10 | School holiday feature | medium | 4 h | |
 | 11 | `lag_72h` | low | 30 min | ✓ done |
 | 12 | EV session probability feature | medium | 4 h | |
 | 13 | Prediction intervals (HA sensors) | UX value | 4 h | |
-| 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | |
+| 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | ✓ done |
 | 15 | HVAC state feature | high (if available) | 3 h | |

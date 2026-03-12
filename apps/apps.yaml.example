@@ -57,6 +57,12 @@ energy_forecast:
   # If omitted, only federal public holidays are used.
   # holiday_canton: ZH
 
+  # Optional: adaptive retraining threshold (default: 2.0).
+  # Triggers an early retrain when live MAE (day-ahead predictions vs actuals,
+  # over the last 24+ matched hours) exceeds this multiple of the CV MAE.
+  # Set higher to retrain less aggressively; 0 disables the feature.
+  # adaptive_retrain_threshold: 2.0
+
 # ── One-off backfill (uncomment only when needed) ────────────────────────────
 #energy_history_backfill:
 #  module: energy_forecast.energy_history_backfill
