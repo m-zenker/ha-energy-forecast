@@ -299,7 +299,7 @@ Backfill complete — remove 'energy_history_backfill' from apps.yaml and delete
 | [SRG-SSR Forecast API](https://developer.srgssr.ch) | 7-day hourly forecast | Free API key |
 | [Open-Meteo Forecast](https://open-meteo.com/) | Forecast fallback | Nothing (free, no key) |
 
-The SRG-SSR API provides high-resolution Swiss weather data including sunshine minutes, which improves summer forecast accuracy. If credentials are not configured, or if the SRG-SSR request fails for any reason, Open-Meteo is used automatically — the app will never fail to produce a forecast due to a weather API issue.
+Both SRG-SSR and Open-Meteo provide temperature, precipitation, sunshine, and wind data. SRG-SSR offers higher spatial resolution for Swiss locations. If credentials are not configured, or if the SRG-SSR request fails for any reason, Open-Meteo is used automatically — the app will never fail to produce a forecast due to a weather API issue.
 
 ---
 

@@ -7,13 +7,13 @@ Current baseline: v0.2.1 on `main`.
 
 ## Tier 1 — High impact, low effort (quick wins)
 
-### 1. Fix missing sunshine in Open-Meteo fallback
-`weather.py` hardcodes `sunshine_min = 0` for the Open-Meteo forecast fallback.
+### ~~1. Fix missing sunshine in Open-Meteo fallback~~ ✓ done (144de78)
+~~`weather.py` hardcodes `sunshine_min = 0` for the Open-Meteo forecast fallback.
 The free Open-Meteo API *does* provide `sunshine_duration`. This is a bug that
 silently degrades any installation without SRG-SSR credentials — summer cooling
 and daylighting-driven consumption patterns become invisible to the model for all
 48 prediction hours. Fix: add `sunshine_duration` to the Open-Meteo forecast URL
-and convert from seconds to minutes, matching the archive fetcher.
+and convert from seconds to minutes, matching the archive fetcher.~~
 
 ### 2. Add `temp_rolling_3d` to the prediction horizon
 `temp_rolling_3d` is computed only over historical weather. During prediction it
@@ -39,15 +39,15 @@ and include them in `_FEATURES_BASE`.
 
 ## Tier 2 — High impact, medium effort
 
-### 5. Fix training/prediction mismatch in rolling features
-`rolling_mean_24h`, `rolling_mean_7d`, and `rolling_std_24h` are computed as a
+### ~~5. Fix training/prediction mismatch in rolling features~~ ✓ done (144de78)
+~~`rolling_mean_24h`, `rolling_mean_7d`, and `rolling_std_24h` are computed as a
 *single scalar* applied to all 48 prediction hours. During training these are
 time-varying per row. This creates a systematic bias: hours 1–2 ahead get a
 reasonably calibrated feature value, but hours 24–48 ahead get a stale one.
 
 Fix: project these features forward hour-by-hour using the predicted values for
 intermediate hours (auto-regressive unrolling), or at minimum decay them toward
-the training-set median as `hours_ahead` increases.
+the training-set median as `hours_ahead` increases.~~
 
 ### 6. LightGBM early stopping + validation-set tuning
 Fixed hyperparameters (`n_estimators=500`, `learning_rate=0.05`, `num_leaves=31`)
@@ -123,24 +123,20 @@ cannot capture.
 
 ## Summary
 
-| # | Change | Expected MAE impact | Effort |
-|---|--------|--------------------:|--------|
-| 1 | Fix Open-Meteo sunshine | high (non-SRG installs) | 15 min |
-| 2 | Forward-roll `temp_rolling_3d` | medium | 1 h |
-| 3 | Pre/post holiday bridge features | medium | 1 h |
-| 4 | Cloud cover / radiation feature | medium | 2 h |
-| 5 | Per-hour rolling prediction features | **high** | 3 h |
-| 6 | LightGBM early stopping | medium | 2 h |
-| 7 | Log-transform target | medium | 1 h |
-| 8 | Adaptive retraining trigger | medium | 3 h |
-| 9 | Cantonal holidays config | low | 30 min |
-| 10 | School holiday feature | medium | 4 h |
-| 11 | `lag_72h` | low | 30 min |
-| 12 | EV session probability feature | medium | 4 h |
-| 13 | Prediction intervals (HA sensors) | UX value | 4 h |
-| 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h |
-| 15 | HVAC state feature | high (if available) | 3 h |
-
-The highest-leverage first steps are **#5** (rolling feature projection) and **#1**
-(sunshine bug fix) — both address systematic errors present in every prediction
-cycle today.
+| # | Change | Expected MAE impact | Effort | Status |
+|---|--------|--------------------:|--------|--------|
+| 1 | Fix Open-Meteo sunshine | high (non-SRG installs) | 15 min | ✓ done |
+| 2 | Forward-roll `temp_rolling_3d` | medium | 1 h | |
+| 3 | Pre/post holiday bridge features | medium | 1 h | |
+| 4 | Cloud cover / radiation feature | medium | 2 h | |
+| 5 | Per-hour rolling prediction features | **high** | 3 h | ✓ done |
+| 6 | LightGBM early stopping | medium | 2 h | |
+| 7 | Log-transform target | medium | 1 h | |
+| 8 | Adaptive retraining trigger | medium | 3 h | |
+| 9 | Cantonal holidays config | low | 30 min | |
+| 10 | School holiday feature | medium | 4 h | |
+| 11 | `lag_72h` | low | 30 min | |
+| 12 | EV session probability feature | medium | 4 h | |
+| 13 | Prediction intervals (HA sensors) | UX value | 4 h | |
+| 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | |
+| 15 | HVAC state feature | high (if available) | 3 h | |

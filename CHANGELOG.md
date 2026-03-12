@@ -8,6 +8,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Open-Meteo fallback sunshine**: `fetch_open_meteo` previously hardcoded
+  `sunshine_min = 0`, silently degrading forecasts for all installations without
+  SRG-SSR credentials. `sunshine_duration` is now requested from the API and
+  converted from seconds to minutes, matching the archive fetcher. A safe `.get()`
+  fallback handles any API response that omits the field.
+- **Rolling feature train/predict mismatch**: `rolling_mean_24h`, `rolling_mean_7d`,
+  and `rolling_std_24h` were broadcast as a single scalar across all 48 prediction
+  hours, diverging from their time-varying per-row semantics during training. These
+  features now slide forward over an extended series (known actuals + fill values at
+  future timestamps) with `shift(1)` applied to exactly mirror the training
+  computation. At h=0 the value matches `mean(actuals[-24:])` exactly; beyond h=24
+  it stabilises at the recent household baseline.
+
+### Added
+- `tests/test_weather.py` — 6 tests covering `fetch_open_meteo` sunshine parsing,
+  unit conversion, missing-key fallback, column contract, and network errors
+- `tests/test_model.py` — 12 tests covering rolling feature variance, exact h=0
+  boundary semantics, smooth transition at h=24, and short/empty actuals edge cases
+- `ROADMAP.md` — forecast accuracy improvement roadmap (15 items across 4 tiers)
+
 ---
 
 ## [0.2.1] — 2026-03-10
