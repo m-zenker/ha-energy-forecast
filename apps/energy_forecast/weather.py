@@ -72,9 +72,12 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         try:
             data = res.json()
         except ValueError as exc:
+            import re as _re
+            _title = (_re.search(r"<title[^>]*>(.*?)</title>", res.text, _re.I | _re.S) or None)
+            title_str = _title.group(1).strip() if _title else res.text[:120].strip()
             _LOGGER.warning(
-                "SRG-SSR forecast parse failed — HTTP %s, body: %.500r — falling back to Open-Meteo.",
-                res.status_code, res.text,
+                "SRG-SSR forecast parse failed — HTTP %s, page: %r — falling back to Open-Meteo.",
+                res.status_code, title_str,
             )
             return fetch_open_meteo(lat, lon)
 
