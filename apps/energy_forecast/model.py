@@ -446,18 +446,43 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
                 lag, nan_count, len(future_df), lag,
             )
 
-    # Rolling stats from the actual recent window
-    def _safe_stat(fn, window_h):
-        try:
-            subset = actuals.iloc[-window_h:]
-            val = fn(subset)
-            return float(val) if not pd.isna(val) else np.nan
-        except (ValueError, TypeError, IndexError):
-            return np.nan
+    # ── Rolling stats — sliding window projection ────────────────────────────
+    # During training, rolling_mean_24h[i] = mean(gross_kwh[i-24:i]) — it varies
+    # per row as the window slides forward.  Broadcasting a single scalar to all
+    # 48 future hours creates a systematic train/predict mismatch that worsens
+    # beyond h=24.
+    #
+    # Fix: extend the actuals series with fill values at the 48 future timestamps,
+    # then compute rolling stats on the combined series.  Unknown future values
+    # are filled with the recent 24h mean — a stable proxy that causes the
+    # rolling stats to decay smoothly toward the current household baseline as
+    # h increases rather than jumping discontinuously.
+    #
+    # For h=0  the window is 100% known actuals  → exact match with training.
+    # For h=12 the window is half-known, half-filled → gradual blend.
+    # For h≥24 the window is mostly/entirely filled → stabilises at fill_val.
+    future_index = pd.to_datetime(future_df["timestamp"])
+    try:
+        fill_val = float(actuals.iloc[-24:].mean())
+    except (ValueError, TypeError, IndexError):
+        fill_val = float(actuals.mean()) if len(actuals) > 0 else np.nan
 
-    future_df["rolling_mean_24h"] = _safe_stat(lambda s: s.mean(), 24)
-    future_df["rolling_mean_7d"]  = _safe_stat(lambda s: s.mean(), 168)
-    future_df["rolling_std_24h"]  = _safe_stat(lambda s: s.std(),  24)
+    future_fill = pd.Series(fill_val, index=future_index)
+    extended = pd.concat([actuals, future_fill]).sort_index()
+    extended = extended[~extended.index.duplicated(keep="last")]
+
+    # shift(1) mirrors the training computation (_add_lag_and_rolling_training
+    # applies shift(1) before rolling so the window excludes the current row).
+    # Without it, the window at h=0 would include the fill-value slot itself,
+    # causing a mismatch with the training semantics at the boundary.
+    extended_shifted = extended.shift(1)
+    rm24 = extended_shifted.rolling(24,  min_periods=12).mean()
+    rm7d = extended_shifted.rolling(168, min_periods=48).mean()
+    rs24 = extended_shifted.rolling(24,  min_periods=12).std().fillna(0)
+
+    future_df["rolling_mean_24h"] = rm24.reindex(future_index).values
+    future_df["rolling_mean_7d"]  = rm7d.reindex(future_index).values
+    future_df["rolling_std_24h"]  = rs24.reindex(future_index).values
 
     return future_df
 

@@ -69,17 +69,25 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
 
 def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
     """Fallback forecast using the free Open-Meteo API."""
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,precipitation,windspeed_10m&timezone=Europe%2FZurich"
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
+        "&timezone=Europe%2FZurich"
+    )
     try:
         res = requests.get(url, timeout=10)
         res.raise_for_status()
         h = res.json()["hourly"]
+        n = len(h["time"])
+        # Open-Meteo returns sunshine_duration in seconds; model expects minutes.
+        # Use .get() with a zero-filled fallback in case the field is absent.
+        sunshine_s = h.get("sunshine_duration", [0] * n)
         return pd.DataFrame({
-            "timestamp": pd.to_datetime(h["time"]),
-            "temp_c": h["temperature_2m"],
+            "timestamp":        pd.to_datetime(h["time"]),
+            "temp_c":           h["temperature_2m"],
             "precipitation_mm": h["precipitation"],
-            "sunshine_min": 0,  # Open-Meteo free tier doesn't always provide sunshine duration
-            "wind_kmh": h["windspeed_10m"]
+            "sunshine_min":     [s / 60.0 for s in sunshine_s],
+            "wind_kmh":         h["windspeed_10m"],
         })
     except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()
