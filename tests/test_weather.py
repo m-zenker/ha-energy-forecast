@@ -246,6 +246,28 @@ class TestSupplementFromOpenMeteo:
         assert len(result) == len(srg)
         assert list(result["temp_c"]) == list(srg["temp_c"])
 
+    def test_tz_aware_srg_timestamps_do_not_raise(self):
+        """SRG v2 returns ISO timestamps with +01:00 offset; _supplement must not crash."""
+        # Reproduce real SRG v2 date_time strings (tz-aware, UTC+1)
+        tz_timestamps = pd.to_datetime([
+            "2026-03-12T08:00:00+01:00",
+            "2026-03-12T09:00:00+01:00",
+            "2026-03-12T10:00:00+01:00",
+            "2026-03-12T11:00:00+01:00",
+        ])
+        srg = pd.DataFrame({
+            "timestamp":        tz_timestamps,
+            "temp_c":           [10.0] * 4,
+            "precipitation_mm": [0.0]  * 4,
+            "sunshine_min":     [30.0] * 4,
+            "wind_kmh":         [5.0]  * 4,
+        })
+        om = _make_om_df("2026-03-12 06:00", 6)
+        result = _supplement_from_open_meteo(srg, om)
+        # Must not raise; timestamps in result must be tz-naive
+        assert result["timestamp"].dt.tz is None
+        assert len(result) > 0
+
 
 # ── fetch_forecast v2 ─────────────────────────────────────────────────────────
 

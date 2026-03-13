@@ -133,7 +133,10 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
         return srg_df
 
     srg_df = srg_df.copy()
-    srg_df["timestamp"] = pd.to_datetime(srg_df["timestamp"])
+    _ts = pd.to_datetime(srg_df["timestamp"])
+    if _ts.dt.tz is not None:
+        _ts = _ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+    srg_df["timestamp"] = _ts
     om_df  = om_df.copy()
     om_df["timestamp"]  = pd.to_datetime(om_df["timestamp"])
 

@@ -9,6 +9,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **`_supplement_from_open_meteo` crash with tz-aware SRG timestamps** (`weather.py`): SRG-SSR
+  v2 returns `date_time` with UTC offset (e.g. `+01:00`), producing `datetime64[us, UTC+01:00]`.
+  Comparing that tz-aware Series against the tz-naive Open-Meteo timestamps raised
+  `"Invalid comparison between dtype=datetime64[us] and Timestamp"` under pandas 3.x, crashing
+  every sensor update. Fix: strip timezone from SRG timestamps (convert to naive Europe/Zurich)
+  before the comparisons, consistent with how all other timestamps in the pipeline are handled.
 - **SRG-SSR forecast migrated to v2 API** (`weather.py`): Updated endpoint from
   deprecated v1 (`/forecasts/v1.0/weather/7day`) to v2. Flow: resolve nearest station
   via `GET /srf-meteo/v2/geolocations?latitude=...&longitude=...`, then fetch
