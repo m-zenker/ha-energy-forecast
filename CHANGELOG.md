@@ -9,185 +9,91 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
-- **`_update_sensors` forecast timestamps shifted +1h** (`energy_forecast.py`): The previous
-  `pd.to_datetime(forecast_df["timestamp"], utc=True)` call reinterpreted tz-naive local
-  timestamps as UTC then added +1h via `tz_convert("Europe/Zurich")`, causing the weather merge
-  in `_engineer_features` to find zero matches (all weather features fell back to medians).
-  Fixed by replacing the 3-line block with `_strip_tz(forecast_df)` — the same helper used
-  throughout the pipeline. Pre-existing on the Open-Meteo fallback path; also affected SRG after
-  the previous tz-strip fix.
-- **`_supplement_from_open_meteo` crash with tz-aware SRG timestamps** (`weather.py`): SRG-SSR
-  v2 returns `date_time` with UTC offset (e.g. `+01:00`), producing `datetime64[us, UTC+01:00]`.
-  Comparing that tz-aware Series against the tz-naive Open-Meteo timestamps raised
-  `"Invalid comparison between dtype=datetime64[us] and Timestamp"` under pandas 3.x, crashing
-  every sensor update. Fix: strip timezone from SRG timestamps (convert to naive Europe/Zurich)
-  before the comparisons, consistent with how all other timestamps in the pipeline are handled.
-- **SRG-SSR forecast migrated to v2 API** (`weather.py`): Updated endpoint from
-  deprecated v1 (`/forecasts/v1.0/weather/7day`) to v2. Flow: resolve nearest station
-  via `GET /srf-meteo/v2/geolocations?latitude=...&longitude=...`, then fetch
-  `GET /srf-meteo/v2/forecastpoint/{id}`. Response parsing updated for v2's flat `hours`
-  array (was nested `forecast[].hours[]`) and renamed precipitation field `PRP_MM` → `RRR_MM`.
-  lat/lon lookup used (not PLZ) to ensure the registered Freemium location is matched.
-- **`TestEvKwhSensorCalc` hardcoded date** (`tests/test_energy_forecast.py`): Two tests
-  used `2026-03-12`; replaced with `pd.Timestamp.now().normalize()` so they don't rot
-  as real time passes.
-
-### Fixed
-- **`_retrain_cb` / `_update_cb` event-callback signature** (#review-1): Both callbacks
-  now accept `(event_name=None, data=None, kwargs=None)` so they work correctly when
-  triggered via `listen_event` (which passes three positional args) as well as from
-  timer callbacks (which pass one). Previously a `RELOAD_ENERGY_MODEL` event raised
-  `TypeError` before the fault-boundary `except Exception` was reached.
-- **EV charger power used in `_update_sensors` lag features** (#review-2): The hourly
-  sensor update path now passes `charger_kw=self._ev_charger_kw` to
-  `split_ev_charging`, consistent with the weekly retrain path. Previously the default
-  9.0 kW was hardcoded regardless of `ev_charger_kw` configuration, causing
-  lag-feature drift for custom charger powers.
-- **EV kWh sensor reports charger energy, not threshold energy** (#review-10): The
-  `ev_today` / `ev_yesterday` sensors now subtract `ev_charger_kw` from gross import
-  (clipped at 0) rather than the detection `ev_charging_threshold_kwh`. This gives the
-  correct net charger energy estimate.
-- **`adaptive_retrain_threshold` validated at startup** (#review-7): A negative value
-  would have triggered retraining on every hourly update; `_validate_config` now
-  raises `ValueError` for values < 0.
-- **SRG-SSR fallback now logged** (#review-6): When the SRG API call fails and the
-  forecast falls back to Open-Meteo, a `WARNING` is emitted so operators know forecast
-  quality may be reduced.
-- **Lock contention logged at DEBUG** (#review-8): Skipped retrain and sensor-update
-  cycles (normal during long retrains) are now visible at DEBUG level instead of being
-  silently swallowed.
-
-### Changed
-- **`_empty_weather_df` column set extended** (#review-5): Now includes
-  `cloud_cover_pct` and `direct_radiation_wm2`, matching the full column contract of
-  the real fetchers. The `_engineer_features` safety-net NaN fill remains in place.
-- **`fetch_recent_energy` signature cleaned up** (#review-3): Removed the unused
-  `hours: int = 6` parameter which was never read by the function body.
-- **Dead URL constants removed from `const.py`** (#review-4): `METEOSWISS_URL`,
-  `OPENMETEO_FORECAST_URL`, and `OPENMETEO_ARCHIVE_URL` were defined but never
-  imported; actual URLs are hardcoded inline in `weather.py`.
-- **`model.py` module docstring rewritten** (#review-11): Replaced the "Changes from
-  original" framing (git-history content) with a description of the current feature
-  set, model architecture, and persistence scheme.
-- **`is_public_holiday` flag vectorised** (#review-9): Replaced per-row
-  `dates.map(lambda d: ...)` with `dates.isin(set(...)).astype(int)` in
-  `_add_holiday_feature`.
-- **`tz_convert(None)` replaces `tz_localize(None)`** (#review-12): Both work in
-  pandas but `tz_convert` better expresses "convert tz-aware timestamp to wall time,
-  drop tz annotation".
-
-### Added
-- 12 new tests across `test_energy_forecast.py`:
-  `TestAggregate` (6) — next_3h sum, tomorrow sum, EV sensors zero without actuals,
-  interval keys present/absent, 8 block slots; `TestEvKwhSensorCalc` (2) — charger_kw
-  vs threshold subtraction; `TestCallbackSignature` (4) — timer and event calling
-  conventions for both callbacks.
-
-
-
-### Added
-- **EV session probability feature** (#12): `likely_ev_hour` binary feature added to
-  `_FEATURES_BASE`. After training, `_compute_likely_ev_hours()` inspects which
-  `hour_of_week` slots (0-167) appeared as EV charging hours in ≥ 15% of their
-  historical occurrences and stores the result as `self._likely_ev_hours` (persisted
-  in `meta.pkl`). The feature lets the model explicitly account for recurring EV
-  charging windows when predicting household baseline consumption. `ev_df` is now
-  passed from `_retrain()` to `train()` to enable this computation.
-- **Fix `split_ev_charging` charger power** (#12): `ev_charger_kw` configured in
-  `apps.yaml` is now correctly forwarded to `ha_data.split_ev_charging()` via a
-  new `charger_kw` parameter. Previously the function hardcoded 9.0 regardless of
-  configuration.
-- `tests/test_ha_data.py` — 2 new tests: `TestSplitEvCharging` (custom charger_kw
-  subtracted, default 9.0 preserved)
-- `tests/test_model.py` — 3 new tests: `TestLikelyEvHour` (hours identified after
-  train, binary column, empty set without ev_df)
-
-- **Prediction intervals** (#13): two quantile regression models (α=0.1, α=0.9)
-  are trained alongside the point-estimate model using the same feature matrix,
-  log-transformed target, and n_estimators from early stopping. Quantile training
-  is wrapped in a broad `try/except` so a failure never interrupts normal operation.
-  Six new HA sensors are published once quantile models are available:
-  `sensor.energy_forecast_{next_3h,today,tomorrow}_{low,high}`. Today's bounds
-  blend actuals for elapsed hours with quantile forecasts for remaining hours —
-  the interval collapses to zero width for hours that have already passed.
-  Models are persisted as `energy_model_q10.pkl` / `energy_model_q90.pkl` with
-  SHA-256 sidecars (same integrity pattern as the main model). A new
-  `_prepare_prediction_X()` helper eliminates the shared feature-engineering
-  duplication between `predict()` and `predict_intervals()`.
-- **Intra-day actuals substitution** (#14): `sensor.energy_forecast_today` and
-  the `today_HH_HH` block sensors now blend measured actuals (elapsed hours) with
-  model predictions (remaining hours). Previously the today total was based on
-  predictions alone, which missed all consumption before the current hour. A new
-  module-level helper `_blend_today_totals` handles the blending; `"tomorrow"` and
-  `"next_3h"` sensors are unchanged.
-- **Adaptive retraining trigger** (#8): each hourly sensor update stores the
-  48-hour prediction in an in-memory prediction history (keep-first semantics,
-  preserving the ≈24h-ahead prediction for each future hour). After every update
-  the live day-ahead MAE is compared against `adaptive_retrain_threshold × cv_MAE`;
-  if exceeded with ≥ 24 matched pairs and a 24h cooldown has elapsed, an early
-  retrain is triggered and logged at WARNING level. Configurable via
-  `adaptive_retrain_threshold` in `apps.yaml` (default 2.0; 0 disables).
-- `conftest.py`: `hassapi` stub so `energy_forecast.py` module-level helpers are
-  importable in the test environment without AppDaemon installed.
-- `tests/test_energy_forecast.py` — 7 new tests: `TestBlendTodayTotals` (4),
-  `TestComputeLiveMae` (3)
-- **Log-transform target** (#7): `gross_kwh` is now `log1p`-transformed before
-  training and `expm1`-inverted at prediction time. Reduces the outsized influence
-  of rare high-energy hours on the loss, improving MAE on typical hours. MAE
-  continues to be reported in kWh (not log space). A `log_transform` flag is
-  persisted in `meta.pkl`; old installs without the key default to False (no
-  behaviour change until the next retrain).
-- **LightGBM early stopping** (#6): CV fold fits now use
-  `lgb.early_stopping(stopping_rounds=50)` with the fold's validation set as
-  `eval_set`. The `best_iteration_` from the last fold is used as `n_estimators`
-  for the final model, eliminating fixed-count under/over-fitting. Falls back to
-  the default 500 estimators if early stopping raises an exception or LightGBM is
-  unavailable. `_build_model` accepts an `n_estimators` override.
-- **Cantonal holidays** (#9): `_add_holiday_feature` accepts a `canton` keyword
-  (e.g. `"ZH"`, `"BE"`) passed as `subdiv` to `holidays.country_holidays`. Invalid
-  codes fall back to federal-only with a warning. Configure via `holiday_canton`
-  in `apps.yaml`; defaults to federal holidays only if omitted.
-- `tests/test_model.py` — 8 new tests: `TestLogTransform` (3), `TestBuildModel`
-  (2), `TestCantonalHolidays` (3)
-
-### Fixed
-- **Open-Meteo fallback sunshine**: `fetch_open_meteo` previously hardcoded
-  `sunshine_min = 0`, silently degrading forecasts for all installations without
-  SRG-SSR credentials. `sunshine_duration` is now requested from the API and
-  converted from seconds to minutes, matching the archive fetcher. A safe `.get()`
-  fallback handles any API response that omits the field.
+- **Forecast weather features silently imputed from medians** (`energy_forecast.py`):
+  `pd.to_datetime(forecast_df["timestamp"], utc=True)` reinterpreted tz-naive local
+  timestamps as UTC, then `tz_convert("Europe/Zurich")` shifted them +1h. The weather
+  merge in `_engineer_features` consequently found zero timestamp matches, causing all
+  weather features to fall back to training-set medians on every sensor update.
+  Replaced with `_strip_tz(forecast_df)` — a no-op for tz-naive input, correct for
+  tz-aware. Pre-existing on the Open-Meteo path; also affected SRG after the fix below.
+- **`_supplement_from_open_meteo` crash under pandas 3.x** (`weather.py`): SRG-SSR v2
+  returns timestamps with UTC offset (e.g. `+01:00`). Comparing that tz-aware Series
+  against tz-naive Open-Meteo timestamps raised `"Invalid comparison between
+  dtype=datetime64[us] and Timestamp"`, crashing every sensor update. SRG timestamps
+  are now stripped to naive Europe/Zurich before the comparison, consistent with the
+  rest of the pipeline.
+- **SRG-SSR API migrated to v2** (`weather.py`): v1 endpoint
+  (`/forecasts/v1.0/weather/7day`) was decommissioned. Updated flow: resolve station
+  via `GET /srf-meteo/v2/geolocations?latitude=...&longitude=...`, fetch forecast via
+  `GET /srf-meteo/v2/forecastpoint/{id}`. Precipitation field renamed `PRP_MM` →
+  `RRR_MM`; response structure changed from nested `forecast[].hours[]` to flat
+  `hours[]`. Geolocation now uses lat/lon (not PLZ) to reliably match the registered
+  Freemium station.
+- **`_retrain_cb` / `_update_cb` crash on `RELOAD_ENERGY_MODEL` event**: Both
+  callbacks now accept `(event_name=None, data=None, kwargs=None)` so they work when
+  fired by `listen_event` (three positional args) as well as the scheduler (one arg).
+- **EV charger power ignored in hourly lag features**: `_update_sensors` was passing
+  the default 9.0 kW to `split_ev_charging` regardless of the configured
+  `ev_charger_kw`, causing lag-feature drift for non-default charger powers.
+- **EV kWh sensors reported threshold energy instead of charger energy**: `ev_today`
+  / `ev_yesterday` now subtract `ev_charger_kw` (not `ev_charging_threshold_kwh`)
+  from gross import, giving the correct net charger energy estimate.
+- **`adaptive_retrain_threshold` accepts negative values at startup**: `_validate_config`
+  now raises `ValueError` for values < 0; a negative threshold would have triggered
+  retraining on every hourly update.
+- **Open-Meteo sunshine hardcoded to zero**: `fetch_open_meteo` previously set
+  `sunshine_min = 0` unconditionally, silently degrading forecasts for all
+  installations without SRG-SSR credentials. `sunshine_duration` is now requested
+  from the API and converted from seconds to minutes.
 - **Rolling feature train/predict mismatch**: `rolling_mean_24h`, `rolling_mean_7d`,
   and `rolling_std_24h` were broadcast as a single scalar across all 48 prediction
-  hours, diverging from their time-varying per-row semantics during training. These
-  features now slide forward over an extended series (known actuals + fill values at
-  future timestamps) with `shift(1)` applied to exactly mirror the training
-  computation. At h=0 the value matches `mean(actuals[-24:])` exactly; beyond h=24
-  it stabilises at the recent household baseline.
+  hours. These features now slide over an extended actuals + fill series with
+  `shift(1)`, mirroring the training computation exactly.
+
+### Changed
+- **`_empty_weather_df`** now includes `cloud_cover_pct` and `direct_radiation_wm2`,
+  matching the full column contract of the real weather fetchers.
+- **`fetch_recent_energy`**: removed unused `hours: int = 6` parameter.
+- **Dead URL constants** `METEOSWISS_URL`, `OPENMETEO_FORECAST_URL`,
+  `OPENMETEO_ARCHIVE_URL` removed from `const.py` (never imported).
+- **`is_public_holiday`** computation vectorised in `_add_holiday_feature`.
+- **SRG-SSR fallback** now logged at WARNING so operators know forecast quality may
+  be reduced when the SRG API is unavailable.
+- **Lock contention** (skipped retrain / sensor-update cycles) now logged at DEBUG.
 
 ### Added
-- **Cloud cover and direct radiation features** (`cloud_cover_pct`, `direct_radiation_wm2`)
-  added to archive fetcher, Open-Meteo forecast fetcher, and `_FEATURES_BASE`. SRG users
-  receive these from an automatic Open-Meteo supplement call (`_supplement_from_open_meteo`),
-  so the full feature set is available regardless of weather source.
-- **`fetch_open_meteo` now includes `past_days=3`**, returning 72 h of measured history
-  alongside the 7-day forecast. This anchors `temp_rolling_3d` in real observations for
-  both Open-Meteo and SRG users, eliminating the single-value initialisation that
-  previously caused the 3-day rolling mean to be based on forecast-only data.
-- **`_supplement_from_open_meteo` helper** in `weather.py`: merges the Open-Meteo
-  historical tail and cloud/radiation columns into SRG forecast results, preserving
-  SRG values for all fields it provides.
-- **`lag_72h`** autoregressive feature — captures the same-time-3-days-ago pattern,
-  useful for weekend/holiday bridge transitions. Activates dynamically once ≥172 h
-  of history is available, consistent with the existing dynamic lag selection logic.
-- **Bridge-day holiday features** — `days_to_next_holiday` and `days_since_last_holiday`
-  (integers, capped at 3). Both are 0 on a holiday itself; fallback to 3 if the
-  `holidays` package is unavailable. Holiday years extended by ±1 to handle dates
-  near year boundaries (e.g. Dec 31 seeing Jan 1).
-- `tests/test_weather.py` — 6 tests covering `fetch_open_meteo` sunshine parsing,
-  unit conversion, missing-key fallback, column contract, and network errors
-- `tests/test_model.py` — 23 tests covering rolling feature variance, exact h=0
-  boundary semantics, smooth transition at h=24, short/empty actuals edge cases,
-  lag_72h correctness, and bridge-day feature range/values/fallback
+- **Prediction intervals**: quantile regression models (α=0.1, α=0.9) trained
+  alongside the point-estimate model. Six new sensors:
+  `sensor.energy_forecast_{next_3h,today,tomorrow}_{low,high}`. Today's bounds blend
+  actuals for elapsed hours with quantile forecasts for remaining hours; the interval
+  collapses to zero width for hours that have already passed.
+- **Intra-day actuals blending**: `sensor.energy_forecast_today` and the
+  `today_HH_HH` block sensors now substitute measured consumption for elapsed hours
+  instead of relying on predictions alone.
+- **Adaptive retraining**: each hourly update stores the 48h prediction (keep-first,
+  preserving the ≈24h-ahead forecast). If live day-ahead MAE exceeds
+  `adaptive_retrain_threshold × cv_MAE` with ≥ 24 matched pairs and a 24h cooldown
+  has elapsed, an early retrain is triggered. Configure via `adaptive_retrain_threshold`
+  in `apps.yaml` (default 2.0).
+- **Log-transform target**: `gross_kwh` is `log1p`-transformed before training and
+  `expm1`-inverted at prediction time, reducing the influence of high-energy outliers.
+  MAE is still reported in kWh. Backward-compatible: existing pickles default to no
+  transform until the next retrain.
+- **LightGBM early stopping**: CV folds use `stopping_rounds=50`; `best_iteration_`
+  from the last fold sets `n_estimators` for the final model.
+- **Cantonal holidays**: configure `holiday_canton` (e.g. `"ZH"`, `"BE"`) in
+  `apps.yaml`; invalid codes fall back to federal-only with a warning.
+- **EV charging pattern feature**: `likely_ev_hour` binary feature marks
+  `hour_of_week` slots where EV charging occurred in ≥ 15% of historical occurrences.
+- **Cloud cover and direct radiation** (`cloud_cover_pct`, `direct_radiation_wm2`)
+  added to archive fetcher, Open-Meteo forecast fetcher, and `_FEATURES_BASE`. SRG
+  users receive these via `_supplement_from_open_meteo`.
+- **`lag_72h`** autoregressive feature (same time 3 days ago); activates dynamically
+  at ≥ 172 h of history.
+- **Bridge-day proximity features**: `days_to_next_holiday` and
+  `days_since_last_holiday` (integers, capped at 3; 0 on a holiday itself).
+- **`fetch_open_meteo` `past_days=3`**: 72 h of measured history anchors
+  `temp_rolling_3d` in real observations for both Open-Meteo and SRG users.
 - `ROADMAP.md` — forecast accuracy improvement roadmap (15 items across 4 tiers)
 
 ---
