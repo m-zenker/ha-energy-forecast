@@ -286,7 +286,7 @@ class TestEvKwhSensorCalc:
         """Run _aggregate with synthetic actuals containing one EV hour."""
         from energy_forecast.energy_forecast import EnergyForecast
 
-        today = pd.Timestamp("2026-03-12 00:00")
+        today = pd.Timestamp.now().normalize()
         tmrw  = today + pd.Timedelta(days=1)
         now   = today  # start of day — nothing elapsed yet
 

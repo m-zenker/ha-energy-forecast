@@ -245,3 +245,106 @@ class TestSupplementFromOpenMeteo:
         result = _supplement_from_open_meteo(srg, pd.DataFrame())
         assert len(result) == len(srg)
         assert list(result["temp_c"]) == list(srg["temp_c"])
+
+
+# ── fetch_forecast v2 ─────────────────────────────────────────────────────────
+
+def _make_srg_v2_response(n: int = 3) -> MagicMock:
+    """Mock for /forecastpoint/{id} — v2 flat hours array."""
+    hours = [
+        {
+            "date_time": f"2026-03-12T{h:02d}:00:00+01:00",
+            "TTT_C": 10, "RRR_MM": 1.5, "SUN_MIN": 30, "FF_KMH": 15,
+        }
+        for h in range(n)
+    ]
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    mock.status_code = 200
+    mock.json.return_value = {"hours": hours}
+    return mock
+
+
+def _make_geo_plz_response(geo_id: str = "47.2044,7.5581") -> MagicMock:
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    mock.json.return_value = [{"geolocation": {"id": geo_id}}]
+    return mock
+
+
+def _make_geo_latlon_response(geo_id: str = "47.2263,7.5784") -> MagicMock:
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    mock.json.return_value = [{"id": geo_id}]
+    return mock
+
+
+def _make_token_response() -> MagicMock:
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    mock.json.return_value = {"access_token": "test-token"}
+    return mock
+
+
+def _om_empty() -> MagicMock:
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    mock.json.return_value = {"hourly": {
+        "time": [], "temperature_2m": [], "precipitation": [],
+        "windspeed_10m": [], "sunshine_duration": [], "cloud_cover": [], "direct_radiation": [],
+    }}
+    return mock
+
+
+class TestFetchForecastV2:
+
+    def test_geolocation_resolved_via_latlon(self):
+        """Geolocation must always be resolved via lat/lon (not PLZ) to match the registered station."""
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[
+                 _make_geo_latlon_response(), _make_srg_v2_response(), _om_empty(),
+             ]) as mock_get:
+            weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+        first_url = mock_get.call_args_list[0][0][0]
+        assert "geolocations" in first_url
+        assert "latitude" in first_url
+
+    def test_forecastpoint_called_with_id_from_latlon_lookup(self):
+        """forecastpoint URL must use the id returned by the lat/lon lookup."""
+        geo_id = "47.2263,7.5784"
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[
+                 _make_geo_latlon_response(geo_id), _make_srg_v2_response(), _om_empty(),
+             ]) as mock_get:
+            weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+        forecast_url = mock_get.call_args_list[1][0][0]
+        assert f"forecastpoint/{geo_id}" in forecast_url
+
+    def test_empty_geo_response_falls_back_to_open_meteo(self):
+        """If geolocation returns no hits, fall back to Open-Meteo."""
+        empty_geo = MagicMock()
+        empty_geo.raise_for_status = MagicMock()
+        empty_geo.json.return_value = []
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[empty_geo, _om_empty()]):
+            df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+        assert isinstance(df, pd.DataFrame)
+
+    def test_rrr_mm_mapped_to_precipitation_mm(self):
+        """v2 field RRR_MM must be read as precipitation_mm (not PRP_MM)."""
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[
+                 _make_geo_latlon_response(), _make_srg_v2_response(), _om_empty(),
+             ]):
+            df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+        srg_rows = df[df["precipitation_mm"].notna()]
+        assert not srg_rows.empty
+        assert (srg_rows["precipitation_mm"] == 1.5).any()
+
+    def test_no_credentials_returns_open_meteo(self):
+        """Without credentials, must skip SRG entirely and call Open-Meteo."""
+        with patch("requests.get", return_value=_make_response(_full_hourly(3))) as mock_get:
+            df = weather.fetch_forecast("4528", 47.2, 7.5, None, None)
+        assert not df.empty
+        # Only one GET (Open-Meteo), no POST for auth
+        assert mock_get.call_count == 1

@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **SRG-SSR forecast migrated to v2 API** (`weather.py`): Updated endpoint from
+  deprecated v1 (`/forecasts/v1.0/weather/7day`) to v2. Flow: resolve nearest station
+  via `GET /srf-meteo/v2/geolocations?latitude=...&longitude=...`, then fetch
+  `GET /srf-meteo/v2/forecastpoint/{id}`. Response parsing updated for v2's flat `hours`
+  array (was nested `forecast[].hours[]`) and renamed precipitation field `PRP_MM` → `RRR_MM`.
+  lat/lon lookup used (not PLZ) to ensure the registered Freemium location is matched.
+- **`TestEvKwhSensorCalc` hardcoded date** (`tests/test_energy_forecast.py`): Two tests
+  used `2026-03-12`; replaced with `pd.Timestamp.now().normalize()` so they don't rot
+  as real time passes.
+
+### Fixed
 - **`_retrain_cb` / `_update_cb` event-callback signature** (#review-1): Both callbacks
   now accept `(event_name=None, data=None, kwargs=None)` so they work correctly when
   triggered via `listen_event` (which passes three positional args) as well as from

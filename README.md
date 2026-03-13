@@ -114,13 +114,13 @@ energy_forecast:
 
   # ── Required ──────────────────────────────────────────────────────────────
   energy_sensor: sensor.your_grid_import_sensor
-  plz: 1234          # Swiss postal code — used for SRG-SSR weather lookup
   latitude: 47.0     # decimal degrees
   longitude: 8.0     # decimal degrees
 
   # ── SRG-SSR weather API (optional) ───────────────────────────────────────
   # High-quality Swiss forecast. If omitted, Open-Meteo is used instead.
   # Obtain credentials free at https://developer.srgssr.ch
+  # The nearest weather station is resolved automatically from latitude/longitude.
   # srg_client_id: YOUR_CLIENT_ID
   # srg_client_secret: YOUR_CLIENT_SECRET
 
@@ -147,9 +147,9 @@ energy_forecast:
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `energy_sensor` | Yes | — | Entity ID of your cumulative grid-import kWh meter (`state_class: total_increasing`) |
-| `plz` | Yes | — | Swiss postal code for SRG-SSR weather lookup |
 | `latitude` | Yes | — | Home latitude in decimal degrees |
 | `longitude` | Yes | — | Home longitude in decimal degrees |
+| `plz` | No | — | Swiss postal code. Accepted for backward compatibility but no longer used — the nearest SRG-SSR weather station is resolved from `latitude`/`longitude` |
 | `srg_client_id` | No | — | SRG-SSR API client ID. If absent, Open-Meteo is used |
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
@@ -315,7 +315,7 @@ Backfill complete — remove 'energy_history_backfill' from apps.yaml and delete
 | [SRG-SSR Forecast API](https://developer.srgssr.ch) | 7-day hourly forecast | Free API key |
 | [Open-Meteo Forecast](https://open-meteo.com/) | Forecast fallback | Nothing (free, no key) |
 
-Both SRG-SSR and Open-Meteo provide temperature, precipitation, sunshine, and wind data. SRG-SSR offers higher spatial resolution for Swiss locations. If credentials are not configured, or if the SRG-SSR request fails for any reason, Open-Meteo is used automatically — the app will never fail to produce a forecast due to a weather API issue.
+Both SRG-SSR and Open-Meteo provide temperature, precipitation, sunshine, and wind data. SRG-SSR offers higher spatial resolution for Swiss locations. When SRG-SSR credentials are configured, the app resolves the nearest weather station from your `latitude`/`longitude` (via the v2 `/geolocations` endpoint), then fetches a 7-day hourly forecast from `/forecastpoint/{id}`. Open-Meteo is supplemented for cloud cover and direct radiation, and to anchor the 3-day rolling temperature feature with measured history. If credentials are not configured, or if any SRG-SSR request fails, Open-Meteo is used automatically — the app will never fail to produce a forecast due to a weather API issue.
 
 ---
 

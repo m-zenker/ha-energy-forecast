@@ -44,7 +44,7 @@ class EnergyForecast(hass.Hass):
 
         self._energy_sensor: str         = self.args["energy_sensor"]
         self._outdoor_sensor: str | None = self.args.get("outdoor_temp_sensor")
-        self._plz: str                   = str(self.args["plz"])
+        self._plz: str                   = str(self.args.get("plz", ""))
         self._lat: float                 = float(self.args["latitude"])
         self._lon: float                 = float(self.args["longitude"])
         self._weight_halflife: float     = float(self.args.get("weight_halflife_days", 90))

@@ -65,8 +65,23 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
             return fetch_open_meteo(lat, lon)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        # 2. Get Forecast (60min intervals)
-        forecast_url = f"https://api.srgssr.ch/forecasts/v1.0/weather/7day?latitude={lat}&longitude={lon}"
+        # 2. Resolve geolocation ID — nearest station by lat/lon.
+        # The Freemium plan locks a single registered location; using lat/lon ensures
+        # we always resolve the same station that was registered in the developer app.
+        geo_res = requests.get(
+            f"https://api.srgssr.ch/srf-meteo/v2/geolocations?latitude={lat}&longitude={lon}",
+            headers=headers, timeout=10,
+        )
+        geo_res.raise_for_status()
+        geo_hits = geo_res.json()
+        geo_id = geo_hits[0]["id"] if geo_hits else None
+
+        if not geo_id:
+            _LOGGER.warning("SRG-SSR geolocation lookup returned no results — falling back to Open-Meteo.")
+            return fetch_open_meteo(lat, lon)
+
+        # 3. Get Forecast (60min intervals)
+        forecast_url = f"https://api.srgssr.ch/srf-meteo/v2/forecastpoint/{geo_id}"
         res = requests.get(forecast_url, headers=headers, timeout=10)
         res.raise_for_status()
         try:
@@ -82,15 +97,14 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
             return fetch_open_meteo(lat, lon)
 
         records = []
-        for day in data.get("forecast", []):
-            for hour in day.get("hours", []):
-                records.append({
-                    "timestamp":        hour.get("date_time"),
-                    "temp_c":           float(hour.get("TTT_C", 0)),
-                    "precipitation_mm": float(hour.get("PRP_MM", 0)),
-                    "sunshine_min":     float(hour.get("SUN_MIN", 0)),
-                    "wind_kmh":         float(hour.get("FF_KMH", 0)),
-                })
+        for hour in data.get("hours", []):
+            records.append({
+                "timestamp":        hour.get("date_time"),
+                "temp_c":           float(hour.get("TTT_C", 0)),
+                "precipitation_mm": float(hour.get("RRR_MM", 0)),
+                "sunshine_min":     float(hour.get("SUN_MIN", 0)),
+                "wind_kmh":         float(hour.get("FF_KMH", 0)),
+            })
 
         srg_df = pd.DataFrame(records)
 

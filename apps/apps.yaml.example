@@ -10,22 +10,21 @@
 #                     sensor. Must be a kWh meter that counts upward over time
 #                     (i.e. total_increasing). Example: sensor.grid_import_kwh
 #
-#   plz               Your Swiss postal code for MeteoSwiss forecasts.
-#                     Open-Meteo is used automatically if MeteoSwiss fails.
-#
 #   latitude          Your home latitude  (decimal degrees)
 #   longitude         Your home longitude (decimal degrees)
 #
 # ── Optional ──────────────────────────────────────────────────────────────────
 #
 #   outdoor_temp_sensor   entity_id of an outdoor temperature sensor.
-#                         When provided, it is blended with the MeteoSwiss
-#                         forecast for the first 12 hours to improve accuracy.
+#                         When provided, it is blended with the SRG-SSR / Open-Meteo
+#                         forecast for the first 6 hours to improve accuracy.
 #
 #   srg_client_id / srg_client_secret
 #                         SRG-SSR API credentials for high-quality Swiss
 #                         weather forecasts. Obtain from developer.srgssr.ch.
 #                         If omitted, Open-Meteo is used automatically.
+#                         The nearest weather station is resolved from your
+#                         latitude/longitude — no postal code needed.
 #
 #   timezone          Timezone for all forecasts. Default: Europe/Zurich
 #
@@ -37,7 +36,6 @@ energy_forecast:
 
   # ── Required ────────────────────────────────────────────────────────────────
   energy_sensor: sensor.your_grid_import_sensor  # ← change this
-  plz: 1234                                       # ← change this
   latitude: 47.0                                  # ← change this
   longitude: 8.0                                  # ← change this
 
