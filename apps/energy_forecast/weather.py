@@ -88,7 +88,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
             data = res.json()
         except ValueError as exc:
             import re as _re
-            _title = (_re.search(r"<title[^>]*>(.*?)</title>", res.text, _re.I | _re.S) or None)
+            _title = _re.search(r"<title[^>]*>(.*?)</title>", res.text, _re.I | _re.S)
             title_str = _title.group(1).strip() if _title else res.text[:120].strip()
             _LOGGER.warning(
                 "SRG-SSR forecast parse failed — HTTP %s, page: %r — falling back to Open-Meteo.",

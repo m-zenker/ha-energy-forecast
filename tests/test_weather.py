@@ -370,3 +370,14 @@ class TestFetchForecastV2:
         assert not df.empty
         # Only one GET (Open-Meteo), no POST for auth
         assert mock_get.call_count == 1
+
+    def test_fetch_forecast_timestamps_are_tz_naive(self):
+        """fetch_forecast must always return tz-naive timestamps regardless of SRG offset strings."""
+        # Use a non-empty OM response so _supplement_from_open_meteo runs its tz-strip path.
+        om_mock = _make_response(_full_hourly(6))
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[
+                 _make_geo_latlon_response(), _make_srg_v2_response(3), om_mock,
+             ]):
+            df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+        assert df["timestamp"].dt.tz is None

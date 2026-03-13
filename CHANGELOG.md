@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **`_update_sensors` forecast timestamps shifted +1h** (`energy_forecast.py`): The previous
+  `pd.to_datetime(forecast_df["timestamp"], utc=True)` call reinterpreted tz-naive local
+  timestamps as UTC then added +1h via `tz_convert("Europe/Zurich")`, causing the weather merge
+  in `_engineer_features` to find zero matches (all weather features fell back to medians).
+  Fixed by replacing the 3-line block with `_strip_tz(forecast_df)` — the same helper used
+  throughout the pipeline. Pre-existing on the Open-Meteo fallback path; also affected SRG after
+  the previous tz-strip fix.
 - **`_supplement_from_open_meteo` crash with tz-aware SRG timestamps** (`weather.py`): SRG-SSR
   v2 returns `date_time` with UTC offset (e.g. `+01:00`), producing `datetime64[us, UTC+01:00]`.
   Comparing that tz-aware Series against the tz-naive Open-Meteo timestamps raised

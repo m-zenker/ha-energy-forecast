@@ -201,11 +201,7 @@ class EnergyForecast(hass.Hass):
             self.args.get("srg_client_id"),
             self.args.get("srg_client_secret"),
         )
-        forecast_df["timestamp"] = (
-            pd.to_datetime(forecast_df["timestamp"], utc=True)
-            .dt.tz_convert("Europe/Zurich")
-            .dt.tz_localize(None)
-        )
+        forecast_df = _strip_tz(forecast_df)
 
         # ── Fetch recent actuals ──────────────────────────────────────────────
         # Uses the lightweight fetch (last 2 days only) to stay well within
