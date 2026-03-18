@@ -245,6 +245,14 @@ class EnergyForecastModel:
         )
         feature_cols = sensor_features if use_sensor else base_features
 
+        # Sub-sensor lag columns can be sparsely populated during warm-up (e.g. a
+        # new sensor that started recording today).  Fill NaN with 0 before the
+        # dropna so these rows are not discarded — 0 means "appliance was off / no
+        # data", which is a safe neutral value that does not distort other features.
+        for col in sub_sensor_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(0)
+
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
         df = df[df["gross_kwh"] > 0]
 

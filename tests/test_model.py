@@ -686,6 +686,24 @@ class TestSubSensorFeatures:
         df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
         assert "sub_hp_lag_168h" in df.columns
 
+    def test_sparse_sub_sensor_does_not_skip_training(self, tmp_path):
+        """A nearly-all-NaN sub-sensor (warm-up period) must not cause training to be skipped.
+
+        Regression for: sub-sensor NaN included in dropna → 0 clean rows → model not trained.
+        """
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(5).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        # Only 1 data point — simulates a sensor that started today
+        sub_df  = pd.DataFrame({"timestamp": ts[-1:], "kwh": [0.5]})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_new": sub_df})
+        # Model must have trained — feature_cols and model are set
+        assert m.feature_cols is not None
+        assert m.model is not None
+
     def test_sparse_sub_sensor_triggers_nan_warning(self, caplog):
         """Sub-sensor with >50% gaps triggers NaN warning during training."""
         import logging
