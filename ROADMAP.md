@@ -121,6 +121,70 @@ cannot capture.
 
 ---
 
+## Distribution
+
+### 16. HACS support *(planned)*
+
+Make the app installable via [HACS](https://hacs.xyz/) (AppDaemon category).
+
+Required changes:
+- Add `hacs.json` at repo root (HACS manifest; `render_readme: true`).
+- Add `info.md` — shown in the HACS detail panel before installation; must prominently warn that HACS only copies app files and that the AppDaemon add-on dependency config and `apps.yaml` creation are still manual steps.
+- Add a "Install via HACS" subsection to `README.md` under `## Installation`, explaining what HACS does and doesn't do, with links to the dependency config and `apps.yaml.example` steps.
+- Set GitHub repo topics: `appdaemon` (required for HACS category), `home-assistant`, `hacs`.
+
+No code changes required — `apps/energy_forecast/` is already in the correct location for HACS AppDaemon installs. Semver tags are already present.
+
+### 17. Setup checker sensor *(planned)*
+Bake a startup self-check into the main app that surfaces setup problems as a visible HA entity rather than silent log failures.
+
+- On initialisation, attempt `import pandas, numpy, lightgbm, sklearn, requests, holidays` and log a clear error for each missing package.
+- Validate required config keys (`energy_sensor`, `latitude`, `longitude`); validate optional keys have sane types.
+- Publish `sensor.energy_forecast_setup_status` with states `ok`, `missing_packages`, `missing_config`, or `invalid_config`, and an `issues` attribute listing specific problems.
+- Self-silences (removes sensor) once all checks pass and the main app is running normally.
+
+This converts silent failure after a fresh HACS install into actionable, user-visible feedback without requiring any Supervisor access.
+
+### 19. CSV cache: append-only writes *(planned)*
+For long-running installs with months of history, `fetch_recent_energy` rewrites the entire `energy_history.csv` on every hourly update. At ~8 760 rows/year this is already measurable I/O and will compound over time.
+
+Improvement: write only new rows using `df.to_csv(..., mode='a', header=False)` in `fetch_recent_energy`, and perform a periodic compaction (dedup + sort) in `fetch_energy_history` (the weekly full-read path) rather than on every update. Requires care around the merge-winner rule to avoid duplicating rows that already exist in the CSV.
+
+### 20. Config validation: warn when `ev_charging_threshold_kwh >= ev_charger_kw` *(planned)*
+When the detection threshold is set at or above the charger power (e.g. threshold=10, charger=9), every detected EV hour produces `max(0, gross - charger_kw) = 0`, so the EV sensors always read zero while the model still strips those hours from training data. The combination is silently confusing.
+
+Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
+
+### 21. Occupancy feature (`people_home`) *(long-term backlog)*
+Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
+
+### 22. EV charging state + SoC feature *(long-term backlog)*
+The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
+
+### 23. Solar PV integration *(long-term backlog)*
+Households with panels train the model on net grid import, which conflates household consumption with solar self-consumption — on a sunny day the model sees low import and learns the wrong signal. Two sub-items:
+
+1. **Production offset during training**: subtract a `solar_production_sensor` reading from `gross_kwh` to recover true household consumption before feature engineering.
+2. **Solar forecast as feature**: derive an expected production curve for the prediction horizon from PV system parameters (`pv_kwp`, `pv_azimuth`, `pv_tilt`) combined with the already-fetched `direct_radiation_wm2` forecast.
+
+### 24. Electricity spot price feature *(long-term backlog)*
+Households on dynamic tariffs (Tibber, Nordpool) actively shift deferrable loads — dishwasher, washing machine, EV charging — to cheap hours. The model currently cannot learn this behaviour because it sees no price signal. Add an optional `price_sensor` config key; include the hourly price (or a `is_cheap_hour` binary derived from a configurable threshold) as a feature. The Tibber and Nordpool HA integrations already expose standardised hourly price sensors.
+
+### 25. Vacation / away flag *(long-term backlog)*
+Multi-day absences cause baseline drops that look like anomalies to the rolling lag features and bias the model until history catches up. An optional `away_mode_entity` config key (e.g. `input_boolean.vacation_mode` or a `calendar` entity) adds a binary `is_away` feature. When set, the model can learn the reduced baseline explicitly rather than treating it as noise.
+
+### 18. Custom component config flow *(long-term backlog)*
+A full HA custom component (lives in `custom_components/energy_forecast/`) that provides a UI-driven setup wizard via HA's config flow:
+
+- Step 1: entity picker for `energy_sensor`; lat/lon auto-populated from HA's own location config.
+- Step 2: optional fields (SRG credentials, outdoor temp sensor, canton, EV threshold).
+- On completion: writes the `energy_forecast:` stanza into `appdaemon/apps/apps.yaml` via the HA filesystem API.
+- Calls the Supervisor REST API (`/supervisor/addons/<appdaemon_slug>/options`) to patch `python_packages` and `init_commands` with the required dependencies, then triggers an add-on restart.
+
+This is the only path to fully zero-manual-step installation. Significant effort: requires maintaining a separate HA integration type alongside the AppDaemon app, Supervisor API integration, and config flow UI.
+
+---
+
 ## Summary
 
 | # | Change | Expected MAE impact | Effort | Status |
@@ -140,3 +204,14 @@ cannot capture.
 | 13 | Prediction intervals (HA sensors) | UX value | 4 h | ✓ done |
 | 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | ✓ done |
 | 15 | HVAC state feature | high (if available) | 3 h | long-term backlog |
+| 16 | HACS support | distribution | 1 h | planned |
+| 17 | Setup checker sensor | UX / install | 2 h | planned |
+| 18 | Custom component config flow | UX / install | 8+ h | long-term backlog |
+| 19 | CSV append-only writes | performance | 2 h | planned |
+| 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | planned |
+| 21 | Occupancy feature (`people_home`) | **high** | 4 h | long-term backlog |
+| 22 | EV SoC + charging state feature | high (EV households) | 4 h | long-term backlog |
+| 23 | Solar PV integration | high (solar households) | 6 h | long-term backlog |
+| 24 | Electricity spot price feature | medium (dynamic tariff) | 2 h | long-term backlog |
+| 25 | Vacation / away flag | medium | 2 h | long-term backlog |
+| 26 | Sub-energy sensors (`sub_energy_sensors`) | medium | 4 h | ✓ done |
