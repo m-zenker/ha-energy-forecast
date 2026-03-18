@@ -6,6 +6,38 @@ Forecasts are published as native Home Assistant sensor entities and update ever
 
 ---
 
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+  - [Home Assistant side](#home-assistant-side)
+  - [AppDaemon add-on configuration](#appdaemon-add-on-configuration)
+  - [Python packages reference](#python-packages-reference)
+- [Installation](#installation)
+- [Configuration](#configuration)
+  - [Parameter reference](#parameter-reference)
+- [Published sensors](#published-sensors)
+  - [Forecast totals](#forecast-totals)
+  - [Prediction intervals (80% confidence)](#prediction-intervals-80-confidence)
+  - [3-hour block forecasts](#3-hour-block-forecasts)
+  - [EV charging actuals](#ev-charging-actuals)
+  - [Model diagnostics](#model-diagnostics)
+- [How it works](#how-it-works)
+  - [Data pipeline](#data-pipeline)
+  - [Prediction pipeline (hourly)](#prediction-pipeline-hourly)
+  - [Schedule](#schedule)
+  - [Features used](#features-used)
+  - [Model persistence](#model-persistence)
+- [Backfilling history](#backfilling-history)
+- [Weather sources](#weather-sources)
+- [EV charging detection](#ev-charging-detection)
+- [Sub-energy sensors](#sub-energy-sensors)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Licence](#licence)
+
+---
+
 ## Features
 
 - **48-hour hourly forecast** — trained on your own consumption history, not generic averages
