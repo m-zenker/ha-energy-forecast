@@ -519,4 +519,17 @@ class TestFetchSubSensorHistory:
 
         assert cache_path.exists()
         assert "kwh" in result.columns
-        assert len(result) >= 1
+        assert len(result) == 1
+
+    def test_both_empty_returns_empty_with_warning(self, mock_app, tmp_path):
+        """When both HA and cache are empty, returns empty DataFrame and logs WARNING."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        # No cache file, HA returns empty DataFrame
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert result.empty
+        assert list(result.columns) == ["timestamp", "kwh"]
+        mock_app.log.assert_called_once()
+        args, kwargs = mock_app.log.call_args
+        assert kwargs.get("level") == "WARNING"

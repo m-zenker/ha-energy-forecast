@@ -688,8 +688,16 @@ def _add_sub_sensor_lags_training(
             .sort_index()
         )
         kwh_series = pd.Series(sub_series.reindex(ts_idx).values)
+        nan_count = int(kwh_series.isna().sum())
+        if nan_count > len(kwh_series) * 0.5:
+            _LOGGER.warning(
+                "%s reindex introduces %d/%d NaN values during training — "
+                "sub-sensor data may have gaps or misaligned timestamps; "
+                "will be filled with training medians.",
+                prefix, nan_count, len(kwh_series),
+            )
         df[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
-        if n_rows - 168 >= 100:
+        if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
             df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
 
     return df
