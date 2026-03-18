@@ -21,6 +21,9 @@ apps/energy_forecast/energy_history.csv
 # HA database (large, local only)
 *.db
 
+# Temporary files / log drops
+temp/
+
 # Claude Code — local only, not for sharing
 CLAUDE.md
 MEMORY.md

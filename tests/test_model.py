@@ -667,6 +667,25 @@ class TestSubSensorFeatures:
         assert len(result) == 48
         assert result["predicted_kwh"].ge(0).all()
 
+    def test_prediction_lag_columns_are_float_dtype(self, tmp_path):
+        """Regression: reindex of a sparse sub-sensor must produce float64, not object dtype.
+
+        In pandas 3.x, reindexing across mismatched datetime resolutions (ns vs us from
+        CSV cache) returned dtype=object, which LightGBM rejected at predict time.
+        """
+        future_ts = pd.date_range("2024-01-10", periods=48, freq="1h")
+        future_df = pd.DataFrame({"timestamp": future_ts})
+        # Only 1 recent data point — simulates a sensor active for just a few hours
+        recent_sub = pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-09 12:00"]),
+            "kwh": [0.3],
+        })
+        result = _add_sub_sensor_lags_prediction(future_df, {"sub_t": recent_sub})
+        assert result["sub_t_lag_24h"].dtype == np.float64, (
+            f"expected float64, got {result['sub_t_lag_24h'].dtype}"
+        )
+        assert result["sub_t_lag_168h"].dtype == np.float64
+
     def test_lag_168h_absent_below_threshold(self):
         """lag_168h is absent when n_rows - 168 < 100 (n=267, threshold−1)."""
         n = 267

@@ -726,18 +726,22 @@ def _add_sub_sensor_lags_prediction(
 
     for prefix, sub_df in sub_sensors_recent.items():
         if sub_df is None or sub_df.empty:
-            future_df[f"{prefix}_lag_24h"]  = np.nan
-            future_df[f"{prefix}_lag_168h"] = np.nan
+            future_df[f"{prefix}_lag_24h"]  = float("nan")
+            future_df[f"{prefix}_lag_168h"] = float("nan")
             continue
 
         sub_series = (
             sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
             .sort_index()
+            .astype(float)
         )
         for lag, col in [(24, f"{prefix}_lag_24h"), (168, f"{prefix}_lag_168h")]:
-            lag_td   = pd.Timedelta(hours=lag)
-            lag_times = pd.to_datetime(future_df["timestamp"]) - lag_td
-            future_df[col] = sub_series.reindex(lag_times).values
+            lag_td    = pd.Timedelta(hours=lag)
+            lag_times = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]) - lag_td)
+            # Normalise index resolution so reindex finds matches regardless of
+            # whether the CSV cache was written with ns or us precision (pandas 3.x).
+            lag_times = lag_times.as_unit(sub_series.index.unit if hasattr(sub_series.index, "unit") else "ns")
+            future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
             nan_count = int(future_df[col].isna().sum())
             if nan_count > len(future_df) * 0.5:
                 _LOGGER.warning(
