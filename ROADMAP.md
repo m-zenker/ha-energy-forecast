@@ -1,7 +1,7 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.2.1 on `main`.
+Current baseline: v0.5.1 on `feature/stage6-distribution-ux` (next milestone: #16 HACS support).
 
 ---
 
