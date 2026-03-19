@@ -357,3 +357,46 @@ class TestCallbackSignature:
     def test_update_cb_event_style(self):
         from energy_forecast.energy_forecast import EnergyForecast
         EnergyForecast._update_cb(_FakeSelf(), "some_event", {}, {})
+
+
+# ── Config validation — EV threshold vs charger_kw warning (#20) ─────────────
+
+class _FakeValidateSelf:
+    """Minimal stand-in for _validate_config with configurable EV params."""
+
+    def __init__(self, ev_threshold: float, ev_charger_kw: float):
+        self._lat                        = 47.0
+        self._lon                        = 8.5
+        self._plz                        = ""
+        self._weight_halflife            = 90.0
+        self._ev_threshold               = ev_threshold
+        self._ev_charger_kw              = ev_charger_kw
+        self._adaptive_retrain_threshold = 2.0
+        self._sub_energy_sensors         = []
+        self._warnings: list[str]        = []
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        if level == "WARNING":
+            self._warnings.append(msg)
+
+
+class TestValidateConfig:
+    """_validate_config must warn when ev_threshold >= ev_charger_kw."""
+
+    def test_warns_when_threshold_equals_charger_kw(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeValidateSelf(ev_threshold=9.0, ev_charger_kw=9.0)
+        EnergyForecast._validate_config(fake)
+        assert fake._warnings, "Expected WARNING when ev_threshold == ev_charger_kw"
+
+    def test_warns_when_threshold_exceeds_charger_kw(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeValidateSelf(ev_threshold=10.0, ev_charger_kw=9.0)
+        EnergyForecast._validate_config(fake)
+        assert fake._warnings, "Expected WARNING when ev_threshold > ev_charger_kw"
+
+    def test_no_warning_when_threshold_below_charger_kw(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        EnergyForecast._validate_config(fake)
+        assert not fake._warnings, "No warning expected when ev_threshold < ev_charger_kw"

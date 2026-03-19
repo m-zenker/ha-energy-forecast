@@ -109,6 +109,13 @@ class EnergyForecast(hass.Hass):
             raise ValueError(
                 f"adaptive_retrain_threshold must be ≥ 0, got {self._adaptive_retrain_threshold}"
             )
+        if self._ev_threshold >= self._ev_charger_kw:
+            self.log(
+                f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
+                f"({self._ev_charger_kw}). EV sessions may not be detected correctly — "
+                "lower the threshold or raise ev_charger_kw.",
+                level="WARNING",
+            )
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
             f"weight_halflife={self._weight_halflife}d, "
