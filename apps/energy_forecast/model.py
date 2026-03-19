@@ -247,6 +247,8 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_lag_24h")
                 if n_rows - 168 >= 100:
                     sub_sensor_cols.append(f"{prefix}_lag_168h")
+                sub_sensor_cols.append(f"{prefix}_active_24h")
+                sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
@@ -763,12 +765,16 @@ def _add_sub_sensor_lags_training(
     df: pd.DataFrame,
     sub_sensors: dict | None,
 ) -> pd.DataFrame:
-    """Add lag_24h (and optionally lag_168h) columns for each sub-sensor.
+    """Add lag_24h, lag_168h, active_24h, and runs_7d columns for each sub-sensor.
 
     For each prefix/DataFrame pair in sub_sensors:
     - Reindexes the sub-sensor kWh series onto the training timestamps
-    - Computes lag_24h via shift(24), lag_168h via shift(168) when n_rows ≥ 268
+    - lag_24h via shift(24); lag_168h via shift(168) when n_rows ≥ 268
+    - active_24h: 1 if any non-zero reading in the 24h window ending at the row
+    - runs_7d: count of appliance start events (0→>0 transitions) in past 168h
 
+    All rolling ops use shift(1) first to exclude the current row, matching
+    the training semantics for the main lag features.
     Returns df unchanged when sub_sensors is empty/None.
     """
     import pandas as pd
@@ -799,6 +805,19 @@ def _add_sub_sensor_lags_training(
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
             df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
 
+        # active_24h: was the appliance active any time in the past 24h?
+        # Use shift(1) so the current-row value is excluded (lag semantics).
+        filled = kwh_series.fillna(0)
+        shifted_kwh = filled.shift(1)
+        active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
+        df[f"{prefix}_active_24h"] = active.values
+
+        # runs_7d: how many times did the appliance start (0→>0 transition) in
+        # the past 168h?  shift(1) applied before rolling to exclude current row.
+        is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
+        runs = is_start.shift(1).rolling(168, min_periods=1).sum()
+        df[f"{prefix}_runs_7d"] = runs.values
+
     return df
 
 
@@ -806,19 +825,26 @@ def _add_sub_sensor_lags_prediction(
     future_df: pd.DataFrame,
     sub_sensors_recent: dict,
 ) -> pd.DataFrame:
-    """Fill sub-sensor lag features for the 48-hour prediction horizon.
+    """Fill sub-sensor lag + derived features for the 48-hour prediction horizon.
 
-    For each sub-sensor, reindexes the recent actuals series at
-    (timestamp - 24h) and (timestamp - 168h).  Falls back to NaN when actuals
-    don't reach far enough back (logged at WARNING).
+    For each sub-sensor:
+    - lag_24h / lag_168h: reindex recent actuals at (timestamp - Lh)
+    - active_24h: 1 if any non-zero reading in the 24h window before each future
+      hour (populated from recent actuals; becomes 0 for future hours > 24h ahead)
+    - runs_7d: appliance start count in the past 168h (constant across all 48 future
+      hours — we can only know the count from recent actuals)
+
+    Falls back to NaN/0 when actuals don't reach far enough back.
     """
     import pandas as pd
     import numpy as np
 
     for prefix, sub_df in sub_sensors_recent.items():
         if sub_df is None or sub_df.empty:
-            future_df[f"{prefix}_lag_24h"]  = float("nan")
-            future_df[f"{prefix}_lag_168h"] = float("nan")
+            for col in (f"{prefix}_lag_24h", f"{prefix}_lag_168h"):
+                future_df[col] = float("nan")
+            future_df[f"{prefix}_active_24h"] = 0
+            future_df[f"{prefix}_runs_7d"]    = 0
             continue
 
         sub_series = (
@@ -826,20 +852,44 @@ def _add_sub_sensor_lags_prediction(
             .sort_index()
             .astype(float)
         )
+        future_ts = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]))
+
         for lag, col in [(24, f"{prefix}_lag_24h"), (168, f"{prefix}_lag_168h")]:
             lag_td    = pd.Timedelta(hours=lag)
-            lag_times = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]) - lag_td)
+            lag_times = future_ts - lag_td
             # Normalise index resolution so reindex finds matches regardless of
             # whether the CSV cache was written with ns or us precision (pandas 3.x).
             lag_times = lag_times.as_unit(sub_series.index.unit if hasattr(sub_series.index, "unit") else "ns")
             future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
             nan_count = int(future_df[col].isna().sum())
-            if nan_count > len(future_df) * 0.5:
+            if lag >= 24 and nan_count > len(future_df) * 0.5:
                 _LOGGER.warning(
                     "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
                     "will be filled with training medians.",
                     col, nan_count, len(future_df), lag,
                 )
+
+        # active_24h: check 24h window before each future hour from recent actuals.
+        # For future hours beyond the 24h actuals horizon this will be 0.
+        active_vals = []
+        for fts in future_ts:
+            window_start = fts - pd.Timedelta(hours=24)
+            window = sub_series[(sub_series.index >= window_start) & (sub_series.index < fts)]
+            active_vals.append(int((window > 0).any()))
+        future_df[f"{prefix}_active_24h"] = active_vals
+
+        # runs_7d: appliance start count from the most recent 168h of actuals.
+        # Constant across all future hours — future starts are unknown.
+        if len(sub_series) > 0:
+            filled = sub_series.fillna(0)
+            is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
+            # Use actuals in the window [last_ts - 168h, last_ts]
+            last_ts    = sub_series.index.max()
+            window_168 = is_start[is_start.index >= last_ts - pd.Timedelta(hours=168)]
+            runs_count = int(window_168.sum())
+        else:
+            runs_count = 0
+        future_df[f"{prefix}_runs_7d"] = runs_count
 
     return future_df
 

@@ -869,6 +869,118 @@ class TestSubSensorFeatures:
         assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 
 
+# ── Stage 4 — Sub-sensor activity flag and run count (#35, #36) ───────────────
+
+class TestSubSensorActivityAndRuns:
+    """active_24h and runs_7d computed correctly in training and prediction."""
+
+    def _all_zero_series(self, n: int = 400) -> pd.DataFrame:
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "kwh": [0.0] * n})
+
+    def _series_with_event(self, n: int = 400, event_start: int = 200) -> pd.DataFrame:
+        """All-zero series except rows event_start..event_start+3 which are non-zero."""
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        kwh = [0.0] * n
+        for i in range(event_start, min(event_start + 4, n)):
+            kwh[i] = 1.5
+        return pd.DataFrame({"timestamp": ts, "kwh": kwh})
+
+    def test_active_24h_zero_for_all_zero_series(self):
+        """All-zero sub-sensor → active_24h must be 0 everywhere."""
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=400, freq="1h"),
+            "gross_kwh": [2.0] * 400,
+        })
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": self._all_zero_series()})
+        assert "sub_dw_active_24h" in df.columns
+        assert (df["sub_dw_active_24h"] == 0).all()
+
+    def test_active_24h_becomes_one_after_event(self):
+        """After a non-zero event, active_24h must become 1 within the next 24 rows."""
+        n = 400
+        event_start = 200
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="1h"),
+            "gross_kwh": [2.0] * n,
+        })
+        sub = self._series_with_event(n=n, event_start=event_start)
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": sub})
+        # Rows from event_start+1 to event_start+24 should have active_24h=1
+        assert df["sub_dw_active_24h"].iloc[event_start + 1] == 1
+
+    def test_runs_7d_zero_for_all_zero_series(self):
+        """All-zero sub-sensor → runs_7d must be 0 everywhere (NaN at row 0 is OK)."""
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=400, freq="1h"),
+            "gross_kwh": [2.0] * 400,
+        })
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": self._all_zero_series()})
+        assert "sub_dw_runs_7d" in df.columns
+        # Row 0 can be NaN (no prior row for transition detection); all others must be 0
+        assert (df["sub_dw_runs_7d"].iloc[1:] == 0).all()
+
+    def test_runs_7d_counts_appliance_starts(self):
+        """Two non-zero events separated by zeros → runs_7d counts correctly."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        # Two runs: rows 50-52 and 100-102
+        kwh = [0.0] * n
+        for i in range(50, 53):
+            kwh[i] = 1.0
+        for i in range(100, 103):
+            kwh[i] = 1.0
+        sub = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": sub})
+        # At row 168 (within 168h of both events), runs_7d should be 2
+        assert int(df["sub_dw_runs_7d"].iloc[168]) == 2
+
+    def test_active_24h_in_feature_cols_after_train(self, tmp_path):
+        """active_24h must appear in feature_cols after training with sub-sensors."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(9)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts, "temp_c": rng.uniform(-5, 25, n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        sub = self._series_with_event(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_dw": sub})
+        assert "sub_dw_active_24h" in m.feature_cols
+        assert "sub_dw_runs_7d" in m.feature_cols
+
+    def test_prediction_active_24h_zero_for_empty_sub_sensor(self):
+        """active_24h in prediction must be 0 when no recent actuals are available."""
+        future = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=48, freq="1h")})
+        result = _add_sub_sensor_lags_prediction(future, {"sub_dw": pd.DataFrame()})
+        assert (result["sub_dw_active_24h"] == 0).all()
+
+    def test_prediction_runs_7d_counts_from_recent_actuals(self):
+        """runs_7d at predict time must reflect start events in recent 168h actuals."""
+        now = pd.Timestamp("2026-01-08 12:00")
+        # 200h of actuals; two events: 50h and 100h ago
+        ts_hist = pd.date_range(now - pd.Timedelta(hours=200), now, freq="1h")
+        kwh = [0.0] * len(ts_hist)
+        idx_50  = len(ts_hist) - 51   # 50h ago
+        idx_100 = len(ts_hist) - 101  # 100h ago
+        if idx_50 >= 0:
+            kwh[idx_50]  = 2.0
+        if idx_100 >= 0:
+            kwh[idx_100] = 2.0
+        sub_recent = pd.DataFrame({"timestamp": ts_hist, "kwh": kwh})
+
+        future = pd.DataFrame({"timestamp": pd.date_range(now.floor("1h"), periods=48, freq="1h")})
+        result = _add_sub_sensor_lags_prediction(future, {"sub_dw": sub_recent})
+        # Both events are within 168h → runs_7d should be 2 for all future hours
+        assert (result["sub_dw_runs_7d"] == 2).all()
+
+
 # ── Stage 1 — Feature importance + CV std logging (#29, #30) ─────────────────
 
 class TestFeatureImportanceLogging:

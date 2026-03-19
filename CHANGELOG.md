@@ -10,6 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.4] — 2026-03-19
+
+### Added
+- **`{prefix}_active_24h` binary flag** (`model.py`, #35): 1 when the sub-sensor had
+  any non-zero reading in the 24h window before each training/prediction row, else 0.
+  Provides a "was the appliance recently active?" signal for sparse sensors (~95% zero).
+- **`{prefix}_runs_7d` rolling run count** (`model.py`, #36): count of appliance start
+  events (0 → >0 transitions) in the past 168h during training.  At predict time the
+  count is computed from recent actuals and held constant across the 48-hour horizon
+  (future starts are unknown).  Helps the model distinguish heavy-use from idle periods.
+
+---
+
 ## [0.4.3] — 2026-03-19
 
 ### Added
