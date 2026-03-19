@@ -125,12 +125,17 @@ class TestFetchOpenMeteo:
         assert list(df["direct_radiation_wm2"]) == [100, 200, 300]
 
     def test_new_columns_missing_key_fallback(self):
-        """If cloud_cover or direct_radiation absent, columns default to 0."""
+        """If cloud_cover or direct_radiation absent, columns default to NaN (not 0).
+
+        NaN allows the safety-net median fill in _engineer_features to substitute
+        a sensible value rather than treating missing data as "perfectly clear sky".
+        """
+        import numpy as np
         hourly = {**_base_hourly(3), "sunshine_duration": [0]*3}  # no cloud/radiation
         with patch("requests.get", return_value=_make_response(hourly)):
             df = weather.fetch_open_meteo(47.0, 8.0)
-        assert (df["cloud_cover_pct"] == 0).all()
-        assert (df["direct_radiation_wm2"] == 0).all()
+        assert df["cloud_cover_pct"].isna().all()
+        assert df["direct_radiation_wm2"].isna().all()
 
     def test_returns_all_expected_columns(self):
         with patch("requests.get", return_value=_make_response(_full_hourly(3))):
@@ -182,8 +187,9 @@ class TestFetchHistoricalWeather:
         mock.json.return_value = {"hourly": hourly}
         with patch("requests.get", return_value=mock):
             df = weather.fetch_historical_weather(47.0, 8.0, date(2026, 1, 1), date(2026, 1, 1))
-        assert (df["cloud_cover_pct"] == 0).all()
-        assert (df["direct_radiation_wm2"] == 0).all()
+        # Fallback is NaN (not 0) so _engineer_features can substitute a sensible median.
+        assert df["cloud_cover_pct"].isna().all()
+        assert df["direct_radiation_wm2"].isna().all()
 
 
 # ── _supplement_from_open_meteo ───────────────────────────────────────────────

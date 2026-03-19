@@ -214,7 +214,15 @@ class EnergyForecastModel:
         n_rows = len(energy_df)
         active_lags = [lag for lag in LAG_HOURS if n_rows - lag >= 100]
         skipped_lags = [lag for lag in LAG_HOURS if lag not in active_lags]
-        if skipped_lags:
+        if not active_lags:
+            _LOGGER.warning(
+                "Dynamic lag selection: no lag features active (need ≥%d rows, have %d). "
+                "The model will train without autoregressive features — accuracy will be "
+                "significantly reduced until more history is collected.",
+                min(LAG_HOURS) + 100,
+                n_rows,
+            )
+        elif skipped_lags:
             _LOGGER.info(
                 "Dynamic lag selection: skipping %s (need %d+ rows, have %d). "
                 "These will be added automatically as history grows.",

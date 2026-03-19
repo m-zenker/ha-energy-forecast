@@ -98,7 +98,7 @@ def fetch_energy_history(
         hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
         diff = hourly.diff().clip(lower=0).reset_index()
         diff.columns = ["timestamp", "gross_kwh"]
-        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+        if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
     else:
@@ -157,7 +157,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
         hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
         diff = hourly.diff().clip(lower=0).reset_index()
         diff.columns = ["timestamp", "gross_kwh"]
-        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+        if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
     else:
@@ -173,8 +173,10 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
     new_rows = combined[~combined["timestamp"].isin(existing_ts)]
     if not new_rows.empty:
-        write_header = not cache_path.exists() or cache_path.stat().st_size == 0
         try:
+            # Determine header inside the same except block to avoid a TOCTOU race:
+            # another process could delete/truncate the file between stat() and to_csv().
+            write_header = not cache_path.exists() or cache_path.stat().st_size == 0
             new_rows.to_csv(cache_path, mode="a", header=write_header, index=False)
         except OSError as e:
             app.log(f"Failed to save cache: {e}", level="ERROR")
@@ -216,6 +218,29 @@ def split_ev_charging(
     return df, ev_df
 
 
+def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame") -> "pd.DataFrame":
+    """Merge two sub-sensor DataFrames (column 'kwh'); fresh HA data wins on conflicts.
+
+    Thin wrapper around _merge_energy_frames: temporarily renames 'kwh' to
+    'gross_kwh' so the shared helper can be used, then renames back.  This
+    avoids duplicating the concat/drop_duplicates/sort logic and keeps both
+    sub-sensor fetch paths in lockstep with the main energy merge semantics.
+
+    Unlike fetch_sub_sensor_history (which raises ValueError when both sources
+    are empty), sub-sensor functions return an empty DataFrame silently — callers
+    should handle both cases.
+    """
+    import pandas as pd
+
+    rename_to   = {"kwh": "gross_kwh"}
+    rename_back = {"gross_kwh": "kwh"}
+    combined = _merge_energy_frames(
+        df_winner=df_winner.rename(columns=rename_to),
+        df_loser=df_loser.rename(columns=rename_to),
+    )
+    return combined.rename(columns=rename_back)
+
+
 def fetch_sub_sensor_history(
     app: "hass.Hass",
     entity_id: str,
@@ -253,19 +278,13 @@ def fetch_sub_sensor_history(
         hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
         diff = hourly.diff().clip(lower=0).reset_index()
         diff.columns = ["timestamp", "kwh"]
-        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+        if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
         df_new = pd.DataFrame(columns=["timestamp", "kwh"])
 
-    combined = (
-        pd.concat([df_cache, df_new])
-        .drop_duplicates(subset=["timestamp"], keep="last")
-        .sort_values("timestamp")
-        .dropna(subset=["timestamp", "kwh"])
-        .reset_index(drop=True)
-    )
+    combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
         combined.to_csv(cache_path, index=False)
@@ -285,6 +304,10 @@ def fetch_recent_sub_sensor(
     Fetches only the last 2 days of HA history, merges into the existing CSV
     cache, and returns the full cache for lag-feature use.  Analogous to
     fetch_recent_energy but for sub-sensors (column name 'kwh', keeps zeros).
+
+    Unlike fetch_energy_history (raises ValueError when both sources empty),
+    this function returns an empty DataFrame silently so a missing sub-sensor
+    does not abort the hourly update for the main sensor.
     """
     import pandas as pd
 
@@ -309,19 +332,13 @@ def fetch_recent_sub_sensor(
         hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
         diff = hourly.diff().clip(lower=0).reset_index()
         diff.columns = ["timestamp", "kwh"]
-        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+        if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
         df_new = pd.DataFrame(columns=["timestamp", "kwh"])
 
-    combined = (
-        pd.concat([df_cache, df_new])
-        .drop_duplicates(subset=["timestamp"], keep="last")
-        .sort_values("timestamp")
-        .dropna(subset=["timestamp", "kwh"])
-        .reset_index(drop=True)
-    )
+    combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
         combined.to_csv(cache_path, index=False)

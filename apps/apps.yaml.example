@@ -69,6 +69,13 @@ energy_forecast:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
 
+  # Optional: EV charging detection.
+  # Hours where gross consumption exceeds ev_charging_threshold_kwh are treated
+  # as EV charging sessions.  The charger load (ev_charger_kw) is subtracted
+  # before training so household baseline accuracy is preserved.
+  # ev_charging_threshold_kwh: 7    # default: 7 kWh/h
+  # ev_charger_kw: 9                # default: 9 kW (e.g. 11 kW Type 2 at ~80% efficiency)
+
 # ── One-off backfill (uncomment only when needed) ────────────────────────────
 #energy_history_backfill:
 #  module: energy_forecast.energy_history_backfill

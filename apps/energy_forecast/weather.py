@@ -1,10 +1,34 @@
 import logging
+import time
 
+import numpy as np
 import requests
 import pandas as pd
 from datetime import datetime, date
 
 _LOGGER = logging.getLogger(__name__)
+
+# Module-level OAuth token cache.  Avoids a new token request on every hourly
+# forecast update (~24+ per day) and reduces the risk of SRG rate-limiting.
+_srg_token: str | None = None
+_srg_token_expires_at: float = 0.0  # Unix timestamp after which token is invalid
+
+
+def _parse_sunshine_min(sunshine_seconds: list) -> list:
+    """Convert Open-Meteo sunshine_duration (seconds) to minutes, clamped to [0, 60].
+
+    Values above 60 min/h are physically impossible for hourly slots and indicate
+    API bugs or schema drift; they are clamped and logged as a warning.
+    """
+    result = [s / 60.0 for s in sunshine_seconds]
+    over = [v for v in result if v > 60.0]
+    if over:
+        _LOGGER.warning(
+            "sunshine_duration contains %d value(s) > 60 min/h (max=%.1f) — clamping. "
+            "This may indicate an API schema change.",
+            len(over), max(over),
+        )
+    return [min(60.0, v) for v in result]
 
 
 def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date: date) -> pd.DataFrame:
@@ -32,10 +56,13 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
         "temp_c":                h["temperature_2m"],
         "precipitation_mm":      h["precipitation"],
         # Open-Meteo returns sunshine_duration in seconds; model expects minutes
-        "sunshine_min":          [s / 60.0 for s in h["sunshine_duration"]],
+        "sunshine_min":          _parse_sunshine_min(h["sunshine_duration"]),
         "wind_kmh":              h["windspeed_10m"],
-        "cloud_cover_pct":       h.get("cloud_cover",      [0] * n),
-        "direct_radiation_wm2":  h.get("direct_radiation", [0] * n),
+        # Default to NaN (not 0) when the field is absent so the safety-net NaN fill
+        # in _engineer_features applies the feature median rather than 0% cloud cover
+        # (which would falsely imply a perfectly clear sky).
+        "cloud_cover_pct":       h.get("cloud_cover",      [np.nan] * n),
+        "direct_radiation_wm2":  h.get("direct_radiation", [np.nan] * n),
     })
 
 
@@ -51,18 +78,22 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         return fetch_open_meteo(lat, lon)
 
     try:
-        # 1. Get OAuth Token
-        auth_url = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
-        auth_res = requests.post(auth_url, auth=(client_id, client_secret), timeout=10)
-        auth_res.raise_for_status()
-        try:
-            token = auth_res.json()["access_token"]
-        except (ValueError, KeyError) as exc:
-            _LOGGER.warning(
-                "SRG-SSR auth failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
-                auth_res.status_code, auth_res.text,
-            )
-            return fetch_open_meteo(lat, lon)
+        # 1. Get OAuth Token (cached for 55 minutes to avoid rate-limiting).
+        global _srg_token, _srg_token_expires_at
+        if _srg_token is None or time.monotonic() >= _srg_token_expires_at:
+            auth_url = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
+            auth_res = requests.post(auth_url, auth=(client_id, client_secret), timeout=10)
+            auth_res.raise_for_status()
+            try:
+                _srg_token = auth_res.json()["access_token"]
+                _srg_token_expires_at = time.monotonic() + 55 * 60  # 55-minute window
+            except (ValueError, KeyError):
+                _LOGGER.warning(
+                    "SRG-SSR auth failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
+                    auth_res.status_code, auth_res.text,
+                )
+                return fetch_open_meteo(lat, lon)
+        token = _srg_token
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
         # 2. Resolve geolocation ID — nearest station by lat/lon.
@@ -145,8 +176,18 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
     # Historical tail: Open-Meteo rows before the SRG window
     om_hist = om_df[om_df["timestamp"] < srg_start].copy()
 
-    # Cloud/radiation columns to pull from Open-Meteo for future rows
-    om_supplement_cols = ["timestamp", "cloud_cover_pct", "direct_radiation_wm2"]
+    # Cloud/radiation columns to pull from Open-Meteo for future rows.
+    # Guard against API schema drift: only select columns that actually exist.
+    desired_supplement = ["cloud_cover_pct", "direct_radiation_wm2"]
+    available_supplement = [c for c in desired_supplement if c in om_df.columns]
+    if not available_supplement:
+        _LOGGER.warning(
+            "_supplement_from_open_meteo: Open-Meteo response missing cloud/radiation columns "
+            "(%s) — SRG forecast returned without supplement.",
+            desired_supplement,
+        )
+        return srg_df
+    om_supplement_cols = ["timestamp"] + available_supplement
     om_future = om_df[om_df["timestamp"] >= srg_start][om_supplement_cols]
 
     # Join cloud/radiation onto SRG future rows
@@ -183,10 +224,12 @@ def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
             "timestamp":            pd.to_datetime(h["time"]),
             "temp_c":               h["temperature_2m"],
             "precipitation_mm":     h["precipitation"],
-            "sunshine_min":         [s / 60.0 for s in sunshine_s],
+            "sunshine_min":         _parse_sunshine_min(sunshine_s),
             "wind_kmh":             h["windspeed_10m"],
-            "cloud_cover_pct":      h.get("cloud_cover",      [0] * n),
-            "direct_radiation_wm2": h.get("direct_radiation", [0] * n),
+            # Default to NaN (not 0) so missing data is imputed by median, not
+            # interpreted as "perfectly clear sky" / "zero radiation".
+            "cloud_cover_pct":      h.get("cloud_cover",      [np.nan] * n),
+            "direct_radiation_wm2": h.get("direct_radiation", [np.nan] * n),
         })
     except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()

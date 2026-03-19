@@ -8,6 +8,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Adaptive retrain cooldown timezone** (`energy_forecast.py`, H1): `_maybe_adaptive_retrain`
+  now uses `pd.Timestamp.now("Europe/Zurich").tz_localize(None)` instead of `datetime.now()`
+  (system local time), preventing the 24-hour cooldown from firing ±2 h early/late on
+  UTC-based Docker/HA systems and across DST transitions.
+- **Duplicate numpy import** (`energy_forecast.py`, H2): removed redundant `import numpy as np`
+  inside the EV block of `_aggregate`; numpy was already imported at the top of the method.
+- **CSV header TOCTOU race** (`ha_data.py`, H3): `stat()` + `to_csv(mode="a")` are now
+  wrapped in a single `except OSError` block, preventing a potential race where another
+  process deletes/truncates the file between the stat check and the write.
+- **Sub-sensor merge deduplication** (`ha_data.py`, H4): both `fetch_sub_sensor_history` and
+  `fetch_recent_sub_sensor` now use the shared `_merge_sub_sensor_frames` helper (backed by
+  `_merge_energy_frames`) instead of duplicated inline `pd.concat/drop_duplicates` chains.
+- **Missing cloud/radiation defaults** (`weather.py`, M2): absent `cloud_cover` / `direct_radiation`
+  keys now fall back to `[np.nan]` instead of `[0]`; `0` was interpreted as "perfectly clear sky"
+  and biased training. NaN triggers the safety-net median fill in `_engineer_features`.
+- **SRG OAuth token cached** (`weather.py`, M1): token is now reused for 55 minutes, reducing
+  SRG token-endpoint calls from 24+/day to ~1/day and removing silent Open-Meteo fallbacks
+  caused by rate-limit errors.
+
+### Added
+- **Sunshine clamp + warning** (`weather.py`, M4): `_parse_sunshine_min` helper converts
+  sunshine_duration (seconds → minutes) and clamps values > 60 min/h with a WARNING log.
+- **Column guard in `_supplement_from_open_meteo`** (`weather.py`, M3): if Open-Meteo omits
+  `cloud_cover_pct`/`direct_radiation_wm2` (API schema drift), the function logs a WARNING
+  and returns the SRG DataFrame unchanged instead of raising `KeyError`.
+- **No-lag WARNING** (`model.py`, M7): logs a WARNING when all autoregressive lags are
+  skipped (history too short for even `lag_1h`), making it visible that the model is
+  training without its core predictive features.
+- **EV config in apps.yaml.example** (C3): `ev_charging_threshold_kwh` and `ev_charger_kw`
+  are now documented with default values in the config template.
+
+### Changed
+- `_check_setup` exception narrowed from `except Exception` to
+  `except (AttributeError, TypeError, RuntimeError)` (`energy_forecast.py`, L3).
+- Redundant `hasattr(col.dtype, "tz")` guards removed; idiomatic `col.dt.tz is not None`
+  used directly at all four sites (`ha_data.py`, M8).
+- `HOLDOUT_FRACTION` clarified with inline comment that it is the *training* fraction
+  (`const.py`, L1).
+- `conftest.py` hassapi stub comment expanded to explain the purpose.
+- README features table rewritten to cover stages 2–5 additions; sub-sensor feature list
+  updated to include `active_24h` and `runs_7d`; activation-threshold wording corrected.
+
 ---
 
 ## [0.5.0] — 2026-03-19

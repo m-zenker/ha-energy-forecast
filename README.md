@@ -301,11 +301,20 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 
 ### Features used
 
-Calendar, cyclical encodings (hour, day-of-week, month, hour-of-week), weather (temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured history), autoregressive lags (24 h, 48 h, 72 h, 168 h, 336 h), rolling consumption stats (24 h mean/std, 7-day mean), Swiss public holidays, bridge-day proximity (days to/since nearest holiday, capped at 3), EV session probability per hour-of-week slot.
+| Category | Features |
+|----------|----------|
+| Calendar | hour, day-of-week, month, season, hour-of-week |
+| Cyclical encodings | sin/cos of hour, day-of-week, month, day-of-year (`doy_sin`/`doy_cos`) |
+| Horizon | `hours_ahead` (0–47, how far into the future the row is) |
+| Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
+| Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_24h`, `lag_48h`, `lag_72h`, `lag_168h`, `lag_336h` (daily/weekly) |
+| Rolling consumption | 24 h mean, 24 h std, 7-day mean |
+| Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
+| EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
 
-When `sub_energy_sensors` is configured, each sub-sensor adds two features: `lag_24h` (same hour yesterday) and `lag_168h` (same hour last week).
+When `sub_energy_sensors` is configured, each sub-sensor adds four features: `lag_24h` (same hour yesterday), `lag_168h` (same hour last week, requires ≥ 268 rows of sub-sensor history), `{prefix}_active_24h` (was the appliance active in the past 24 h?), and `{prefix}_runs_7d` (how many on/off cycles in the past 7 days).
 
-Lag features are dynamically enabled as history grows — the full feature set is active once you have ≥ 436 hours (≈18 days) of data.
+Lag features are dynamically enabled as history grows — short-horizon lags (`lag_1h` etc.) activate at ≥ 101 rows; the full autoregressive feature set is active at ≥ 436 rows (≈ 18 days).
 
 ### Model persistence
 

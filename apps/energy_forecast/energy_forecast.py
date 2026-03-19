@@ -169,7 +169,7 @@ class EnergyForecast(hass.Hass):
                 },
                 replace=True,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (AttributeError, TypeError, RuntimeError) as exc:
             self.log(f"Could not publish setup status sensor: {exc}", level="WARNING")
 
     # ── Sub-sensor helpers ────────────────────────────────────────────────────
@@ -355,10 +355,16 @@ class EnergyForecast(hass.Hass):
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""
+        import pandas as pd
+
         cv_mae = self._ml_model.last_cv_mae
         if cv_mae is None:
             return
-        hours_since = (datetime.now() - self._last_adaptive_retrain).total_seconds() / 3600
+        # Use Europe/Zurich local time (tz-naive) consistent with pipeline timestamps.
+        # datetime.now() would use system time, which is UTC in Docker/HA and
+        # causes the cooldown to fire up to ±2h early/late and wrong during DST.
+        _now = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+        hours_since = (_now - self._last_adaptive_retrain).total_seconds() / 3600
         if hours_since < 24:
             return
         live_mae, n_pairs = _compute_live_mae(self._pred_history, actuals_df)
@@ -371,7 +377,7 @@ class EnergyForecast(hass.Hass):
                 f"(over {n_pairs} matched hours)",
                 level="WARNING",
             )
-            self._last_adaptive_retrain = datetime.now()
+            self._last_adaptive_retrain = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
             self._retrain()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
@@ -561,7 +567,6 @@ class EnergyForecast(hass.Hass):
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
             if not ev_rows.empty:
-                import numpy as np
                 ev_rows["ev_kwh"] = np.maximum(
                     0.0, ev_rows["gross_kwh"] - self._ev_charger_kw
                 )
@@ -660,6 +665,12 @@ def _compute_live_mae(
 
     Returns (mae, n_pairs).  mae is float('nan') when n_pairs == 0.
     Only hours present in both pred_history and actuals_df are included.
+
+    DST fall-back caveat: during the October clock-back, the naive 02:xx hour
+    appears twice in the history.  Both occurrences map to the same floor("1h")
+    key here, so the second occurrence overwrites the first in actuals_map and
+    the wrong actual may be matched to the prediction.  This is an accepted
+    edge case (one hour per year) and not worth the complexity of tz-aware storage.
     """
     import pandas as pd
 
