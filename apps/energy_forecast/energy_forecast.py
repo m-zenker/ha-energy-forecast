@@ -164,6 +164,7 @@ class EnergyForecast(hass.Hass):
                 state=state,
                 attributes={
                     "friendly_name": "Energy Forecast Setup Status",
+                    "unique_id": "energy_forecast_setup_status",
                     "missing_packages": missing,
                     "icon": "mdi:check-circle" if state == "ok" else "mdi:alert-circle",
                 },
@@ -390,6 +391,8 @@ class EnergyForecast(hass.Hass):
                 attributes={
                     "unit_of_measurement": "kWh",
                     "friendly_name": f"Energy Forecast {slot.title().replace('_', ' ')}",
+                    "unique_id": f"energy_forecast_{slot}",
+                    "icon": "mdi:lightning-bolt",
                 },
                 replace=True,
             )
@@ -400,6 +403,8 @@ class EnergyForecast(hass.Hass):
                 attributes={
                     "unit_of_measurement": "kWh",
                     "friendly_name": f"EV Charging Detected {day.title()}",
+                    "unique_id": f"energy_forecast_ev_{day}",
+                    "icon": "mdi:car-electric",
                 },
                 replace=True,
             )
@@ -420,14 +425,20 @@ class EnergyForecast(hass.Hass):
             "last_trained": trained_str,
         }
 
-        def safe_set(entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None) -> None:
+        def safe_set(entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None, icon: str | None = None) -> None:
             try:
                 val = float(value)
                 if math.isnan(val) or math.isinf(val):
                     val = 0.0
             except (TypeError, ValueError):
                 val = 0.0
-            attrs = {**base_attrs, "friendly_name": friendly_name}
+            attrs = {
+                **base_attrs,
+                "friendly_name": friendly_name,
+                "unique_id": entity_id.split(".", 1)[-1],
+            }
+            if icon:
+                attrs["icon"] = icon
             if extra_attrs:
                 attrs.update(extra_attrs)
             self.set_state(
@@ -439,15 +450,15 @@ class EnergyForecast(hass.Hass):
 
         # ── Forecast totals ───────────────────────────────────────────────────
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
-            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}")
+            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
 
         # ── Prediction intervals (only published when quantile models trained) ─
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             low  = data.get(f"{key}_low")
             high = data.get(f"{key}_high")
             if low is not None and high is not None:
-                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)")
-                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)")
+                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)",  icon="mdi:arrow-down-bold")
+                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)", icon="mdi:arrow-up-bold")
 
         # ── Forecast 3-hour blocks ────────────────────────────────────────────
         for day in ("today", "tomorrow"):
@@ -458,6 +469,7 @@ class EnergyForecast(hass.Hass):
                     f"sensor.energy_forecast_{day}_{slot}",
                     blocks.get(slot, 0),
                     f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00",
+                    icon="mdi:calendar-clock",
                 )
 
         # ── EV actuals sensors ────────────────────────────────────────────────
@@ -470,12 +482,14 @@ class EnergyForecast(hass.Hass):
             data.get("ev_today", 0),
             "EV Charging Detected Today",
             extra_attrs=ev_attrs,
+            icon="mdi:car-electric",
         )
         safe_set(
             "sensor.energy_forecast_ev_yesterday",
             data.get("ev_yesterday", 0),
             "EV Charging Detected Yesterday",
             extra_attrs=ev_attrs,
+            icon="mdi:car-electric",
         )
 
         # ── Model MAE sensor ──────────────────────────────────────────────────
@@ -486,6 +500,8 @@ class EnergyForecast(hass.Hass):
             attributes={
                 "unit_of_measurement": "kWh",
                 "friendly_name": "Energy Forecast Model MAE",
+                "unique_id": "energy_forecast_model_mae",
+                "icon": "mdi:chart-bell-curve-cumulative",
                 "attribution": ATTRIBUTION,
                 "cv_mae": str(model.last_cv_mae) if model.last_cv_mae is not None else "n/a",
                 "model_engine": str(model.engine),
