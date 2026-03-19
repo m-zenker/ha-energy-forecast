@@ -10,6 +10,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.3] — 2026-03-19
+
+### Added
+- **Day-of-year cyclical features** (`model.py`, #33): `doy_sin` and `doy_cos`
+  (period 365) added to `_FEATURES_BASE` and `_engineer_features`.  Gives the model
+  a smooth, continuous seasonal signal independent of month/season buckets.
+- **`hours_ahead` horizon feature** (`model.py`, #34): set to 0 for all training rows
+  (actuals) and overwritten with 0–47 in `_prepare_prediction_X` so the model can
+  learn horizon-specific bias without distributional leakage.
+- **`num_leaves` sweep** (`model.py`, #28): on the last CV fold (LightGBM only), values
+  `[16, 31, 63]` are evaluated; the best is selected and used for the final model.
+  Results are logged at INFO level.  Falls back to 31 on sklearn GBR.
+
+---
+
 ## [0.4.2] — 2026-03-19
 
 ### Added

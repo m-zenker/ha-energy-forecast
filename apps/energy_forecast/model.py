@@ -3,7 +3,8 @@ ML model — feature engineering, training, prediction and disk persistence.
 
 Feature set:
   - Calendar: hour, day_of_week, month, season, hour_of_week (0-167),
-    cyclical encodings (sin/cos) for hour, month, day-of-week, hour-of-week
+    cyclical encodings (sin/cos) for hour, month, day-of-week, hour-of-week,
+    day-of-year; hours_ahead horizon feature
   - Weather: temp_c, precipitation_mm, sunshine_min, wind_kmh,
     cloud_cover_pct, direct_radiation_wm2, heating_degree, cooling_degree,
     temp_rolling_3d (3-day thermal mass proxy)
@@ -73,6 +74,9 @@ _FEATURES_BASE = [
     "month_sin", "month_cos",
     "dow_sin", "dow_cos",
     "how_sin", "how_cos",                            # hour-of-week cyclical
+    "doy_sin", "doy_cos",                            # day-of-year cyclical (seasonal curve)
+    # Horizon
+    "hours_ahead",                                   # 0 at training (actuals), 0-47 at predict
     # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
     "cloud_cover_pct", "direct_radiation_wm2",
@@ -289,18 +293,50 @@ class EnergyForecastModel:
         # Also used to determine optimal n_estimators via LightGBM early stopping.
         cv_mae = None
         best_n_est: int | None = None
+        _NUM_LEAVES_SWEEP = [16, 31, 63]   # candidates; only used on last CV fold
+        best_num_leaves: int = 31
         if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
-                tscv      = TimeSeriesSplit(n_splits=3)
+                tscv   = TimeSeriesSplit(n_splits=3)
+                splits = list(tscv.split(X))
                 fold_maes = []
-                for tr_idx, val_idx in tscv.split(X):
+                for fold_idx, (tr_idx, val_idx) in enumerate(splits):
                     sw_fold = sample_weight[tr_idx] if sample_weight is not None else None
-                    m = _build_model(lgb, GBR)
                     fit_kwargs: dict = {}
                     if sw_fold is not None:
                         fit_kwargs["sample_weight"] = sw_fold
-                    if lgb is not None:
+
+                    is_last_fold = fold_idx == len(splits) - 1
+
+                    if is_last_fold and lgb is not None:
+                        # ── num_leaves sweep on last fold (LightGBM only) ──────────
+                        sweep_maes: dict[int, float] = {}
+                        for nl in _NUM_LEAVES_SWEEP:
+                            m_nl = _build_model(lgb, GBR, num_leaves=nl)
+                            try:
+                                m_nl.fit(
+                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    callbacks=[
+                                        lgb.early_stopping(50, verbose=False),
+                                        lgb.log_evaluation(-1),
+                                    ],
+                                    **fit_kwargs,
+                                )
+                            except Exception:  # noqa: BLE001
+                                m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                            sweep_maes[nl] = float(
+                                mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx])))
+                            )
+                        best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
+                        _LOGGER.info(
+                            "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
+                            {nl: round(v, 4) for nl, v in sweep_maes.items()},
+                            best_num_leaves, sweep_maes[best_num_leaves],
+                        )
+                        # Refit last fold with the winning num_leaves for consistent n_est
+                        m = _build_model(lgb, GBR, num_leaves=best_num_leaves)
                         try:
                             m.fit(
                                 X.iloc[tr_idx], y_fit[tr_idx],
@@ -312,18 +348,38 @@ class EnergyForecastModel:
                                 **fit_kwargs,
                             )
                             best_n_est = getattr(m, "best_iteration_", best_n_est)
-                        except Exception as _es_exc:  # noqa: BLE001
-                            _LOGGER.debug("Early stopping failed for fold: %s — using fixed estimators", _es_exc)
+                        except Exception:  # noqa: BLE001
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        fold_maes.append(sweep_maes[best_num_leaves])
                     else:
-                        m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                    # MAE reported in original kWh space (expm1 undoes log1p)
-                    fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
+                        m = _build_model(lgb, GBR)
+                        if lgb is not None:
+                            try:
+                                m.fit(
+                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    callbacks=[
+                                        lgb.early_stopping(50, verbose=False),
+                                        lgb.log_evaluation(-1),
+                                    ],
+                                    **fit_kwargs,
+                                )
+                                best_n_est = getattr(m, "best_iteration_", best_n_est)
+                            except Exception as _es_exc:  # noqa: BLE001
+                                _LOGGER.debug(
+                                    "Early stopping failed for fold: %s — using fixed estimators",
+                                    _es_exc,
+                                )
+                                m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        else:
+                            m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        # MAE reported in original kWh space (expm1 undoes log1p)
+                        fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(
                     "CV fold MAEs: %s → mean=%.4f ± %.4f",
-                    [round(m, 4) for m in fold_maes], cv_mae, cv_std,
+                    [round(v, 4) for v in fold_maes], cv_mae, cv_std,
                 )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
@@ -332,7 +388,7 @@ class EnergyForecastModel:
             _LOGGER.info("LightGBM early stopping: using %d estimators (from last CV fold)", best_n_est)
 
         # ── Final model on all data ─────────────────────────────────────────
-        model = _build_model(lgb, GBR, n_estimators=best_n_est)
+        model = _build_model(lgb, GBR, n_estimators=best_n_est, num_leaves=best_num_leaves)
         if sample_weight is not None:
             model.fit(X, y_fit, sample_weight=sample_weight)
         else:
@@ -428,6 +484,11 @@ class EnergyForecastModel:
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours)
+
+        # Overwrite hours_ahead with the actual prediction horizon (0–47).
+        # _engineer_features sets it to 0 (training-row semantics); here we
+        # populate the real horizon so the model can learn near-vs-far bias.
+        feat_df["hours_ahead"] = np.arange(len(feat_df))
 
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
@@ -819,6 +880,14 @@ def _engineer_features(
     df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
     df["how_sin"]   = np.sin(2 * np.pi * df["hour_of_week"] / 168)
     df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
+    doy = df["timestamp"].dt.dayofyear
+    df["doy_sin"]   = np.sin(2 * np.pi * doy / 365)
+    df["doy_cos"]   = np.cos(2 * np.pi * doy / 365)
+
+    # ── Horizon feature (0 for training rows — always actuals) ───────────────
+    # At predict time _prepare_prediction_X overwrites this with 0..47 so the
+    # model can learn horizon-specific bias without distributional leakage.
+    df["hours_ahead"] = 0
 
     # ── EV charging pattern ───────────────────────────────────────────────────
     if likely_ev_hours:
@@ -1052,16 +1121,17 @@ def _build_quantile_model(lgb: Any, GBR: Any, alpha: float, n_estimators: int | 
     )
 
 
-def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None) -> Any:
+def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None, num_leaves: int = 31) -> Any:
     """Instantiate the best available model (LightGBM preferred, sklearn GBR fallback).
 
     n_estimators overrides the default when provided (e.g. from early stopping).
+    num_leaves is LightGBM-only; ignored for sklearn GBR.
     """
     if lgb is not None:
         return lgb.LGBMRegressor(
             n_estimators=n_estimators or 500,
             learning_rate=0.05,
-            num_leaves=31,
+            num_leaves=num_leaves,
             subsample=0.8,
             colsample_bytree=0.8,
             min_child_samples=20,

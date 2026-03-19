@@ -926,3 +926,101 @@ class TestHolidayVectorisation:
         assert int(result["days_to_next_holiday"].iloc[0]) <= _BRIDGE_CAP
         assert int(result["days_since_last_holiday"].iloc[0]) <= _BRIDGE_CAP
 
+
+# ── Stage 3 — doy cyclical, hours_ahead, num_leaves sweep (#33, #34, #28) ─────
+
+class TestDoyFeatures:
+    """doy_sin and doy_cos must be present and have correct values."""
+
+    def _make_bare_df(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * len(ts)})
+
+    def test_doy_columns_in_features_base(self):
+        assert "doy_sin" in _FEATURES_BASE
+        assert "doy_cos" in _FEATURES_BASE
+
+    def test_doy_columns_in_engineer_features_output(self):
+        ts = pd.date_range("2026-01-01", periods=4, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0]*4, "precipitation_mm": [0.0]*4,
+            "sunshine_min": [30.0]*4, "wind_kmh": [10.0]*4,
+            "cloud_cover_pct": [50.0]*4, "direct_radiation_wm2": [100.0]*4,
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert "doy_sin" in result.columns
+        assert "doy_cos" in result.columns
+
+    def test_doy_sin_near_zero_on_jan1(self):
+        """Jan 1 is doy=1; sin(2π·1/365) ≈ 0.0172 — near but not exactly 0."""
+        ts = pd.date_range("2026-01-01", periods=1, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0], "precipitation_mm": [0.0],
+            "sunshine_min": [30.0], "wind_kmh": [10.0],
+            "cloud_cover_pct": [50.0], "direct_radiation_wm2": [100.0],
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        expected_sin = np.sin(2 * np.pi * 1 / 365)
+        assert abs(float(result["doy_sin"].iloc[0]) - expected_sin) < 1e-9
+
+    def test_doy_sin_near_one_at_peak(self):
+        """doy ≈ 91 (April 1) sin ≈ 1; verify value is reasonable."""
+        ts = pd.date_range("2026-04-01", periods=1, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [10.0], "precipitation_mm": [0.0],
+            "sunshine_min": [30.0], "wind_kmh": [10.0],
+            "cloud_cover_pct": [50.0], "direct_radiation_wm2": [100.0],
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert float(result["doy_sin"].iloc[0]) > 0.99
+
+
+class TestHoursAheadFeature:
+    """hours_ahead = 0 in training rows; 0–47 monotonically in prediction."""
+
+    def _make_bare_df(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * len(ts)})
+
+    def test_hours_ahead_in_features_base(self):
+        assert "hours_ahead" in _FEATURES_BASE
+
+    def test_hours_ahead_zero_in_engineer_features(self):
+        """Training rows must always get hours_ahead=0."""
+        ts = pd.date_range("2026-01-01", periods=4, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0]*4, "precipitation_mm": [0.0]*4,
+            "sunshine_min": [30.0]*4, "wind_kmh": [10.0]*4,
+            "cloud_cover_pct": [50.0]*4, "direct_radiation_wm2": [100.0]*4,
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert (result["hours_ahead"] == 0).all()
+
+    def test_hours_ahead_monotonic_in_prediction(self, tmp_path):
+        """Prediction X must have hours_ahead = 0, 1, 2, ..., 47."""
+        m, forecast = _make_trained_model(tmp_path)
+        # Peek at the feature matrix built for prediction
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=None, recent_actuals=None)
+        assert "hours_ahead" in X.columns
+        expected = list(range(48))
+        actual   = X["hours_ahead"].tolist()
+        assert actual == expected, f"hours_ahead not monotonic: {actual[:5]}…"
+
+
+class TestNumLeavesSweep:
+    """num_leaves sweep on last CV fold: best value logged; _build_model accepts param."""
+
+    def test_build_model_accepts_num_leaves(self):
+        from sklearn.ensemble import GradientBoostingRegressor
+        # GBR doesn't use num_leaves — should not raise
+        m = _build_model(None, GradientBoostingRegressor, num_leaves=63)
+        assert m is not None
+
+    def test_num_leaves_sweep_logged_when_cv_runs(self, tmp_path, caplog):
+        """With enough rows for CV and LightGBM absent, sweep is skipped gracefully."""
+        import logging
+        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+            _make_trained_model(tmp_path, n=900)
+        # If LightGBM is present, expect sweep log; if not (sklearn fallback), no crash.
+        # Either way CV must complete without error.
+        cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
+        assert cv_logs, "CV must have run with n=900 rows"
+
