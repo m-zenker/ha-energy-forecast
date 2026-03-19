@@ -45,7 +45,7 @@ energy_forecast:
 
   # ── Optional ────────────────────────────────────────────────────────────────
   # outdoor_temp_sensor: sensor.outdoor_temperature
-  timezone: Europe/Zurich
+  timezone: Europe/Zurich  # ← change if you're outside Switzerland (IANA timezone name)
 
   # Optional: exponential sample weight half-life in days (default: 90).
   # Lower = recent data matters more. Set to 0 to disable weighting.

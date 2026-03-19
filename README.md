@@ -124,7 +124,7 @@ The above configuration is also available as [`ha_appdaemon_config.yaml`](ha_app
 
    > `apps.yaml` is **gitignored** in this repo because it contains API credentials. Never commit it.
 
-3. **Restart AppDaemon.** The add-on will run the `init_commands` to install dependencies, then start the app. Watch the AppDaemon log for:
+4. **Restart AppDaemon.** The add-on will run the `init_commands` to install dependencies, then start the app. Watch the AppDaemon log for:
    ```
    HA Energy Forecast initialising…
    ML engine: LightGBM
@@ -132,7 +132,7 @@ The above configuration is also available as [`ha_appdaemon_config.yaml`](ha_app
    HA Energy Forecast ready.
    ```
 
-4. **Initial training** runs ~10 seconds after startup. If you have fewer than 48 hours of history the app will log a warning and skip training until more data accumulates. See [Backfilling history](#backfilling-history) to import years of history from the HA SQLite database.
+5. **Initial training** runs ~10 seconds after startup. If you have fewer than 48 hours of history the app will log a warning and skip training until more data accumulates. See [Backfilling history](#backfilling-history) to import years of history from the HA SQLite database.
 
 ---
 
@@ -187,7 +187,6 @@ energy_forecast:
 | `energy_sensor` | Yes | — | Entity ID of your cumulative grid-import kWh meter (`state_class: total_increasing`) |
 | `latitude` | Yes | — | Home latitude in decimal degrees |
 | `longitude` | Yes | — | Home longitude in decimal degrees |
-| `plz` | No | — | Swiss postal code. Accepted for backward compatibility but no longer used — the nearest SRG-SSR weather station is resolved from `latitude`/`longitude` |
 | `srg_client_id` | No | — | SRG-SSR API client ID. If absent, Open-Meteo is used |
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
@@ -199,6 +198,8 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+
+> **Deprecated:** `plz` (Swiss postal code) is silently accepted for backward compatibility but has no effect. The nearest SRG-SSR weather station is resolved from `latitude`/`longitude`. You can remove it from existing configs.
 
 ---
 
@@ -252,6 +253,7 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | Entity ID | Description |
 |-----------|-------------|
 | `sensor.energy_forecast_model_mae` | Model mean absolute error (kWh). Attributes include `cv_mae`, `model_engine`, `last_trained` |
+| `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
 
 ---
 
@@ -389,14 +391,14 @@ sub_energy_sensors:
   - sensor.dishwasher_energy_kwh
 ```
 
-For each sensor the model gains two features:
+For each sensor the model gains four features:
 
-| Feature | Value |
-|---------|-------|
-| `sub_<name>_lag_24h` | kWh consumed at the same hour yesterday |
-| `sub_<name>_lag_168h` | kWh consumed at the same hour last week |
-
-`lag_168h` is only enabled once ≥ 268 hours of data are available for that sensor.
+| Feature | Value | Activation |
+|---------|-------|------------|
+| `sub_<name>_lag_24h` | kWh consumed at the same hour yesterday | always |
+| `sub_<name>_lag_168h` | kWh consumed at the same hour last week | ≥ 268 h of sub-sensor history |
+| `sub_<name>_active_24h` | 1 if the appliance had any non-zero reading in the past 24 h, else 0 | always |
+| `sub_<name>_runs_7d` | Number of on/off cycles (0 → >0 transitions) in the past 7 days | always |
 
 **Requirements:**
 - The sensor must be a `total_increasing` cumulative kWh meter (same type as `energy_sensor`). Power sensors (W or kW) must first be integrated into a kWh template helper in HA.
@@ -429,7 +431,7 @@ For each sensor the model gains two features:
 
 **Forecast accuracy is poor in the first few weeks**
 - The model needs at least a few weeks of data to learn daily and weekly patterns. Use the backfill tool to give it a head start.
-- Check `sensor.energy_forecast_model_mae` — a MAE below 0.3 kWh indicates a well-fitted model.
+- Check `sensor.energy_forecast_model_mae` — as a rough guide, MAE below ~15% of your average hourly consumption suggests a well-fitted model (e.g. below 0.3 kWh for a household averaging ~2 kWh/h). Larger homes or those with EV/heat-pump loads will have proportionally higher absolute MAE.
 
 **DST fall-back warning in the log**
 - `DST fall-back: N rows share M duplicate naive timestamp(s) after merge` is expected on the last Sunday of October. It is informational — the merge still completes correctly.

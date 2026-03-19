@@ -50,6 +50,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `conftest.py` hassapi stub comment expanded to explain the purpose.
 - README features table rewritten to cover stages 2–5 additions; sub-sensor feature list
   updated to include `active_24h` and `runs_7d`; activation-threshold wording corrected.
+- README Installation step numbering fixed (duplicate step 3 renumbered to 4/5).
+- README Published Sensors: `sensor.energy_forecast_setup_status` documented in Model diagnostics table.
+- README Sub-energy sensors: feature table expanded to show all four features (`lag_24h`, `lag_168h`, `active_24h`, `runs_7d`) with activation thresholds.
+- README Parameter reference: deprecated `plz` parameter removed from table; replaced with a brief callout note.
+- README Troubleshooting: MAE guidance reframed as a percentage of average hourly consumption rather than a fixed threshold.
+- CHANGELOG version comparison links added for v0.4.0–v0.5.0; `[Unreleased]` pointer corrected to `v0.5.0...HEAD`.
+- `apps.yaml.example`: `timezone` line annotated with a change hint for non-Swiss users.
 
 ---
 
@@ -299,7 +306,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.3.0...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.0...HEAD
+[0.5.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.5...v0.5.0
+[0.4.5]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.4...v0.4.5
+[0.4.4]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.3...v0.4.4
+[0.4.3]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.2...v0.4.3
+[0.4.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.1...v0.4.2
+[0.4.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.0...v0.4.1
+[0.4.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.3.0...v0.4.0
 [0.3.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.1...v0.3.0
 [0.2.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.0...v0.2.1
 [0.2.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.1.0...v0.2.0
