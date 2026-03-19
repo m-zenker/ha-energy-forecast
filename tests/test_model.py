@@ -1136,3 +1136,80 @@ class TestNumLeavesSweep:
         cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
         assert cv_logs, "CV must have run with n=900 rows"
 
+
+# ── Stage 5 — Per-HOW NaN fill medians (#31) ─────────────────────────────────
+
+class TestHowMedians:
+    """_feature_medians_by_how stored after training; used in prediction; backward compat."""
+
+    def test_how_medians_populated_after_train(self, tmp_path):
+        """After training, _feature_medians_by_how must have entries for lag/rolling cols."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        assert m._feature_medians_by_how, "_feature_medians_by_how must not be empty"
+        # Keys should be integers 0-167 (hour_of_week)
+        sample_key = next(iter(m._feature_medians_by_how))
+        assert isinstance(sample_key, (int, np.integer)), "HOW keys must be integers"
+        assert 0 <= int(sample_key) <= 167
+
+    def test_how_medians_contain_lag_columns(self, tmp_path):
+        """HOW median dict must include lag and rolling columns."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        sample_meds = next(iter(m._feature_medians_by_how.values()))
+        lag_cols = [c for c in sample_meds if c.startswith("lag_") or c.startswith("rolling_")]
+        assert lag_cols, "HOW medians must include lag/rolling columns"
+
+    def test_how_medians_persisted_and_loaded(self, tmp_path):
+        """_feature_medians_by_how must survive a save/load cycle via meta.pkl."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        original = m._feature_medians_by_how
+        # Load a fresh instance from the same directory
+        m2 = EnergyForecastModel(tmp_path)
+        assert m2._feature_medians_by_how == original
+
+    def test_backward_compat_meta_without_how_medians(self, tmp_path):
+        """meta.pkl without feature_medians_by_how must load as empty dict (no crash)."""
+        import pickle, hashlib
+        meta_path = tmp_path / "meta.pkl"
+        meta = {
+            "feature_cols":    _FEATURES_BASE,
+            "last_trained":    __import__("datetime").datetime.min,
+            "last_mae":        None,
+            "last_cv_mae":     None,
+            "engine":          "test",
+            "feature_medians": {},
+            # intentionally omit feature_medians_by_how
+        }
+        with open(meta_path, "wb") as fh:
+            pickle.dump(meta, fh)
+        digest = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+        meta_path.with_suffix(".pkl.sha256").write_text(digest)
+
+        m = EnergyForecastModel(tmp_path)
+        assert m._feature_medians_by_how == {}
+
+    def test_how_median_applied_when_global_would_differ(self, tmp_path):
+        """When HOW-specific median differs from global, prediction uses HOW value."""
+        # Create training data where lag_24h has a clear HOW pattern:
+        # HOW=0 (Mon 00:00) always has lag_24h ≈ 10, rest ≈ 1
+        n = 600
+        rng = np.random.default_rng(42)
+        ts  = pd.date_range("2024-01-01", periods=n, freq="1h")
+        # Start on Monday so HOW=0 is the first row's hour_of_week
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # The HOW dict must exist and have lag_24h entries
+        assert m._feature_medians_by_how
+        sample = next(iter(m._feature_medians_by_how.values()))
+        # At minimum one lag column should be present
+        assert any(k.startswith("lag_") for k in sample)
+

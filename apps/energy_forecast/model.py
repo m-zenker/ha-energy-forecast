@@ -167,7 +167,8 @@ class EnergyForecastModel:
         self.last_mae: float | None        = None
         self.last_cv_mae: float | None     = None   # cross-validated MAE
         self.engine: str                   = "not trained"
-        self._feature_medians: dict        = {}     # used to fill NaN at predict time
+        self._feature_medians: dict        = {}     # global medians — used to fill NaN at predict time
+        self._feature_medians_by_how: dict = {}     # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
@@ -279,6 +280,27 @@ class EnergyForecastModel:
         self._feature_medians = {
             col: float(df[col].median()) for col in feature_cols if col in df.columns
         }
+
+        # Per-hour-of-week medians for lag and rolling columns (#31).
+        # These columns vary significantly by HOW (e.g. lag_24h at Monday 08:00
+        # differs from Saturday 08:00), so HOW-specific imputation is more accurate
+        # than the global median when recent actuals are sparse.
+        # Falls back to global median when a HOW bucket has no data.
+        how_cols = [
+            c for c in feature_cols
+            if (c.startswith("lag_") or c.startswith("rolling_") or
+                "_lag_" in c)          # sub-sensor lags: e.g. sub_hp_lag_24h
+            and c in df.columns
+        ]
+        if how_cols and "hour_of_week" in df.columns:
+            how_med = (
+                df.groupby("hour_of_week")[how_cols]
+                .median()
+                .to_dict(orient="index")    # {how: {col: median}}
+            )
+            self._feature_medians_by_how = how_med
+        else:
+            self._feature_medians_by_how = {}
 
         X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
         y = df["gross_kwh"].values
@@ -492,9 +514,25 @@ class EnergyForecastModel:
         # populate the real horizon so the model can learn near-vs-far bias.
         feat_df["hours_ahead"] = np.arange(len(feat_df))
 
+        # Build per-HOW fill lookups once (for lag/rolling cols with HOW-specific medians).
+        # For each such column, map hour_of_week → stored HOW median.
+        how_fill_lookup: dict[str, "pd.Series"] = {}
+        if self._feature_medians_by_how and "hour_of_week" in feat_df.columns:
+            sample_meds = next(iter(self._feature_medians_by_how.values()), {})
+            for col in sample_meds:
+                how_fill_lookup[col] = pd.Series(
+                    {how: meds.get(col) for how, meds in self._feature_medians_by_how.items()}
+                )
+
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
-                feat_df[col] = feat_df[col].fillna(self._feature_medians.get(col, 0.0))
+                global_med = self._feature_medians.get(col, 0.0)
+                if col in how_fill_lookup and "hour_of_week" in feat_df.columns:
+                    # HOW-specific fill; fall back to global median for empty HOW buckets
+                    how_fill = feat_df["hour_of_week"].map(how_fill_lookup[col]).fillna(global_med)
+                    feat_df[col] = feat_df[col].where(feat_df[col].notna(), how_fill)
+                else:
+                    feat_df[col] = feat_df[col].fillna(global_med)
 
         X = feat_df[self.feature_cols].fillna(0)
         return future_hours, X
@@ -563,16 +601,17 @@ class EnergyForecastModel:
         _write_hash(self._model_path)
 
         meta = {
-            "feature_cols":          self.feature_cols,
-            "last_trained":          self.last_trained,
-            "last_mae":              self.last_mae,
-            "last_cv_mae":           self.last_cv_mae,
-            "engine":                self.engine,
-            "feature_medians":       self._feature_medians,
-            "log_transform":         self._log_transform,
-            "canton":                self._canton,
-            "likely_ev_hours":       self._likely_ev_hours,
-            "sub_sensor_prefixes":   self._sub_sensor_prefixes,
+            "feature_cols":              self.feature_cols,
+            "last_trained":              self.last_trained,
+            "last_mae":                  self.last_mae,
+            "last_cv_mae":               self.last_cv_mae,
+            "engine":                    self.engine,
+            "feature_medians":           self._feature_medians,
+            "feature_medians_by_how":    self._feature_medians_by_how,
+            "log_transform":             self._log_transform,
+            "canton":                    self._canton,
+            "likely_ev_hours":           self._likely_ev_hours,
+            "sub_sensor_prefixes":       self._sub_sensor_prefixes,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -636,6 +675,7 @@ class EnergyForecastModel:
                     self.last_cv_mae           = meta.get("last_cv_mae")
                     self.engine                = meta.get("engine",                "unknown")
                     self._feature_medians      = meta.get("feature_medians",       {})
+                    self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform        = meta.get("log_transform",         False)
                     self._canton               = meta.get("canton",                None)
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())

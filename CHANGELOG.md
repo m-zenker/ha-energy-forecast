@@ -10,6 +10,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.5] — 2026-03-19
+
+### Added
+- **Per-hour-of-week NaN fill medians** (`model.py`, #31): during training, per-HOW
+  (168-cell) medians are computed for all lag and rolling columns and stored as
+  `feature_medians_by_how` in `meta.pkl`.  At predict time, NaN values in these columns
+  are filled using the HOW-specific median for the matching `hour_of_week` slot, falling
+  back to the global median when the HOW bucket is empty.  Backward compatible — old
+  `meta.pkl` without this key silently defaults to global-median behaviour.
+
+---
+
 ## [0.4.4] — 2026-03-19
 
 ### Added
