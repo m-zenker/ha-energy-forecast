@@ -108,10 +108,12 @@ def fetch_energy_history(
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
 
-    # 5. Save back to CSV
+    # 5. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
+    # This also corrects any stale values that slipped through fetch_recent_energy's
+    # append-only path (HA-wins corrections are applied here on the next retrain).
     try:
         combined.to_csv(cache_path, index=False)
-        app.log(f"Cache updated. Total history: {len(combined)} hours.")
+        app.log(f"Cache compacted. Total history: {len(combined)} hours.")
     except OSError as e:
         app.log(f"Failed to save cache: {e}", level="ERROR")
 
@@ -161,14 +163,21 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     else:
         df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
 
-    # 4. Merge — fresh HA data wins on timestamp conflicts
+    # 4. Merge — fresh HA data wins on timestamp conflicts (for return value)
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
 
-    try:
-        combined.to_csv(cache_path, index=False)
-    except OSError as e:
-        app.log(f"Failed to save cache: {e}", level="ERROR")
+    # 5. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
+    # Timestamps already in the cache are not re-written; any HA-wins corrections for
+    # existing rows will be fixed during the next weekly fetch_energy_history compaction.
+    existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
+    new_rows = combined[~combined["timestamp"].isin(existing_ts)]
+    if not new_rows.empty:
+        write_header = not cache_path.exists() or cache_path.stat().st_size == 0
+        try:
+            new_rows.to_csv(cache_path, mode="a", header=write_header, index=False)
+        except OSError as e:
+            app.log(f"Failed to save cache: {e}", level="ERROR")
 
     return combined
 

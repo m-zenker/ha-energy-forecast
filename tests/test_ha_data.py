@@ -533,3 +533,81 @@ class TestFetchSubSensorHistory:
         mock_app.log.assert_called_once()
         args, kwargs = mock_app.log.call_args
         assert kwargs.get("level") == "WARNING"
+
+
+# ── Stage 6 — CSV append-only writes (#19) ────────────────────────────────────
+
+class TestCsvAppendOnlyWrites:
+    """fetch_recent_energy must only append new timestamps, not rewrite the whole CSV."""
+
+    def test_append_does_not_duplicate_existing_rows(self, mock_app, tmp_path):
+        """Rows already in the CSV cache must not appear twice after fetch_recent_energy."""
+        cache_path = tmp_path / "energy_history.csv"
+        # Pre-populate cache with one row
+        existing = make_energy_df(["2024-01-01 09:00"], [1.0])
+        existing.to_csv(cache_path, index=False)
+
+        # HA returns the same timestamp with slightly different value (edge-case)
+        ha_raw = make_ha_raw(
+            ["2024-01-01T07:00:00Z", "2024-01-01T08:00:00Z"],
+            [100.0, 101.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = pd.read_csv(cache_path)
+        # No duplicate timestamps in the saved CSV
+        assert saved["timestamp"].duplicated().sum() == 0
+
+    def test_new_rows_appended_to_csv(self, mock_app, tmp_path):
+        """Genuinely new rows from HA must appear in the CSV after fetch_recent_energy."""
+        cache_path = tmp_path / "energy_history.csv"
+        # Cache has one row at 09:00; HA brings a new row at 10:00
+        make_energy_df(["2024-01-01 09:00"], [0.8]).to_csv(cache_path, index=False)
+
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 101.5],    # diff at 10:00 local = 1.5 kWh
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = pd.read_csv(cache_path)
+        saved_ts = pd.to_datetime(saved["timestamp"])
+        # New row at 10:00 local (09:00 UTC + 1h) must be in the CSV
+        assert pd.Timestamp("2024-01-01 10:00") in saved_ts.values
+
+    def test_csv_created_when_not_exists(self, mock_app, tmp_path):
+        """When no cache file exists, fetch_recent_energy creates it on first write."""
+        cache_path = tmp_path / "energy_history.csv"
+        assert not cache_path.exists()
+
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 101.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert cache_path.exists()
+        saved = pd.read_csv(cache_path)
+        assert len(saved) >= 1
+
+    def test_fetch_energy_history_compacts_and_deduplicates(self, mock_app, tmp_path):
+        """fetch_energy_history must write a sorted, deduped CSV (compaction)."""
+        cache_path = tmp_path / "energy_history.csv"
+        # Pre-populate with out-of-order rows and a duplicate
+        make_energy_df(
+            ["2024-01-01 11:00", "2024-01-01 09:00", "2024-01-01 10:00", "2024-01-01 10:00"],
+            [1.0, 0.5, 0.8, 0.8],
+        ).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = pd.read_csv(cache_path)
+        saved_ts = pd.to_datetime(saved["timestamp"])
+        # Sorted ascending
+        assert list(saved_ts) == sorted(saved_ts)
+        # No duplicates
+        assert saved_ts.duplicated().sum() == 0

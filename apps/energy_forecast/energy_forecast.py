@@ -75,6 +75,7 @@ class EnergyForecast(hass.Hass):
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
 
+        self._check_setup()
         self._publish_unavailable()
         self.run_in(self._retrain_cb, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
@@ -122,6 +123,54 @@ class EnergyForecast(hass.Hass):
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}"
         )
+
+    # ── Setup checker ─────────────────────────────────────────────────────────
+
+    def _check_setup(self) -> None:
+        """Publish sensor.energy_forecast_setup_status with import diagnostics.
+
+        State is "ok" when all required packages are importable.  If a package
+        is missing the state is "missing_packages" and the attributes list which
+        ones failed, so users can diagnose install issues from HA dev tools
+        without reading AppDaemon logs.
+        """
+        _REQUIRED = [
+            ("pandas",    "pandas"),
+            ("numpy",     "numpy"),
+            ("sklearn",   "scikit-learn"),
+            ("requests",  "requests"),
+            ("holidays",  "holidays"),
+        ]
+        missing: list[str] = []
+        for module, pip_name in _REQUIRED:
+            try:
+                __import__(module)
+            except ImportError:
+                missing.append(pip_name)
+
+        if missing:
+            state = "missing_packages"
+            self.log(
+                f"Setup check: missing packages — {missing}. "
+                "Install them via AppDaemon add-on configuration.",
+                level="WARNING",
+            )
+        else:
+            state = "ok"
+
+        try:
+            self.set_state(
+                "sensor.energy_forecast_setup_status",
+                state=state,
+                attributes={
+                    "friendly_name": "Energy Forecast Setup Status",
+                    "missing_packages": missing,
+                    "icon": "mdi:check-circle" if state == "ok" else "mdi:alert-circle",
+                },
+                replace=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Could not publish setup status sensor: {exc}", level="WARNING")
 
     # ── Sub-sensor helpers ────────────────────────────────────────────────────
 

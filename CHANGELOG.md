@@ -10,6 +10,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.5.0] — 2026-03-19
+
+### Added
+- **Setup checker sensor** (`energy_forecast.py`, #17): `_check_setup()` is called on
+  `initialize()` and publishes `sensor.energy_forecast_setup_status` (state: `ok` or
+  `missing_packages`).  The `missing_packages` attribute lists which pip packages failed
+  to import, so users can diagnose install issues directly from HA Developer Tools without
+  reading AppDaemon logs.
+
+### Changed
+- **CSV append-only writes** (`ha_data.py`, #19): `fetch_recent_energy` (hourly) now
+  appends only genuinely new timestamps to the cache CSV instead of rewriting the entire
+  file on every sensor update.  `fetch_energy_history` (weekly retrain) continues to do a
+  full sort + dedup compaction rewrite, which also corrects any stale values that bypassed
+  the append-only path.
+
+---
+
 ## [0.4.5] — 2026-03-19
 
 ### Added
