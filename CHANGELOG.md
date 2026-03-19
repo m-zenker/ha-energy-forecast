@@ -9,13 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- **`unique_id` + MDI icons on all published sensors** (`energy_forecast.py`): every
-  `set_state()` call now includes `"unique_id"` in the attributes dict, causing AppDaemon
-  4.4+ to register the entity in HA's entity registry on first creation — enabling area
-  assignment, labels, and UI renaming.  Icons added: `mdi:lightning-bolt` (forecast totals
-  and 3h blocks), `mdi:arrow-down-bold` / `mdi:arrow-up-bold` (prediction interval low/high),
-  `mdi:calendar-clock` (3-hour block sensors), `mdi:car-electric` (EV sensors),
-  `mdi:chart-bell-curve-cumulative` (model MAE sensor).
+- **MDI icons on all published sensors** (`energy_forecast.py`): every `set_state()` call
+  now carries a `"unique_id"` attribute (stable identifier = entity_id minus `sensor.` prefix,
+  reserved for future MQTT Discovery integration) and an `"icon"` attribute.  Icons:
+  `mdi:lightning-bolt` (forecast totals + unavailable placeholders), `mdi:arrow-down-bold` /
+  `mdi:arrow-up-bold` (prediction interval low/high), `mdi:calendar-clock` (3-hour block
+  sensors), `mdi:car-electric` (EV sensors), `mdi:chart-bell-curve-cumulative` (model MAE).
+
+  **Note:** AppDaemon's `set_state()` writes to HA's state machine only; it does not register
+  entities in the entity registry.  Area assignment and labels require MQTT Discovery (roadmap
+  item #37).
 
 ---
 

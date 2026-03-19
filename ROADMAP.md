@@ -268,6 +268,14 @@ Implementation: in `_add_sub_sensor_lags_training`, compute
 `{prefix}_runs_7d` to the feature list.
 Expected impact: **LOW–MEDIUM**; Low effort.
 
+### 37. MQTT Discovery for entity registry *(planned)*
+Publish `homeassistant/sensor/<id>/config` payloads on `initialize()` so HA registers all
+`energy_forecast_*` sensors in the entity registry (enables area assignment, labels, UI
+renaming). Requires Mosquitto add-on or any MQTT broker. State updates switch from
+`set_state()` to `mqtt_publish()` on the corresponding state topics. Optional: falls back
+to `set_state()` if `mqtt_host` not configured. Stable `unique_id` values are already
+embedded in sensor attributes as preparation.
+
 ---
 
 ## Summary
@@ -310,3 +318,4 @@ Expected impact: **LOW–MEDIUM**; Low effort.
 | 34 | `hours_ahead` horizon feature | low | 1 h | ✓ done |
 | 35 | Sub-sensor binary activity flag (`{prefix}_active_24h`) | low–medium | 30 min | ✓ done |
 | 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | ✓ done |
+| 37 | MQTT Discovery for entity registry | UX / install | 4 h | planned |
