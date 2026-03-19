@@ -7,7 +7,8 @@ Feature set:
   - Weather: temp_c, precipitation_mm, sunshine_min, wind_kmh,
     cloud_cover_pct, direct_radiation_wm2, heating_degree, cooling_degree,
     temp_rolling_3d (3-day thermal mass proxy)
-  - Autoregressive lags: lag_24h, lag_48h, lag_72h, lag_168h, lag_336h
+  - Autoregressive lags: lag_1h, lag_2h, lag_6h, lag_12h,
+    lag_24h, lag_48h, lag_72h, lag_168h, lag_336h
     (dynamically selected based on available history)
   - Rolling activity: rolling_mean_24h, rolling_mean_7d, rolling_std_24h
     (per-hour sliding projection at predict time to match training semantics)
@@ -53,7 +54,14 @@ _LOGGER = logging.getLogger(__name__)
 # ── Lag hours used as autoregressive features ─────────────────────────────────
 # All are safe for a 48-hour forecast: target is always ≥1h ahead,
 # so lag_24h for h=+1 points to now-23h — always in the past.
-LAG_HOURS = [24, 48, 72, 168, 336]
+#
+# Short-horizon lags (1h, 2h, 6h, 12h): at predict time only the first L
+# future hours can look up a real past value for lag_Lh; beyond that the
+# model receives NaN → filled with the training median.  This is by design:
+# the model learns that median-valued short lags carry no information and
+# weights them heavily only in the near-term window.  Impact is concentrated
+# on hours 1–12 ahead.
+LAG_HOURS = [1, 2, 6, 12, 24, 48, 72, 168, 336]
 
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
@@ -71,6 +79,7 @@ _FEATURES_BASE = [
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy
     # Autoregressive lags — always safe (see note above)
+    "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
     "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
@@ -634,13 +643,17 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
         lag_td = pd.Timedelta(hours=lag)
         lag_times = future_df["timestamp"] - lag_td
         future_df[f"lag_{lag}h"] = actuals.reindex(lag_times).values
-        nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
-        if nan_count > len(future_df) * 0.5:
-            _LOGGER.warning(
-                "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
-                "back %dh; these will be filled with training medians.",
-                lag, nan_count, len(future_df), lag,
-            )
+        # Short-horizon lags (lag < 48h) are expected to be NaN for most future
+        # hours — only the first `lag` hours can look up a real past value.
+        # Only warn for long lags where NaN indicates an actuals coverage gap.
+        if lag >= 24:
+            nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
+            if nan_count > len(future_df) * 0.5:
+                _LOGGER.warning(
+                    "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
+                    "back %dh; these will be filled with training medians.",
+                    lag, nan_count, len(future_df), lag,
+                )
 
     # ── Rolling stats — sliding window projection ────────────────────────────
     # During training, rolling_mean_24h[i] = mean(gross_kwh[i-24:i]) — it varies

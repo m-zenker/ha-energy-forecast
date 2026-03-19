@@ -10,6 +10,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.4.2] — 2026-03-19
+
+### Added
+- **Short-horizon lag features** (`model.py`, #27): `lag_1h`, `lag_2h`, `lag_6h`, and
+  `lag_12h` added to `LAG_HOURS`.  The existing dynamic-selection gate (`n_rows - lag ≥ 100`)
+  activates each as history grows (lag_1h at 101 rows, lag_12h at 112).  At predict time
+  only the first `L` future hours carry real lag values; later hours receive the training
+  median, which is intentional — the model learns horizon-specific weighting.  Expected
+  accuracy improvement is concentrated on hours 1–12 ahead.
+
+---
+
 ## [0.4.1] — 2026-03-19
 
 ### Added

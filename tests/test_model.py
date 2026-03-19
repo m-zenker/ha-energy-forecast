@@ -241,6 +241,103 @@ class TestLag72h:
         assert result["lag_72h"].isna().all()
 
 
+# ── Stage 2 — Short-horizon lags (#27) ────────────────────────────────────────
+
+class TestShortHorizonLags:
+    """lag_1h, lag_2h, lag_6h, lag_12h: presence, values, thresholds, backward compat."""
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_in_lag_hours(self, lag):
+        assert lag in LAG_HOURS
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_present_in_prediction_output(self, lag):
+        result = _add_lag_and_rolling_prediction(_make_future_df(), _make_actuals(200))
+        assert f"lag_{lag}h" in result.columns
+
+    def test_lag_1h_value_matches_actuals(self):
+        """lag_1h at h=0 must equal the actual at (future_ts[0] - 1h)."""
+        actuals_df = _make_actuals(200)
+        future_df  = _make_future_df()
+        result = _add_lag_and_rolling_prediction(future_df, actuals_df)
+        actuals_ser = (
+            actuals_df.set_index(pd.to_datetime(actuals_df["timestamp"]))["gross_kwh"]
+            .sort_index()
+        )
+        ts = future_df["timestamp"].iloc[0] - pd.Timedelta(hours=1)
+        expected = actuals_ser.get(ts, float("nan"))
+        if not np.isnan(expected):
+            assert abs(result["lag_1h"].iloc[0] - expected) < 1e-9
+
+    def test_lag_1h_nan_for_far_future_hours(self):
+        """lag_1h for h≥2 must be NaN — those lookup times are in the future."""
+        actuals_df = _make_actuals(200)
+        result = _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
+        # hours h=2..47 need actuals at (now+h-1h) which are not in recent history
+        assert result["lag_1h"].iloc[2:].isna().all()
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_all_nan_when_no_actuals(self, lag):
+        """With no recent actuals, short lag columns must be all NaN."""
+        result = _add_lag_and_rolling_prediction(_make_future_df(), None)
+        assert result[f"lag_{lag}h"].isna().all()
+
+    def test_short_lags_in_feature_cols_after_train(self, tmp_path):
+        """Short lags must appear in feature_cols after training with ≥112 rows (lag_12h threshold)."""
+        n = 250  # 250 - 12 = 238 ≥ 100 → lag_12h active; 250 - 24 = 226 ≥ 100 → lag_24h active
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(7)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        for lag in (1, 2, 6, 12):
+            assert f"lag_{lag}h" in m.feature_cols, f"lag_{lag}h missing from feature_cols"
+
+    def test_short_lags_skipped_when_too_few_rows(self, tmp_path):
+        """With exactly 100 rows, ALL lags (including short ones) are skipped by the dynamic gate."""
+        n = 100  # n - lag >= 100 fails for all lags when n=100 and min lag=1 → 100-1=99 < 100
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(8)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # With 100 rows, training should skip (need ≥100 rows after dropna)
+        # model may be None (not enough clean rows after dropna+filter)
+        if m.model is not None:
+            for lag in (1, 2, 6, 12):
+                assert f"lag_{lag}h" not in m.feature_cols
+
+    def test_no_nan_warning_for_short_lags(self, caplog):
+        """Short lags must NOT emit the NaN coverage warning even though most hours are NaN."""
+        import logging
+        actuals_df = _make_actuals(200)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
+        for rec in caplog.records:
+            assert "lag_1h" not in rec.message
+            assert "lag_2h" not in rec.message
+            assert "lag_6h" not in rec.message
+            assert "lag_12h" not in rec.message
+
+
 # ── Bridge-day holiday features ───────────────────────────────────────────────
 
 def _make_ts_df(dates: list[str]) -> pd.DataFrame:
