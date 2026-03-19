@@ -311,6 +311,11 @@ class EnergyForecastModel:
                     # MAE reported in original kWh space (expm1 undoes log1p)
                     fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
+                cv_std = round(float(np.std(fold_maes)), 4)
+                _LOGGER.info(
+                    "CV fold MAEs: %s → mean=%.4f ± %.4f",
+                    [round(m, 4) for m in fold_maes], cv_mae, cv_std,
+                )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
 
@@ -323,6 +328,18 @@ class EnergyForecastModel:
             model.fit(X, y_fit, sample_weight=sample_weight)
         else:
             model.fit(X, y_fit)
+
+        # ── Feature importance (top 10, log-scale gains) ─────────────────────
+        if hasattr(model, "feature_importances_"):
+            top = sorted(
+                zip(feature_cols, model.feature_importances_),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:10]
+            _LOGGER.info(
+                "Feature importances (top 10): %s",
+                ", ".join(f"{n}={v:.0f}" for n, v in top),
+            )
 
         # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
         holdout_mae = None
@@ -865,8 +882,8 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
     `holidays` package is not installed.
     """
     try:
-        import bisect  # noqa: PLC0415
         import holidays as hd  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
         import pandas as pd
 
         # Extend by ±1 year so dates near year boundaries (e.g. Dec 31)
@@ -889,22 +906,32 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
 
         df["is_public_holiday"] = dates.isin(set(ch_holidays.keys())).astype(int)
 
-        def _days_to_next(d):
-            # bisect_left: if d is a holiday, idx points to d → distance 0
-            idx = bisect.bisect_left(holiday_dates, d)
-            if idx >= len(holiday_dates):
-                return _BRIDGE_CAP
-            return min(_BRIDGE_CAP, (holiday_dates[idx] - d).days)
+        if holiday_dates:
+            # Vectorised distance computation via ordinals + np.searchsorted.
+            # bisect_left semantics: on a holiday, idx points to the holiday → distance 0.
+            holiday_ords = np.array([d.toordinal() for d in holiday_dates])
+            date_ords    = np.array([d.toordinal() for d in dates])
 
-        def _days_since_last(d):
-            # bisect_right - 1: if d is a holiday, idx points to d → distance 0
-            idx = bisect.bisect_right(holiday_dates, d) - 1
-            if idx < 0:
-                return _BRIDGE_CAP
-            return min(_BRIDGE_CAP, (d - holiday_dates[idx]).days)
+            idx_next  = np.searchsorted(holiday_ords, date_ords, side="left")
+            safe_next = np.minimum(idx_next, len(holiday_ords) - 1)
+            days_next = np.where(
+                idx_next >= len(holiday_ords),
+                _BRIDGE_CAP,
+                holiday_ords[safe_next] - date_ords,
+            )
+            df["days_to_next_holiday"] = np.minimum(_BRIDGE_CAP, days_next).astype(int)
 
-        df["days_to_next_holiday"]    = dates.map(_days_to_next).astype(int)
-        df["days_since_last_holiday"] = dates.map(_days_since_last).astype(int)
+            idx_prev   = np.searchsorted(holiday_ords, date_ords, side="right") - 1
+            safe_prev  = np.maximum(idx_prev, 0)
+            days_since = np.where(
+                idx_prev < 0,
+                _BRIDGE_CAP,
+                date_ords - holiday_ords[safe_prev],
+            )
+            df["days_since_last_holiday"] = np.minimum(_BRIDGE_CAP, days_since).astype(int)
+        else:
+            df["days_to_next_holiday"]    = _BRIDGE_CAP
+            df["days_since_last_holiday"] = _BRIDGE_CAP
 
     except ImportError:
         df["is_public_holiday"]       = 0

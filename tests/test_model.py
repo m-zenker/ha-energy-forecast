@@ -771,3 +771,61 @@ class TestSubSensorFeatures:
         assert float(non_nan.iloc[0]) == pytest.approx(0.0)
         assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 
+
+# ── Stage 1 — Feature importance + CV std logging (#29, #30) ─────────────────
+
+class TestFeatureImportanceLogging:
+    """After train(), feature importances and CV fold std must be logged."""
+
+    def test_feature_importances_logged_after_training(self, tmp_path, caplog):
+        """Feature importances (top 10) must appear in logs after a successful train."""
+        import logging
+        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+            _make_trained_model(tmp_path, n=600)
+        assert any("Feature importances" in r.message for r in caplog.records), (
+            "Expected 'Feature importances' in log output after train()"
+        )
+
+    def test_cv_fold_std_logged_alongside_mean(self, tmp_path, caplog):
+        """CV fold MAE log must include both mean and ± std when CV runs (≥500 rows).
+
+        Need n≥836 so that after the lag_336h dropna there are still ≥500 clean rows
+        for TimeSeriesSplit (MIN_CV_ROWS=500).
+        """
+        import logging
+        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+            _make_trained_model(tmp_path, n=900)
+        cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
+        assert cv_logs, "Expected 'CV fold MAEs' log entry when n≥500 clean rows"
+        assert "±" in cv_logs[0], f"Expected std (±) in CV log: {cv_logs[0]}"
+
+
+# ── Stage 1 — Holiday vectorisation (#32) ─────────────────────────────────────
+
+class TestHolidayVectorisation:
+    """np.searchsorted vectorisation must give identical results to bisect."""
+
+    def test_days_to_next_zero_on_holiday(self):
+        """days_to_next_holiday must be 0 on a holiday date itself."""
+        # New Year's Day 2025 is a Swiss federal holiday
+        ts = pd.Timestamp("2025-01-01")
+        df = pd.DataFrame({"timestamp": [ts]})
+        result = _add_holiday_feature(df)
+        assert int(result["days_to_next_holiday"].iloc[0]) == 0
+
+    def test_days_since_last_zero_on_holiday(self):
+        """days_since_last_holiday must be 0 on a holiday date itself."""
+        ts = pd.Timestamp("2025-01-01")
+        df = pd.DataFrame({"timestamp": [ts]})
+        result = _add_holiday_feature(df)
+        assert int(result["days_since_last_holiday"].iloc[0]) == 0
+
+    def test_distance_columns_capped_at_bridge_cap(self):
+        """Dates far from any holiday must be capped at _BRIDGE_CAP."""
+        # Mid-July is typically far from holidays in CH (National Day = Aug 1)
+        ts = pd.Timestamp("2025-07-15")
+        df = pd.DataFrame({"timestamp": [ts]})
+        result = _add_holiday_feature(df)
+        assert int(result["days_to_next_holiday"].iloc[0]) <= _BRIDGE_CAP
+        assert int(result["days_since_last_holiday"].iloc[0]) <= _BRIDGE_CAP
+

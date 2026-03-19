@@ -8,6 +8,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.4.1] — 2026-03-19
+
+### Added
+- **Feature importance logging** (`model.py`, #29): after every training run the top-10
+  feature importances (by gain) are logged at INFO level for quick diagnostics.
+- **CV fold std logging** (`model.py`, #30): the CV MAE log line now includes
+  `mean ± std` across the three TimeSeriesSplit folds alongside the per-fold values.
+- **EV threshold / charger_kw mismatch warning** (`energy_forecast.py`, #20):
+  `_validate_config` now logs a WARNING when `ev_charging_threshold_kwh ≥ ev_charger_kw`,
+  which would prevent any EV session from being detected.
+
+### Changed
+- **Holiday distance vectorisation** (`model.py`, #32): `days_to_next_holiday` and
+  `days_since_last_holiday` are now computed via `np.searchsorted` on date ordinals
+  instead of a per-row Python `bisect` + `.map()` call. Semantics are identical.
+
+---
+
+## [0.4.0] — 2026-03-19
+
 ### Fixed
 - **NaN warning in `_add_sub_sensor_lags_training`** (`model.py`): mirrors the
   prediction-side check — logs WARNING when sub-sensor reindex introduces >50% NaN
