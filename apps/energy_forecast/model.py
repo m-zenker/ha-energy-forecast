@@ -164,6 +164,8 @@ class EnergyForecastModel:
         self._model_q90 = None
         self._model_q10_path = model_dir / "energy_model_q10.pkl"
         self._model_q90_path = model_dir / "energy_model_q90.pkl"
+        # Sub-energy sensor prefixes used in last training run
+        self._sub_sensor_prefixes: list[str] = []
 
         self._load()
 
@@ -177,6 +179,7 @@ class EnergyForecastModel:
         weight_halflife_days: float = 90.0,
         canton: str | None = None,
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
+        sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -208,6 +211,7 @@ class EnergyForecastModel:
 
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
+        df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
 
         # ── EV session probability: which hour_of_week slots charge regularly ─
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
@@ -222,7 +226,16 @@ class EnergyForecastModel:
         # only the lags that were actually computed for this training run.
         all_lag_cols = {f"lag_{l}h" for l in LAG_HOURS}
         active_lag_cols = [f"lag_{l}h" for l in active_lags]
-        base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols
+
+        # Sub-sensor lag columns: lag_24h always; lag_168h only with enough history
+        sub_sensor_cols: list[str] = []
+        if sub_sensors_dict:
+            for prefix in sub_sensors_dict:
+                sub_sensor_cols.append(f"{prefix}_lag_24h")
+                if n_rows - 168 >= 100:
+                    sub_sensor_cols.append(f"{prefix}_lag_168h")
+
+        base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = (
@@ -231,6 +244,14 @@ class EnergyForecastModel:
             and "outdoor_temp_live" in df.columns
         )
         feature_cols = sensor_features if use_sensor else base_features
+
+        # Sub-sensor lag columns can be sparsely populated during warm-up (e.g. a
+        # new sensor that started recording today).  Fill NaN with 0 before the
+        # dropna so these rows are not discarded — 0 means "appliance was off / no
+        # data", which is a safe neutral value that does not distort other features.
+        for col in sub_sensor_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna(0)
 
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
         df = df[df["gross_kwh"] > 0]
@@ -312,14 +333,15 @@ class EnergyForecastModel:
             except (ValueError, IndexError):
                 pass
 
-        self.model          = model
-        self.feature_cols   = feature_cols
-        self.last_trained   = datetime.now()
-        self.last_mae       = cv_mae if cv_mae is not None else holdout_mae
-        self.last_cv_mae    = cv_mae
-        self.engine         = engine_name
-        self._log_transform = True
-        self._canton        = canton
+        self.model                 = model
+        self.feature_cols          = feature_cols
+        self.last_trained          = datetime.now()
+        self.last_mae              = cv_mae if cv_mae is not None else holdout_mae
+        self.last_cv_mae           = cv_mae
+        self.engine                = engine_name
+        self._log_transform        = True
+        self._canton               = canton
+        self._sub_sensor_prefixes  = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
         self._save()
 
         mae_str = f"cv_MAE={cv_mae:.4f}" if cv_mae else (f"holdout_MAE={holdout_mae:.4f}" if holdout_mae else "MAE=n/a")
@@ -355,6 +377,7 @@ class EnergyForecastModel:
         forecast_df: pd.DataFrame,
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None,
+        sub_sensors_recent: dict | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -371,6 +394,7 @@ class EnergyForecastModel:
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
         future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
+        future_df = _add_sub_sensor_lags_prediction(future_df, sub_sensors_recent or {})
 
         outdoor_pred_df: pd.DataFrame | None = None
         if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
@@ -391,6 +415,7 @@ class EnergyForecastModel:
         forecast_df: pd.DataFrame,                    # naive timestamps
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
+        sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -399,7 +424,7 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals)
+        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
@@ -411,6 +436,7 @@ class EnergyForecastModel:
         forecast_df: pd.DataFrame,
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,
+        sub_sensors_recent: dict | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -423,7 +449,7 @@ class EnergyForecastModel:
         if self._model_q10 is None or self._model_q90 is None:
             return None
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals)
+        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
@@ -448,15 +474,16 @@ class EnergyForecastModel:
         _write_hash(self._model_path)
 
         meta = {
-            "feature_cols":     self.feature_cols,
-            "last_trained":     self.last_trained,
-            "last_mae":         self.last_mae,
-            "last_cv_mae":      self.last_cv_mae,
-            "engine":           self.engine,
-            "feature_medians":  self._feature_medians,
-            "log_transform":    self._log_transform,
-            "canton":           self._canton,
-            "likely_ev_hours":  self._likely_ev_hours,
+            "feature_cols":          self.feature_cols,
+            "last_trained":          self.last_trained,
+            "last_mae":              self.last_mae,
+            "last_cv_mae":           self.last_cv_mae,
+            "engine":                self.engine,
+            "feature_medians":       self._feature_medians,
+            "log_transform":         self._log_transform,
+            "canton":                self._canton,
+            "likely_ev_hours":       self._likely_ev_hours,
+            "sub_sensor_prefixes":   self._sub_sensor_prefixes,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -514,15 +541,16 @@ class EnergyForecastModel:
                 try:
                     with open(self._meta_path, "rb") as fh:
                         meta = pickle.load(fh)
-                    self.feature_cols      = meta.get("feature_cols",    _FEATURES_BASE)
-                    self.last_trained      = meta.get("last_trained",    datetime.min)
-                    self.last_mae          = meta.get("last_mae")
-                    self.last_cv_mae       = meta.get("last_cv_mae")
-                    self.engine            = meta.get("engine",          "unknown")
-                    self._feature_medians  = meta.get("feature_medians", {})
-                    self._log_transform    = meta.get("log_transform",   False)
-                    self._canton           = meta.get("canton",          None)
-                    self._likely_ev_hours  = meta.get("likely_ev_hours", set())
+                    self.feature_cols          = meta.get("feature_cols",          _FEATURES_BASE)
+                    self.last_trained          = meta.get("last_trained",          datetime.min)
+                    self.last_mae              = meta.get("last_mae")
+                    self.last_cv_mae           = meta.get("last_cv_mae")
+                    self.engine                = meta.get("engine",                "unknown")
+                    self._feature_medians      = meta.get("feature_medians",       {})
+                    self._log_transform        = meta.get("log_transform",         False)
+                    self._canton               = meta.get("canton",                None)
+                    self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
+                    self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -634,6 +662,93 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
     future_df["rolling_mean_24h"] = rm24.reindex(future_index).values
     future_df["rolling_mean_7d"]  = rm7d.reindex(future_index).values
     future_df["rolling_std_24h"]  = rs24.reindex(future_index).values
+
+    return future_df
+
+
+# ── Sub-sensor lag helpers ────────────────────────────────────────────────────
+
+def _add_sub_sensor_lags_training(
+    df: pd.DataFrame,
+    sub_sensors: dict | None,
+) -> pd.DataFrame:
+    """Add lag_24h (and optionally lag_168h) columns for each sub-sensor.
+
+    For each prefix/DataFrame pair in sub_sensors:
+    - Reindexes the sub-sensor kWh series onto the training timestamps
+    - Computes lag_24h via shift(24), lag_168h via shift(168) when n_rows ≥ 268
+
+    Returns df unchanged when sub_sensors is empty/None.
+    """
+    import pandas as pd
+
+    if not sub_sensors:
+        return df
+
+    n_rows = len(df)
+    ts_idx = pd.to_datetime(df["timestamp"])
+
+    for prefix, sub_df in sub_sensors.items():
+        if sub_df is None or sub_df.empty:
+            continue
+        sub_series = (
+            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
+            .sort_index()
+        )
+        kwh_series = pd.Series(sub_series.reindex(ts_idx).values)
+        nan_count = int(kwh_series.isna().sum())
+        if nan_count > len(kwh_series) * 0.5:
+            _LOGGER.warning(
+                "%s reindex introduces %d/%d NaN values during training — "
+                "sub-sensor data may have gaps or misaligned timestamps; "
+                "will be filled with training medians.",
+                prefix, nan_count, len(kwh_series),
+            )
+        df[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
+        if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
+            df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
+
+    return df
+
+
+def _add_sub_sensor_lags_prediction(
+    future_df: pd.DataFrame,
+    sub_sensors_recent: dict,
+) -> pd.DataFrame:
+    """Fill sub-sensor lag features for the 48-hour prediction horizon.
+
+    For each sub-sensor, reindexes the recent actuals series at
+    (timestamp - 24h) and (timestamp - 168h).  Falls back to NaN when actuals
+    don't reach far enough back (logged at WARNING).
+    """
+    import pandas as pd
+    import numpy as np
+
+    for prefix, sub_df in sub_sensors_recent.items():
+        if sub_df is None or sub_df.empty:
+            future_df[f"{prefix}_lag_24h"]  = float("nan")
+            future_df[f"{prefix}_lag_168h"] = float("nan")
+            continue
+
+        sub_series = (
+            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
+            .sort_index()
+            .astype(float)
+        )
+        for lag, col in [(24, f"{prefix}_lag_24h"), (168, f"{prefix}_lag_168h")]:
+            lag_td    = pd.Timedelta(hours=lag)
+            lag_times = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]) - lag_td)
+            # Normalise index resolution so reindex finds matches regardless of
+            # whether the CSV cache was written with ns or us precision (pandas 3.x).
+            lag_times = lag_times.as_unit(sub_series.index.unit if hasattr(sub_series.index, "unit") else "ns")
+            future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
+            nan_count = int(future_df[col].isna().sum())
+            if nan_count > len(future_df) * 0.5:
+                _LOGGER.warning(
+                    "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
+                    "will be filled with training medians.",
+                    col, nan_count, len(future_df), lag,
+                )
 
     return future_df
 

@@ -6,12 +6,45 @@ Forecasts are published as native Home Assistant sensor entities and update ever
 
 ---
 
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+  - [Home Assistant side](#home-assistant-side)
+  - [AppDaemon add-on configuration](#appdaemon-add-on-configuration)
+  - [Python packages reference](#python-packages-reference)
+- [Installation](#installation)
+- [Configuration](#configuration)
+  - [Parameter reference](#parameter-reference)
+- [Published sensors](#published-sensors)
+  - [Forecast totals](#forecast-totals)
+  - [Prediction intervals (80% confidence)](#prediction-intervals-80-confidence)
+  - [3-hour block forecasts](#3-hour-block-forecasts)
+  - [EV charging actuals](#ev-charging-actuals)
+  - [Model diagnostics](#model-diagnostics)
+- [How it works](#how-it-works)
+  - [Data pipeline](#data-pipeline)
+  - [Prediction pipeline (hourly)](#prediction-pipeline-hourly)
+  - [Schedule](#schedule)
+  - [Features used](#features-used)
+  - [Model persistence](#model-persistence)
+- [Backfilling history](#backfilling-history)
+- [Weather sources](#weather-sources)
+- [EV charging detection](#ev-charging-detection)
+- [Sub-energy sensors](#sub-energy-sensors)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Licence](#licence)
+
+---
+
 ## Features
 
 - **48-hour hourly forecast** — trained on your own consumption history, not generic averages
 - **LightGBM model** (auto-falls back to scikit-learn GBR on platforms without a C compiler, e.g. armv7)
 - **Swiss weather integration** — SRG-SSR high-resolution forecast with automatic Open-Meteo fallback
 - **EV charging detection** — EV sessions are identified and subtracted from the training signal so they don't distort household baseline forecasts; detected kWh are published as separate sensors
+- **Sub-energy sensor lags** — track hourly consumption of individual appliances (heat pump, dishwasher, EV charger, etc.) as lag features to give the model appliance-level context
 - **Local outdoor temperature blending** — if you have an outdoor sensor, its live reading is blended with the weather forecast for the first few hours of the prediction window
 - **Exponential sample weighting** — recent data influences the model more than old data
 - **Persistent CSV cache** — energy history survives Home Assistant database purges
@@ -138,6 +171,11 @@ energy_forecast:
 
   # Path override for the energy history CSV (default: next to energy_forecast.py).
   # cache_path: /config/appdaemon/apps/energy_forecast/energy_history.csv
+
+  # Optional: cumulative kWh sub-sensors tracked as lag features (see below).
+  # sub_energy_sensors:
+  #   - sensor.heat_pump_energy_kwh
+  #   - sensor.dishwasher_energy_kwh
 ```
 
 > **Finding your `energy_sensor` entity ID:** In HA go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for your grid-import meter. It should be a sensor whose state increases continuously (never resets to zero each day).
@@ -160,6 +198,7 @@ energy_forecast:
 | `cache_path` | No | Next to `energy_forecast.py` | Override path for the energy history CSV file |
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
+| `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
 
 ---
 
@@ -262,7 +301,9 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 
 ### Features used
 
-Calendar, cyclical encodings (hour, day-of-week, month, hour-of-week), weather (temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured history), autoregressive lags (24 h, 48 h, 72 h, 168 h, 336 h), rolling consumption stats (24 h mean/std, 7-day mean), Swiss public holidays, bridge-day proximity (days to/since nearest holiday, capped at 3).
+Calendar, cyclical encodings (hour, day-of-week, month, hour-of-week), weather (temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured history), autoregressive lags (24 h, 48 h, 72 h, 168 h, 336 h), rolling consumption stats (24 h mean/std, 7-day mean), Swiss public holidays, bridge-day proximity (days to/since nearest holiday, capped at 3), EV session probability per hour-of-week slot.
+
+When `sub_energy_sensors` is configured, each sub-sensor adds two features: `lag_24h` (same hour yesterday) and `lag_168h` (same hour last week).
 
 Lag features are dynamically enabled as history grows — the full feature set is active once you have ≥ 436 hours (≈18 days) of data.
 
@@ -326,6 +367,36 @@ Any hour where gross grid import exceeds `ev_charging_threshold_kwh` (default 7 
 This means the model trains on the true household signal even on days with EV sessions. The raw detected EV kWh are published separately as `sensor.energy_forecast_ev_today` and `sensor.energy_forecast_ev_yesterday`.
 
 Tune the threshold in `apps.yaml` to match your charger and household ceiling. The default 7 kWh/h suits a 9–11 kW charger with a household ceiling below 6.5 kWh/h.
+
+---
+
+## Sub-energy sensors
+
+The optional `sub_energy_sensors` list lets you give the model appliance-level context — instead of seeing only the aggregate grid import, it can also see how much the heat pump or dishwasher consumed at the same hour yesterday and last week.
+
+```yaml
+sub_energy_sensors:
+  - sensor.heat_pump_energy_kwh
+  - sensor.dishwasher_energy_kwh
+```
+
+For each sensor the model gains two features:
+
+| Feature | Value |
+|---------|-------|
+| `sub_<name>_lag_24h` | kWh consumed at the same hour yesterday |
+| `sub_<name>_lag_168h` | kWh consumed at the same hour last week |
+
+`lag_168h` is only enabled once ≥ 268 hours of data are available for that sensor.
+
+**Requirements:**
+- The sensor must be a `total_increasing` cumulative kWh meter (same type as `energy_sensor`). Power sensors (W or kW) must first be integrated into a kWh template helper in HA.
+- Hours when the appliance is off appear as 0 kWh (not excluded), so the model correctly learns that a zero-lag means the appliance was idle.
+- Each sub-sensor gets its own CSV cache file (`sub_<name>.csv`) in the same directory as the main energy cache.
+
+**How many sensors?** 3–5 is a practical limit — each sensor adds 2 feature columns and a separate HA history fetch on every retrain and hourly update.
+
+**Backward compatibility:** Omitting `sub_energy_sensors` (or leaving it commented out) produces no behaviour change. Old model files without sub-sensor features load cleanly and continue to work.
 
 ---
 

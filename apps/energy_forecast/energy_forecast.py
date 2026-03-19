@@ -3,7 +3,7 @@ HA Energy Forecast — AppDaemon app.
 
 EV charging handling:
   Hours where gross grid import exceeds ev_charging_threshold_kwh (default
-  4.5 kWh/h) are classified as EV charging.  The fixed charger load (9 kWh/h)
+  7 kWh/h) are classified as EV charging.  The fixed charger load (9 kWh/h)
   is subtracted, leaving the concurrent household baseline intact.  The model
   trains on this cleaned signal, so EV sessions don't distort forecasts.
 
@@ -12,7 +12,7 @@ EV charging handling:
     sensor.energy_forecast_ev_yesterday  — EV kWh detected yesterday
 
   The threshold and charger power are configurable in apps.yaml:
-    ev_charging_threshold_kwh: 4.5   # default
+    ev_charging_threshold_kwh: 7     # default
     ev_charger_kw: 9.0               # default
 """
 from __future__ import annotations
@@ -59,6 +59,9 @@ class EnergyForecast(hass.Hass):
         self._adaptive_retrain_threshold: float = float(
             self.args.get("adaptive_retrain_threshold", 2.0)
         )
+        # Optional sub-sensors: cumulative kWh meters (heat pump, dishwasher, etc.)
+        # whose consumption is tracked as lag features to improve forecast accuracy.
+        self._sub_energy_sensors: list[str] = list(self.args.get("sub_energy_sensors") or [])
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict        = {}
@@ -109,8 +112,21 @@ class EnergyForecast(hass.Hass):
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
             f"weight_halflife={self._weight_halflife}d, "
-            f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW"
+            f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
+            f"sub_energy_sensors={len(self._sub_energy_sensors)}"
         )
+
+    # ── Sub-sensor helpers ────────────────────────────────────────────────────
+
+    def _sub_sensor_prefix(self, entity_id: str) -> str:
+        """Return the feature-column prefix for a sub-energy sensor entity_id."""
+        sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
+        return f"sub_{sanitized}"
+
+    def _sub_sensor_cache_path(self, entity_id: str) -> Path:
+        """Return the CSV cache path for a sub-energy sensor."""
+        sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
+        return self._cache_path.parent / f"sub_{sanitized}.csv"
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -180,6 +196,17 @@ class EnergyForecast(hass.Hass):
             )
             weather_df = _empty_weather_df()
 
+        sub_sensors_dict: dict = {}
+        for entity_id in self._sub_energy_sensors:
+            prefix = self._sub_sensor_prefix(entity_id)
+            cache_path = self._sub_sensor_cache_path(entity_id)
+            try:
+                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path)
+                sub_df = _strip_tz(sub_df)
+                sub_sensors_dict[prefix] = sub_df
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -187,6 +214,7 @@ class EnergyForecast(hass.Hass):
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
             ev_df=ev_df,
+            sub_sensors_dict=sub_sensors_dict or None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -219,11 +247,24 @@ class EnergyForecast(hass.Hass):
             recent_actuals = None
             full_actuals   = None
 
+        sub_sensors_recent: dict = {}
+        for entity_id in self._sub_energy_sensors:
+            prefix = self._sub_sensor_prefix(entity_id)
+            cache_path = self._sub_sensor_cache_path(entity_id)
+            try:
+                sub_df = ha_data.fetch_recent_sub_sensor(self, entity_id, cache_path)
+                sub_df = _strip_tz(sub_df)
+                sub_sensors_recent[prefix] = sub_df
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
+
         live_temp   = self._read_live_temp()
-        predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals)
+        predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals,
+                                             sub_sensors_recent=sub_sensors_recent or None)
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
-        intervals = self._ml_model.predict_intervals(forecast_df, live_temp, recent_actuals)
+        intervals = self._ml_model.predict_intervals(forecast_df, live_temp, recent_actuals,
+                                                     sub_sensors_recent=sub_sensors_recent or None)
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
 

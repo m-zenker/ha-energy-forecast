@@ -24,6 +24,8 @@ import pytest
 from energy_forecast.model import (
     _add_holiday_feature,
     _add_lag_and_rolling_prediction,
+    _add_sub_sensor_lags_training,
+    _add_sub_sensor_lags_prediction,
     _BRIDGE_CAP,
     _build_model,
     _compute_likely_ev_hours,
@@ -570,4 +572,202 @@ class TestLikelyEvHour:
         })
         assert _compute_likely_ev_hours(baseline, None) == set()
         assert _compute_likely_ev_hours(baseline, pd.DataFrame()) == set()
+
+
+# ── Sub-sensor lag features ────────────────────────────────────────────────────
+
+def _make_sub_sensor_df(n: int = 400, start: str = "2024-01-01") -> pd.DataFrame:
+    """Return a sub-sensor DataFrame with 'timestamp' and 'kwh' columns."""
+    rng = np.random.default_rng(7)
+    ts  = pd.date_range(start, periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "kwh": rng.uniform(0, 3.0, size=n)})
+
+
+class TestSubSensorFeatures:
+
+    def _make_weather(self, ts):
+        return pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [10.0] * len(ts),
+            "precipitation_mm":     [0.0]  * len(ts),
+            "sunshine_min":         [30.0] * len(ts),
+            "wind_kmh":             [10.0] * len(ts),
+            "cloud_cover_pct":      [50.0] * len(ts),
+            "direct_radiation_wm2": [100.0]* len(ts),
+        })
+
+    def test_lag_24h_in_feature_cols_when_sub_sensor_provided(self, tmp_path):
+        """sub_sensor lag_24h column appears in feature_cols after train()."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(0).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        sub_df  = _make_sub_sensor_df(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_hp": sub_df})
+        assert "sub_hp_lag_24h" in m.feature_cols
+
+    def test_lag_168h_in_feature_cols_with_enough_history(self, tmp_path):
+        """sub_sensor lag_168h appears when n_rows >= 268 (168 + 100)."""
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(1).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        sub_df  = _make_sub_sensor_df(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_hp": sub_df})
+        assert "sub_hp_lag_168h" in m.feature_cols
+
+    def test_no_sub_sensor_cols_without_sub_sensors_dict(self, tmp_path):
+        """Without sub_sensors_dict, no 'sub_' columns appear in feature_cols."""
+        m, _ = _make_trained_model(tmp_path)
+        sub_cols = [c for c in m.feature_cols if c.startswith("sub_")]
+        assert sub_cols == [], f"unexpected sub-sensor columns: {sub_cols}"
+
+    def test_sub_sensor_lag_values_are_correct(self, tmp_path):
+        """lag_24h for a sub-sensor equals the kwh value 24 positions earlier in training."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        weather = self._make_weather(ts)
+        # Sub-sensor: deterministic values so we can verify the lag
+        sub_kwh = list(range(n))   # 0, 1, 2, ..., n-1
+        sub_df  = pd.DataFrame({"timestamp": ts, "kwh": sub_kwh})
+
+        # Call the training helper directly
+        from energy_forecast.model import _add_lag_and_rolling_training
+        df = _add_lag_and_rolling_training(energy, list(range(24, n - 100)))
+        df = _add_sub_sensor_lags_training(df, {"sub_hp": sub_df})
+
+        # Row 24 in the sorted df should have sub_hp_lag_24h == sub_kwh[0] == 0
+        assert "sub_hp_lag_24h" in df.columns
+        # lag_24h at position 24 = sub_kwh[0]; shift(24) makes first 24 NaN
+        non_nan = df["sub_hp_lag_24h"].dropna()
+        assert float(non_nan.iloc[0]) == pytest.approx(0.0)
+        assert float(non_nan.iloc[1]) == pytest.approx(1.0)
+
+    def test_predict_runs_with_sub_sensors_recent(self, tmp_path):
+        """predict() accepts sub_sensors_recent without error."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(3).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        sub_df  = _make_sub_sensor_df(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_hp": sub_df})
+
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast  = self._make_weather(future_ts)
+        # Recent actuals for sub-sensor — recent 200 hours
+        recent_sub = _make_sub_sensor_df(n=200, start=str((pd.Timestamp.now() - pd.Timedelta(hours=200)).date()))
+        result = m.predict(forecast, live_temp=None, sub_sensors_recent={"sub_hp": recent_sub})
+        assert len(result) == 48
+        assert result["predicted_kwh"].ge(0).all()
+
+    def test_prediction_lag_columns_are_float_dtype(self, tmp_path):
+        """Regression: reindex of a sparse sub-sensor must produce float64, not object dtype.
+
+        In pandas 3.x, reindexing across mismatched datetime resolutions (ns vs us from
+        CSV cache) returned dtype=object, which LightGBM rejected at predict time.
+        """
+        future_ts = pd.date_range("2024-01-10", periods=48, freq="1h")
+        future_df = pd.DataFrame({"timestamp": future_ts})
+        # Only 1 recent data point — simulates a sensor active for just a few hours
+        recent_sub = pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-09 12:00"]),
+            "kwh": [0.3],
+        })
+        result = _add_sub_sensor_lags_prediction(future_df, {"sub_t": recent_sub})
+        assert result["sub_t_lag_24h"].dtype == np.float64, (
+            f"expected float64, got {result['sub_t_lag_24h'].dtype}"
+        )
+        assert result["sub_t_lag_168h"].dtype == np.float64
+
+    def test_lag_168h_absent_below_threshold(self):
+        """lag_168h is absent when n_rows - 168 < 100 (n=267, threshold−1)."""
+        n = 267
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        sub_df = _make_sub_sensor_df(n=n)
+        df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
+        assert "sub_hp_lag_168h" not in df.columns
+        assert "sub_hp_lag_24h" in df.columns
+
+    def test_lag_168h_present_at_threshold(self):
+        """lag_168h is present when n_rows - 168 == 100 (n=268, exactly at threshold)."""
+        n = 268
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        sub_df = _make_sub_sensor_df(n=n)
+        df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
+        assert "sub_hp_lag_168h" in df.columns
+
+    def test_sparse_sub_sensor_does_not_skip_training(self, tmp_path):
+        """A nearly-all-NaN sub-sensor (warm-up period) must not cause training to be skipped.
+
+        Regression for: sub-sensor NaN included in dropna → 0 clean rows → model not trained.
+        """
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(5).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        # Only 1 data point — simulates a sensor that started today
+        sub_df  = pd.DataFrame({"timestamp": ts[-1:], "kwh": [0.5]})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_new": sub_df})
+        # Model must have trained — feature_cols and model are set
+        assert m.feature_cols is not None
+        assert m.model is not None
+
+    def test_sparse_sub_sensor_triggers_nan_warning(self, caplog):
+        """Sub-sensor with >50% gaps triggers NaN warning during training."""
+        import logging
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        # Only 10 data points out of 400 — reindex will produce >50% NaN
+        sparse_ts = ts[::40]
+        sub_df = pd.DataFrame({"timestamp": sparse_ts, "kwh": [1.0] * len(sparse_ts)})
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
+
+        assert "sub_hp" in caplog.text
+        assert "NaN" in caplog.text
+        assert "sub_hp_lag_24h" in df.columns
+
+    def test_multiple_sub_sensors_in_feature_cols(self, tmp_path):
+        """Two sub-sensors both produce lag columns in feature_cols after train()."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(4).uniform(0.5, 5, n)})
+        weather = self._make_weather(ts)
+        sub_hp  = _make_sub_sensor_df(n=n)
+        sub_dw  = _make_sub_sensor_df(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_hp": sub_hp, "sub_dw": sub_dw})
+        assert "sub_hp_lag_24h" in m.feature_cols
+        assert "sub_dw_lag_24h" in m.feature_cols
+
+    def test_lag_168h_values_are_correct(self):
+        """lag_168h for a sub-sensor equals the kwh value 168 positions earlier in training."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        sub_kwh = list(range(n))  # 0, 1, 2, ..., n-1
+        sub_df  = pd.DataFrame({"timestamp": ts, "kwh": sub_kwh})
+
+        from energy_forecast.model import _add_lag_and_rolling_training
+        df = _add_lag_and_rolling_training(energy, list(range(24, n - 100)))
+        df = _add_sub_sensor_lags_training(df, {"sub_hp": sub_df})
+
+        assert "sub_hp_lag_168h" in df.columns
+        non_nan = df["sub_hp_lag_168h"].dropna()
+        assert float(non_nan.iloc[0]) == pytest.approx(0.0)
+        assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 

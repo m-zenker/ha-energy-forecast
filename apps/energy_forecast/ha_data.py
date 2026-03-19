@@ -207,6 +207,121 @@ def split_ev_charging(
     return df, ev_df
 
 
+def fetch_sub_sensor_history(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+) -> pd.DataFrame:
+    """Pull sub-sensor kWh history, merging local CSV cache with fresh HA data.
+
+    Analogous to fetch_energy_history but:
+    - Column name is 'kwh' (not 'gross_kwh')
+    - Zero-diff hours are kept (diff >= 0 instead of > 0): they represent the
+      appliance being off and must appear as 0 so lag features return 0 (not NaN)
+      during idle hours.
+    - Suitable for any cumulative kWh meter (heat pump, dishwasher, etc.)
+    """
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "kwh"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"])
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError) as e:
+            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=30)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No history found for sub-sensor {entity_id} — skipping.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "kwh"])
+
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
+        diff = hourly.diff().clip(lower=0).reset_index()
+        diff.columns = ["timestamp", "kwh"]
+        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
+        df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+
+    combined = (
+        pd.concat([df_cache, df_new])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp", "kwh"])
+        .reset_index(drop=True)
+    )
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
+def fetch_recent_sub_sensor(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+) -> pd.DataFrame:
+    """Lightweight update for sub-sensor hourly refreshes.
+
+    Fetches only the last 2 days of HA history, merges into the existing CSV
+    cache, and returns the full cache for lag-feature use.  Analogous to
+    fetch_recent_energy but for sub-sensors (column name 'kwh', keeps zeros).
+    """
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "kwh"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"])
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError) as e:
+            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=2)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No recent data for sub-sensor {entity_id}.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "kwh"])
+
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
+        diff = hourly.diff().clip(lower=0).reset_index()
+        diff.columns = ["timestamp", "kwh"]
+        if hasattr(diff["timestamp"].dtype, "tz") and diff["timestamp"].dt.tz is not None:
+            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
+        df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+
+    combined = (
+        pd.concat([df_cache, df_new])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp", "kwh"])
+        .reset_index(drop=True)
+    )
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
 def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd

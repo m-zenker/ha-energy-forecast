@@ -8,6 +8,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **NaN warning in `_add_sub_sensor_lags_training`** (`model.py`): mirrors the
+  prediction-side check — logs WARNING when sub-sensor reindex introduces >50% NaN
+  values, surfacing gap/alignment issues during training.
+
+### Added
+- **`sub_energy_sensors` config key** (`ha_data.py`, `model.py`, `energy_forecast.py`):
+  Track hourly consumption of custom HA cumulative kWh sensors (e.g. heat pump,
+  dishwasher) as `lag_24h` / `lag_168h` features to improve forecast accuracy.
+  Sub-sensors must be `total_increasing` kWh meters; zero-kWh hours (appliance off)
+  are preserved so lag features correctly return 0 instead of NaN during idle periods.
+  All parameters are optional and default to `[]` — no behaviour change for existing
+  deployments.
+
 ---
 
 ## [0.3.0] — 2026-03-13

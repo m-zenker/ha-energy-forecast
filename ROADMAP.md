@@ -121,6 +121,155 @@ cannot capture.
 
 ---
 
+## Distribution
+
+### 16. HACS support *(planned)*
+
+Make the app installable via [HACS](https://hacs.xyz/) (AppDaemon category).
+
+Required changes:
+- Add `hacs.json` at repo root (HACS manifest; `render_readme: true`).
+- Add `info.md` — shown in the HACS detail panel before installation; must prominently warn that HACS only copies app files and that the AppDaemon add-on dependency config and `apps.yaml` creation are still manual steps.
+- Add a "Install via HACS" subsection to `README.md` under `## Installation`, explaining what HACS does and doesn't do, with links to the dependency config and `apps.yaml.example` steps.
+- Set GitHub repo topics: `appdaemon` (required for HACS category), `home-assistant`, `hacs`.
+
+No code changes required — `apps/energy_forecast/` is already in the correct location for HACS AppDaemon installs. Semver tags are already present.
+
+### 17. Setup checker sensor *(planned)*
+Bake a startup self-check into the main app that surfaces setup problems as a visible HA entity rather than silent log failures.
+
+- On initialisation, attempt `import pandas, numpy, lightgbm, sklearn, requests, holidays` and log a clear error for each missing package.
+- Validate required config keys (`energy_sensor`, `latitude`, `longitude`); validate optional keys have sane types.
+- Publish `sensor.energy_forecast_setup_status` with states `ok`, `missing_packages`, `missing_config`, or `invalid_config`, and an `issues` attribute listing specific problems.
+- Self-silences (removes sensor) once all checks pass and the main app is running normally.
+
+This converts silent failure after a fresh HACS install into actionable, user-visible feedback without requiring any Supervisor access.
+
+### 19. CSV cache: append-only writes *(planned)*
+For long-running installs with months of history, `fetch_recent_energy` rewrites the entire `energy_history.csv` on every hourly update. At ~8 760 rows/year this is already measurable I/O and will compound over time.
+
+Improvement: write only new rows using `df.to_csv(..., mode='a', header=False)` in `fetch_recent_energy`, and perform a periodic compaction (dedup + sort) in `fetch_energy_history` (the weekly full-read path) rather than on every update. Requires care around the merge-winner rule to avoid duplicating rows that already exist in the CSV.
+
+### 20. Config validation: warn when `ev_charging_threshold_kwh >= ev_charger_kw` *(planned)*
+When the detection threshold is set at or above the charger power (e.g. threshold=10, charger=9), every detected EV hour produces `max(0, gross - charger_kw) = 0`, so the EV sensors always read zero while the model still strips those hours from training data. The combination is silently confusing.
+
+Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
+
+### 21. Occupancy feature (`people_home`) *(long-term backlog)*
+Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
+
+### 22. EV charging state + SoC feature *(long-term backlog)*
+The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
+
+### 23. Solar PV integration *(long-term backlog)*
+Households with panels train the model on net grid import, which conflates household consumption with solar self-consumption — on a sunny day the model sees low import and learns the wrong signal. Two sub-items:
+
+1. **Production offset during training**: subtract a `solar_production_sensor` reading from `gross_kwh` to recover true household consumption before feature engineering.
+2. **Solar forecast as feature**: derive an expected production curve for the prediction horizon from PV system parameters (`pv_kwp`, `pv_azimuth`, `pv_tilt`) combined with the already-fetched `direct_radiation_wm2` forecast.
+
+### 24. Electricity spot price feature *(long-term backlog)*
+Households on dynamic tariffs (Tibber, Nordpool) actively shift deferrable loads — dishwasher, washing machine, EV charging — to cheap hours. The model currently cannot learn this behaviour because it sees no price signal. Add an optional `price_sensor` config key; include the hourly price (or a `is_cheap_hour` binary derived from a configurable threshold) as a feature. The Tibber and Nordpool HA integrations already expose standardised hourly price sensors.
+
+### 25. Vacation / away flag *(long-term backlog)*
+Multi-day absences cause baseline drops that look like anomalies to the rolling lag features and bias the model until history catches up. An optional `away_mode_entity` config key (e.g. `input_boolean.vacation_mode` or a `calendar` entity) adds a binary `is_away` feature. When set, the model can learn the reduced baseline explicitly rather than treating it as noise.
+
+### 18. Custom component config flow *(long-term backlog)*
+A full HA custom component (lives in `custom_components/energy_forecast/`) that provides a UI-driven setup wizard via HA's config flow:
+
+- Step 1: entity picker for `energy_sensor`; lat/lon auto-populated from HA's own location config.
+- Step 2: optional fields (SRG credentials, outdoor temp sensor, canton, EV threshold).
+- On completion: writes the `energy_forecast:` stanza into `appdaemon/apps/apps.yaml` via the HA filesystem API.
+- Calls the Supervisor REST API (`/supervisor/addons/<appdaemon_slug>/options`) to patch `python_packages` and `init_commands` with the required dependencies, then triggers an add-on restart.
+
+This is the only path to fully zero-manual-step installation. Significant effort: requires maintaining a separate HA integration type alongside the AppDaemon app, Supervisor API integration, and config flow UI.
+
+---
+
+## Tier 5 — Diagnostics, Performance & Minor Features
+
+### 27. Short-horizon lags (`lag_1h`, `lag_2h`, `lag_6h`, `lag_12h`) *(planned)*
+The current lag set jumps from `lag_24h` to `lag_48h`, leaving a blind spot in the
+1–12 h range that matters most for same-day intra-day prediction. Adding `lag_1h`,
+`lag_2h`, `lag_6h`, and `lag_12h` to `_add_lag_features` (training) and
+`_add_lags_prediction` (inference) is a direct feature-engineering win at negligible
+data-volume cost — all four are available as soon as a single day of history exists.
+Expected impact: **HIGH** for hours 1–6 ahead; Low effort.
+
+### 28. `num_leaves` hyperparameter sweep — complete ROADMAP #6 *(planned)*
+ROADMAP item #6 added early stopping but left the `num_leaves` sweep (`16 / 31 / 63`)
+as a follow-up. A narrow grid search on the final CV split can be wired into the
+existing `_cross_validate` path without changing the training API. Prevents the model
+from being locked into the LightGBM default of 31 leaves regardless of data volume.
+Expected impact: **MEDIUM**; Low effort (sweep is already sketched in the #6 description).
+
+### 29. Feature importance logging after training *(planned)*
+After `model.fit()` in `_train_model`, log `model.feature_importances_` sorted by
+weight. Currently there is no visibility into which features the model actually uses.
+One `logger.debug` call with the sorted list adds zero runtime cost and makes
+under-contributing features immediately visible in the AppDaemon log.
+Expected impact: Diagnostic; Trivial effort.
+
+### 30. CV fold std logging alongside mean *(planned)*
+`_cross_validate` currently logs only the mean MAE across folds. Adding the standard
+deviation (and optionally the per-fold breakdown at DEBUG level) surfaces high-variance
+training runs — an early signal of insufficient data or a degraded feature — without
+changing any model logic.
+Expected impact: Diagnostic; Trivial effort.
+
+### 31. Per-hour-of-week NaN fill medians *(planned)*
+NaN values in rolling/lag features are currently filled with the global training
+median. A per-`hour_of_week` median (168 cells) is a much tighter imputation for the
+warm-up period at install time, where the model would otherwise use a "typical any
+hour" stand-in for a specifically 3 a.m. Tuesday slot. Requires computing and caching
+a `(168,)` lookup table during training and applying it in `_build_prediction_features`.
+Expected impact: **LOW–MEDIUM** (mainly during first week of data); Medium effort.
+
+### 32. Holiday `apply` → `np.searchsorted` vectorization *(planned)*
+`_add_holiday_feature` calls `pd.Series.apply(lambda ts: ts.date() in holiday_set)`,
+which is a Python loop over every row in the training frame. Replacing it with
+`np.searchsorted` on a sorted date array (or a boolean index join) reduces the
+holiday computation from O(n) Python-level iterations to a vectorised C operation.
+Expected impact: Performance (training speed); Low effort.
+
+### 33. Day-of-year cyclical feature (`doy_sin` / `doy_cos`) *(planned)*
+The model captures seasonality through rolling temperature features and calendar
+proxies, but has no smooth cyclic encoding of position within the year. Adding
+`doy_sin = sin(2π·doy/365)` and `doy_cos = cos(2π·doy/365)` to `_FEATURES_BASE`
+gives the model a continuous signal for seasonal baseline that avoids the
+discontinuity at New Year's Day.
+Expected impact: **LOW**; Low effort.
+
+### 34. `hours_ahead` feature for horizon-aware prediction *(planned)*
+All 48 prediction rows currently receive identical feature vectors; the model cannot
+distinguish whether it is predicting 1 h ahead or 47 h ahead. Adding `hours_ahead`
+(0–47) as a numeric feature lets the model learn horizon-specific biases — e.g. that
+rolling features decay in reliability with distance. Requires adding the feature during
+`_build_prediction_features` and including a `hours_ahead = 0` column in training rows
+(or omitting from training to avoid leakage — needs careful scoping).
+Expected impact: **LOW**; Low effort.
+
+### 35. Sub-sensor binary activity flag (`{prefix}_active_24h`) *(planned)*
+With ~95% zero hours in dishwasher/washer data, the raw `{prefix}_lag_24h` feature is
+almost always 0 and carries near-zero signal for those appliances. A binary
+"was it used in the last 24 hours?" flag is more robust to sparsity and provides a
+useful signal from the very first recorded event during the warm-up period.
+Implementation: in `_add_sub_sensor_lags_training` and `_add_sub_sensor_lags_prediction`,
+compute `(kwh_lag > 0).astype(int)` for each sub-sensor prefix and add
+`{prefix}_active_24h` to the feature list.
+Expected impact: **LOW–MEDIUM** (mainly during warm-up); Low effort.
+
+### 36. Sub-sensor rolling run count (`{prefix}_runs_7d`) *(planned)*
+Weekly appliance usage frequency (dishwasher 1–2×/day, washer 1–2×/week) is more
+predictable than a point-in-time lag. A count of non-zero hours in the trailing 7 days
+captures the weekly rhythm more stably than `lag_168h` alone, especially during the
+warm-up phase when the 168 h window is partially empty.
+Implementation: in `_add_sub_sensor_lags_training`, compute
+`(kwh_series > 0).astype(int).rolling(168, min_periods=1).sum().shift(1)` and add
+`{prefix}_runs_7d` to the feature list.
+Expected impact: **LOW–MEDIUM**; Low effort.
+
+---
+
 ## Summary
 
 | # | Change | Expected MAE impact | Effort | Status |
@@ -140,3 +289,24 @@ cannot capture.
 | 13 | Prediction intervals (HA sensors) | UX value | 4 h | ✓ done |
 | 14 | Intra-day actuals substitution | high (late-day sensor) | 2 h | ✓ done |
 | 15 | HVAC state feature | high (if available) | 3 h | long-term backlog |
+| 16 | HACS support | distribution | 1 h | planned |
+| 17 | Setup checker sensor | UX / install | 2 h | planned |
+| 18 | Custom component config flow | UX / install | 8+ h | long-term backlog |
+| 19 | CSV append-only writes | performance | 2 h | planned |
+| 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | planned |
+| 21 | Occupancy feature (`people_home`) | **high** | 4 h | long-term backlog |
+| 22 | EV SoC + charging state feature | high (EV households) | 4 h | long-term backlog |
+| 23 | Solar PV integration | high (solar households) | 6 h | long-term backlog |
+| 24 | Electricity spot price feature | medium (dynamic tariff) | 2 h | long-term backlog |
+| 25 | Vacation / away flag | medium | 2 h | long-term backlog |
+| 26 | Sub-energy sensors (`sub_energy_sensors`) | medium | 4 h | ✓ done |
+| 27 | Short-horizon lags (`lag_1h`–`lag_12h`) | **high** | 1 h | planned |
+| 28 | `num_leaves` sweep (complete #6) | medium | 1 h | planned |
+| 29 | Feature importance logging | diagnostic | 15 min | planned |
+| 30 | CV fold std logging | diagnostic | 15 min | planned |
+| 31 | Per-hour-of-week NaN fill medians | low–medium | 2 h | planned |
+| 32 | Holiday `apply` → `np.searchsorted` | performance | 30 min | planned |
+| 33 | Day-of-year cyclical feature (`doy_sin/cos`) | low | 30 min | planned |
+| 34 | `hours_ahead` horizon feature | low | 1 h | planned |
+| 35 | Sub-sensor binary activity flag (`{prefix}_active_24h`) | low–medium | 30 min | planned |
+| 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | planned |

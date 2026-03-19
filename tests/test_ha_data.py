@@ -418,3 +418,118 @@ class TestSplitEvCharging:
         # Non-EV hours are unchanged
         assert abs(baseline.iloc[0]["gross_kwh"] - 3.0) < 1e-6
         assert len(ev) == 2
+
+
+# ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
+
+class TestFetchSubSensorHistory:
+    """Tests for fetch_sub_sensor_history and fetch_recent_sub_sensor.
+
+    Both functions track cumulative kWh sub-sensors (heat pump, dishwasher, etc.)
+    and differ from the main energy fetch in two ways:
+    - Column name is 'kwh' (not 'gross_kwh')
+    - Zero-kWh hours (appliance off) are kept so lag features return 0, not NaN
+    """
+
+    def test_returns_kwh_column(self, mock_app, tmp_path):
+        """Result DataFrame has 'timestamp' and 'kwh' columns (not gross_kwh)."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 101.5],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert "kwh" in result.columns
+        assert "gross_kwh" not in result.columns
+        assert "timestamp" in result.columns
+
+    def test_falls_back_to_cache_when_ha_empty(self, mock_app, tmp_path):
+        """When HA returns nothing, the existing cache is returned."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
+            "kwh": [2.5],
+        }).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert len(result) == 1
+        assert result.iloc[0]["kwh"] == pytest.approx(2.5)
+
+    def test_spike_filter_applied(self, mock_app, tmp_path):
+        """Hours with diff >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
+        from energy_forecast.const import MAX_HOURLY_KWH
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        # diff = 999 kWh — well above MAX_HOURLY_KWH, should be filtered
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 100.0 + MAX_HOURLY_KWH + 10],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert len(result) == 0
+
+    def test_zero_kwh_hours_kept(self, mock_app, tmp_path):
+        """Zero-kWh diff hours (appliance off) are retained, unlike the main sensor."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        # diff at 10:00 local = 100.0 - 100.0 = 0.0 kWh (appliance off)
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 100.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert len(result) == 1
+        assert result.iloc[0]["kwh"] == pytest.approx(0.0)
+
+    def test_ha_wins_on_conflict(self, mock_app, tmp_path):
+        """Fresh HA data overwrites cached value for the same timestamp."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
+            "kwh": [1.0],
+        }).to_csv(cache_path, index=False)
+
+        # HA cumulative: diff at local 10:00 = 102.0 - 100.0 = 2.0 kWh
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [100.0, 102.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["kwh"] == pytest.approx(2.0)
+
+    def test_recent_sub_sensor_saves_cache(self, mock_app, tmp_path):
+        """fetch_recent_sub_sensor merges and saves result to cache."""
+        cache_path = tmp_path / "sub_dishwasher.csv"
+        ha_raw = make_ha_raw(
+            ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
+            [50.0, 50.5],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_sub_sensor(mock_app, "sensor.dishwasher_kwh", cache_path)
+
+        assert cache_path.exists()
+        assert "kwh" in result.columns
+        assert len(result) == 1
+
+    def test_both_empty_returns_empty_with_warning(self, mock_app, tmp_path):
+        """When both HA and cache are empty, returns empty DataFrame and logs WARNING."""
+        cache_path = tmp_path / "sub_heat_pump.csv"
+        # No cache file, HA returns empty DataFrame
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
+
+        assert result.empty
+        assert list(result.columns) == ["timestamp", "kwh"]
+        mock_app.log.assert_called_once()
+        args, kwargs = mock_app.log.call_args
+        assert kwargs.get("level") == "WARNING"
