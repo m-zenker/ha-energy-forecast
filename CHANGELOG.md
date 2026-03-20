@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **pandas 3.x mixed-format timestamp parse failure** (`ha_data.py`): all four CSV-cache
+  `pd.to_datetime()` calls now pass `format="mixed"`, preventing a `ValueError` when a
+  date-only midnight entry (e.g. `"2026-03-20"`) appeared alongside full datetime strings
+  in `energy_history.csv`.  Without this fix every hourly update after midnight ran with
+  `recent_actuals = None`, degrading all lag/rolling features to training medians for the
+  rest of the day.  The inner `except` clauses at each load site also widen to include
+  `ValueError` so any future parse error degrades gracefully (empty cache, WARNING logged)
+  rather than silently losing lag features.
+
 ### Added
 - **MDI icons on all published sensors** (`energy_forecast.py`): every `set_state()` call
   now carries a `"unique_id"` attribute (stable identifier = entity_id minus `sensor.` prefix,

@@ -78,13 +78,13 @@ def fetch_energy_history(
     if cache_path.exists():
         try:
             df_cache = pd.read_csv(cache_path)
-            ts = pd.to_datetime(df_cache["timestamp"])
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
             app.log(f"Loaded {len(df_cache)} records from local cache.")
-        except (OSError, pd.errors.ParserError) as e:
+        except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch fresh data from HA
@@ -138,11 +138,11 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     if cache_path.exists():
         try:
             df_cache = pd.read_csv(cache_path)
-            ts = pd.to_datetime(df_cache["timestamp"])
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
-        except (OSError, pd.errors.ParserError) as e:
+        except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
@@ -261,11 +261,11 @@ def fetch_sub_sensor_history(
     if cache_path.exists():
         try:
             df_cache = pd.read_csv(cache_path)
-            ts = pd.to_datetime(df_cache["timestamp"])
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
-        except (OSError, pd.errors.ParserError) as e:
+        except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
     raw_ha = _fetch_history(app, entity_id, days=30)
@@ -315,11 +315,11 @@ def fetch_recent_sub_sensor(
     if cache_path.exists():
         try:
             df_cache = pd.read_csv(cache_path)
-            ts = pd.to_datetime(df_cache["timestamp"])
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
             df_cache["timestamp"] = ts
-        except (OSError, pd.errors.ParserError) as e:
+        except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
     raw_ha = _fetch_history(app, entity_id, days=2)

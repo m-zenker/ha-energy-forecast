@@ -593,6 +593,28 @@ class TestCsvAppendOnlyWrites:
         saved = pd.read_csv(cache_path)
         assert len(saved) >= 1
 
+    def test_fetch_recent_energy_mixed_timestamp_format(self, mock_app, tmp_path):
+        """Regression: CSV with mixed-format timestamps (datetime + date-only) must parse cleanly.
+
+        Reproduces the pandas 3.x failure where a date-only midnight entry
+        ("2026-03-20") caused a ValueError because format was inferred as
+        "%Y-%m-%d %H:%M:%S" from the first row.  With format="mixed" all rows
+        parse successfully and fetch_recent_energy returns a non-empty result.
+        """
+        cache_path = tmp_path / "energy_history.csv"
+        # Write a CSV with mixed formats: one datetime string, one date-only string
+        cache_path.write_text(
+            "timestamp,gross_kwh\n"
+            "2026-03-20 01:00:00,1.2\n"
+            "2026-03-20,0.9\n"
+        )
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert not result.empty, "Expected non-empty result with mixed-format timestamps"
+        assert len(result) == 2
+
     def test_fetch_energy_history_compacts_and_deduplicates(self, mock_app, tmp_path):
         """fetch_energy_history must write a sorted, deduped CSV (compaction)."""
         cache_path = tmp_path / "energy_history.csv"
