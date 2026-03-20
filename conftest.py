@@ -8,8 +8,11 @@ from unittest.mock import MagicMock
 # without installing it, mirroring how AppDaemon loads it at runtime.
 sys.path.insert(0, str(Path(__file__).parent / "apps"))
 
-# Stub out hassapi so energy_forecast.py can be imported without AppDaemon.
-# Tests that exercise AppDaemon-specific behaviour should mock at a higher level.
+# Stub out the `hassapi` module before any test imports energy_forecast.py.
+# Without this stub, the top-level `import hassapi as hass` in energy_forecast.py
+# raises an ImportError because the hassapi package is only available inside an
+# AppDaemon process.  Tests that need real AppDaemon behaviour should mock the
+# specific methods (e.g. self.set_state, self.log) at a higher level.
 if "hassapi" not in sys.modules:
     _hassapi_stub = ModuleType("hassapi")
     _hassapi_stub.Hass = MagicMock  # type: ignore[attr-defined]

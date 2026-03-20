@@ -3,11 +3,13 @@ ML model — feature engineering, training, prediction and disk persistence.
 
 Feature set:
   - Calendar: hour, day_of_week, month, season, hour_of_week (0-167),
-    cyclical encodings (sin/cos) for hour, month, day-of-week, hour-of-week
+    cyclical encodings (sin/cos) for hour, month, day-of-week, hour-of-week,
+    day-of-year; hours_ahead horizon feature
   - Weather: temp_c, precipitation_mm, sunshine_min, wind_kmh,
     cloud_cover_pct, direct_radiation_wm2, heating_degree, cooling_degree,
     temp_rolling_3d (3-day thermal mass proxy)
-  - Autoregressive lags: lag_24h, lag_48h, lag_72h, lag_168h, lag_336h
+  - Autoregressive lags: lag_1h, lag_2h, lag_6h, lag_12h,
+    lag_24h, lag_48h, lag_72h, lag_168h, lag_336h
     (dynamically selected based on available history)
   - Rolling activity: rolling_mean_24h, rolling_mean_7d, rolling_std_24h
     (per-hour sliding projection at predict time to match training semantics)
@@ -53,7 +55,14 @@ _LOGGER = logging.getLogger(__name__)
 # ── Lag hours used as autoregressive features ─────────────────────────────────
 # All are safe for a 48-hour forecast: target is always ≥1h ahead,
 # so lag_24h for h=+1 points to now-23h — always in the past.
-LAG_HOURS = [24, 48, 72, 168, 336]
+#
+# Short-horizon lags (1h, 2h, 6h, 12h): at predict time only the first L
+# future hours can look up a real past value for lag_Lh; beyond that the
+# model receives NaN → filled with the training median.  This is by design:
+# the model learns that median-valued short lags carry no information and
+# weights them heavily only in the near-term window.  Impact is concentrated
+# on hours 1–12 ahead.
+LAG_HOURS = [1, 2, 6, 12, 24, 48, 72, 168, 336]
 
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
@@ -65,12 +74,16 @@ _FEATURES_BASE = [
     "month_sin", "month_cos",
     "dow_sin", "dow_cos",
     "how_sin", "how_cos",                            # hour-of-week cyclical
+    "doy_sin", "doy_cos",                            # day-of-year cyclical (seasonal curve)
+    # Horizon
+    "hours_ahead",                                   # 0 at training (actuals), 0-47 at predict
     # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy
     # Autoregressive lags — always safe (see note above)
+    "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
     "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
@@ -154,7 +167,8 @@ class EnergyForecastModel:
         self.last_mae: float | None        = None
         self.last_cv_mae: float | None     = None   # cross-validated MAE
         self.engine: str                   = "not trained"
-        self._feature_medians: dict        = {}     # used to fill NaN at predict time
+        self._feature_medians: dict        = {}     # global medians — used to fill NaN at predict time
+        self._feature_medians_by_how: dict = {}     # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
@@ -200,7 +214,15 @@ class EnergyForecastModel:
         n_rows = len(energy_df)
         active_lags = [lag for lag in LAG_HOURS if n_rows - lag >= 100]
         skipped_lags = [lag for lag in LAG_HOURS if lag not in active_lags]
-        if skipped_lags:
+        if not active_lags:
+            _LOGGER.warning(
+                "Dynamic lag selection: no lag features active (need ≥%d rows, have %d). "
+                "The model will train without autoregressive features — accuracy will be "
+                "significantly reduced until more history is collected.",
+                min(LAG_HOURS) + 100,
+                n_rows,
+            )
+        elif skipped_lags:
             _LOGGER.info(
                 "Dynamic lag selection: skipping %s (need %d+ rows, have %d). "
                 "These will be added automatically as history grows.",
@@ -234,6 +256,8 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_lag_24h")
                 if n_rows - 168 >= 100:
                     sub_sensor_cols.append(f"{prefix}_lag_168h")
+                sub_sensor_cols.append(f"{prefix}_active_24h")
+                sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
@@ -265,6 +289,27 @@ class EnergyForecastModel:
             col: float(df[col].median()) for col in feature_cols if col in df.columns
         }
 
+        # Per-hour-of-week medians for lag and rolling columns (#31).
+        # These columns vary significantly by HOW (e.g. lag_24h at Monday 08:00
+        # differs from Saturday 08:00), so HOW-specific imputation is more accurate
+        # than the global median when recent actuals are sparse.
+        # Falls back to global median when a HOW bucket has no data.
+        how_cols = [
+            c for c in feature_cols
+            if (c.startswith("lag_") or c.startswith("rolling_") or
+                "_lag_" in c)          # sub-sensor lags: e.g. sub_hp_lag_24h
+            and c in df.columns
+        ]
+        if how_cols and "hour_of_week" in df.columns:
+            how_med = (
+                df.groupby("hour_of_week")[how_cols]
+                .median()
+                .to_dict(orient="index")    # {how: {col: median}}
+            )
+            self._feature_medians_by_how = how_med
+        else:
+            self._feature_medians_by_how = {}
+
         X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
         y = df["gross_kwh"].values
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
@@ -280,18 +325,50 @@ class EnergyForecastModel:
         # Also used to determine optimal n_estimators via LightGBM early stopping.
         cv_mae = None
         best_n_est: int | None = None
+        _NUM_LEAVES_SWEEP = [16, 31, 63]   # candidates; only used on last CV fold
+        best_num_leaves: int = 31
         if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
-                tscv      = TimeSeriesSplit(n_splits=3)
+                tscv   = TimeSeriesSplit(n_splits=3)
+                splits = list(tscv.split(X))
                 fold_maes = []
-                for tr_idx, val_idx in tscv.split(X):
+                for fold_idx, (tr_idx, val_idx) in enumerate(splits):
                     sw_fold = sample_weight[tr_idx] if sample_weight is not None else None
-                    m = _build_model(lgb, GBR)
                     fit_kwargs: dict = {}
                     if sw_fold is not None:
                         fit_kwargs["sample_weight"] = sw_fold
-                    if lgb is not None:
+
+                    is_last_fold = fold_idx == len(splits) - 1
+
+                    if is_last_fold and lgb is not None:
+                        # ── num_leaves sweep on last fold (LightGBM only) ──────────
+                        sweep_maes: dict[int, float] = {}
+                        for nl in _NUM_LEAVES_SWEEP:
+                            m_nl = _build_model(lgb, GBR, num_leaves=nl)
+                            try:
+                                m_nl.fit(
+                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    callbacks=[
+                                        lgb.early_stopping(50, verbose=False),
+                                        lgb.log_evaluation(-1),
+                                    ],
+                                    **fit_kwargs,
+                                )
+                            except Exception:  # noqa: BLE001
+                                m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                            sweep_maes[nl] = float(
+                                mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx])))
+                            )
+                        best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
+                        _LOGGER.info(
+                            "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
+                            {nl: round(v, 4) for nl, v in sweep_maes.items()},
+                            best_num_leaves, sweep_maes[best_num_leaves],
+                        )
+                        # Refit last fold with the winning num_leaves for consistent n_est
+                        m = _build_model(lgb, GBR, num_leaves=best_num_leaves)
                         try:
                             m.fit(
                                 X.iloc[tr_idx], y_fit[tr_idx],
@@ -303,18 +380,38 @@ class EnergyForecastModel:
                                 **fit_kwargs,
                             )
                             best_n_est = getattr(m, "best_iteration_", best_n_est)
-                        except Exception as _es_exc:  # noqa: BLE001
-                            _LOGGER.debug("Early stopping failed for fold: %s — using fixed estimators", _es_exc)
+                        except Exception:  # noqa: BLE001
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        fold_maes.append(sweep_maes[best_num_leaves])
                     else:
-                        m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                    # MAE reported in original kWh space (expm1 undoes log1p)
-                    fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
+                        m = _build_model(lgb, GBR)
+                        if lgb is not None:
+                            try:
+                                m.fit(
+                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    callbacks=[
+                                        lgb.early_stopping(50, verbose=False),
+                                        lgb.log_evaluation(-1),
+                                    ],
+                                    **fit_kwargs,
+                                )
+                                best_n_est = getattr(m, "best_iteration_", best_n_est)
+                            except Exception as _es_exc:  # noqa: BLE001
+                                _LOGGER.debug(
+                                    "Early stopping failed for fold: %s — using fixed estimators",
+                                    _es_exc,
+                                )
+                                m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        else:
+                            m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
+                        # MAE reported in original kWh space (expm1 undoes log1p)
+                        fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(
                     "CV fold MAEs: %s → mean=%.4f ± %.4f",
-                    [round(m, 4) for m in fold_maes], cv_mae, cv_std,
+                    [round(v, 4) for v in fold_maes], cv_mae, cv_std,
                 )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
@@ -323,7 +420,7 @@ class EnergyForecastModel:
             _LOGGER.info("LightGBM early stopping: using %d estimators (from last CV fold)", best_n_est)
 
         # ── Final model on all data ─────────────────────────────────────────
-        model = _build_model(lgb, GBR, n_estimators=best_n_est)
+        model = _build_model(lgb, GBR, n_estimators=best_n_est, num_leaves=best_num_leaves)
         if sample_weight is not None:
             model.fit(X, y_fit, sample_weight=sample_weight)
         else:
@@ -420,9 +517,30 @@ class EnergyForecastModel:
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours)
 
+        # Overwrite hours_ahead with the actual prediction horizon (0–47).
+        # _engineer_features sets it to 0 (training-row semantics); here we
+        # populate the real horizon so the model can learn near-vs-far bias.
+        feat_df["hours_ahead"] = np.arange(len(feat_df))
+
+        # Build per-HOW fill lookups once (for lag/rolling cols with HOW-specific medians).
+        # For each such column, map hour_of_week → stored HOW median.
+        how_fill_lookup: dict[str, "pd.Series"] = {}
+        if self._feature_medians_by_how and "hour_of_week" in feat_df.columns:
+            sample_meds = next(iter(self._feature_medians_by_how.values()), {})
+            for col in sample_meds:
+                how_fill_lookup[col] = pd.Series(
+                    {how: meds.get(col) for how, meds in self._feature_medians_by_how.items()}
+                )
+
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
-                feat_df[col] = feat_df[col].fillna(self._feature_medians.get(col, 0.0))
+                global_med = self._feature_medians.get(col, 0.0)
+                if col in how_fill_lookup and "hour_of_week" in feat_df.columns:
+                    # HOW-specific fill; fall back to global median for empty HOW buckets
+                    how_fill = feat_df["hour_of_week"].map(how_fill_lookup[col]).fillna(global_med)
+                    feat_df[col] = feat_df[col].where(feat_df[col].notna(), how_fill)
+                else:
+                    feat_df[col] = feat_df[col].fillna(global_med)
 
         X = feat_df[self.feature_cols].fillna(0)
         return future_hours, X
@@ -491,16 +609,17 @@ class EnergyForecastModel:
         _write_hash(self._model_path)
 
         meta = {
-            "feature_cols":          self.feature_cols,
-            "last_trained":          self.last_trained,
-            "last_mae":              self.last_mae,
-            "last_cv_mae":           self.last_cv_mae,
-            "engine":                self.engine,
-            "feature_medians":       self._feature_medians,
-            "log_transform":         self._log_transform,
-            "canton":                self._canton,
-            "likely_ev_hours":       self._likely_ev_hours,
-            "sub_sensor_prefixes":   self._sub_sensor_prefixes,
+            "feature_cols":              self.feature_cols,
+            "last_trained":              self.last_trained,
+            "last_mae":                  self.last_mae,
+            "last_cv_mae":               self.last_cv_mae,
+            "engine":                    self.engine,
+            "feature_medians":           self._feature_medians,
+            "feature_medians_by_how":    self._feature_medians_by_how,
+            "log_transform":             self._log_transform,
+            "canton":                    self._canton,
+            "likely_ev_hours":           self._likely_ev_hours,
+            "sub_sensor_prefixes":       self._sub_sensor_prefixes,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -564,6 +683,7 @@ class EnergyForecastModel:
                     self.last_cv_mae           = meta.get("last_cv_mae")
                     self.engine                = meta.get("engine",                "unknown")
                     self._feature_medians      = meta.get("feature_medians",       {})
+                    self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform        = meta.get("log_transform",         False)
                     self._canton               = meta.get("canton",                None)
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
@@ -634,13 +754,17 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
         lag_td = pd.Timedelta(hours=lag)
         lag_times = future_df["timestamp"] - lag_td
         future_df[f"lag_{lag}h"] = actuals.reindex(lag_times).values
-        nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
-        if nan_count > len(future_df) * 0.5:
-            _LOGGER.warning(
-                "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
-                "back %dh; these will be filled with training medians.",
-                lag, nan_count, len(future_df), lag,
-            )
+        # Short-horizon lags (lag < 48h) are expected to be NaN for most future
+        # hours — only the first `lag` hours can look up a real past value.
+        # Only warn for long lags where NaN indicates an actuals coverage gap.
+        if lag >= 24:
+            nan_count = int(future_df[f"lag_{lag}h"].isna().sum())
+            if nan_count > len(future_df) * 0.5:
+                _LOGGER.warning(
+                    "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
+                    "back %dh; these will be filled with training medians.",
+                    lag, nan_count, len(future_df), lag,
+                )
 
     # ── Rolling stats — sliding window projection ────────────────────────────
     # During training, rolling_mean_24h[i] = mean(gross_kwh[i-24:i]) — it varies
@@ -689,12 +813,16 @@ def _add_sub_sensor_lags_training(
     df: pd.DataFrame,
     sub_sensors: dict | None,
 ) -> pd.DataFrame:
-    """Add lag_24h (and optionally lag_168h) columns for each sub-sensor.
+    """Add lag_24h, lag_168h, active_24h, and runs_7d columns for each sub-sensor.
 
     For each prefix/DataFrame pair in sub_sensors:
     - Reindexes the sub-sensor kWh series onto the training timestamps
-    - Computes lag_24h via shift(24), lag_168h via shift(168) when n_rows ≥ 268
+    - lag_24h via shift(24); lag_168h via shift(168) when n_rows ≥ 268
+    - active_24h: 1 if any non-zero reading in the 24h window ending at the row
+    - runs_7d: count of appliance start events (0→>0 transitions) in past 168h
 
+    All rolling ops use shift(1) first to exclude the current row, matching
+    the training semantics for the main lag features.
     Returns df unchanged when sub_sensors is empty/None.
     """
     import pandas as pd
@@ -725,6 +853,19 @@ def _add_sub_sensor_lags_training(
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
             df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
 
+        # active_24h: was the appliance active any time in the past 24h?
+        # Use shift(1) so the current-row value is excluded (lag semantics).
+        filled = kwh_series.fillna(0)
+        shifted_kwh = filled.shift(1)
+        active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
+        df[f"{prefix}_active_24h"] = active.values
+
+        # runs_7d: how many times did the appliance start (0→>0 transition) in
+        # the past 168h?  shift(1) applied before rolling to exclude current row.
+        is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
+        runs = is_start.shift(1).rolling(168, min_periods=1).sum()
+        df[f"{prefix}_runs_7d"] = runs.values
+
     return df
 
 
@@ -732,19 +873,26 @@ def _add_sub_sensor_lags_prediction(
     future_df: pd.DataFrame,
     sub_sensors_recent: dict,
 ) -> pd.DataFrame:
-    """Fill sub-sensor lag features for the 48-hour prediction horizon.
+    """Fill sub-sensor lag + derived features for the 48-hour prediction horizon.
 
-    For each sub-sensor, reindexes the recent actuals series at
-    (timestamp - 24h) and (timestamp - 168h).  Falls back to NaN when actuals
-    don't reach far enough back (logged at WARNING).
+    For each sub-sensor:
+    - lag_24h / lag_168h: reindex recent actuals at (timestamp - Lh)
+    - active_24h: 1 if any non-zero reading in the 24h window before each future
+      hour (populated from recent actuals; becomes 0 for future hours > 24h ahead)
+    - runs_7d: appliance start count in the past 168h (constant across all 48 future
+      hours — we can only know the count from recent actuals)
+
+    Falls back to NaN/0 when actuals don't reach far enough back.
     """
     import pandas as pd
     import numpy as np
 
     for prefix, sub_df in sub_sensors_recent.items():
         if sub_df is None or sub_df.empty:
-            future_df[f"{prefix}_lag_24h"]  = float("nan")
-            future_df[f"{prefix}_lag_168h"] = float("nan")
+            for col in (f"{prefix}_lag_24h", f"{prefix}_lag_168h"):
+                future_df[col] = float("nan")
+            future_df[f"{prefix}_active_24h"] = 0
+            future_df[f"{prefix}_runs_7d"]    = 0
             continue
 
         sub_series = (
@@ -752,20 +900,44 @@ def _add_sub_sensor_lags_prediction(
             .sort_index()
             .astype(float)
         )
+        future_ts = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]))
+
         for lag, col in [(24, f"{prefix}_lag_24h"), (168, f"{prefix}_lag_168h")]:
             lag_td    = pd.Timedelta(hours=lag)
-            lag_times = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]) - lag_td)
+            lag_times = future_ts - lag_td
             # Normalise index resolution so reindex finds matches regardless of
             # whether the CSV cache was written with ns or us precision (pandas 3.x).
             lag_times = lag_times.as_unit(sub_series.index.unit if hasattr(sub_series.index, "unit") else "ns")
             future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
             nan_count = int(future_df[col].isna().sum())
-            if nan_count > len(future_df) * 0.5:
+            if lag >= 24 and nan_count > len(future_df) * 0.5:
                 _LOGGER.warning(
                     "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
                     "will be filled with training medians.",
                     col, nan_count, len(future_df), lag,
                 )
+
+        # active_24h: check 24h window before each future hour from recent actuals.
+        # For future hours beyond the 24h actuals horizon this will be 0.
+        active_vals = []
+        for fts in future_ts:
+            window_start = fts - pd.Timedelta(hours=24)
+            window = sub_series[(sub_series.index >= window_start) & (sub_series.index < fts)]
+            active_vals.append(int((window > 0).any()))
+        future_df[f"{prefix}_active_24h"] = active_vals
+
+        # runs_7d: appliance start count from the most recent 168h of actuals.
+        # Constant across all future hours — future starts are unknown.
+        if len(sub_series) > 0:
+            filled = sub_series.fillna(0)
+            is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
+            # Use actuals in the window [last_ts - 168h, last_ts]
+            last_ts    = sub_series.index.max()
+            window_168 = is_start[is_start.index >= last_ts - pd.Timedelta(hours=168)]
+            runs_count = int(window_168.sum())
+        else:
+            runs_count = 0
+        future_df[f"{prefix}_runs_7d"] = runs_count
 
     return future_df
 
@@ -806,6 +978,14 @@ def _engineer_features(
     df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
     df["how_sin"]   = np.sin(2 * np.pi * df["hour_of_week"] / 168)
     df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
+    doy = df["timestamp"].dt.dayofyear
+    df["doy_sin"]   = np.sin(2 * np.pi * doy / 365)
+    df["doy_cos"]   = np.cos(2 * np.pi * doy / 365)
+
+    # ── Horizon feature (0 for training rows — always actuals) ───────────────
+    # At predict time _prepare_prediction_X overwrites this with 0..47 so the
+    # model can learn horizon-specific bias without distributional leakage.
+    df["hours_ahead"] = 0
 
     # ── EV charging pattern ───────────────────────────────────────────────────
     if likely_ev_hours:
@@ -1039,16 +1219,17 @@ def _build_quantile_model(lgb: Any, GBR: Any, alpha: float, n_estimators: int | 
     )
 
 
-def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None) -> Any:
+def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None, num_leaves: int = 31) -> Any:
     """Instantiate the best available model (LightGBM preferred, sklearn GBR fallback).
 
     n_estimators overrides the default when provided (e.g. from early stopping).
+    num_leaves is LightGBM-only; ignored for sklearn GBR.
     """
     if lgb is not None:
         return lgb.LGBMRegressor(
             n_estimators=n_estimators or 500,
             learning_rate=0.05,
-            num_leaves=31,
+            num_leaves=num_leaves,
             subsample=0.8,
             colsample_bytree=0.8,
             min_child_samples=20,

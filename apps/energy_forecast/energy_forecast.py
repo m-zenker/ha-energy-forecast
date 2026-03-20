@@ -75,6 +75,7 @@ class EnergyForecast(hass.Hass):
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
 
+        self._check_setup()
         self._publish_unavailable()
         self.run_in(self._retrain_cb, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
@@ -122,6 +123,55 @@ class EnergyForecast(hass.Hass):
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}"
         )
+
+    # ── Setup checker ─────────────────────────────────────────────────────────
+
+    def _check_setup(self) -> None:
+        """Publish sensor.energy_forecast_setup_status with import diagnostics.
+
+        State is "ok" when all required packages are importable.  If a package
+        is missing the state is "missing_packages" and the attributes list which
+        ones failed, so users can diagnose install issues from HA dev tools
+        without reading AppDaemon logs.
+        """
+        _REQUIRED = [
+            ("pandas",    "pandas"),
+            ("numpy",     "numpy"),
+            ("sklearn",   "scikit-learn"),
+            ("requests",  "requests"),
+            ("holidays",  "holidays"),
+        ]
+        missing: list[str] = []
+        for module, pip_name in _REQUIRED:
+            try:
+                __import__(module)
+            except ImportError:
+                missing.append(pip_name)
+
+        if missing:
+            state = "missing_packages"
+            self.log(
+                f"Setup check: missing packages — {missing}. "
+                "Install them via AppDaemon add-on configuration.",
+                level="WARNING",
+            )
+        else:
+            state = "ok"
+
+        try:
+            self.set_state(
+                "sensor.energy_forecast_setup_status",
+                state=state,
+                attributes={
+                    "friendly_name": "Energy Forecast Setup Status",
+                    "unique_id": "energy_forecast_setup_status",
+                    "missing_packages": missing,
+                    "icon": "mdi:check-circle" if state == "ok" else "mdi:alert-circle",
+                },
+                replace=True,
+            )
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            self.log(f"Could not publish setup status sensor: {exc}", level="WARNING")
 
     # ── Sub-sensor helpers ────────────────────────────────────────────────────
 
@@ -306,10 +356,16 @@ class EnergyForecast(hass.Hass):
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""
+        import pandas as pd
+
         cv_mae = self._ml_model.last_cv_mae
         if cv_mae is None:
             return
-        hours_since = (datetime.now() - self._last_adaptive_retrain).total_seconds() / 3600
+        # Use Europe/Zurich local time (tz-naive) consistent with pipeline timestamps.
+        # datetime.now() would use system time, which is UTC in Docker/HA and
+        # causes the cooldown to fire up to ±2h early/late and wrong during DST.
+        _now = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+        hours_since = (_now - self._last_adaptive_retrain).total_seconds() / 3600
         if hours_since < 24:
             return
         live_mae, n_pairs = _compute_live_mae(self._pred_history, actuals_df)
@@ -322,7 +378,7 @@ class EnergyForecast(hass.Hass):
                 f"(over {n_pairs} matched hours)",
                 level="WARNING",
             )
-            self._last_adaptive_retrain = datetime.now()
+            self._last_adaptive_retrain = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
             self._retrain()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
@@ -335,6 +391,8 @@ class EnergyForecast(hass.Hass):
                 attributes={
                     "unit_of_measurement": "kWh",
                     "friendly_name": f"Energy Forecast {slot.title().replace('_', ' ')}",
+                    "unique_id": f"energy_forecast_{slot}",
+                    "icon": "mdi:lightning-bolt",
                 },
                 replace=True,
             )
@@ -345,6 +403,8 @@ class EnergyForecast(hass.Hass):
                 attributes={
                     "unit_of_measurement": "kWh",
                     "friendly_name": f"EV Charging Detected {day.title()}",
+                    "unique_id": f"energy_forecast_ev_{day}",
+                    "icon": "mdi:car-electric",
                 },
                 replace=True,
             )
@@ -365,14 +425,20 @@ class EnergyForecast(hass.Hass):
             "last_trained": trained_str,
         }
 
-        def safe_set(entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None) -> None:
+        def safe_set(entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None, icon: str | None = None) -> None:
             try:
                 val = float(value)
                 if math.isnan(val) or math.isinf(val):
                     val = 0.0
             except (TypeError, ValueError):
                 val = 0.0
-            attrs = {**base_attrs, "friendly_name": friendly_name}
+            attrs = {
+                **base_attrs,
+                "friendly_name": friendly_name,
+                "unique_id": entity_id.split(".", 1)[-1],
+            }
+            if icon:
+                attrs["icon"] = icon
             if extra_attrs:
                 attrs.update(extra_attrs)
             self.set_state(
@@ -384,15 +450,15 @@ class EnergyForecast(hass.Hass):
 
         # ── Forecast totals ───────────────────────────────────────────────────
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
-            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}")
+            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
 
         # ── Prediction intervals (only published when quantile models trained) ─
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             low  = data.get(f"{key}_low")
             high = data.get(f"{key}_high")
             if low is not None and high is not None:
-                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)")
-                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)")
+                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)",  icon="mdi:arrow-down-bold")
+                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)", icon="mdi:arrow-up-bold")
 
         # ── Forecast 3-hour blocks ────────────────────────────────────────────
         for day in ("today", "tomorrow"):
@@ -403,6 +469,7 @@ class EnergyForecast(hass.Hass):
                     f"sensor.energy_forecast_{day}_{slot}",
                     blocks.get(slot, 0),
                     f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00",
+                    icon="mdi:calendar-clock",
                 )
 
         # ── EV actuals sensors ────────────────────────────────────────────────
@@ -415,12 +482,14 @@ class EnergyForecast(hass.Hass):
             data.get("ev_today", 0),
             "EV Charging Detected Today",
             extra_attrs=ev_attrs,
+            icon="mdi:car-electric",
         )
         safe_set(
             "sensor.energy_forecast_ev_yesterday",
             data.get("ev_yesterday", 0),
             "EV Charging Detected Yesterday",
             extra_attrs=ev_attrs,
+            icon="mdi:car-electric",
         )
 
         # ── Model MAE sensor ──────────────────────────────────────────────────
@@ -431,6 +500,8 @@ class EnergyForecast(hass.Hass):
             attributes={
                 "unit_of_measurement": "kWh",
                 "friendly_name": "Energy Forecast Model MAE",
+                "unique_id": "energy_forecast_model_mae",
+                "icon": "mdi:chart-bell-curve-cumulative",
                 "attribution": ATTRIBUTION,
                 "cv_mae": str(model.last_cv_mae) if model.last_cv_mae is not None else "n/a",
                 "model_engine": str(model.engine),
@@ -512,7 +583,6 @@ class EnergyForecast(hass.Hass):
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
             if not ev_rows.empty:
-                import numpy as np
                 ev_rows["ev_kwh"] = np.maximum(
                     0.0, ev_rows["gross_kwh"] - self._ev_charger_kw
                 )
@@ -611,6 +681,12 @@ def _compute_live_mae(
 
     Returns (mae, n_pairs).  mae is float('nan') when n_pairs == 0.
     Only hours present in both pred_history and actuals_df are included.
+
+    DST fall-back caveat: during the October clock-back, the naive 02:xx hour
+    appears twice in the history.  Both occurrences map to the same floor("1h")
+    key here, so the second occurrence overwrites the first in actuals_map and
+    the wrong actual may be matched to the prediction.  This is an accepted
+    edge case (one hour per year) and not worth the complexity of tz-aware storage.
     """
     import pandas as pd
 

@@ -6,7 +6,153 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.5.2] — 2026-03-20
+
+### Fixed
+- **pandas 3.x mixed-format timestamp parse failure** (`ha_data.py`): all four CSV-cache
+  `pd.to_datetime()` calls now pass `format="mixed"`, preventing a `ValueError` when a
+  date-only midnight entry (e.g. `"2026-03-20"`) appeared alongside full datetime strings
+  in `energy_history.csv`.  Without this fix every hourly update after midnight ran with
+  `recent_actuals = None`, degrading all lag/rolling features to training medians for the
+  rest of the day.  The inner `except` clauses at each load site also widen to include
+  `ValueError` so any future parse error degrades gracefully (empty cache, WARNING logged)
+  rather than silently losing lag features.
+
+### Added
+- **MDI icons on all published sensors** (`energy_forecast.py`): every `set_state()` call
+  now carries a `"unique_id"` attribute (stable identifier = entity_id minus `sensor.` prefix,
+  reserved for future MQTT Discovery integration) and an `"icon"` attribute.  Icons:
+  `mdi:lightning-bolt` (forecast totals + unavailable placeholders), `mdi:arrow-down-bold` /
+  `mdi:arrow-up-bold` (prediction interval low/high), `mdi:calendar-clock` (3-hour block
+  sensors), `mdi:car-electric` (EV sensors), `mdi:chart-bell-curve-cumulative` (model MAE).
+
+  **Note:** AppDaemon's `set_state()` writes to HA's state machine only; it does not register
+  entities in the entity registry.  Area assignment and labels require MQTT Discovery (roadmap
+  item #37).
+
+---
+
+## [0.5.1] — 2026-03-19
+
+### Fixed
+- **Adaptive retrain cooldown timezone** (`energy_forecast.py`, H1): `_maybe_adaptive_retrain`
+  now uses `pd.Timestamp.now("Europe/Zurich").tz_localize(None)` instead of `datetime.now()`
+  (system local time), preventing the 24-hour cooldown from firing ±2 h early/late on
+  UTC-based Docker/HA systems and across DST transitions.
+- **Duplicate numpy import** (`energy_forecast.py`, H2): removed redundant `import numpy as np`
+  inside the EV block of `_aggregate`; numpy was already imported at the top of the method.
+- **CSV header TOCTOU race** (`ha_data.py`, H3): `stat()` + `to_csv(mode="a")` are now
+  wrapped in a single `except OSError` block, preventing a potential race where another
+  process deletes/truncates the file between the stat check and the write.
+- **Sub-sensor merge deduplication** (`ha_data.py`, H4): both `fetch_sub_sensor_history` and
+  `fetch_recent_sub_sensor` now use the shared `_merge_sub_sensor_frames` helper (backed by
+  `_merge_energy_frames`) instead of duplicated inline `pd.concat/drop_duplicates` chains.
+- **Missing cloud/radiation defaults** (`weather.py`, M2): absent `cloud_cover` / `direct_radiation`
+  keys now fall back to `[np.nan]` instead of `[0]`; `0` was interpreted as "perfectly clear sky"
+  and biased training. NaN triggers the safety-net median fill in `_engineer_features`.
+- **SRG OAuth token cached** (`weather.py`, M1): token is now reused for 55 minutes, reducing
+  SRG token-endpoint calls from 24+/day to ~1/day and removing silent Open-Meteo fallbacks
+  caused by rate-limit errors.
+
+### Added
+- **Sunshine clamp + warning** (`weather.py`, M4): `_parse_sunshine_min` helper converts
+  sunshine_duration (seconds → minutes) and clamps values > 60 min/h with a WARNING log.
+- **Column guard in `_supplement_from_open_meteo`** (`weather.py`, M3): if Open-Meteo omits
+  `cloud_cover_pct`/`direct_radiation_wm2` (API schema drift), the function logs a WARNING
+  and returns the SRG DataFrame unchanged instead of raising `KeyError`.
+- **No-lag WARNING** (`model.py`, M7): logs a WARNING when all autoregressive lags are
+  skipped (history too short for even `lag_1h`), making it visible that the model is
+  training without its core predictive features.
+- **EV config in apps.yaml.example** (C3): `ev_charging_threshold_kwh` and `ev_charger_kw`
+  are now documented with default values in the config template.
+
+### Changed
+- `_check_setup` exception narrowed from `except Exception` to
+  `except (AttributeError, TypeError, RuntimeError)` (`energy_forecast.py`, L3).
+- Redundant `hasattr(col.dtype, "tz")` guards removed; idiomatic `col.dt.tz is not None`
+  used directly at all four sites (`ha_data.py`, M8).
+- `HOLDOUT_FRACTION` clarified with inline comment that it is the *training* fraction
+  (`const.py`, L1).
+- `conftest.py` hassapi stub comment expanded to explain the purpose.
+- README features table rewritten to cover stages 2–5 additions; sub-sensor feature list
+  updated to include `active_24h` and `runs_7d`; activation-threshold wording corrected.
+- README Installation step numbering fixed (duplicate step 3 renumbered to 4/5).
+- README Published Sensors: `sensor.energy_forecast_setup_status` documented in Model diagnostics table.
+- README Sub-energy sensors: feature table expanded to show all four features (`lag_24h`, `lag_168h`, `active_24h`, `runs_7d`) with activation thresholds.
+- README Parameter reference: deprecated `plz` parameter removed from table; replaced with a brief callout note.
+- README Troubleshooting: MAE guidance reframed as a percentage of average hourly consumption rather than a fixed threshold.
+- CHANGELOG version comparison links added for v0.4.0–v0.5.0; `[Unreleased]` pointer corrected to `v0.5.0...HEAD`.
+- `apps.yaml.example`: `timezone` line annotated with a change hint for non-Swiss users.
+
+---
+
+## [0.5.0] — 2026-03-19
+
+### Added
+- **Setup checker sensor** (`energy_forecast.py`, #17): `_check_setup()` is called on
+  `initialize()` and publishes `sensor.energy_forecast_setup_status` (state: `ok` or
+  `missing_packages`).  The `missing_packages` attribute lists which pip packages failed
+  to import, so users can diagnose install issues directly from HA Developer Tools without
+  reading AppDaemon logs.
+
+### Changed
+- **CSV append-only writes** (`ha_data.py`, #19): `fetch_recent_energy` (hourly) now
+  appends only genuinely new timestamps to the cache CSV instead of rewriting the entire
+  file on every sensor update.  `fetch_energy_history` (weekly retrain) continues to do a
+  full sort + dedup compaction rewrite, which also corrects any stale values that bypassed
+  the append-only path.
+
+---
+
+## [0.4.5] — 2026-03-19
+
+### Added
+- **Per-hour-of-week NaN fill medians** (`model.py`, #31): during training, per-HOW
+  (168-cell) medians are computed for all lag and rolling columns and stored as
+  `feature_medians_by_how` in `meta.pkl`.  At predict time, NaN values in these columns
+  are filled using the HOW-specific median for the matching `hour_of_week` slot, falling
+  back to the global median when the HOW bucket is empty.  Backward compatible — old
+  `meta.pkl` without this key silently defaults to global-median behaviour.
+
+---
+
+## [0.4.4] — 2026-03-19
+
+### Added
+- **`{prefix}_active_24h` binary flag** (`model.py`, #35): 1 when the sub-sensor had
+  any non-zero reading in the 24h window before each training/prediction row, else 0.
+  Provides a "was the appliance recently active?" signal for sparse sensors (~95% zero).
+- **`{prefix}_runs_7d` rolling run count** (`model.py`, #36): count of appliance start
+  events (0 → >0 transitions) in the past 168h during training.  At predict time the
+  count is computed from recent actuals and held constant across the 48-hour horizon
+  (future starts are unknown).  Helps the model distinguish heavy-use from idle periods.
+
+---
+
+## [0.4.3] — 2026-03-19
+
+### Added
+- **Day-of-year cyclical features** (`model.py`, #33): `doy_sin` and `doy_cos`
+  (period 365) added to `_FEATURES_BASE` and `_engineer_features`.  Gives the model
+  a smooth, continuous seasonal signal independent of month/season buckets.
+- **`hours_ahead` horizon feature** (`model.py`, #34): set to 0 for all training rows
+  (actuals) and overwritten with 0–47 in `_prepare_prediction_X` so the model can
+  learn horizon-specific bias without distributional leakage.
+- **`num_leaves` sweep** (`model.py`, #28): on the last CV fold (LightGBM only), values
+  `[16, 31, 63]` are evaluated; the best is selected and used for the final model.
+  Results are logged at INFO level.  Falls back to 31 on sklearn GBR.
+
+---
+
+## [0.4.2] — 2026-03-19
+
+### Added
+- **Short-horizon lag features** (`model.py`, #27): `lag_1h`, `lag_2h`, `lag_6h`, and
+  `lag_12h` added to `LAG_HOURS`.  The existing dynamic-selection gate (`n_rows - lag ≥ 100`)
+  activates each as history grows (lag_1h at 101 rows, lag_12h at 112).  At predict time
+  only the first `L` future hours carry real lag values; later hours receive the training
+  median, which is intentional — the model learns horizon-specific weighting.  Expected
+  accuracy improvement is concentrated on hours 1–12 ahead.
 
 ---
 
@@ -186,7 +332,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.3.0...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.2...HEAD
+[0.5.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.1...v0.5.2
+[0.5.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.0...v0.5.1
+[0.5.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.5...v0.5.0
+[0.4.5]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.4...v0.4.5
+[0.4.4]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.3...v0.4.4
+[0.4.3]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.2...v0.4.3
+[0.4.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.1...v0.4.2
+[0.4.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.0...v0.4.1
+[0.4.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.3.0...v0.4.0
 [0.3.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.1...v0.3.0
 [0.2.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.2.0...v0.2.1
 [0.2.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.1.0...v0.2.0

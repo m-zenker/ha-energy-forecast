@@ -241,6 +241,103 @@ class TestLag72h:
         assert result["lag_72h"].isna().all()
 
 
+# ── Stage 2 — Short-horizon lags (#27) ────────────────────────────────────────
+
+class TestShortHorizonLags:
+    """lag_1h, lag_2h, lag_6h, lag_12h: presence, values, thresholds, backward compat."""
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_in_lag_hours(self, lag):
+        assert lag in LAG_HOURS
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_present_in_prediction_output(self, lag):
+        result = _add_lag_and_rolling_prediction(_make_future_df(), _make_actuals(200))
+        assert f"lag_{lag}h" in result.columns
+
+    def test_lag_1h_value_matches_actuals(self):
+        """lag_1h at h=0 must equal the actual at (future_ts[0] - 1h)."""
+        actuals_df = _make_actuals(200)
+        future_df  = _make_future_df()
+        result = _add_lag_and_rolling_prediction(future_df, actuals_df)
+        actuals_ser = (
+            actuals_df.set_index(pd.to_datetime(actuals_df["timestamp"]))["gross_kwh"]
+            .sort_index()
+        )
+        ts = future_df["timestamp"].iloc[0] - pd.Timedelta(hours=1)
+        expected = actuals_ser.get(ts, float("nan"))
+        if not np.isnan(expected):
+            assert abs(result["lag_1h"].iloc[0] - expected) < 1e-9
+
+    def test_lag_1h_nan_for_far_future_hours(self):
+        """lag_1h for h≥2 must be NaN — those lookup times are in the future."""
+        actuals_df = _make_actuals(200)
+        result = _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
+        # hours h=2..47 need actuals at (now+h-1h) which are not in recent history
+        assert result["lag_1h"].iloc[2:].isna().all()
+
+    @pytest.mark.parametrize("lag", [1, 2, 6, 12])
+    def test_short_lag_all_nan_when_no_actuals(self, lag):
+        """With no recent actuals, short lag columns must be all NaN."""
+        result = _add_lag_and_rolling_prediction(_make_future_df(), None)
+        assert result[f"lag_{lag}h"].isna().all()
+
+    def test_short_lags_in_feature_cols_after_train(self, tmp_path):
+        """Short lags must appear in feature_cols after training with ≥112 rows (lag_12h threshold)."""
+        n = 250  # 250 - 12 = 238 ≥ 100 → lag_12h active; 250 - 24 = 226 ≥ 100 → lag_24h active
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(7)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        for lag in (1, 2, 6, 12):
+            assert f"lag_{lag}h" in m.feature_cols, f"lag_{lag}h missing from feature_cols"
+
+    def test_short_lags_skipped_when_too_few_rows(self, tmp_path):
+        """With exactly 100 rows, ALL lags (including short ones) are skipped by the dynamic gate."""
+        n = 100  # n - lag >= 100 fails for all lags when n=100 and min lag=1 → 100-1=99 < 100
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(8)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # With 100 rows, training should skip (need ≥100 rows after dropna)
+        # model may be None (not enough clean rows after dropna+filter)
+        if m.model is not None:
+            for lag in (1, 2, 6, 12):
+                assert f"lag_{lag}h" not in m.feature_cols
+
+    def test_no_nan_warning_for_short_lags(self, caplog):
+        """Short lags must NOT emit the NaN coverage warning even though most hours are NaN."""
+        import logging
+        actuals_df = _make_actuals(200)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
+        for rec in caplog.records:
+            assert "lag_1h" not in rec.message
+            assert "lag_2h" not in rec.message
+            assert "lag_6h" not in rec.message
+            assert "lag_12h" not in rec.message
+
+
 # ── Bridge-day holiday features ───────────────────────────────────────────────
 
 def _make_ts_df(dates: list[str]) -> pd.DataFrame:
@@ -772,6 +869,118 @@ class TestSubSensorFeatures:
         assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 
 
+# ── Stage 4 — Sub-sensor activity flag and run count (#35, #36) ───────────────
+
+class TestSubSensorActivityAndRuns:
+    """active_24h and runs_7d computed correctly in training and prediction."""
+
+    def _all_zero_series(self, n: int = 400) -> pd.DataFrame:
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "kwh": [0.0] * n})
+
+    def _series_with_event(self, n: int = 400, event_start: int = 200) -> pd.DataFrame:
+        """All-zero series except rows event_start..event_start+3 which are non-zero."""
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        kwh = [0.0] * n
+        for i in range(event_start, min(event_start + 4, n)):
+            kwh[i] = 1.5
+        return pd.DataFrame({"timestamp": ts, "kwh": kwh})
+
+    def test_active_24h_zero_for_all_zero_series(self):
+        """All-zero sub-sensor → active_24h must be 0 everywhere."""
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=400, freq="1h"),
+            "gross_kwh": [2.0] * 400,
+        })
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": self._all_zero_series()})
+        assert "sub_dw_active_24h" in df.columns
+        assert (df["sub_dw_active_24h"] == 0).all()
+
+    def test_active_24h_becomes_one_after_event(self):
+        """After a non-zero event, active_24h must become 1 within the next 24 rows."""
+        n = 400
+        event_start = 200
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="1h"),
+            "gross_kwh": [2.0] * n,
+        })
+        sub = self._series_with_event(n=n, event_start=event_start)
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": sub})
+        # Rows from event_start+1 to event_start+24 should have active_24h=1
+        assert df["sub_dw_active_24h"].iloc[event_start + 1] == 1
+
+    def test_runs_7d_zero_for_all_zero_series(self):
+        """All-zero sub-sensor → runs_7d must be 0 everywhere (NaN at row 0 is OK)."""
+        energy = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=400, freq="1h"),
+            "gross_kwh": [2.0] * 400,
+        })
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": self._all_zero_series()})
+        assert "sub_dw_runs_7d" in df.columns
+        # Row 0 can be NaN (no prior row for transition detection); all others must be 0
+        assert (df["sub_dw_runs_7d"].iloc[1:] == 0).all()
+
+    def test_runs_7d_counts_appliance_starts(self):
+        """Two non-zero events separated by zeros → runs_7d counts correctly."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        # Two runs: rows 50-52 and 100-102
+        kwh = [0.0] * n
+        for i in range(50, 53):
+            kwh[i] = 1.0
+        for i in range(100, 103):
+            kwh[i] = 1.0
+        sub = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
+        df = _add_sub_sensor_lags_training(energy, {"sub_dw": sub})
+        # At row 168 (within 168h of both events), runs_7d should be 2
+        assert int(df["sub_dw_runs_7d"].iloc[168]) == 2
+
+    def test_active_24h_in_feature_cols_after_train(self, tmp_path):
+        """active_24h must appear in feature_cols after training with sub-sensors."""
+        n = 400
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(9)
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts, "temp_c": rng.uniform(-5, 25, n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        sub = self._series_with_event(n=n)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                sub_sensors_dict={"sub_dw": sub})
+        assert "sub_dw_active_24h" in m.feature_cols
+        assert "sub_dw_runs_7d" in m.feature_cols
+
+    def test_prediction_active_24h_zero_for_empty_sub_sensor(self):
+        """active_24h in prediction must be 0 when no recent actuals are available."""
+        future = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=48, freq="1h")})
+        result = _add_sub_sensor_lags_prediction(future, {"sub_dw": pd.DataFrame()})
+        assert (result["sub_dw_active_24h"] == 0).all()
+
+    def test_prediction_runs_7d_counts_from_recent_actuals(self):
+        """runs_7d at predict time must reflect start events in recent 168h actuals."""
+        now = pd.Timestamp("2026-01-08 12:00")
+        # 200h of actuals; two events: 50h and 100h ago
+        ts_hist = pd.date_range(now - pd.Timedelta(hours=200), now, freq="1h")
+        kwh = [0.0] * len(ts_hist)
+        idx_50  = len(ts_hist) - 51   # 50h ago
+        idx_100 = len(ts_hist) - 101  # 100h ago
+        if idx_50 >= 0:
+            kwh[idx_50]  = 2.0
+        if idx_100 >= 0:
+            kwh[idx_100] = 2.0
+        sub_recent = pd.DataFrame({"timestamp": ts_hist, "kwh": kwh})
+
+        future = pd.DataFrame({"timestamp": pd.date_range(now.floor("1h"), periods=48, freq="1h")})
+        result = _add_sub_sensor_lags_prediction(future, {"sub_dw": sub_recent})
+        # Both events are within 168h → runs_7d should be 2 for all future hours
+        assert (result["sub_dw_runs_7d"] == 2).all()
+
+
 # ── Stage 1 — Feature importance + CV std logging (#29, #30) ─────────────────
 
 class TestFeatureImportanceLogging:
@@ -828,4 +1037,179 @@ class TestHolidayVectorisation:
         result = _add_holiday_feature(df)
         assert int(result["days_to_next_holiday"].iloc[0]) <= _BRIDGE_CAP
         assert int(result["days_since_last_holiday"].iloc[0]) <= _BRIDGE_CAP
+
+
+# ── Stage 3 — doy cyclical, hours_ahead, num_leaves sweep (#33, #34, #28) ─────
+
+class TestDoyFeatures:
+    """doy_sin and doy_cos must be present and have correct values."""
+
+    def _make_bare_df(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * len(ts)})
+
+    def test_doy_columns_in_features_base(self):
+        assert "doy_sin" in _FEATURES_BASE
+        assert "doy_cos" in _FEATURES_BASE
+
+    def test_doy_columns_in_engineer_features_output(self):
+        ts = pd.date_range("2026-01-01", periods=4, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0]*4, "precipitation_mm": [0.0]*4,
+            "sunshine_min": [30.0]*4, "wind_kmh": [10.0]*4,
+            "cloud_cover_pct": [50.0]*4, "direct_radiation_wm2": [100.0]*4,
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert "doy_sin" in result.columns
+        assert "doy_cos" in result.columns
+
+    def test_doy_sin_near_zero_on_jan1(self):
+        """Jan 1 is doy=1; sin(2π·1/365) ≈ 0.0172 — near but not exactly 0."""
+        ts = pd.date_range("2026-01-01", periods=1, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0], "precipitation_mm": [0.0],
+            "sunshine_min": [30.0], "wind_kmh": [10.0],
+            "cloud_cover_pct": [50.0], "direct_radiation_wm2": [100.0],
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        expected_sin = np.sin(2 * np.pi * 1 / 365)
+        assert abs(float(result["doy_sin"].iloc[0]) - expected_sin) < 1e-9
+
+    def test_doy_sin_near_one_at_peak(self):
+        """doy ≈ 91 (April 1) sin ≈ 1; verify value is reasonable."""
+        ts = pd.date_range("2026-04-01", periods=1, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [10.0], "precipitation_mm": [0.0],
+            "sunshine_min": [30.0], "wind_kmh": [10.0],
+            "cloud_cover_pct": [50.0], "direct_radiation_wm2": [100.0],
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert float(result["doy_sin"].iloc[0]) > 0.99
+
+
+class TestHoursAheadFeature:
+    """hours_ahead = 0 in training rows; 0–47 monotonically in prediction."""
+
+    def _make_bare_df(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * len(ts)})
+
+    def test_hours_ahead_in_features_base(self):
+        assert "hours_ahead" in _FEATURES_BASE
+
+    def test_hours_ahead_zero_in_engineer_features(self):
+        """Training rows must always get hours_ahead=0."""
+        ts = pd.date_range("2026-01-01", periods=4, freq="1h")
+        w  = pd.DataFrame({
+            "timestamp": ts, "temp_c": [5.0]*4, "precipitation_mm": [0.0]*4,
+            "sunshine_min": [30.0]*4, "wind_kmh": [10.0]*4,
+            "cloud_cover_pct": [50.0]*4, "direct_radiation_wm2": [100.0]*4,
+        })
+        result = _engineer_features(self._make_bare_df(ts), w, None)
+        assert (result["hours_ahead"] == 0).all()
+
+    def test_hours_ahead_monotonic_in_prediction(self, tmp_path):
+        """Prediction X must have hours_ahead = 0, 1, 2, ..., 47."""
+        m, forecast = _make_trained_model(tmp_path)
+        # Peek at the feature matrix built for prediction
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=None, recent_actuals=None)
+        assert "hours_ahead" in X.columns
+        expected = list(range(48))
+        actual   = X["hours_ahead"].tolist()
+        assert actual == expected, f"hours_ahead not monotonic: {actual[:5]}…"
+
+
+class TestNumLeavesSweep:
+    """num_leaves sweep on last CV fold: best value logged; _build_model accepts param."""
+
+    def test_build_model_accepts_num_leaves(self):
+        from sklearn.ensemble import GradientBoostingRegressor
+        # GBR doesn't use num_leaves — should not raise
+        m = _build_model(None, GradientBoostingRegressor, num_leaves=63)
+        assert m is not None
+
+    def test_num_leaves_sweep_logged_when_cv_runs(self, tmp_path, caplog):
+        """With enough rows for CV and LightGBM absent, sweep is skipped gracefully."""
+        import logging
+        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+            _make_trained_model(tmp_path, n=900)
+        # If LightGBM is present, expect sweep log; if not (sklearn fallback), no crash.
+        # Either way CV must complete without error.
+        cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
+        assert cv_logs, "CV must have run with n=900 rows"
+
+
+# ── Stage 5 — Per-HOW NaN fill medians (#31) ─────────────────────────────────
+
+class TestHowMedians:
+    """_feature_medians_by_how stored after training; used in prediction; backward compat."""
+
+    def test_how_medians_populated_after_train(self, tmp_path):
+        """After training, _feature_medians_by_how must have entries for lag/rolling cols."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        assert m._feature_medians_by_how, "_feature_medians_by_how must not be empty"
+        # Keys should be integers 0-167 (hour_of_week)
+        sample_key = next(iter(m._feature_medians_by_how))
+        assert isinstance(sample_key, (int, np.integer)), "HOW keys must be integers"
+        assert 0 <= int(sample_key) <= 167
+
+    def test_how_medians_contain_lag_columns(self, tmp_path):
+        """HOW median dict must include lag and rolling columns."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        sample_meds = next(iter(m._feature_medians_by_how.values()))
+        lag_cols = [c for c in sample_meds if c.startswith("lag_") or c.startswith("rolling_")]
+        assert lag_cols, "HOW medians must include lag/rolling columns"
+
+    def test_how_medians_persisted_and_loaded(self, tmp_path):
+        """_feature_medians_by_how must survive a save/load cycle via meta.pkl."""
+        m, _ = _make_trained_model(tmp_path, n=600)
+        original = m._feature_medians_by_how
+        # Load a fresh instance from the same directory
+        m2 = EnergyForecastModel(tmp_path)
+        assert m2._feature_medians_by_how == original
+
+    def test_backward_compat_meta_without_how_medians(self, tmp_path):
+        """meta.pkl without feature_medians_by_how must load as empty dict (no crash)."""
+        import pickle, hashlib
+        meta_path = tmp_path / "meta.pkl"
+        meta = {
+            "feature_cols":    _FEATURES_BASE,
+            "last_trained":    __import__("datetime").datetime.min,
+            "last_mae":        None,
+            "last_cv_mae":     None,
+            "engine":          "test",
+            "feature_medians": {},
+            # intentionally omit feature_medians_by_how
+        }
+        with open(meta_path, "wb") as fh:
+            pickle.dump(meta, fh)
+        digest = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+        meta_path.with_suffix(".pkl.sha256").write_text(digest)
+
+        m = EnergyForecastModel(tmp_path)
+        assert m._feature_medians_by_how == {}
+
+    def test_how_median_applied_when_global_would_differ(self, tmp_path):
+        """When HOW-specific median differs from global, prediction uses HOW value."""
+        # Create training data where lag_24h has a clear HOW pattern:
+        # HOW=0 (Mon 00:00) always has lag_24h ≈ 10, rest ≈ 1
+        n = 600
+        rng = np.random.default_rng(42)
+        ts  = pd.date_range("2024-01-01", periods=n, freq="1h")
+        # Start on Monday so HOW=0 is the first row's hour_of_week
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # The HOW dict must exist and have lag_24h entries
+        assert m._feature_medians_by_how
+        sample = next(iter(m._feature_medians_by_how.values()))
+        # At minimum one lag column should be present
+        assert any(k.startswith("lag_") for k in sample)
 

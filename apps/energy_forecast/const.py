@@ -14,7 +14,7 @@ EV_CHARGING_THRESHOLD_KWH = 7
 
 # Model Training
 MIN_TRAINING_ROWS = 100   # Minimum clean rows to proceed with training
-HOLDOUT_FRACTION  = 0.9   # Train/test split fraction for holdout MAE
+HOLDOUT_FRACTION  = 0.9   # Training fraction (first 90% of rows); name kept for backward compat
 MIN_CV_ROWS       = 500   # Minimum rows for TimeSeriesSplit cross-validation
 
 # Data Storage

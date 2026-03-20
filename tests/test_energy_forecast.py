@@ -400,3 +400,55 @@ class TestValidateConfig:
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         EnergyForecast._validate_config(fake)
         assert not fake._warnings, "No warning expected when ev_threshold < ev_charger_kw"
+
+
+# ── Setup checker sensor (#17) ────────────────────────────────────────────────
+
+class _FakeCheckSetup:
+    """Minimal stand-in for _check_setup with controllable set_state and log."""
+
+    def __init__(self):
+        self._states: dict[str, dict] = {}
+        self._warnings: list[str]     = []
+
+    def set_state(self, entity_id: str, state: str, attributes: dict, replace: bool = False) -> None:
+        self._states[entity_id] = {"state": state, "attributes": attributes}
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        if level == "WARNING":
+            self._warnings.append(msg)
+
+
+class TestCheckSetup:
+    """_check_setup publishes setup status sensor; detects missing packages."""
+
+    def test_ok_state_when_all_packages_present(self):
+        """When all imports succeed, sensor state must be 'ok'."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeCheckSetup()
+        # All packages importable in test environment → state = 'ok'
+        EnergyForecast._check_setup(fake)
+        status = fake._states.get("sensor.energy_forecast_setup_status", {})
+        assert status.get("state") == "ok"
+        assert status["attributes"]["missing_packages"] == []
+
+    def test_missing_packages_state_when_import_fails(self):
+        """When an import fails, sensor state must be 'missing_packages'."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeCheckSetup()
+        # Patch builtins.__import__ to fail for 'holidays'
+        import builtins
+        real_import = builtins.__import__
+
+        def failing_import(name, *args, **kwargs):
+            if name == "holidays":
+                raise ImportError(f"No module named '{name}'")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=failing_import):
+            EnergyForecast._check_setup(fake)
+
+        status = fake._states.get("sensor.energy_forecast_setup_status", {})
+        assert status.get("state") == "missing_packages"
+        assert "holidays" in status["attributes"]["missing_packages"]
+        assert fake._warnings  # warning must be logged
