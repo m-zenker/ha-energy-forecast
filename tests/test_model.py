@@ -868,6 +868,16 @@ class TestSubSensorFeatures:
         assert float(non_nan.iloc[0]) == pytest.approx(0.0)
         assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 
+    def test_sparse_sub_sensor_prediction_logs_debug_not_warning(self, caplog):
+        """Prediction-time sub-sensor NaN message must be DEBUG, not WARNING."""
+        import logging
+        future_ts = pd.date_range("2024-01-03", periods=48, freq="1h")
+        future_df = pd.DataFrame({"timestamp": future_ts})
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast.model"):
+            _add_sub_sensor_lags_prediction(future_df.copy(), {"sub_sparse": pd.DataFrame()})
+        warning_msgs = [r for r in caplog.records if r.levelno >= logging.WARNING and "sub_sparse" in r.message]
+        assert warning_msgs == [], f"Expected no WARNING for sparse sub-sensor, got: {warning_msgs}"
+
 
 # ── Stage 4 — Sub-sensor activity flag and run count (#35, #36) ───────────────
 

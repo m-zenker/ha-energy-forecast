@@ -911,7 +911,7 @@ def _add_sub_sensor_lags_prediction(
             future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
             nan_count = int(future_df[col].isna().sum())
             if lag >= 24 and nan_count > len(future_df) * 0.5:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
                     "will be filled with training medians.",
                     col, nan_count, len(future_df), lag,

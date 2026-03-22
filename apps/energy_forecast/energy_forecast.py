@@ -18,7 +18,7 @@ EV charging handling:
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -80,7 +80,7 @@ class EnergyForecast(hass.Hass):
         self.run_in(self._retrain_cb, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
-        self.run_every(self._update_cb, f"now+{UPDATE_INTERVAL_S + 130}", UPDATE_INTERVAL_S)
+        self.run_hourly(self._update_cb, time(0, 1, 0))
 
         self.log(
             f"HA Energy Forecast ready. "
