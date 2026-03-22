@@ -32,6 +32,7 @@ Forecasts are published as native Home Assistant sensor entities and update ever
 - [Weather sources](#weather-sources)
 - [EV charging detection](#ev-charging-detection)
 - [Sub-energy sensors](#sub-energy-sensors)
+- [MQTT Discovery](#mqtt-discovery-optional)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Licence](#licence)
@@ -49,6 +50,7 @@ Forecasts are published as native Home Assistant sensor entities and update ever
 - **Exponential sample weighting** — recent data influences the model more than old data
 - **Persistent CSV cache** — energy history survives Home Assistant database purges
 - **Self-healing** — graceful fallbacks at every external dependency (weather API, HA history, ML packages)
+- **MQTT Discovery** (optional) — registers all sensors in the HA entity registry so you can assign them to areas, add labels, and rename them in the UI. Requires a running MQTT broker and the AppDaemon MQTT plugin.
 
 ---
 
@@ -198,6 +200,9 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
+| `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
+| `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
 
 > **Deprecated:** `plz` (Swiss postal code) is silently accepted for backward compatibility but has no effect. The nearest SRG-SSR weather station is resolved from `latitude`/`longitude`. You can remove it from existing configs.
 
@@ -205,7 +210,7 @@ energy_forecast:
 
 ## Published sensors
 
-All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engine`, and `last_trained` attributes.
+All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engine`, and `last_trained` attributes. By default they are published to the HA state machine only. To register them in the entity registry (enabling area assignment and labels), see [MQTT Discovery](#mqtt-discovery-optional).
 
 ### Forecast totals
 
@@ -408,6 +413,71 @@ For each sensor the model gains four features:
 **How many sensors?** 3–5 is a practical limit — each sensor adds 2 feature columns and a separate HA history fetch on every retrain and hourly update.
 
 **Backward compatibility:** Omitting `sub_energy_sensors` (or leaving it commented out) produces no behaviour change. Old model files without sub-sensor features load cleanly and continue to work.
+
+---
+
+## MQTT Discovery (optional)
+
+By default the app publishes all sensors via AppDaemon's `set_state()` API, which writes values to the HA **state machine** only. This means sensors appear in **Developer Tools → States** and can be used in dashboards and automations, but they are **not** registered in the **entity registry** — so you cannot assign them to an area, add labels, or rename them from the HA UI.
+
+Enabling MQTT Discovery registers every sensor as a proper HA entity under a single **HA Energy Forecast** device, unlocking:
+- Area assignment (persists across restarts)
+- Labels and aliases
+- UI renaming without breaking automations
+
+### Prerequisites
+
+1. **MQTT broker** — Mosquitto is the standard choice. Install it as an HA add-on via **Settings → Add-ons → Mosquitto broker**.
+2. **AppDaemon MQTT plugin** — add the following block to `appdaemon/appdaemon.yaml`:
+
+```yaml
+plugins:
+  MQTT:
+    type: mqtt
+    namespace: mqtt
+    client_host: 192.168.1.x   # ← your broker IP or hostname
+    client_port: 1883
+```
+
+> If your broker requires authentication add `client_user` and `client_password` to the plugin block. See the [AppDaemon MQTT plugin docs](https://appdaemon.readthedocs.io/en/latest/AD_API_REFERENCE.html#mqtt) for all options.
+
+### Enabling MQTT Discovery
+
+Add these keys to `apps.yaml`:
+
+```yaml
+energy_forecast:
+  # … existing keys …
+
+  # ── MQTT Discovery ──────────────────────────────────────────────────────
+  mqtt_discovery: true
+  # mqtt_namespace: mqtt            # must match the namespace in appdaemon.yaml
+  # mqtt_discovery_prefix: homeassistant   # change only if HA uses a custom prefix
+```
+
+Restart AppDaemon. After a few seconds, the device **HA Energy Forecast** appears in **Settings → Devices & Services → MQTT → Devices**.
+
+### What gets registered
+
+All sensors are registered at startup. The 6 prediction-interval sensors (`*_low` / `*_high`) are registered on the **first hourly update after the quantile models finish training** — typically within an hour of the initial retrain.
+
+| Sensor group | Count |
+|---|---|
+| Forecast totals (`next_3h`, `today`, `tomorrow`) | 3 |
+| 3-hour blocks (today + tomorrow) | 16 |
+| EV actuals (`ev_today`, `ev_yesterday`) | 2 |
+| Model MAE | 1 |
+| Setup status | 1 |
+| Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
+| **Total** | **29** |
+
+### Availability
+
+When AppDaemon starts it publishes `online` to the availability topic. When AppDaemon stops cleanly, it publishes `offline` and all sensors show **Unavailable** in the HA UI automatically.
+
+### Reverting to set_state() mode
+
+Set `mqtt_discovery: false` (or remove the key). The app reverts to writing directly to the HA state machine. Previously registered MQTT entities remain in the entity registry until you delete them manually from **Settings → Devices & Services → MQTT**.
 
 ---
 

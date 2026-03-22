@@ -19,6 +19,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `"online"` at startup and `"offline"` on AppDaemon shutdown.  Existing `set_state()` behaviour
   is unchanged when `mqtt_discovery: false`.
 
+### Changed
+- README: added MQTT Discovery section (prerequisites, `appdaemon.yaml` snippet, `apps.yaml` example, sensor count table, availability behaviour, revert instructions); added `mqtt_discovery` / `mqtt_namespace` / `mqtt_discovery_prefix` to parameter reference; updated Published sensors intro and Features bullet; added Contents entry
+
 ### Fixed
 - Align hourly sensor updates to XX:01:00 wall-clock time using `run_hourly`; eliminates startup-time drift
 - Downgrade prediction-time sub-sensor NaN log from WARNING to DEBUG; training-time WARNING (weekly) is sufficient
