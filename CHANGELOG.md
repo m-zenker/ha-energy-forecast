@@ -9,8 +9,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
-- fix(scheduler): align hourly sensor updates to XX:01:00 wall-clock time using `run_hourly`; eliminates startup-time drift
-- fix(model): downgrade prediction-time sub-sensor NaN log from WARNING to DEBUG; training-time WARNING (weekly) is sufficient
+- Align hourly sensor updates to XX:01:00 wall-clock time using `run_hourly`; eliminates startup-time drift
+- Downgrade prediction-time sub-sensor NaN log from WARNING to DEBUG; training-time WARNING (weekly) is sufficient
 
 ---
 

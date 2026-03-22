@@ -30,7 +30,6 @@ from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600   # weekly
-UPDATE_INTERVAL_S  =       3600   # hourly
 MIN_HISTORY_HOURS  = 48
 BLOCK_SLOTS        = [f"{h:02d}_{h+3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION        = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
