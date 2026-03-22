@@ -5,6 +5,29 @@ Current baseline: v0.5.1 on `feature/stage6-distribution-ux` (next milestone: #1
 
 ---
 
+## Staged Development & Deployment Plan
+
+### Release milestones
+
+| Milestone | Version | Contents | Status |
+|-----------|---------|----------|--------|
+| Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
+| Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
+| HACS distribution | v0.7.0 | #16 HACS support (hacs.json, info.md, README section, GitHub topics) | planned |
+| Long-term | v1.x+ | #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #23 Solar, #24 Spot price, #25 Vacation, #18 Config flow | backlog |
+
+### Deployment workflow (per release)
+
+1. Feature branch → implement + tests pass (`python -m pytest tests/ -v`)
+2. PR → code review → merge to `dev`
+3. Smoke-test on local HA instance (watch AppDaemon log; confirm sensors update)
+4. PR `dev` → `main` after stable period on local instance
+5. Update CHANGELOG.md (close `[Unreleased]` → `vX.Y.Z`)
+6. Create semver tag (`git tag vX.Y.Z`) → push tag → GitHub release with notes
+7. After #16: HACS auto-picks up new semver tag for AppDaemon category listing
+
+---
+
 ## Tier 1 — High impact, low effort (quick wins)
 
 ### ~~1. Fix missing sunshine in Open-Meteo fallback~~ ✓ done (144de78)
@@ -268,13 +291,13 @@ Implementation: in `_add_sub_sensor_lags_training`, compute
 `{prefix}_runs_7d` to the feature list.
 Expected impact: **LOW–MEDIUM**; Low effort.
 
-### 37. MQTT Discovery for entity registry *(planned)*
-Publish `homeassistant/sensor/<id>/config` payloads on `initialize()` so HA registers all
+### ~~37. MQTT Discovery for entity registry~~ ✓ done (feature/mqtt-discovery)
+~~Publish `homeassistant/sensor/<id>/config` payloads on `initialize()` so HA registers all
 `energy_forecast_*` sensors in the entity registry (enables area assignment, labels, UI
 renaming). Requires Mosquitto add-on or any MQTT broker. State updates switch from
 `set_state()` to `mqtt_publish()` on the corresponding state topics. Optional: falls back
 to `set_state()` if `mqtt_host` not configured. Stable `unique_id` values are already
-embedded in sensor attributes as preparation.
+embedded in sensor attributes as preparation.~~
 
 ---
 
@@ -318,4 +341,4 @@ embedded in sensor attributes as preparation.
 | 34 | `hours_ahead` horizon feature | low | 1 h | ✓ done |
 | 35 | Sub-sensor binary activity flag (`{prefix}_active_24h`) | low–medium | 30 min | ✓ done |
 | 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | ✓ done |
-| 37 | MQTT Discovery for entity registry | UX / install | 4 h | planned |
+| 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
