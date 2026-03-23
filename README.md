@@ -2,7 +2,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.6.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-200%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.6.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 

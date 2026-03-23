@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.6.0] — 2026-03-23
+
 ### Fixed
 - **Doubled "Energy Forecast" prefix in MQTT Discovery sensor names** (`energy_forecast.py`): HA
   prepends the device name ("HA Energy Forecast") to the sensor `name` field, so names like
@@ -372,7 +376,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.2...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.6.0...HEAD
+[0.6.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.2...v0.6.0
 [0.5.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.1...v0.5.2
 [0.5.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.0...v0.5.1
 [0.5.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.4.5...v0.5.0
