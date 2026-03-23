@@ -18,6 +18,7 @@ EV charging handling:
 from __future__ import annotations
 
 import json
+import math
 import threading
 from datetime import datetime, time
 from pathlib import Path
@@ -264,7 +265,6 @@ class EnergyForecast(hass.Hass):
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         """Publish a numeric sensor state (NaN/Inf → 0.0) to the MQTT state topic."""
-        import math
         try:
             val = float(value)
             if math.isnan(val) or math.isinf(val):
@@ -628,8 +628,6 @@ class EnergyForecast(hass.Hass):
             )
 
     def _publish(self, data: dict) -> None:
-        import math
-
         model       = self._ml_model
         trained_str = (
             model.last_trained.strftime("%Y-%m-%d %H:%M")
