@@ -76,6 +76,7 @@ class EnergyForecast(hass.Hass):
         self._validate_config()
 
         if self._mqtt_discovery:
+            self._cleanup_legacy_states()   # remove ghost set_state entities
             self._mqtt_publish_all_discovery()
             self._mqtt_publish_availability("online")
 
@@ -312,7 +313,7 @@ class EnergyForecast(hass.Hass):
         # Setup status
         self._mqtt_publish_discovery(
             "energy_forecast_setup_status",
-            "Energy Forecast Setup Status",
+            "Setup Status",
             "",
             "mdi:check-circle",
             None,
@@ -322,7 +323,7 @@ class EnergyForecast(hass.Hass):
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             self._mqtt_publish_discovery(
                 f"energy_forecast_{key}",
-                f"Energy Forecast {label}",
+                label,
                 "kWh",
                 "mdi:lightning-bolt",
                 "energy",
@@ -335,7 +336,7 @@ class EnergyForecast(hass.Hass):
                 h_start, h_end = f"{h:02d}", f"{h+3:02d}"
                 self._mqtt_publish_discovery(
                     f"energy_forecast_{day}_{slot}",
-                    f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00",
+                    f"{day.title()} {h_start}:00–{h_end}:00",
                     "kWh",
                     "mdi:calendar-clock",
                     "energy",
@@ -354,7 +355,7 @@ class EnergyForecast(hass.Hass):
         # Model MAE
         self._mqtt_publish_discovery(
             "energy_forecast_model_mae",
-            "Energy Forecast Model MAE",
+            "Model MAE",
             "kWh",
             "mdi:chart-bell-curve-cumulative",
             "energy",
@@ -564,6 +565,40 @@ class EnergyForecast(hass.Hass):
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
 
+    def _cleanup_legacy_states(self) -> None:
+        """Remove AppDaemon-managed states for sensors now served via MQTT Discovery.
+
+        Called at startup when mqtt_discovery=True to eliminate ghost entities left
+        over from a previous run with mqtt_discovery=False.
+        """
+        legacy_ids: list[str] = [
+            "sensor.energy_forecast_setup_status",
+            "sensor.energy_forecast_next_1h",
+            "sensor.energy_forecast_next_3h",
+            "sensor.energy_forecast_today",
+            "sensor.energy_forecast_tomorrow",
+            "sensor.energy_forecast_ev_today",
+            "sensor.energy_forecast_ev_yesterday",
+            "sensor.energy_forecast_model_mae",
+            # Interval sensors
+            "sensor.energy_forecast_next_3h_low",
+            "sensor.energy_forecast_next_3h_high",
+            "sensor.energy_forecast_today_low",
+            "sensor.energy_forecast_today_high",
+            "sensor.energy_forecast_tomorrow_low",
+            "sensor.energy_forecast_tomorrow_high",
+        ]
+        # Block sensors
+        for day in ("today", "tomorrow"):
+            for slot in BLOCK_SLOTS:
+                legacy_ids.append(f"sensor.energy_forecast_{day}_{slot}")
+
+        for entity_id in legacy_ids:
+            try:
+                self.remove_entity(entity_id)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
             return  # availability topic serves this purpose in MQTT mode
@@ -647,7 +682,7 @@ class EnergyForecast(hass.Hass):
             for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
                 self._mqtt_publish_discovery(
                     f"energy_forecast_{key}_low",
-                    f"Energy Forecast {label} Low (10th pct)",
+                    f"{label} Low (10th pct)",
                     "kWh",
                     "mdi:arrow-down-bold",
                     "energy",
@@ -655,7 +690,7 @@ class EnergyForecast(hass.Hass):
                 )
                 self._mqtt_publish_discovery(
                     f"energy_forecast_{key}_high",
-                    f"Energy Forecast {label} High (90th pct)",
+                    f"{label} High (90th pct)",
                     "kWh",
                     "mdi:arrow-up-bold",
                     "energy",

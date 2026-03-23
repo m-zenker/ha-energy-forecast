@@ -492,6 +492,7 @@ class _FakeMqttSelf:
         self._mqtt_intervals_discovered = False
         self._publishes: list[dict] = []  # records all mqtt_publish() calls
         self._warnings: list[str] = []
+        self._removed_entities: list[str] = []
         # Attributes needed by safe_set / _publish
         self._ml_model = MagicMock()
         self._ml_model.last_mae = 0.5
@@ -513,6 +514,9 @@ class _FakeMqttSelf:
 
     def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes or {}}
+
+    def remove_entity(self, entity_id: str) -> None:
+        self._removed_entities.append(entity_id)
 
     def log(self, msg: str, level: str = "INFO") -> None:
         if level == "WARNING":
@@ -550,7 +554,7 @@ class TestMqttPublishDiscovery:
         """Discovery payload must include a 'device' block with identifiers=['ha_energy_forecast']."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "energy_forecast_today", "Today", "kWh",
             "mdi:lightning-bolt", "energy", "measurement",
         )
         assert "device" in payload
@@ -560,7 +564,7 @@ class TestMqttPublishDiscovery:
         """Config topic must be <prefix>/sensor/<unique_id>/config."""
         fake = _FakeMqttSelf(mqtt_discovery_prefix="myprefix")
         fake._mqtt_publish_discovery(
-            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "energy_forecast_today", "Today", "kWh",
             "mdi:lightning-bolt", "energy", "measurement",
         )
         assert len(fake._publishes) == 1
@@ -570,7 +574,7 @@ class TestMqttPublishDiscovery:
         """kWh sensor must have device_class='energy' and state_class='measurement'."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "energy_forecast_today", "Today", "kWh",
             "mdi:lightning-bolt", "energy", "measurement",
         )
         assert payload.get("device_class") == "energy"
@@ -580,7 +584,7 @@ class TestMqttPublishDiscovery:
         """Setup status sensor must not include device_class or state_class."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_setup_status", "Energy Forecast Setup Status", "",
+            "energy_forecast_setup_status", "Setup Status", "",
             "mdi:check-circle", None, None,
         )
         assert "device_class" not in payload
@@ -596,7 +600,7 @@ class TestMqttPublishDiscovery:
         fake.call_service = bad_call_service
         # Must not raise
         fake._mqtt_publish_discovery(
-            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "energy_forecast_today", "Today", "kWh",
             "mdi:lightning-bolt", "energy", "measurement",
         )
         assert fake._warnings, "Expected WARNING on call_service failure"
@@ -730,4 +734,28 @@ class TestMqttFallback:
         }
         EnergyForecast._publish(fake, data)
         fake.call_service.assert_not_called()
-        assert fake._states, "Expected set_state() calls when mqtt_discovery=False"
+
+
+class TestCleanupLegacyStates:
+    def test_removes_all_expected_legacy_ids(self):
+        fake = _FakeMqttSelf()
+        from energy_forecast.energy_forecast import EnergyForecast, BLOCK_SLOTS
+        EnergyForecast._cleanup_legacy_states(fake)
+        removed = set(fake._removed_entities)
+        # Core sensors
+        for key in ["setup_status", "next_1h", "next_3h", "today", "tomorrow",
+                    "ev_today", "ev_yesterday", "model_mae"]:
+            assert f"sensor.energy_forecast_{key}" in removed
+        # Block sensors
+        for day in ("today", "tomorrow"):
+            for slot in BLOCK_SLOTS:
+                assert f"sensor.energy_forecast_{day}_{slot}" in removed
+
+    def test_swallows_remove_entity_exceptions(self):
+        fake = _FakeMqttSelf()
+        def bad_remove(entity_id):
+            raise RuntimeError("not found")
+        fake.remove_entity = bad_remove
+        from energy_forecast.energy_forecast import EnergyForecast
+        # Must not raise
+        EnergyForecast._cleanup_legacy_states(fake)

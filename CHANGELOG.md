@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **Doubled "Energy Forecast" prefix in MQTT Discovery sensor names** (`energy_forecast.py`): HA
+  prepends the device name ("HA Energy Forecast") to the sensor `name` field, so names like
+  `"Energy Forecast Model MAE"` were displayed as `"HA Energy Forecast Energy Forecast Model MAE"`.
+  Discovery `name` values are now short labels (`"Model MAE"`, `"Today"`, `"Setup Status"`, etc.);
+  `set_state()` paths are unchanged as they have no device grouping.
+- **Doubled sensors after enabling MQTT Discovery** (`energy_forecast.py`): on startup when
+  `mqtt_discovery=True`, `_cleanup_legacy_states()` now calls `remove_entity()` for every
+  entity_id previously created by the `set_state` path.  Ghost entities from a prior
+  `mqtt_discovery=False` run are removed without requiring an HA restart.
 - **MQTT publish broken on HASS apps** (`energy_forecast.py`): replaced `self.mqtt_publish()` (only
   available on MQTT-namespace apps) with `self.call_service("mqtt/publish", ...)`, which works from
   any AppDaemon HASS app.  Discovery, state, and availability publishes now succeed at startup and
