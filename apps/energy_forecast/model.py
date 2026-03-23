@@ -311,7 +311,7 @@ class EnergyForecastModel:
             self._feature_medians_by_how = {}
 
         X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
-        y = df["gross_kwh"].values
+        y = df["gross_kwh"].to_numpy(dtype=float)
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
         # ── Exponential sample weighting ────────────────────────────────────

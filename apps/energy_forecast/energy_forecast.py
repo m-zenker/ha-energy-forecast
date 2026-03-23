@@ -251,11 +251,12 @@ class EnergyForecast(hass.Hass):
                 unique_id, friendly_name, unit, icon, device_class, state_class
             )
             topic = f"{self._mqtt_discovery_prefix}/sensor/{unique_id}/config"
-            self.mqtt_publish(
-                topic,
-                json.dumps(payload),
-                namespace=self._mqtt_namespace,
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=json.dumps(payload),
                 retain=True,
+                namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT discovery publish failed for {unique_id}: {exc}", level="WARNING")
@@ -268,11 +269,12 @@ class EnergyForecast(hass.Hass):
             if math.isnan(val) or math.isinf(val):
                 val = 0.0
             topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state"
-            self.mqtt_publish(
-                topic,
-                str(val),
-                namespace=self._mqtt_namespace,
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=str(val),
                 retain=True,
+                namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT state publish failed for {unique_id}: {exc}", level="WARNING")
@@ -281,11 +283,12 @@ class EnergyForecast(hass.Hass):
         """Publish a verbatim string payload to the MQTT state topic."""
         try:
             topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state"
-            self.mqtt_publish(
-                topic,
-                value_str,
-                namespace=self._mqtt_namespace,
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=value_str,
                 retain=True,
+                namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
@@ -294,11 +297,12 @@ class EnergyForecast(hass.Hass):
         """Publish 'online' or 'offline' to the shared availability topic."""
         try:
             topic = f"{self._mqtt_discovery_prefix}/energy_forecast/availability"
-            self.mqtt_publish(
-                topic,
-                payload,
-                namespace=self._mqtt_namespace,
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=payload,
                 retain=True,
+                namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT availability publish failed: {exc}", level="WARNING")

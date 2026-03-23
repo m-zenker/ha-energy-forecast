@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **MQTT publish broken on HASS apps** (`energy_forecast.py`): replaced `self.mqtt_publish()` (only
+  available on MQTT-namespace apps) with `self.call_service("mqtt/publish", ...)`, which works from
+  any AppDaemon HASS app.  Discovery, state, and availability publishes now succeed at startup and
+  after retraining.
+- **numpy 2.x retraining error** (`model.py`): `np.log1p` on object-dtype arrays (Python floats)
+  raised `"loop of ufunc does not support argument 0 of type float"` on numpy 2.x.
+  Fix: `df["gross_kwh"].to_numpy(dtype=float)` forces float64 before the log transform.
+
 ### Added
 - **MQTT Discovery (#37)** (`energy_forecast.py`): opt-in entity registration via MQTT Discovery.
   Set `mqtt_discovery: true` in `apps.yaml` to register all ~29 sensors in the HA entity registry,

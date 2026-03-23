@@ -502,8 +502,14 @@ class _FakeMqttSelf:
         self._ev_charger_kw = 9.0
         self._states: dict = {}
 
-    def mqtt_publish(self, topic: str, payload: str, namespace: str = "", retain: bool = False) -> None:
-        self._publishes.append({"topic": topic, "payload": payload, "namespace": namespace, "retain": retain})
+    def call_service(self, service: str, **kwargs) -> None:
+        if service == "mqtt/publish":
+            self._publishes.append({
+                "topic": kwargs.get("topic", ""),
+                "payload": kwargs.get("payload", ""),
+                "namespace": kwargs.get("namespace", ""),
+                "retain": kwargs.get("retain", False),
+            })
 
     def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes or {}}
@@ -581,19 +587,19 @@ class TestMqttPublishDiscovery:
         assert "state_class" not in payload
 
     def test_mqtt_publish_failure_logs_warning_and_does_not_raise(self):
-        """If mqtt_publish raises, _mqtt_publish_discovery must log WARNING and not re-raise."""
+        """If call_service raises, _mqtt_publish_discovery must log WARNING and not re-raise."""
         fake = _FakeMqttSelf()
 
-        def bad_publish(*args, **kwargs):
+        def bad_call_service(service, **kwargs):
             raise RuntimeError("broker down")
 
-        fake.mqtt_publish = bad_publish
+        fake.call_service = bad_call_service
         # Must not raise
         fake._mqtt_publish_discovery(
             "energy_forecast_today", "Energy Forecast Today", "kWh",
             "mdi:lightning-bolt", "energy", "measurement",
         )
-        assert fake._warnings, "Expected WARNING on mqtt_publish failure"
+        assert fake._warnings, "Expected WARNING on call_service failure"
 
 
 class TestMqttSetSensor:
@@ -712,10 +718,10 @@ class TestMqttFallback:
     """When mqtt_discovery=False, safe_set must use set_state and never call mqtt_publish."""
 
     def test_safe_set_uses_set_state_not_mqtt(self):
-        """With mqtt_discovery=False, _publish() must call set_state and not mqtt_publish."""
+        """With mqtt_discovery=False, _publish() must call set_state and not call_service."""
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeMqttSelf(mqtt_discovery=False)
-        fake.mqtt_publish = MagicMock()
+        fake.call_service = MagicMock()
         data = {
             "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
             "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
@@ -723,5 +729,5 @@ class TestMqttFallback:
             "ev_today": 0.0, "ev_yesterday": 0.0,
         }
         EnergyForecast._publish(fake, data)
-        fake.mqtt_publish.assert_not_called()
+        fake.call_service.assert_not_called()
         assert fake._states, "Expected set_state() calls when mqtt_discovery=False"
