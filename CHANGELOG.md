@@ -8,6 +8,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **MQTT Discovery (#37)** (`energy_forecast.py`): opt-in entity registration via MQTT Discovery.
+  Set `mqtt_discovery: true` in `apps.yaml` to register all ~29 sensors in the HA entity registry,
+  enabling area assignment and labels.  Requires the AppDaemon MQTT plugin and a running MQTT broker.
+  Config keys: `mqtt_discovery` (default `false`), `mqtt_namespace` (default `mqtt`),
+  `mqtt_discovery_prefix` (default `homeassistant`).  All sensors grouped under a single
+  `HA Energy Forecast` device.  Prediction interval sensors (`*_low`/`*_high`) are registered
+  lazily on the first update cycle where quantile models exist.  Availability topic publishes
+  `"online"` at startup and `"offline"` on AppDaemon shutdown.  Existing `set_state()` behaviour
+  is unchanged when `mqtt_discovery: false`.
+
+### Changed
+- README: added MQTT Discovery section (prerequisites, `appdaemon.yaml` snippet, `apps.yaml` example, sensor count table, availability behaviour, revert instructions); added `mqtt_discovery` / `mqtt_namespace` / `mqtt_discovery_prefix` to parameter reference; updated Published sensors intro and Features bullet; added Contents entry
+
 ### Fixed
 - Align hourly sensor updates to XX:01:00 wall-clock time using `run_hourly`; eliminates startup-time drift
 - Downgrade prediction-time sub-sensor NaN log from WARNING to DEBUG; training-time WARNING (weekly) is sufficient

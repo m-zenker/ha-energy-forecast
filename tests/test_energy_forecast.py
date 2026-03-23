@@ -8,6 +8,7 @@ Covers:
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -216,6 +217,22 @@ class TestAggregate:
             _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
         )
 
+    def test_next_1h_sums_only_one_future_hour(self):
+        """next_1h must equal exactly 1 × per-hour prediction."""
+        today = pd.Timestamp.now().normalize()
+        now   = pd.Timestamp.now().floor("1h")
+        preds = _pred_df(now, n=48, kwh=2.0)
+        result = self._run(today, now, preds)
+        assert abs(result["next_1h"] - 2.0) < 1e-3
+
+    def test_next_1h_less_than_next_3h(self):
+        """next_1h must be strictly less than next_3h when kWh/h > 0."""
+        today = pd.Timestamp.now().normalize()
+        now   = pd.Timestamp.now().floor("1h")
+        preds = _pred_df(now, n=48, kwh=1.5)
+        result = self._run(today, now, preds)
+        assert result["next_1h"] < result["next_3h"]
+
     def test_next_3h_sums_only_three_future_hours(self):
         """next_3h must equal exactly 3 × per-hour prediction, not more."""
         today = pd.Timestamp.now().normalize()
@@ -373,6 +390,9 @@ class _FakeValidateSelf:
         self._ev_charger_kw              = ev_charger_kw
         self._adaptive_retrain_threshold = 2.0
         self._sub_energy_sensors         = []
+        self._mqtt_discovery             = False
+        self._mqtt_namespace             = "mqtt"
+        self._mqtt_discovery_prefix      = "homeassistant"
         self._warnings: list[str]        = []
 
     def log(self, msg: str, level: str = "INFO") -> None:
@@ -410,6 +430,7 @@ class _FakeCheckSetup:
     def __init__(self):
         self._states: dict[str, dict] = {}
         self._warnings: list[str]     = []
+        self._mqtt_discovery: bool    = False
 
     def set_state(self, entity_id: str, state: str, attributes: dict, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes}
@@ -452,3 +473,255 @@ class TestCheckSetup:
         assert status.get("state") == "missing_packages"
         assert "holidays" in status["attributes"]["missing_packages"]
         assert fake._warnings  # warning must be logged
+
+
+# ── MQTT Discovery tests ──────────────────────────────────────────────────────
+
+class _FakeMqttSelf:
+    """Minimal stand-in for EnergyForecast for MQTT-related method tests."""
+
+    def __init__(
+        self,
+        mqtt_discovery: bool = True,
+        mqtt_namespace: str = "mqtt",
+        mqtt_discovery_prefix: str = "homeassistant",
+    ):
+        self._mqtt_discovery = mqtt_discovery
+        self._mqtt_namespace = mqtt_namespace
+        self._mqtt_discovery_prefix = mqtt_discovery_prefix
+        self._mqtt_intervals_discovered = False
+        self._publishes: list[dict] = []  # records all mqtt_publish() calls
+        self._warnings: list[str] = []
+        # Attributes needed by safe_set / _publish
+        self._ml_model = MagicMock()
+        self._ml_model.last_mae = 0.5
+        self._ml_model.last_cv_mae = 0.4
+        self._ml_model.last_trained = datetime.min
+        self._ml_model.engine = "lgbm"
+        self._ev_threshold = 7.0
+        self._ev_charger_kw = 9.0
+        self._states: dict = {}
+
+    def mqtt_publish(self, topic: str, payload: str, namespace: str = "", retain: bool = False) -> None:
+        self._publishes.append({"topic": topic, "payload": payload, "namespace": namespace, "retain": retain})
+
+    def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
+        self._states[entity_id] = {"state": state, "attributes": attributes or {}}
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        if level == "WARNING":
+            self._warnings.append(msg)
+
+    def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_set_sensor(self, unique_id, value)
+
+    def _mqtt_set_sensor_raw(self, unique_id: str, value_str: str) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_set_sensor_raw(self, unique_id, value_str)
+
+    def _mqtt_publish_discovery(self, *args, **kwargs) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_publish_discovery(self, *args, **kwargs)
+
+    def _build_sensor_discovery_payload(self, *args, **kwargs) -> dict:
+        from energy_forecast.energy_forecast import EnergyForecast
+        return EnergyForecast._build_sensor_discovery_payload(self, *args, **kwargs)
+
+    def _mqtt_publish_availability(self, payload: str) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_publish_availability(self, payload)
+
+    def _mqtt_publish_all_discovery(self) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_publish_all_discovery(self)
+
+
+class TestMqttPublishDiscovery:
+    """Discovery payload structure and publish behaviour."""
+
+    def test_payload_contains_device_block_with_identifier(self):
+        """Discovery payload must include a 'device' block with identifiers=['ha_energy_forecast']."""
+        fake = _FakeMqttSelf()
+        payload = fake._build_sensor_discovery_payload(
+            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "mdi:lightning-bolt", "energy", "measurement",
+        )
+        assert "device" in payload
+        assert payload["device"]["identifiers"] == ["ha_energy_forecast"]
+
+    def test_discovery_config_topic_uses_configured_prefix(self):
+        """Config topic must be <prefix>/sensor/<unique_id>/config."""
+        fake = _FakeMqttSelf(mqtt_discovery_prefix="myprefix")
+        fake._mqtt_publish_discovery(
+            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "mdi:lightning-bolt", "energy", "measurement",
+        )
+        assert len(fake._publishes) == 1
+        assert fake._publishes[0]["topic"] == "myprefix/sensor/energy_forecast_today/config"
+
+    def test_kwh_sensor_payload_has_device_class_and_state_class(self):
+        """kWh sensor must have device_class='energy' and state_class='measurement'."""
+        fake = _FakeMqttSelf()
+        payload = fake._build_sensor_discovery_payload(
+            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "mdi:lightning-bolt", "energy", "measurement",
+        )
+        assert payload.get("device_class") == "energy"
+        assert payload.get("state_class") == "measurement"
+
+    def test_setup_status_payload_omits_device_class(self):
+        """Setup status sensor must not include device_class or state_class."""
+        fake = _FakeMqttSelf()
+        payload = fake._build_sensor_discovery_payload(
+            "energy_forecast_setup_status", "Energy Forecast Setup Status", "",
+            "mdi:check-circle", None, None,
+        )
+        assert "device_class" not in payload
+        assert "state_class" not in payload
+
+    def test_mqtt_publish_failure_logs_warning_and_does_not_raise(self):
+        """If mqtt_publish raises, _mqtt_publish_discovery must log WARNING and not re-raise."""
+        fake = _FakeMqttSelf()
+
+        def bad_publish(*args, **kwargs):
+            raise RuntimeError("broker down")
+
+        fake.mqtt_publish = bad_publish
+        # Must not raise
+        fake._mqtt_publish_discovery(
+            "energy_forecast_today", "Energy Forecast Today", "kWh",
+            "mdi:lightning-bolt", "energy", "measurement",
+        )
+        assert fake._warnings, "Expected WARNING on mqtt_publish failure"
+
+
+class TestMqttSetSensor:
+    """State topic and value normalisation for _mqtt_set_sensor."""
+
+    def test_state_topic_format(self):
+        """State topic must be <prefix>/energy_forecast/sensor/<unique_id>/state."""
+        fake = _FakeMqttSelf(mqtt_discovery_prefix="homeassistant")
+        fake._mqtt_set_sensor("energy_forecast_today", 3.14)
+        assert len(fake._publishes) == 1
+        assert fake._publishes[0]["topic"] == "homeassistant/energy_forecast/sensor/energy_forecast_today/state"
+
+    def test_nan_value_publishes_zero(self):
+        """NaN must be normalised to 0.0 before publishing."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_set_sensor("energy_forecast_today", float("nan"))
+        assert fake._publishes[0]["payload"] == "0.0"
+
+    def test_retain_is_true(self):
+        """mqtt_publish must always be called with retain=True."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_set_sensor("energy_forecast_today", 1.5)
+        assert fake._publishes[0]["retain"] is True
+
+
+class TestMqttAvailability:
+    """Availability topic publish and terminate() lifecycle."""
+
+    def test_online_published_to_availability_topic(self):
+        """_mqtt_publish_availability('online') must publish to the correct topic."""
+        fake = _FakeMqttSelf(mqtt_discovery_prefix="homeassistant")
+        fake._mqtt_publish_availability("online")
+        assert len(fake._publishes) == 1
+        pub = fake._publishes[0]
+        assert pub["topic"] == "homeassistant/energy_forecast/availability"
+        assert pub["payload"] == "online"
+
+    def test_terminate_publishes_offline(self):
+        """terminate() must publish 'offline' to the availability topic."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf()
+        EnergyForecast.terminate(fake)
+        assert any(p["payload"] == "offline" for p in fake._publishes), \
+            "Expected 'offline' payload on terminate()"
+
+
+class TestMqttConditionalIntervals:
+    """Interval sensor discovery is deferred until quantile models exist."""
+
+    def test_publish_all_discovery_does_not_include_low_high_topics(self):
+        """_mqtt_publish_all_discovery() must NOT publish *_low/*_high config topics."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        low_high_topics = [
+            p["topic"] for p in fake._publishes
+            if "_low" in p["topic"] or "_high" in p["topic"]
+        ]
+        assert low_high_topics == [], f"Unexpected interval topics at init: {low_high_topics}"
+
+    def test_interval_discovery_fired_on_first_publish_with_data(self):
+        """When _publish() receives low/high data for the first time, interval discovery runs
+        and _mqtt_intervals_discovered flips to True."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf()
+        # Build a minimal aggregated data dict that includes interval values
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "next_3h_low": 0.8, "next_3h_high": 1.2,
+            "today_low": 4.5, "today_high": 5.5,
+            "tomorrow_low": 5.5, "tomorrow_high": 6.5,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+        }
+        EnergyForecast._publish(fake, data)
+        assert fake._mqtt_intervals_discovered is True
+        low_high_topics = [
+            p["topic"] for p in fake._publishes
+            if "_low/config" in p["topic"] or "_high/config" in p["topic"]
+        ]
+        assert len(low_high_topics) == 6, f"Expected 6 interval config topics, got {low_high_topics}"
+
+
+class TestPublishUnavailable:
+    """_publish_unavailable() must mark next_1h (and other totals) as 'unavailable'."""
+
+    def test_next_1h_set_to_unavailable(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish_unavailable(fake)
+        assert "sensor.energy_forecast_next_1h" in fake._states
+        assert fake._states["sensor.energy_forecast_next_1h"]["state"] == "unavailable"
+
+    def test_all_total_slots_set_unavailable(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish_unavailable(fake)
+        for slot in ("next_1h", "next_3h", "today", "tomorrow"):
+            eid = f"sensor.energy_forecast_{slot}"
+            assert eid in fake._states, f"missing {eid}"
+            assert fake._states[eid]["state"] == "unavailable"
+
+
+class TestMqttPublishAllDiscoveryNext1h:
+    """_mqtt_publish_all_discovery() must include next_1h."""
+
+    def test_next_1h_discovery_topic_published(self):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        topics = [p["topic"] for p in fake._publishes]
+        assert any("energy_forecast_next_1h/config" in t for t in topics), \
+            f"next_1h discovery topic not found in: {topics}"
+
+
+class TestMqttFallback:
+    """When mqtt_discovery=False, safe_set must use set_state and never call mqtt_publish."""
+
+    def test_safe_set_uses_set_state_not_mqtt(self):
+        """With mqtt_discovery=False, _publish() must call set_state and not mqtt_publish."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        fake.mqtt_publish = MagicMock()
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+        }
+        EnergyForecast._publish(fake, data)
+        fake.mqtt_publish.assert_not_called()
+        assert fake._states, "Expected set_state() calls when mqtt_discovery=False"
