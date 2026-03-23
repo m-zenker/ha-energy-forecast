@@ -10,3 +10,14 @@ init_commands:
   - >-
     pip install --extra-index-url https://alpine-wheels.github.io/index pandas
     numpy scikit-learn lightgbm
+
+# Optional: AppDaemon MQTT plugin (required for mqtt_discovery: true)
+# Add this to appdaemon/appdaemon.yaml:
+#   plugins:
+#     MQTT:
+#       type: mqtt
+#       namespace: mqtt
+#       client_host: 192.168.1.x
+#       client_port: 1883
+#       client_user: YOUR_MQTT_USERNAME      # required if broker enforces auth
+#       client_password: YOUR_MQTT_PASSWORD  # (Mosquitto add-on → Configuration → Logins)

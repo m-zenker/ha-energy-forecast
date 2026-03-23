@@ -868,6 +868,26 @@ class TestSubSensorFeatures:
         assert float(non_nan.iloc[0]) == pytest.approx(0.0)
         assert float(non_nan.iloc[1]) == pytest.approx(1.0)
 
+    def test_sparse_sub_sensor_prediction_logs_debug_not_warning(self, caplog):
+        """Prediction-time sub-sensor NaN message must be DEBUG, not WARNING.
+
+        Supplies a non-empty sub_df whose timestamps are far in the past so that
+        all reindexed lag values come back NaN — this exercises the actual DEBUG
+        log branch, not just the empty-DataFrame guard.
+        """
+        import logging
+        future_ts = pd.date_range("2024-01-10", periods=48, freq="1h")
+        future_df = pd.DataFrame({"timestamp": future_ts})
+        # Sub-sensor data from 30 days before the future window — all lags will be NaN.
+        old_ts = pd.date_range("2023-12-01", periods=48, freq="1h")
+        sub_df = pd.DataFrame({"timestamp": old_ts, "kwh": [1.0] * 48})
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast.model"):
+            _add_sub_sensor_lags_prediction(future_df.copy(), {"sub_sparse": sub_df})
+        warning_msgs = [r for r in caplog.records if r.levelno >= logging.WARNING and "sub_sparse" in r.message]
+        assert warning_msgs == [], f"Expected no WARNING for sparse sub-sensor, got: {warning_msgs}"
+        debug_msgs = [r for r in caplog.records if r.levelno == logging.DEBUG and "sub_sparse" in r.message]
+        assert debug_msgs, "Expected at least one DEBUG log for sparse sub-sensor NaN values"
+
 
 # ── Stage 4 — Sub-sensor activity flag and run count (#35, #36) ───────────────
 

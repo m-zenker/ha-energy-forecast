@@ -311,7 +311,7 @@ class EnergyForecastModel:
             self._feature_medians_by_how = {}
 
         X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
-        y = df["gross_kwh"].values
+        y = df["gross_kwh"].to_numpy(dtype=float)
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
         # ── Exponential sample weighting ────────────────────────────────────
@@ -911,7 +911,7 @@ def _add_sub_sensor_lags_prediction(
             future_df[col] = sub_series.reindex(lag_times).to_numpy(dtype=float, na_value=float("nan"))
             nan_count = int(future_df[col].isna().sum())
             if lag >= 24 and nan_count > len(future_df) * 0.5:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
                     "will be filled with training medians.",
                     col, nan_count, len(future_df), lag,

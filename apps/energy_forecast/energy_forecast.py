@@ -17,8 +17,9 @@ EV charging handling:
 """
 from __future__ import annotations
 
+import json
 import threading
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,6 @@ from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600   # weekly
-UPDATE_INTERVAL_S  =       3600   # hourly
 MIN_HISTORY_HOURS  = 48
 BLOCK_SLOTS        = [f"{h:02d}_{h+3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION        = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
@@ -67,7 +67,18 @@ class EnergyForecast(hass.Hass):
         self._pred_history: dict        = {}
         self._last_adaptive_retrain: datetime = datetime.min
 
+        # MQTT Discovery (opt-in)
+        self._mqtt_discovery: bool       = bool(self.args.get("mqtt_discovery", False))
+        self._mqtt_namespace: str        = str(self.args.get("mqtt_namespace", "mqtt"))
+        self._mqtt_discovery_prefix: str = str(self.args.get("mqtt_discovery_prefix", "homeassistant"))
+        self._mqtt_intervals_discovered: bool = False
+
         self._validate_config()
+
+        if self._mqtt_discovery:
+            self._cleanup_legacy_states()   # remove ghost set_state entities
+            self._mqtt_publish_all_discovery()
+            self._mqtt_publish_availability("online")
 
         model_dir = Path(__file__).parent / "models"
         self._ml_model = EnergyForecastModel(model_dir)
@@ -80,7 +91,7 @@ class EnergyForecast(hass.Hass):
         self.run_in(self._retrain_cb, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
-        self.run_every(self._update_cb, f"now+{UPDATE_INTERVAL_S + 130}", UPDATE_INTERVAL_S)
+        self.run_hourly(self._update_cb, time(0, 1, 0))
 
         self.log(
             f"HA Energy Forecast ready. "
@@ -117,11 +128,17 @@ class EnergyForecast(hass.Hass):
                 "lower the threshold or raise ev_charger_kw.",
                 level="WARNING",
             )
+        if self._mqtt_discovery:
+            if not self._mqtt_namespace:
+                raise ValueError("mqtt_namespace must be a non-empty string when mqtt_discovery is True")
+            if not self._mqtt_discovery_prefix:
+                raise ValueError("mqtt_discovery_prefix must be a non-empty string when mqtt_discovery is True")
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
             f"weight_halflife={self._weight_halflife}d, "
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
-            f"sub_energy_sensors={len(self._sub_energy_sensors)}"
+            f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
+            f"mqtt_discovery={self._mqtt_discovery}"
         )
 
     # ── Setup checker ─────────────────────────────────────────────────────────
@@ -159,17 +176,20 @@ class EnergyForecast(hass.Hass):
             state = "ok"
 
         try:
-            self.set_state(
-                "sensor.energy_forecast_setup_status",
-                state=state,
-                attributes={
-                    "friendly_name": "Energy Forecast Setup Status",
-                    "unique_id": "energy_forecast_setup_status",
-                    "missing_packages": missing,
-                    "icon": "mdi:check-circle" if state == "ok" else "mdi:alert-circle",
-                },
-                replace=True,
-            )
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor_raw("energy_forecast_setup_status", state)
+            else:
+                self.set_state(
+                    "sensor.energy_forecast_setup_status",
+                    state=state,
+                    attributes={
+                        "friendly_name": "Energy Forecast Setup Status",
+                        "unique_id": "energy_forecast_setup_status",
+                        "missing_packages": missing,
+                        "icon": "mdi:check-circle" if state == "ok" else "mdi:alert-circle",
+                    },
+                    replace=True,
+                )
         except (AttributeError, TypeError, RuntimeError) as exc:
             self.log(f"Could not publish setup status sensor: {exc}", level="WARNING")
 
@@ -184,6 +204,168 @@ class EnergyForecast(hass.Hass):
         """Return the CSV cache path for a sub-energy sensor."""
         sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
         return self._cache_path.parent / f"sub_{sanitized}.csv"
+
+    # ── MQTT Discovery ────────────────────────────────────────────────────────
+
+    def _build_sensor_discovery_payload(
+        self,
+        unique_id: str,
+        friendly_name: str,
+        unit: str,
+        icon: str,
+        device_class: str | None,
+        state_class: str | None,
+    ) -> dict:
+        """Return the HA MQTT Discovery config dict for a single sensor."""
+        payload: dict = {
+            "name": friendly_name,
+            "unique_id": unique_id,
+            "state_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state",
+            "availability_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/availability",
+            "unit_of_measurement": unit,
+            "icon": icon,
+            "device": {
+                "identifiers": ["ha_energy_forecast"],
+                "name": "HA Energy Forecast",
+                "model": "AppDaemon App",
+                "sw_version": "0.6.0",
+            },
+        }
+        if device_class is not None:
+            payload["device_class"] = device_class
+        if state_class is not None:
+            payload["state_class"] = state_class
+        return payload
+
+    def _mqtt_publish_discovery(
+        self,
+        unique_id: str,
+        friendly_name: str,
+        unit: str,
+        icon: str,
+        device_class: str | None,
+        state_class: str | None,
+    ) -> None:
+        """Publish a retained MQTT Discovery config payload for one sensor."""
+        try:
+            payload = self._build_sensor_discovery_payload(
+                unique_id, friendly_name, unit, icon, device_class, state_class
+            )
+            topic = f"{self._mqtt_discovery_prefix}/sensor/{unique_id}/config"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=json.dumps(payload),
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT discovery publish failed for {unique_id}: {exc}", level="WARNING")
+
+    def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
+        """Publish a numeric sensor state (NaN/Inf → 0.0) to the MQTT state topic."""
+        import math
+        try:
+            val = float(value)
+            if math.isnan(val) or math.isinf(val):
+                val = 0.0
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=str(val),
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT state publish failed for {unique_id}: {exc}", level="WARNING")
+
+    def _mqtt_set_sensor_raw(self, unique_id: str, value_str: str) -> None:
+        """Publish a verbatim string payload to the MQTT state topic."""
+        try:
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=value_str,
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
+
+    def _mqtt_publish_availability(self, payload: str) -> None:
+        """Publish 'online' or 'offline' to the shared availability topic."""
+        try:
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/availability"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=payload,
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT availability publish failed: {exc}", level="WARNING")
+
+    def _mqtt_publish_all_discovery(self) -> None:
+        """Publish discovery configs for all non-conditional sensors at init."""
+        # Setup status
+        self._mqtt_publish_discovery(
+            "energy_forecast_setup_status",
+            "Setup Status",
+            "",
+            "mdi:check-circle",
+            None,
+            None,
+        )
+        # Forecast totals
+        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+            self._mqtt_publish_discovery(
+                f"energy_forecast_{key}",
+                label,
+                "kWh",
+                "mdi:lightning-bolt",
+                "energy",
+                "measurement",
+            )
+        # 3h blocks — today and tomorrow, 8 slots each
+        for day in ("today", "tomorrow"):
+            for h in range(0, 24, 3):
+                slot = f"{h:02d}_{h+3:02d}"
+                h_start, h_end = f"{h:02d}", f"{h+3:02d}"
+                self._mqtt_publish_discovery(
+                    f"energy_forecast_{day}_{slot}",
+                    f"{day.title()} {h_start}:00–{h_end}:00",
+                    "kWh",
+                    "mdi:calendar-clock",
+                    "energy",
+                    "measurement",
+                )
+        # EV actuals
+        for day in ("today", "yesterday"):
+            self._mqtt_publish_discovery(
+                f"energy_forecast_ev_{day}",
+                f"EV Charging Detected {day.title()}",
+                "kWh",
+                "mdi:car-electric",
+                "energy",
+                "measurement",
+            )
+        # Model MAE
+        self._mqtt_publish_discovery(
+            "energy_forecast_model_mae",
+            "Model MAE",
+            "kWh",
+            "mdi:chart-bell-curve-cumulative",
+            "energy",
+            "measurement",
+        )
+
+    def terminate(self) -> None:
+        """AppDaemon lifecycle hook — publish offline availability on shutdown."""
+        if getattr(self, "_mqtt_discovery", False):
+            self._mqtt_publish_availability("offline")
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -383,8 +565,44 @@ class EnergyForecast(hass.Hass):
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
 
+    def _cleanup_legacy_states(self) -> None:
+        """Remove AppDaemon-managed states for sensors now served via MQTT Discovery.
+
+        Called at startup when mqtt_discovery=True to eliminate ghost entities left
+        over from a previous run with mqtt_discovery=False.
+        """
+        legacy_ids: list[str] = [
+            "sensor.energy_forecast_setup_status",
+            "sensor.energy_forecast_next_1h",
+            "sensor.energy_forecast_next_3h",
+            "sensor.energy_forecast_today",
+            "sensor.energy_forecast_tomorrow",
+            "sensor.energy_forecast_ev_today",
+            "sensor.energy_forecast_ev_yesterday",
+            "sensor.energy_forecast_model_mae",
+            # Interval sensors
+            "sensor.energy_forecast_next_3h_low",
+            "sensor.energy_forecast_next_3h_high",
+            "sensor.energy_forecast_today_low",
+            "sensor.energy_forecast_today_high",
+            "sensor.energy_forecast_tomorrow_low",
+            "sensor.energy_forecast_tomorrow_high",
+        ]
+        # Block sensors
+        for day in ("today", "tomorrow"):
+            for slot in BLOCK_SLOTS:
+                legacy_ids.append(f"sensor.energy_forecast_{day}_{slot}")
+
+        for entity_id in legacy_ids:
+            try:
+                self.remove_entity(entity_id)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _publish_unavailable(self) -> None:
-        for slot in ["next_3h", "today", "tomorrow"]:
+        if self._mqtt_discovery:
+            return  # availability topic serves this purpose in MQTT mode
+        for slot in ["next_1h", "next_3h", "today", "tomorrow"]:
             self.set_state(
                 f"sensor.energy_forecast_{slot}",
                 state="unavailable",
@@ -432,27 +650,53 @@ class EnergyForecast(hass.Hass):
                     val = 0.0
             except (TypeError, ValueError):
                 val = 0.0
-            attrs = {
-                **base_attrs,
-                "friendly_name": friendly_name,
-                "unique_id": entity_id.split(".", 1)[-1],
-            }
-            if icon:
-                attrs["icon"] = icon
-            if extra_attrs:
-                attrs.update(extra_attrs)
-            self.set_state(
-                entity_id,
-                state=str(round(val, 3)),
-                attributes=attrs,
-                replace=True,
-            )
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor(entity_id.split(".", 1)[-1], val)
+            else:
+                attrs = {
+                    **base_attrs,
+                    "friendly_name": friendly_name,
+                    "unique_id": entity_id.split(".", 1)[-1],
+                }
+                if icon:
+                    attrs["icon"] = icon
+                if extra_attrs:
+                    attrs.update(extra_attrs)
+                self.set_state(
+                    entity_id,
+                    state=str(round(val, 3)),
+                    attributes=attrs,
+                    replace=True,
+                )
 
         # ── Forecast totals ───────────────────────────────────────────────────
-        for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
 
         # ── Prediction intervals (only published when quantile models trained) ─
+        _any_intervals = any(
+            data.get(f"{key}_low") is not None and data.get(f"{key}_high") is not None
+            for key in ("next_3h", "today", "tomorrow")
+        )
+        if _any_intervals and self._mqtt_discovery and not self._mqtt_intervals_discovered:
+            for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+                self._mqtt_publish_discovery(
+                    f"energy_forecast_{key}_low",
+                    f"{label} Low (10th pct)",
+                    "kWh",
+                    "mdi:arrow-down-bold",
+                    "energy",
+                    "measurement",
+                )
+                self._mqtt_publish_discovery(
+                    f"energy_forecast_{key}_high",
+                    f"{label} High (90th pct)",
+                    "kWh",
+                    "mdi:arrow-up-bold",
+                    "energy",
+                    "measurement",
+                )
+            self._mqtt_intervals_discovered = True
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             low  = data.get(f"{key}_low")
             high = data.get(f"{key}_high")
@@ -494,21 +738,24 @@ class EnergyForecast(hass.Hass):
 
         # ── Model MAE sensor ──────────────────────────────────────────────────
         mae_val = model.last_mae if model.last_mae is not None else 0
-        self.set_state(
-            "sensor.energy_forecast_model_mae",
-            state=str(round(float(mae_val), 4)),
-            attributes={
-                "unit_of_measurement": "kWh",
-                "friendly_name": "Energy Forecast Model MAE",
-                "unique_id": "energy_forecast_model_mae",
-                "icon": "mdi:chart-bell-curve-cumulative",
-                "attribution": ATTRIBUTION,
-                "cv_mae": str(model.last_cv_mae) if model.last_cv_mae is not None else "n/a",
-                "model_engine": str(model.engine),
-                "last_trained": trained_str,
-            },
-            replace=True,
-        )
+        if self._mqtt_discovery:
+            self._mqtt_set_sensor("energy_forecast_model_mae", mae_val)
+        else:
+            self.set_state(
+                "sensor.energy_forecast_model_mae",
+                state=str(round(float(mae_val), 4)),
+                attributes={
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": "Energy Forecast Model MAE",
+                    "unique_id": "energy_forecast_model_mae",
+                    "icon": "mdi:chart-bell-curve-cumulative",
+                    "attribution": ATTRIBUTION,
+                    "cv_mae": str(model.last_cv_mae) if model.last_cv_mae is not None else "n/a",
+                    "model_engine": str(model.engine),
+                    "last_trained": trained_str,
+                },
+                replace=True,
+            )
 
     # ── Aggregation ───────────────────────────────────────────────────────────
 
@@ -544,6 +791,7 @@ class EnergyForecast(hass.Hass):
         )
 
         result = {
+            "next_1h":         _sum(now_np, now_np + np.timedelta64(1, "h")),
             "next_3h":         _sum(now_np, now_np + np.timedelta64(3, "h")),
             "today":           today_total,
             "tomorrow":        _sum(tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),

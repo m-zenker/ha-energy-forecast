@@ -6,6 +6,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Doubled "Energy Forecast" prefix in MQTT Discovery sensor names** (`energy_forecast.py`): HA
+  prepends the device name ("HA Energy Forecast") to the sensor `name` field, so names like
+  `"Energy Forecast Model MAE"` were displayed as `"HA Energy Forecast Energy Forecast Model MAE"`.
+  Discovery `name` values are now short labels (`"Model MAE"`, `"Today"`, `"Setup Status"`, etc.);
+  `set_state()` paths are unchanged as they have no device grouping.
+- **Doubled sensors after enabling MQTT Discovery** (`energy_forecast.py`): on startup when
+  `mqtt_discovery=True`, `_cleanup_legacy_states()` now calls `remove_entity()` for every
+  entity_id previously created by the `set_state` path.  Ghost entities from a prior
+  `mqtt_discovery=False` run are removed without requiring an HA restart.
+- **MQTT publish broken on HASS apps** (`energy_forecast.py`): replaced `self.mqtt_publish()` (only
+  available on MQTT-namespace apps) with `self.call_service("mqtt/publish", ...)`, which works from
+  any AppDaemon HASS app.  Discovery, state, and availability publishes now succeed at startup and
+  after retraining.
+- **numpy 2.x retraining error** (`model.py`): `np.log1p` on object-dtype arrays (Python floats)
+  raised `"loop of ufunc does not support argument 0 of type float"` on numpy 2.x.
+  Fix: `df["gross_kwh"].to_numpy(dtype=float)` forces float64 before the log transform.
+
+### Added
+- **MQTT Discovery (#37)** (`energy_forecast.py`): opt-in entity registration via MQTT Discovery.
+  Set `mqtt_discovery: true` in `apps.yaml` to register all ~29 sensors in the HA entity registry,
+  enabling area assignment and labels.  Requires the AppDaemon MQTT plugin and a running MQTT broker.
+  Config keys: `mqtt_discovery` (default `false`), `mqtt_namespace` (default `mqtt`),
+  `mqtt_discovery_prefix` (default `homeassistant`).  All sensors grouped under a single
+  `HA Energy Forecast` device.  Prediction interval sensors (`*_low`/`*_high`) are registered
+  lazily on the first update cycle where quantile models exist.  Availability topic publishes
+  `"online"` at startup and `"offline"` on AppDaemon shutdown.  Existing `set_state()` behaviour
+  is unchanged when `mqtt_discovery: false`.
+
+### Changed
+- README: added MQTT Discovery section (prerequisites, `appdaemon.yaml` snippet, `apps.yaml` example, sensor count table, availability behaviour, revert instructions); added `mqtt_discovery` / `mqtt_namespace` / `mqtt_discovery_prefix` to parameter reference; updated Published sensors intro and Features bullet; added Contents entry
+
+### Fixed
+- Align hourly sensor updates to XX:01:00 wall-clock time using `run_hourly`; eliminates startup-time drift
+- Downgrade prediction-time sub-sensor NaN log from WARNING to DEBUG; training-time WARNING (weekly) is sufficient
+
+---
+
 ## [0.5.2] — 2026-03-20
 
 ### Fixed
