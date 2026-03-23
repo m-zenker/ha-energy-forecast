@@ -242,10 +242,17 @@ After install you will see sensors in **Developer Tools → States** under the `
 
 All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engine`, and `last_trained` attributes.
 
+> **Note — MQTT Discovery entity IDs:** When `mqtt_discovery: true` is set, Home Assistant
+> creates entities under the device "HA Energy Forecast". Entity IDs take the form
+> `sensor.ha_energy_forecast_<unique_id>` (e.g. `sensor.ha_energy_forecast_energy_forecast_today`).
+> The `sensor.energy_forecast_*` IDs in the table below reflect the `set_state()` path; update
+> any automations accordingly when switching modes.
+
 ### Forecast totals
 
 | Entity ID | Description |
 |-----------|-------------|
+| `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
 | `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
@@ -495,13 +502,13 @@ All sensors are registered at startup. The 6 prediction-interval sensors (`*_low
 
 | Sensor group | Count |
 |---|---|
-| Forecast totals (`next_3h`, `today`, `tomorrow`) | 3 |
+| Forecast totals (`next_1h`, `next_3h`, `today`, `tomorrow`) | 4 |
 | 3-hour blocks (today + tomorrow) | 16 |
 | EV actuals (`ev_today`, `ev_yesterday`) | 2 |
 | Model MAE | 1 |
 | Setup status | 1 |
 | Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
-| **Total** | **29** |
+| **Total** | **30** |
 
 ### Availability
 
