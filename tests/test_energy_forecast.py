@@ -217,6 +217,22 @@ class TestAggregate:
             _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
         )
 
+    def test_next_1h_sums_only_one_future_hour(self):
+        """next_1h must equal exactly 1 × per-hour prediction."""
+        today = pd.Timestamp.now().normalize()
+        now   = pd.Timestamp.now().floor("1h")
+        preds = _pred_df(now, n=48, kwh=2.0)
+        result = self._run(today, now, preds)
+        assert abs(result["next_1h"] - 2.0) < 1e-3
+
+    def test_next_1h_less_than_next_3h(self):
+        """next_1h must be strictly less than next_3h when kWh/h > 0."""
+        today = pd.Timestamp.now().normalize()
+        now   = pd.Timestamp.now().floor("1h")
+        preds = _pred_df(now, n=48, kwh=1.5)
+        result = self._run(today, now, preds)
+        assert result["next_1h"] < result["next_3h"]
+
     def test_next_3h_sums_only_three_future_hours(self):
         """next_3h must equal exactly 3 × per-hour prediction, not more."""
         today = pd.Timestamp.now().normalize()
@@ -644,7 +660,7 @@ class TestMqttConditionalIntervals:
         fake = _FakeMqttSelf()
         # Build a minimal aggregated data dict that includes interval values
         data = {
-            "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
             "next_3h_low": 0.8, "next_3h_high": 1.2,
             "today_low": 4.5, "today_high": 5.5,
             "tomorrow_low": 5.5, "tomorrow_high": 6.5,
@@ -661,6 +677,37 @@ class TestMqttConditionalIntervals:
         assert len(low_high_topics) == 6, f"Expected 6 interval config topics, got {low_high_topics}"
 
 
+class TestPublishUnavailable:
+    """_publish_unavailable() must mark next_1h (and other totals) as 'unavailable'."""
+
+    def test_next_1h_set_to_unavailable(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish_unavailable(fake)
+        assert "sensor.energy_forecast_next_1h" in fake._states
+        assert fake._states["sensor.energy_forecast_next_1h"]["state"] == "unavailable"
+
+    def test_all_total_slots_set_unavailable(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish_unavailable(fake)
+        for slot in ("next_1h", "next_3h", "today", "tomorrow"):
+            eid = f"sensor.energy_forecast_{slot}"
+            assert eid in fake._states, f"missing {eid}"
+            assert fake._states[eid]["state"] == "unavailable"
+
+
+class TestMqttPublishAllDiscoveryNext1h:
+    """_mqtt_publish_all_discovery() must include next_1h."""
+
+    def test_next_1h_discovery_topic_published(self):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        topics = [p["topic"] for p in fake._publishes]
+        assert any("energy_forecast_next_1h/config" in t for t in topics), \
+            f"next_1h discovery topic not found in: {topics}"
+
+
 class TestMqttFallback:
     """When mqtt_discovery=False, safe_set must use set_state and never call mqtt_publish."""
 
@@ -670,7 +717,7 @@ class TestMqttFallback:
         fake = _FakeMqttSelf(mqtt_discovery=False)
         fake.mqtt_publish = MagicMock()
         data = {
-            "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
             "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
             "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
             "ev_today": 0.0, "ev_yesterday": 0.0,

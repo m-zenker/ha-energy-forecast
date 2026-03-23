@@ -315,7 +315,7 @@ class EnergyForecast(hass.Hass):
             None,
         )
         # Forecast totals
-        for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             self._mqtt_publish_discovery(
                 f"energy_forecast_{key}",
                 f"Energy Forecast {label}",
@@ -563,7 +563,7 @@ class EnergyForecast(hass.Hass):
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
             return  # availability topic serves this purpose in MQTT mode
-        for slot in ["next_3h", "today", "tomorrow"]:
+        for slot in ["next_1h", "next_3h", "today", "tomorrow"]:
             self.set_state(
                 f"sensor.energy_forecast_{slot}",
                 state="unavailable",
@@ -631,7 +631,7 @@ class EnergyForecast(hass.Hass):
                 )
 
         # ── Forecast totals ───────────────────────────────────────────────────
-        for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
 
         # ── Prediction intervals (only published when quantile models trained) ─
@@ -752,6 +752,7 @@ class EnergyForecast(hass.Hass):
         )
 
         result = {
+            "next_1h":         _sum(now_np, now_np + np.timedelta64(1, "h")),
             "next_3h":         _sum(now_np, now_np + np.timedelta64(3, "h")),
             "today":           today_total,
             "tomorrow":        _sum(tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
