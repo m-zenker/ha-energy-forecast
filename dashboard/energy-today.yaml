@@ -1,0 +1,88 @@
+type: custom:apexcharts-card
+update_interval: 5min
+header:
+  show: true
+  title: Energy — Today
+  show_states: false
+apex_config:
+  chart:
+    height: 220
+  plotOptions:
+    bar:
+      columnWidth: 70%
+      borderRadius: 3
+  dataLabels:
+    enabled: true
+    formatter: "EVAL:function(val) { return val ? val.toFixed(2) : ''; }"
+    style:
+      fontSize: 10px
+  xaxis:
+    type: category
+  yaxis:
+    min: 0
+    decimalsInFloat: 2
+    title:
+      text: kWh
+  tooltip:
+    y:
+      formatter: "EVAL:function(val) { return val != null ? val.toFixed(3) + ' kWh' : ''; }"
+  legend:
+    show: true
+series:
+  - entity: sensor.ha_energy_forecast_energy_forecast_today_00_00_03_00
+    name: Forecast
+    color: "#f0883e"
+    type: column
+    data_generator: |
+      const labels = ['00–03','03–06','06–09','09–12','12–15','15–18','18–21','21–24'];
+      const sensors = [
+        'sensor.ha_energy_forecast_energy_forecast_today_00_00_03_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_03_00_06_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_06_00_09_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_09_00_12_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_12_00_15_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_15_00_18_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_18_00_21_00',
+        'sensor.ha_energy_forecast_energy_forecast_today_21_00_24_00',
+      ];
+      return sensors.map((e, i) => {
+        const s = hass.states[e];
+        return { x: labels[i], y: s ? Number(s.state) : null };
+      });
+  - entity: sensor.gplugk_z_ei
+    name: Actual
+    color: "#3fb950"
+    type: column
+    data_generator: |
+      const labels = ['00–03','03–06','06–09','09–12','12–15','15–18','18–21','21–24'];
+      const nullResult = labels.map(l => ({ x: l, y: null }));
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date();
+      dayEnd.setHours(23, 59, 59, 999);
+      const queryStart = new Date(dayStart.getTime() - 3600 * 1000);
+      const result = await hass.connection.sendMessagePromise({
+        type: 'recorder/statistics_during_period',
+        start_time: queryStart.toISOString(),
+        end_time: dayEnd.toISOString(),
+        statistic_ids: ['sensor.gplugk_z_ei'],
+        period: 'hour',
+        types: ['sum'],
+      });
+      const entries = (result?.['sensor.gplugk_z_ei'] || [])
+        .map(e => ({ t: new Date(e.start).getTime(), sum: e.sum }))
+        .filter(e => e.sum != null);
+      if (entries.length < 2) return nullResult;
+      const sumBefore = t => {
+        const before = entries.filter(e => e.t < t);
+        return before.length ? before[before.length - 1].sum : null;
+      };
+      return labels.map((label, i) => {
+        const slotStart = dayStart.getTime() + i * 3 * 3600 * 1000;
+        const slotEnd   = slotStart + 3 * 3600 * 1000;
+        const s0 = sumBefore(slotStart);
+        const s1 = sumBefore(slotEnd);
+        if (s0 == null || s1 == null) return { x: label, y: null };
+        const diff = s1 - s0;
+        return { x: label, y: diff > 0 ? Math.round(diff * 1000) / 1000 : null };
+      });
