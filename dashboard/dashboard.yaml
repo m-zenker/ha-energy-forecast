@@ -87,7 +87,7 @@ views:
   - type: masonry
     path: warmepumpe
     title: Wärmepumpe
-    icon: mdi:heat-pump
+    icon: m3of:heat-pump-balance
     show_icon_and_title: true
     cards:
       - type: entities

@@ -17,8 +17,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SHAP summary early-day fallback** (`model.py`): `shap_summary` now falls back to all 48
   prediction rows when fewer than 3 rows match today's date slice (previously fell back only
   when zero rows matched, producing a misleading 1-hour average late in the day).
-- **Dashboard icon typo** (`dashboard/dashboard.yaml`): `m3of:heat-pump-balance` → `mdi:heat-pump`
-  (invalid icon set prefix was rendering as a blank glyph in HA).
 
 ### Tests
 - `TestPredictIntervals::test_calibrated_intervals_wider_than_raw`: added `assert m._log_transform`
