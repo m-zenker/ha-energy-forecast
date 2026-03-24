@@ -8,6 +8,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Anomaly binary sensor attributes missing in MQTT mode** (`energy_forecast.py`): `_publish`
+  now publishes the four anomaly attributes (`residual_kwh`, `residual_std_kwh`,
+  `sigma_threshold`, `n_pairs`) to a dedicated `binary_sensor/.../attributes` MQTT topic.
+  Discovery payload for `energy_forecast_unusual_consumption` now includes
+  `json_attributes_topic`. State topic path corrected from `sensor/` to `binary_sensor/`.
+- **`_mqtt_publish_sensor_attributes` category param**: method now accepts `category`
+  (default `"sensor"`) so it can be routed to `binary_sensor/` paths.
+
+### Added
+- **Dashboard card — anomaly detection** (`dashboard/anomaly-detection.yaml`): standalone
+  vertical-stack with mushroom state card + conditional attribute detail (expands when ON).
+- **Dashboard card — SHAP feature importance** (`dashboard/shap-importance.yaml`): native
+  Lovelace markdown card with Jinja2 template; no custom card dependency.
+- **`dashboard/dashboard.yaml`**: anomaly mushroom card inserted after MAE mini-graph card.
+
+### Tests
+- `test_publish_mqtt_mode`: extended to verify anomaly attributes topic and payload keys.
+- `test_mqtt_discovery_includes_anomaly_sensor`: extended to verify `json_attributes_topic`
+  is present in the binary sensor discovery config payload.
+
 ---
 
 ## [0.6.0] — 2026-03-23

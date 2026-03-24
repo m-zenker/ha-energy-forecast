@@ -1,0 +1,38 @@
+type: vertical-stack
+cards:
+  - type: custom:mushroom-entity-card
+    entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+    name: Unusual Consumption
+    icon: mdi:alert-circle-outline
+    layout: horizontal
+    tap_action:
+      action: more-info
+  - type: conditional
+    conditions:
+      - entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+        state: "on"
+    card:
+      type: entities
+      title: Anomaly Detail
+      entities:
+        - entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+          name: Residual
+          type: attribute
+          attribute: residual_kwh
+          suffix: " kWh"
+        - entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+          name: Residual Std
+          type: attribute
+          attribute: residual_std_kwh
+          suffix: " kWh"
+        - entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+          name: σ Threshold
+          type: attribute
+          attribute: sigma_threshold
+        - entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+          name: Sample Pairs
+          type: attribute
+          attribute: n_pairs
+
+# Non-MQTT: strip ha_energy_forecast_ prefix from all entity IDs above.
+# e.g. binary_sensor.energy_forecast_unusual_consumption

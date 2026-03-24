@@ -267,12 +267,13 @@ class EnergyForecast(hass.Hass):
         friendly_name: str,
         icon: str,
         device_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> dict:
         """Return the HA MQTT Discovery config dict for a single binary sensor."""
         payload: dict = {
             "name": friendly_name,
             "unique_id": unique_id,
-            "state_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state",
+            "state_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/binary_sensor/{unique_id}/state",
             "availability_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/availability",
             "payload_on": "ON",
             "payload_off": "OFF",
@@ -286,6 +287,8 @@ class EnergyForecast(hass.Hass):
         }
         if device_class is not None:
             payload["device_class"] = device_class
+        if json_attributes_topic is not None:
+            payload["json_attributes_topic"] = json_attributes_topic
         return payload
 
     def _mqtt_publish_binary_sensor_discovery(
@@ -294,11 +297,13 @@ class EnergyForecast(hass.Hass):
         friendly_name: str,
         icon: str,
         device_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> None:
         """Publish a retained MQTT Discovery config payload for one binary sensor."""
         try:
             payload = self._build_binary_sensor_discovery_payload(
-                unique_id, friendly_name, icon, device_class
+                unique_id, friendly_name, icon, device_class,
+                json_attributes_topic=json_attributes_topic,
             )
             topic = f"{self._mqtt_discovery_prefix}/binary_sensor/{unique_id}/config"
             self.call_service(
@@ -372,10 +377,11 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
 
-    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict) -> None:
+    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict,
+                                        category: str = "sensor") -> None:
         """Publish a JSON attributes dict to the sensor's json_attributes_topic (retained)."""
         try:
-            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/attributes"
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/{category}/{unique_id}/attributes"
             self.call_service(
                 "mqtt/publish",
                 topic=topic,
@@ -463,11 +469,16 @@ class EnergyForecast(hass.Hass):
                           ("energy_forecast_mae_30d", "Energy Forecast MAE 30d")]:
             self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", "energy", "measurement")
         # Anomaly detection sensor (#39)
+        _anomaly_attrs_topic = (
+            f"{self._mqtt_discovery_prefix}/energy_forecast"
+            f"/binary_sensor/energy_forecast_unusual_consumption/attributes"
+        )
         self._mqtt_publish_binary_sensor_discovery(
             "energy_forecast_unusual_consumption",
             "Unusual Consumption",
             "mdi:alert-circle-outline",
             "problem",
+            json_attributes_topic=_anomaly_attrs_topic,
         )
 
     def terminate(self) -> None:
@@ -1028,10 +1039,35 @@ class EnergyForecast(hass.Hass):
             "n_pairs":           data.get("anomaly_n", 0),
         }
         if self._mqtt_discovery:
-            self._mqtt_set_sensor_raw(
-                "energy_forecast_unusual_consumption",
-                "ON" if is_anomaly else "OFF",
+            _anomaly_uid = "energy_forecast_unusual_consumption"
+            _state_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast"
+                f"/binary_sensor/{_anomaly_uid}/state"
             )
+            try:
+                self.call_service(
+                    "mqtt/publish",
+                    topic=_state_topic,
+                    payload="ON" if is_anomaly else "OFF",
+                    retain=True,
+                    namespace=self._mqtt_namespace,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"MQTT anomaly state publish failed: {exc}", level="WARNING")
+            _attr_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast"
+                f"/binary_sensor/{_anomaly_uid}/attributes"
+            )
+            try:
+                self.call_service(
+                    "mqtt/publish",
+                    topic=_attr_topic,
+                    payload=json.dumps(anomaly_attrs),
+                    retain=True,
+                    namespace=self._mqtt_namespace,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"MQTT anomaly attributes publish failed: {exc}", level="WARNING")
         else:
             self.set_state(
                 "binary_sensor.energy_forecast_unusual_consumption",

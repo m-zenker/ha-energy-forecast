@@ -5,7 +5,6 @@ views:
     icon: m3o:energy-program-time-used
     show_icon_and_title: true
     cards:
-
       - square: false
         type: grid
         cards:
@@ -71,12 +70,26 @@ views:
             show_graph: false
             show_state: true
       - type: custom:mini-graph-card
+        show:
+          fill: false
         entities:
-          - sensor.ha_energy_forecast_energy_forecast_model_mae
+          - entity: sensor.ha_energy_forecast_energy_forecast_model_mae
+            name: Model MAE
+          - entity: sensor.ha_energy_forecast_energy_forecast_mae_30d
+            name: 30d MAE
+          - entity: sensor.ha_energy_forecast_energy_forecast_mae_7d
+            name: 7d MAE
         name: Energy Forecast Model MAE
         icon: mdi:bullseye-arrow
         hours_to_show: 1000
         points_per_hour: 0.05
+      - type: custom:mushroom-entity-card
+        entity: binary_sensor.ha_energy_forecast_energy_forecast_unusual_consumption
+        name: Unusual Consumption
+        icon: mdi:alert-circle-outline
+        layout: horizontal
+        tap_action:
+          action: more-info
       - type: gauge
         entity: sensor.skoda_enyaq_battery_percentage
         needle: false

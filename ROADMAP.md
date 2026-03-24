@@ -391,6 +391,23 @@ that will not exist on other installations. Before any wider sharing or HACS inc
   directing users to substitute their own entities.
 - Add a header comment in each file: `# EDIT: replace entity IDs below with your own`.
 
+### 47. Fix 404 DELETE spam in `_cleanup_legacy_states()` *(pre-merge gate — dev → main)*
+
+On startup with `mqtt_discovery: true`, `_cleanup_legacy_states()` calls
+`self.remove_entity()` for each of ~30 legacy entity IDs unconditionally. AppDaemon
+issues an HTTP DELETE to HA for every call; on a fresh install (or when the entities
+never existed), HA returns 404 and AppDaemon logs `ERROR HASS: [404] HTTP DELETE:
+Not Found {}` ~30 times. The app-level `except Exception: pass` does not suppress
+the HTTP-layer log.
+
+Fix: guard each deletion with `self.entity_exists(entity_id)` before calling
+`self.remove_entity()`. Prevents the HTTP round-trip entirely when the entity is absent.
+Also add a test asserting `remove_entity` is **not** called when `entity_exists`
+returns False.
+
+Observed in v0.7.0 test deploy 2026-03-24. Must fix before merging `dev` → `main`.
+Expected impact: Log cleanliness; Trivial effort (~5 min).
+
 ### 43. ApexCharts / Lovelace config snippet *(long-term backlog)*
 A documented, copy-paste YAML config for an ApexCharts card showing forecast vs actual
 consumption. Not a custom card — uses `sensor.energy_forecast_*` sensors that already
@@ -479,3 +496,5 @@ Migration reference:
 | 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | long-term backlog |
 | 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
 | 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |
+| 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
+| 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | **pre-merge gate** |
