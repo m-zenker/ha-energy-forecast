@@ -63,6 +63,11 @@ class EnergyForecast(hass.Hass):
         # Optional sub-sensors: cumulative kWh meters (heat pump, dishwasher, etc.)
         # whose consumption is tracked as lag features to improve forecast accuracy.
         self._sub_energy_sensors: list[str] = list(self.args.get("sub_energy_sensors") or [])
+        # Optional away / vacation mode entities:
+        # away_mode_entity    — input_boolean whose "on" state marks a vacation period
+        # away_return_entity  — input_datetime holding the expected return (for prediction only)
+        self._away_mode_entity: str | None   = self.args.get("away_mode_entity") or None
+        self._away_return_entity: str | None = self.args.get("away_return_entity") or None
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict        = {}
@@ -446,6 +451,12 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
+        away_df = ha_data.fetch_boolean_entity_history(
+            self, self._away_mode_entity, days=30
+        )
+        if not away_df.empty:
+            away_df = _strip_tz(away_df)
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -454,6 +465,7 @@ class EnergyForecast(hass.Hass):
             canton=self._holiday_canton,
             ev_df=ev_df,
             sub_sensors_dict=sub_sensors_dict or None,
+            away_df=away_df if not away_df.empty else None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -497,13 +509,22 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
 
-        live_temp   = self._read_live_temp()
-        predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals,
-                                             sub_sensors_recent=sub_sensors_recent or None)
+        live_temp  = self._read_live_temp()
+        now_ts     = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+        away_series = self._build_away_prediction_series(now_ts)
+
+        predictions = self._ml_model.predict(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+        )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
-        intervals = self._ml_model.predict_intervals(forecast_df, live_temp, recent_actuals,
-                                                     sub_sensors_recent=sub_sensors_recent or None)
+        intervals = self._ml_model.predict_intervals(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+        )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
 
@@ -535,6 +556,53 @@ class EnergyForecast(hass.Hass):
             return float(state)
         except (ValueError, TypeError):
             return None
+
+    def _build_away_prediction_series(self, now_ts: Any) -> Any:
+        """Return a 48-value pd.Series (indexed by naive prediction timestamps) of is_away flags.
+
+        Logic:
+        - Entity is "off" (or not configured)  → all zeros.
+        - Entity is "on", no return entity or return datetime already past → all ones.
+        - Entity is "on", return datetime in the future → 1 before return_dt, 0 at/after.
+        """
+        import pandas as pd
+
+        future_hours = pd.date_range(
+            start=pd.Timestamp(now_ts).floor("1h"), periods=48, freq="1h"
+        )
+        is_away = pd.Series(0, index=future_hours, dtype=int)
+
+        if not self._away_mode_entity:
+            return is_away
+
+        state = self.get_state(self._away_mode_entity)
+        if state not in ("on",):
+            return is_away  # "off", "unavailable", "unknown", None → all zeros
+
+        # Entity is "on" — determine when the away period ends
+        return_dt: pd.Timestamp | None = None
+        if self._away_return_entity:
+            try:
+                raw_return = self.get_state(self._away_return_entity)
+                if raw_return not in (None, "unavailable", "unknown", ""):
+                    return_dt = pd.Timestamp(raw_return)
+                    # Strip tz if present, normalise to naive Europe/Zurich
+                    if return_dt.tzinfo is not None:
+                        return_dt = return_dt.tz_convert("Europe/Zurich").tz_localize(None)
+            except (ValueError, TypeError) as exc:
+                self.log(
+                    f"Could not parse away_return_entity state as datetime: {exc}",
+                    level="WARNING",
+                )
+                return_dt = None
+
+        if return_dt is None or return_dt <= pd.Timestamp(now_ts):
+            # No valid return time → away for the whole 48h window
+            is_away[:] = 1
+        else:
+            is_away[future_hours < return_dt] = 1
+
+        return is_away
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""

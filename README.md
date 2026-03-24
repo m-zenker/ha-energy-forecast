@@ -228,6 +228,8 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
+| `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
@@ -357,6 +359,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
+| Away / vacation | `is_away` — binary flag; 1 during periods when `away_mode_entity` is "on"; teaches the model lower vacation-period consumption |
 
 When `sub_energy_sensors` is configured, each sub-sensor adds four features: `lag_24h` (same hour yesterday), `lag_168h` (same hour last week, requires ≥ 268 rows of sub-sensor history), `{prefix}_active_24h` (was the appliance active in the past 24 h?), and `{prefix}_runs_7d` (how many on/off cycles in the past 7 days).
 

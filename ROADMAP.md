@@ -13,7 +13,7 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features, #25 Vacation flag, #41 Rolling MAE sensor | planned |
+| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor | planned |
 | Anomaly + dashboards | v0.8.0 | #39 Anomaly detection sensor, #43 ApexCharts config snippet | planned |
 | Explainability | v0.9.0 | #42 SHAP feature importance, quantile interval calibration | planned |
 | Solar + battery | v0.10.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
@@ -228,7 +228,18 @@ Three sub-items (B1, B2, B9):
 User is on a fixed flat tariff; price-driven load shifting is out of scope. Retained for reference only.
 
 ### 25. Vacation / away flag *(long-term backlog)*
-Multi-day absences cause baseline drops that look like anomalies to the rolling lag features and bias the model until history catches up. An optional `away_mode_entity` config key (e.g. `input_boolean.vacation_mode` or a `calendar` entity) adds a binary `is_away` feature. When set, the model can learn the reduced baseline explicitly rather than treating it as noise.
+Multi-day absences cause baseline drops that look like anomalies to the rolling lag features and bias the model until history catches up.
+
+Two optional, independent config keys:
+
+- `away_mode_entity` (e.g. `input_boolean.vacation_mode`) → binary `is_away` feature. Sufficient on its own to give the model the basic home/away signal.
+- `away_return_entity` (e.g. `input_datetime.vacation_return`) → numeric `hours_until_return` feature, rules:
+  - **0** when `is_away` is off (home).
+  - **0** when the stored return datetime is in the past — the entity retains its last-used value between trips and must be treated as stale once the date has passed.
+  - **Positive integer (hours)** when the return is in the future; capped at **168 h (7 days)** to bound the range.
+  - Gives the model a forward signal for the pre-heat consumption spike, which starts a few hours before return (not days ahead).
+
+Both keys are optional and independent; `away_mode_entity` alone is enough for the basic feature.
 
 ### 18. Custom component config flow *(long-term backlog)*
 A full HA custom component (lives in `custom_components/energy_forecast/`) that provides a UI-driven setup wizard via HA's config flow:
@@ -337,15 +348,16 @@ embedded in sensor attributes as preparation.~~
 
 ## Tier 6 — Planned (v0.7.0–v0.10.0)
 
-### 38. Full 48 h weather forecast features *(planned — v0.7.0)*
-Open-Meteo is already wired and provides a 48 h forecast, but only `temp_c` is currently
-blended forward across the full horizon. `cloud_cover_pct`, `direct_radiation_wm2`,
-`sunshine_min`, `precipitation_mm`, and `wind_kmh` are available from the same API call
-but held constant at the current-hour value beyond the sensor-blend window (6 h).
+### 38. Full 48 h weather forecast features *(✓ done — v0.7.0)*
+Per-hour weather merge was already in place via `_engineer_features` timestamp join
+(implemented as a side-effect of #4, commit c9513b8). All six weather columns
+(`temp_c`, `cloud_cover_pct`, `direct_radiation_wm2`, `sunshine_min`,
+`precipitation_mm`, `wind_kmh`) are merged onto the 48-row prediction frame by
+timestamp — no scalar broadcast.
 
-Fix: in `_build_prediction_features`, forward-fill each weather variable from the 48 h
-Open-Meteo forecast slice rather than broadcasting the scalar current value.
-Expected impact: **HIGH** for hours 6–48 (tail accuracy); Low effort.
+Regression tests added in `TestWeatherPerHourVariation` (`tests/test_model.py`) to
+guard against future regressions: each column must have `nunique() > 1` across 48 h,
+and `temp_c` at h=0 and h=47 must match the input forecast values exactly.
 
 ### 39. Anomaly detection on forecast residuals *(planned — v0.8.0)*
 Publish `binary_sensor.energy_forecast_unusual_consumption` that fires when the latest
@@ -444,7 +456,7 @@ Migration reference:
 | 22 | EV SoC + charging state feature | high (EV households) | 4 h | long-term backlog |
 | 23 | Solar PV integration (B1 actual + B2 forecast) | high (solar households) | 6 h | planned v0.10.0 |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
-| 25 | Vacation / away flag | medium | 2 h | planned v0.7.0 |
+| 25 | Vacation / away flag | medium | 2 h | ✓ done |
 | 26 | Sub-energy sensors (`sub_energy_sensors`) | medium | 4 h | ✓ done |
 | 27 | Short-horizon lags (`lag_1h`–`lag_12h`) | **high** | 1 h | ✓ done |
 | 28 | `num_leaves` sweep (complete #6) | medium | 1 h | ✓ done |
@@ -457,7 +469,7 @@ Migration reference:
 | 35 | Sub-sensor binary activity flag (`{prefix}_active_24h`) | low–medium | 30 min | ✓ done |
 | 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | ✓ done |
 | 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
-| 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | planned v0.7.0 |
+| 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | ✓ done |
 | 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | planned v0.8.0 |
 | 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | planned v0.7.0 |

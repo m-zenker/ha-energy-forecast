@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Vacation / away flag (#25)** (`model.py`, `ha_data.py`, `energy_forecast.py`): new binary
+  `is_away` feature lets the model learn lower consumption during vacations and predict accordingly.
+  Two optional config keys: `away_mode_entity` (e.g. `input_boolean.vacation_mode`) and
+  `away_return_entity` (e.g. `input_datetime.vacation_return`).  Both are independent and fully
+  backward-compatible — when unconfigured `is_away` is 0 everywhere.
+  - Training: 30-day state history of `away_mode_entity` is fetched via `fetch_boolean_entity_history`
+    and joined to the training DataFrame as hourly `is_away` flags.
+  - Prediction: `_build_away_prediction_series` projects `is_away` across the 48-hour window;
+    if `away_return_entity` holds a future datetime, `is_away` flips to 0 at the return hour.
+
 ---
 
 ## [0.6.0] — 2026-03-23

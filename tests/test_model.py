@@ -1233,3 +1233,113 @@ class TestHowMedians:
         # At minimum one lag column should be present
         assert any(k.startswith("lag_") for k in sample)
 
+
+# ── #38 Regression: per-hour weather variation in _engineer_features ──────────
+
+class TestWeatherPerHourVariation:
+    """Regression guard: weather columns must not be scalar-broadcast in prediction."""
+
+    def _make_varied_forecast(self) -> pd.DataFrame:
+        """48 h forecast where every weather variable has a unique value per hour."""
+        start = pd.Timestamp("2026-03-12 08:00")
+        n = 48
+        hours = pd.date_range(start, periods=n, freq="1h")
+        return pd.DataFrame({
+            "timestamp":            hours,
+            "temp_c":               np.linspace(5.0, 20.0, n),
+            "precipitation_mm":     np.linspace(0.0, 5.0, n),
+            "sunshine_min":         np.linspace(0.0, 60.0, n),
+            "wind_kmh":             np.linspace(5.0, 30.0, n),
+            "cloud_cover_pct":      np.linspace(0.0, 100.0, n),
+            "direct_radiation_wm2": np.linspace(0.0, 800.0, n),
+        })
+
+    def test_all_weather_cols_vary_per_hour(self):
+        """Each weather column must have more than one unique value across 48 h."""
+        forecast = self._make_varied_forecast()
+        future_df = pd.DataFrame({"timestamp": forecast["timestamp"], "gross_kwh": np.nan})
+        result = _engineer_features(future_df, forecast, outdoor_df=None)
+        for col in ["temp_c", "precipitation_mm", "sunshine_min",
+                    "wind_kmh", "cloud_cover_pct", "direct_radiation_wm2"]:
+            vals = result[col].dropna()
+            assert vals.nunique() > 1, (
+                f"{col} is flat across 48 h — scalar-broadcast bug present"
+            )
+
+    def test_temp_c_matches_forecast_values(self):
+        """Spot-check: temp_c at h=0 and h=47 must equal the input forecast values."""
+        forecast = self._make_varied_forecast()
+        future_df = pd.DataFrame({"timestamp": forecast["timestamp"], "gross_kwh": np.nan})
+        result = _engineer_features(future_df, forecast, outdoor_df=None)
+        result = result.reset_index(drop=True)
+        assert abs(float(result.loc[0, "temp_c"]) - 5.0) < 1e-6, (
+            "temp_c at h=0 does not match forecast input"
+        )
+        assert abs(float(result.loc[47, "temp_c"]) - 20.0) < 1e-6, (
+            "temp_c at h=47 does not match forecast input"
+        )
+
+
+# ── #25 Vacation / Away Flag ───────────────────────────────────────────────────
+
+class TestAwayFeature:
+    """is_away binary feature: presence, zero default, value propagation, predict."""
+
+    def _make_weather(self, ts):
+        return pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [10.0] * len(ts),
+            "precipitation_mm":     [0.0]  * len(ts),
+            "sunshine_min":         [30.0] * len(ts),
+            "wind_kmh":             [10.0] * len(ts),
+            "cloud_cover_pct":      [50.0] * len(ts),
+            "direct_radiation_wm2": [100.0]* len(ts),
+        })
+
+    def _make_bare(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.5] * len(ts)})
+
+    def test_is_away_in_features_base(self):
+        assert "is_away" in _FEATURES_BASE
+
+    def test_is_away_column_present_with_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [1, 1, 0, 0]})
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=away_df)
+        assert "is_away" in result.columns
+
+    def test_is_away_zero_without_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=None)
+        assert "is_away" in result.columns
+        assert (result["is_away"] == 0).all()
+
+    def test_is_away_values_match_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [1, 0, 1, 0]})
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=away_df)
+        assert list(result["is_away"].values) == [1, 0, 1, 0]
+
+    def test_is_away_in_feature_cols_after_train(self, tmp_path):
+        n = 600
+        rng = np.random.default_rng(5)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = self._make_weather(ts)
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [0] * n})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, away_df=away_df)
+        assert "is_away" in m.feature_cols
+
+    def test_predict_with_away_series(self, tmp_path):
+        """predict() with a 48-value away_series=all-ones must return valid predictions."""
+        m, forecast = _make_trained_model(tmp_path)
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        away_series = pd.Series(1, index=future_ts, dtype=int)
+        result = m.predict(forecast, live_temp=None, away_series=away_series)
+        assert len(result) == 48
+        assert result["predicted_kwh"].notna().all()
+        assert result["predicted_kwh"].ge(0).all()

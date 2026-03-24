@@ -76,6 +76,16 @@ energy_forecast:
   # ev_charging_threshold_kwh: 7    # default: 7 kWh/h
   # ev_charger_kw: 9                # default: 9 kW (e.g. 11 kW Type 2 at ~80% efficiency)
 
+  # Optional: entity that signals vacation / away mode.
+  # When "on", the model learns lower consumption patterns from historical away periods
+  # and predicts accordingly.
+  # away_mode_entity: input_boolean.vacation_mode
+
+  # Optional: entity holding the expected return datetime (input_datetime).
+  # Used to project is_away=0 for hours after the return within the 48h forecast.
+  # Requires away_mode_entity to be configured.
+  # away_return_entity: input_datetime.vacation_return
+
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).
   # Requires AppDaemon MQTT plugin in appdaemon.yaml + a running MQTT broker.

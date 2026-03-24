@@ -759,3 +759,89 @@ class TestCleanupLegacyStates:
         from energy_forecast.energy_forecast import EnergyForecast
         # Must not raise
         EnergyForecast._cleanup_legacy_states(fake)
+
+# ── #25 Vacation / Away Flag — _build_away_prediction_series ─────────────────
+
+class _FakeAwaySelf:
+    """Stand-in for EnergyForecast for _build_away_prediction_series tests."""
+
+    def __init__(
+        self,
+        away_mode_entity: str | None = None,
+        away_return_entity: str | None = None,
+        away_mode_state: str = "off",
+        away_return_state: str | None = None,
+    ):
+        self._away_mode_entity   = away_mode_entity
+        self._away_return_entity = away_return_entity
+        self._states: dict[str, str] = {}
+        if away_mode_entity:
+            self._states[away_mode_entity] = away_mode_state
+        if away_return_entity and away_return_state is not None:
+            self._states[away_return_entity] = away_return_state
+        self._warnings: list[str] = []
+
+    def get_state(self, entity_id: str) -> str | None:
+        return self._states.get(entity_id)
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        if level == "WARNING":
+            self._warnings.append(msg)
+
+
+class TestBuildAwayPredictionSeries:
+    """_build_away_prediction_series: correct is_away projections for all cases."""
+
+    def _now_ts(self):
+        return pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+
+    def test_no_entity_returns_all_zeros(self):
+        """With no away_mode_entity configured, all 48 values must be 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity=None)
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert len(result) == 48
+        assert (result == 0).all()
+
+    def test_entity_off_returns_all_zeros(self):
+        """When away_mode_entity is 'off', all 48 values must be 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="off")
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert (result == 0).all()
+
+    def test_entity_on_no_return_entity_returns_all_ones(self):
+        """When entity is 'on' and no return entity, all 48 values must be 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="on",
+                             away_return_entity=None)
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert (result == 1).all()
+
+    def test_entity_on_return_in_future_splits_at_return_dt(self):
+        """When entity is 'on' and return_dt is 24h ahead, first 24 rows = 1, rest = 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        now_ts    = pd.Timestamp("2026-04-01 10:00")
+        return_dt = now_ts + pd.Timedelta(hours=24)
+        fake = _FakeAwaySelf(
+            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_return_entity="input_datetime.return",
+            away_return_state=str(return_dt),
+        )
+        result = EnergyForecast._build_away_prediction_series(fake, now_ts)
+        # Hours before return_dt: is_away=1; at/after return_dt: is_away=0
+        assert (result.iloc[:24] == 1).all(), f"Expected first 24 = 1, got {result.iloc[:24].tolist()}"
+        assert (result.iloc[24:] == 0).all(), f"Expected rows 24+ = 0, got {result.iloc[24:].tolist()}"
+
+    def test_entity_on_return_dt_in_past_returns_all_ones(self):
+        """When entity is 'on' and return_dt is in the past, all 48 values must be 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        now_ts    = pd.Timestamp("2026-04-01 10:00")
+        return_dt = now_ts - pd.Timedelta(hours=1)   # 1h ago — already past
+        fake = _FakeAwaySelf(
+            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_return_entity="input_datetime.return",
+            away_return_state=str(return_dt),
+        )
+        result = EnergyForecast._build_away_prediction_series(fake, now_ts)
+        assert (result == 1).all()

@@ -16,6 +16,7 @@ Feature set:
   - Calendar extras: is_public_holiday, days_to_next_holiday,
     days_since_last_holiday (Swiss federal + optional cantonal)
   - EV charging pattern: likely_ev_hour binary flag
+  - Vacation / away: is_away binary flag (0/1, via away_mode_entity)
 
 Model:
   LightGBM preferred; scikit-learn GBR automatic fallback (e.g. armv7).
@@ -93,6 +94,8 @@ _FEATURES_BASE = [
     "days_since_last_holiday",
     # EV charging pattern
     "likely_ev_hour",
+    # Vacation / away flag
+    "is_away",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -194,6 +197,7 @@ class EnergyForecastModel:
         canton: str | None = None,
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
+        away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -241,7 +245,7 @@ class EnergyForecastModel:
 
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
-                                likely_ev_hours=likely_ev_hours)
+                                likely_ev_hours=likely_ev_hours, away_df=away_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -492,6 +496,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None,
         sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -516,6 +521,15 @@ class EnergyForecastModel:
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours)
+
+        # ── Away / vacation flag ─────────────────────────────────────────────
+        # away_series is a 48-value Series indexed by naive prediction timestamps.
+        # Merge by timestamp; fill unmatched rows with 0 (default: not away).
+        if away_series is not None and not away_series.empty:
+            away_map = away_series.reindex(pd.to_datetime(feat_df["timestamp"])).fillna(0)
+            feat_df["is_away"] = away_map.values.astype(int)
+        else:
+            feat_df["is_away"] = 0
 
         # Overwrite hours_ahead with the actual prediction horizon (0–47).
         # _engineer_features sets it to 0 (training-row semantics); here we
@@ -551,6 +565,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
+        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -559,7 +574,9 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
@@ -572,6 +589,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -584,7 +602,9 @@ class EnergyForecastModel:
         if self._model_q10 is None or self._model_q90 is None:
             return None
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
@@ -950,6 +970,7 @@ def _engineer_features(
     outdoor_df: pd.DataFrame | None,    # naive timestamps
     canton: str | None = None,
     likely_ev_hours: set | None = None,
+    away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1037,6 +1058,18 @@ def _engineer_features(
     else:
         df["outdoor_temp_live"] = df["temp_c"]
         df["temp_bias"] = 0.0
+
+    # ── Away / vacation flag ─────────────────────────────────────────────────
+    if away_df is not None and not away_df.empty:
+        a = away_df[["timestamp", "is_away"]].copy()
+        a["timestamp"] = pd.to_datetime(a["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(a, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_aw"))
+        df.drop(columns=["timestamp_aw", "_ts_floor"], errors="ignore", inplace=True)
+        df["is_away"] = df["is_away"].fillna(0).astype(int)
+    else:
+        df["is_away"] = 0
 
     return df
 
