@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- **404 DELETE spam on startup** (`energy_forecast.py`): `_cleanup_legacy_states` now guards
+  each `remove_entity` call with `entity_exists`, eliminating ~30 `[404] HTTP DELETE: Not Found`
+  log errors on fresh installs where legacy entities were never created (fixes #47).
 - **Anomaly binary sensor attributes missing in MQTT mode** (`energy_forecast.py`): `_publish`
   now publishes the four anomaly attributes (`residual_kwh`, `residual_std_kwh`,
   `sigma_threshold`, `n_pairs`) to a dedicated `binary_sensor/.../attributes` MQTT topic.
