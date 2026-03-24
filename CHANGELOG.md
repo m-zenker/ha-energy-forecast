@@ -8,7 +8,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **`_load_interval_correction` stale-value bug** (`model.py`): `_interval_correction` is now
+  reset to `0.0` before attempting to parse the JSON file, so a corrupted or unreadable file
+  can never leave a stale value from a previous run in place.  `json.JSONDecodeError` added
+  explicitly to the except tuple (it is a `ValueError` subclass, so behaviour is unchanged,
+  but intent is clearer).
+- **SHAP summary early-day fallback** (`model.py`): `shap_summary` now falls back to all 48
+  prediction rows when fewer than 3 rows match today's date slice (previously fell back only
+  when zero rows matched, producing a misleading 1-hour average late in the day).
+- **Dashboard icon typo** (`dashboard/dashboard.yaml`): `m3of:heat-pump-balance` → `mdi:heat-pump`
+  (invalid icon set prefix was rendering as a blank glyph in HA).
+
+### Tests
+- `TestPredictIntervals::test_calibrated_intervals_wider_than_raw`: added `assert m._log_transform`
+  guard so the interval-widening assertion cannot pass vacuously if log-transform is disabled.
+- `TestAwayFeature::test_predict_with_away_series`: rewritten to verify `is_away` propagation
+  at the feature-matrix level via `_prepare_prediction_X`, proving a regression that silently
+  ignores `away_series` would be caught.
+
+
+
 ### Added
+- **Quantile interval calibration (CQR)** (`model.py`): prediction intervals (10th–90th percentile)
+  are now calibrated via split conformal prediction (Conformalized Quantile Regression).  The last
+  15% of training rows (≥ 20) are held out as a calibration split; q10/q90 are trained on the
+  remaining 85%.  A conformity score `max(q10(x)−y, y−q90(x))` is computed in log-space for each
+  calibration row, and the empirical `⌈(n+1)·0.8⌉/n` quantile (`q_hat`) is applied as a symmetric
+  additive correction before `expm1` at predict time.  This gives ≥80% marginal coverage on
+  held-out data.  `q_hat` is persisted to `energy_model_interval_correction.json` and reloaded on
+  startup.  A log line `CQR correction: q_hat=<value> (cal_n=<N>)` is emitted after every retrain.
 - **SHAP feature importance (#42)** (`model.py`, `energy_forecast.py`): the top-N driving features
   behind each prediction are exposed as a `shap_top_features` attribute on
   `sensor.energy_forecast_today`.  LightGBM uses native TreeSHAP (`pred_contrib=True`) for

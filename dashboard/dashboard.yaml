@@ -1,0 +1,131 @@
+views:
+  - type: masonry
+    path: energy-prediction
+    title: 'Energy Prediction '
+    icon: m3o:energy-program-time-used
+    show_icon_and_title: true
+    cards:
+
+      - square: false
+        type: grid
+        cards:
+          - type: custom:mushroom-entity-card
+            entity: sensor.ha_energy_forecast_energy_forecast_today
+            icon: mdi:home-lightning-bolt
+            layout: horizontal
+            name: Heute
+          - type: custom:mushroom-entity-card
+            entity: sensor.ha_energy_forecast_energy_forecast_today_low_10th_pct
+            name: Min
+            layout: horizontal
+          - type: custom:mushroom-entity-card
+            entity: sensor.ha_energy_forecast_energy_forecast_today_high_90th_pct
+            name: Max
+            layout: horizontal
+          - type: custom:mushroom-entity-card
+            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow
+            layout: horizontal
+            name: Morgen
+            icon: mdi:home-lightning-bolt-outline
+          - type: custom:mushroom-entity-card
+            icon_type: icon
+            layout: horizontal
+            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_low_10th_pct
+            name: Min
+          - type: custom:mushroom-entity-card
+            icon_type: icon
+            layout: horizontal
+            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_high_90th_pct
+            name: Max
+          - type: custom:mushroom-entity-card
+            icon_type: icon
+            layout: horizontal
+            entity: sensor.ha_energy_forecast_energy_forecast_next_3h
+            name: '3h '
+          - type: custom:mushroom-entity-card
+            icon_type: icon
+            layout: horizontal
+            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_low_10th_pct
+            name: 3h Min
+          - type: custom:mushroom-entity-card
+            layout: horizontal
+            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_high_90th_pct
+            name: 3h Max
+            icon_type: icon
+        title: Energy Forecast
+        columns: 3
+      - type: custom:mini-graph-card
+        name: Energy Forecast vs. Today Actual
+        hour24: true
+        points_per_hour: 4
+        icon: mdi:power-plug
+        entities:
+          - entity: sensor.ha_energy_forecast_energy_forecast_today
+            name: Today
+            show_state: true
+            fill: true
+          - entity: sensor.ha_energy_forecast_energy_forecast_tomorrow
+            name: Tomorrow
+          - entity: sensor.energy_in_daily
+            name: Actual Today
+            show_graph: false
+            show_state: true
+      - type: custom:mini-graph-card
+        entities:
+          - sensor.ha_energy_forecast_energy_forecast_model_mae
+        name: Energy Forecast Model MAE
+        icon: mdi:bullseye-arrow
+        hours_to_show: 1000
+        points_per_hour: 0.05
+      - type: gauge
+        entity: sensor.skoda_enyaq_battery_percentage
+        needle: false
+        severity:
+          green: 40
+          yellow: 20
+          red: 0
+  - type: masonry
+    path: warmepumpe
+    title: Wärmepumpe
+    icon: mdi:heat-pump
+    show_icon_and_title: true
+    cards:
+      - type: entities
+        entities:
+          - sensor.kermi_bridge_status
+          - sensor.kermi_energy_mode_mk1
+          - sensor.kermi_hp_state
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            severity:
+              green: 28
+              yellow: 35
+              red: 45
+            needle: true
+            entity: sensor.kermi_buffer_temp
+            name: Puffer
+          - type: gauge
+            entity: sensor.kermi_setpoint_mk1
+            name: Vorlauf Soll
+            severity:
+              green: 28
+              yellow: 35
+              red: 45
+            needle: true
+          - type: gauge
+            severity:
+              green: 28
+              yellow: 35
+              red: 45
+            needle: true
+            entity: sensor.kermi_flow_temp_mk1
+            name: Vorlauf Ist
+          - type: gauge
+            severity:
+              green: 38
+              yellow: 45
+              red: 60
+            needle: true
+            entity: sensor.kermi_hot_water_temp
+            name: Warmwasser

@@ -33,6 +33,7 @@ Persistence:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import pickle
 from datetime import datetime
@@ -181,6 +182,9 @@ class EnergyForecastModel:
         self._model_q90 = None
         self._model_q10_path = model_dir / "energy_model_q10.pkl"
         self._model_q90_path = model_dir / "energy_model_q90.pkl"
+        # CQR interval correction scalar (log-space additive offset)
+        self._interval_correction: float = 0.0
+        self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
         # Sub-energy sensor prefixes used in last training run
         self._sub_sensor_prefixes: list[str] = []
 
@@ -468,21 +472,32 @@ class EnergyForecastModel:
             len(df), engine_name, len(feature_cols), mae_str,
         )
 
-        # ── Quantile models for prediction intervals ─────────────────────────
-        # Trained on same X/y_fit/sample_weight; n_estimators from early stopping.
+        # ── Quantile models for prediction intervals (CQR) ───────────────────
+        # q10/q90 trained on first 85% of rows; last 15% (≥20 rows) used for
+        # split-conformal calibration to achieve ≥80% marginal coverage.
         # Wrapped so a quantile failure never interrupts normal operation.
         try:
+            cal_size  = max(20, int(len(X) * 0.15))
+            split_idx = len(X) - cal_size
+            X_qtrain  = X.iloc[:split_idx]
+            y_qtrain  = y_fit[:split_idx]
+            X_cal     = X.iloc[split_idx:]
+            y_cal_log = y_fit[split_idx:]
+            sw_qtrain = sample_weight[:split_idx] if sample_weight is not None else None
+
             q10 = _build_quantile_model(lgb, GBR, alpha=0.1, n_estimators=best_n_est)
             q90 = _build_quantile_model(lgb, GBR, alpha=0.9, n_estimators=best_n_est)
-            if sample_weight is not None:
-                q10.fit(X, y_fit, sample_weight=sample_weight)
-                q90.fit(X, y_fit, sample_weight=sample_weight)
+            if sw_qtrain is not None:
+                q10.fit(X_qtrain, y_qtrain, sample_weight=sw_qtrain)
+                q90.fit(X_qtrain, y_qtrain, sample_weight=sw_qtrain)
             else:
-                q10.fit(X, y_fit)
-                q90.fit(X, y_fit)
+                q10.fit(X_qtrain, y_qtrain)
+                q90.fit(X_qtrain, y_qtrain)
             self._model_q10 = q10
             self._model_q90 = q90
+            self._calibrate_intervals(X_cal, y_cal_log)
             self._save_quantile_models()
+            self._save_interval_correction()
             _LOGGER.info("Quantile models trained (q10, q90) — prediction intervals available")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Quantile model training failed: %s — prediction intervals unavailable", exc)
@@ -608,6 +623,9 @@ class EnergyForecastModel:
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
+            correction = self._interval_correction  # 0.0 when uncalibrated
+            low  -= correction
+            high += correction
             low  = np.expm1(low)
             high = np.expm1(high)
         low  = np.maximum(0, low)
@@ -650,7 +668,7 @@ class EnergyForecastModel:
         mask = (pd.Series(future_hours) >= today) & (
             pd.Series(future_hours) < today + pd.Timedelta(days=1)
         )
-        X_slice = X[mask.values] if mask.any() else X
+        X_slice = X[mask.values] if mask.sum() >= 3 else X
 
         if self.engine == "LightGBM":
             # pred_contrib=True → shape (n_rows, n_features + 1); last column is bias
@@ -725,6 +743,48 @@ class EnergyForecastModel:
                     setattr(self, attr, pickle.load(fh))
             except (pickle.UnpicklingError, EOFError, OSError) as exc:
                 _LOGGER.warning("Could not load quantile model %s: %s", path.name, exc)
+        self._load_interval_correction()
+
+    def _calibrate_intervals(self, X_cal: "pd.DataFrame", y_cal_log: "np.ndarray") -> None:
+        """Compute CQR correction scalar from the calibration split and store it.
+
+        Conformity score: s_i = max(q10(x_i) − y_i,  y_i − q90(x_i)) in log-space.
+        q_hat is the ⌈(n+1)·0.8⌉/n empirical quantile of scores — the additive
+        correction applied symmetrically before expm1 in predict_intervals().
+        """
+        import numpy as np
+
+        n = len(X_cal)
+        if n < 20:
+            _LOGGER.info("CQR calibration skipped (cal_n=%d < 20)", n)
+            self._interval_correction = 0.0
+            return
+
+        q10_pred = self._model_q10.predict(X_cal)
+        q90_pred = self._model_q90.predict(X_cal)
+        scores   = np.maximum(q10_pred - y_cal_log, y_cal_log - q90_pred)
+        level    = min(np.ceil((n + 1) * 0.8) / n, 1.0)
+        q_hat    = float(np.quantile(scores, level))
+        self._interval_correction = q_hat
+        _LOGGER.info("CQR correction: q_hat=%.4f (cal_n=%d)", q_hat, n)
+
+    def _save_interval_correction(self) -> None:
+        try:
+            with open(self._interval_correction_path, "w") as fh:
+                json.dump({"correction": self._interval_correction}, fh)
+        except OSError as exc:
+            _LOGGER.warning("Could not save interval correction: %s", exc)
+
+    def _load_interval_correction(self) -> None:
+        if not self._interval_correction_path.exists():
+            return
+        self._interval_correction = 0.0
+        try:
+            with open(self._interval_correction_path) as fh:
+                data = json.load(fh)
+            self._interval_correction = float(data.get("correction", 0.0))
+        except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+            _LOGGER.warning("Could not load interval correction: %s", exc)
 
     def _load(self) -> None:
         if self._model_path.exists():

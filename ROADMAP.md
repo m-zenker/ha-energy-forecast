@@ -13,7 +13,7 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration | planned |
+| Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done) | ✓ done |
 | Solar + battery | v0.8.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #43 ApexCharts snippet, #44 Model versioning, #45 CSV health checks | backlog |
 
@@ -382,6 +382,14 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 `sensor.energy_forecast_today` (e.g. `shap_top_features: ["temp_c", "lag_24h", ...]`).
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
+
+### 46. Dashboard: personalise entity IDs + icon cleanup *(pre-v0.7.0-release)*
+`dashboard/dashboard.yaml` and `dashboard/energy-today.yaml` contain user-specific entity
+IDs (`sensor.skoda_enyaq_battery_percentage`, `sensor.kermi_*`, `sensor.gplugk_z_ei`, etc.)
+that will not exist on other installations. Before any wider sharing or HACS inclusion:
+- Replace all personal entity IDs with commented-out placeholders or a README note
+  directing users to substitute their own entities.
+- Add a header comment in each file: `# EDIT: replace entity IDs below with your own`.
 
 ### 43. ApexCharts / Lovelace config snippet *(long-term backlog)*
 A documented, copy-paste YAML config for an ApexCharts card showing forecast vs actual

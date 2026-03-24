@@ -600,6 +600,34 @@ class TestPredictIntervals:
         assert result is not None
         assert (result["low_kwh"] <= result["high_kwh"]).all()
 
+    def test_interval_correction_stored(self, tmp_path):
+        """After train(), _interval_correction must be a finite float."""
+        m, _ = _make_trained_model(tmp_path)
+        assert isinstance(m._interval_correction, float)
+        assert np.isfinite(m._interval_correction)
+
+    def test_interval_correction_persisted(self, tmp_path):
+        """_interval_correction survives a save/reload round-trip."""
+        m, _ = _make_trained_model(tmp_path)
+        saved_val = m._interval_correction
+        # Reload from disk
+        m2 = EnergyForecastModel(tmp_path)
+        assert np.isclose(m2._interval_correction, saved_val, atol=1e-9)
+
+    def test_calibrated_intervals_wider_than_raw(self, tmp_path):
+        """A positive _interval_correction must widen predict_intervals() output."""
+        m, forecast = _make_trained_model(tmp_path)
+        assert m._log_transform
+        # Raw intervals (no correction)
+        m._interval_correction = 0.0
+        raw = m.predict_intervals(forecast, live_temp=None)
+        # Calibrated intervals (positive correction in log-space)
+        m._interval_correction = 0.3
+        calibrated = m.predict_intervals(forecast, live_temp=None)
+        assert calibrated is not None and raw is not None
+        assert (calibrated["high_kwh"] >= raw["high_kwh"]).all()
+        assert (calibrated["low_kwh"]  <= raw["low_kwh"]).all()
+
 
 # ── EV session probability feature (#12) ─────────────────────────────────────
 
@@ -1335,11 +1363,28 @@ class TestAwayFeature:
         assert "is_away" in m.feature_cols
 
     def test_predict_with_away_series(self, tmp_path):
-        """predict() with a 48-value away_series=all-ones must return valid predictions."""
-        m, forecast = _make_trained_model(tmp_path)
+        """predict() must propagate away_series into the is_away feature column,
+        and predictions must be valid (non-NaN, non-negative)."""
+        n = 600
+        rng = np.random.default_rng(5)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = self._make_weather(ts)
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [0] * n})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, away_df=away_df)
+        assert "is_away" in m.feature_cols
         future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
-        away_series = pd.Series(1, index=future_ts, dtype=int)
-        result = m.predict(forecast, live_temp=None, away_series=away_series)
+        forecast = self._make_weather(future_ts)
+        away_ones  = pd.Series(1, index=future_ts, dtype=int)
+        away_zeros = pd.Series(0, index=future_ts, dtype=int)
+        # Verify feature propagation at the matrix level
+        _, X_away = m._prepare_prediction_X(forecast, None, None, away_series=away_ones)
+        _, X_home = m._prepare_prediction_X(forecast, None, None, away_series=away_zeros)
+        assert (X_away["is_away"] == 1).all(), "is_away must be 1 when away_series=all-ones"
+        assert (X_home["is_away"] == 0).all(), "is_away must be 0 when away_series=all-zeros"
+        # Verify predict() returns valid results
+        result = m.predict(forecast, live_temp=None, away_series=away_ones)
         assert len(result) == 48
         assert result["predicted_kwh"].notna().all()
         assert result["predicted_kwh"].ge(0).all()
