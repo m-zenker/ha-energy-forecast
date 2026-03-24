@@ -2,7 +2,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.7.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-236%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.7.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -76,6 +76,10 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Exponential sample weighting** — recent data influences the model more than old data
 - **Self-healing** — graceful fallbacks at every external dependency (weather API, HA history, ML packages)
 - **MQTT Discovery** (optional) — registers all sensors in the HA entity registry so you can assign them to areas, add labels, and rename them in the UI
+- **Vacation / away mode** — `is_away` binary flag teaches the model your lower holiday consumption so predictions stay accurate while you travel
+- **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
+- **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
+- **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
 
 ---
 
@@ -277,9 +281,13 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 | `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attribute `shap_top_features` lists the top driving features and their mean absolute SHAP contributions (`{temp_c: 0.42, lag_24h: 0.31, ...}`). |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
-### Prediction intervals (80% confidence)
+### Prediction intervals (calibrated 80% coverage)
 
-Published once quantile models are trained (first retrain cycle after install). Elapsed hours use actuals for both bounds; the interval applies only to the forecast portion.
+Published once quantile models are trained (first retrain cycle after install).
+Intervals are calibrated via split conformal prediction (CQR): q10/q90 quantile models are
+trained on the first 85% of history; the remaining 15% serves as a held-out calibration set
+that derives an additive log-space correction `q_hat` ensuring ≥80% marginal coverage.
+Elapsed hours use actuals for both bounds; the interval applies only to the forecast portion.
 
 | Entity ID | Description |
 |-----------|-------------|
