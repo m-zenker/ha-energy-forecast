@@ -71,6 +71,7 @@ class EnergyForecast(hass.Hass):
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict        = {}
+        self._actuals_history: dict     = {}   # {pd.Timestamp (floored 1h): float} rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
         # MQTT Discovery (opt-in)
@@ -366,6 +367,10 @@ class EnergyForecast(hass.Hass):
             "energy",
             "measurement",
         )
+        # Rolling MAE sensors (#41)
+        for uid, name in [("energy_forecast_mae_7d", "Energy Forecast MAE 7d"),
+                          ("energy_forecast_mae_30d", "Energy Forecast MAE 30d")]:
+            self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", "energy", "measurement")
 
     def terminate(self) -> None:
         """AppDaemon lifecycle hook — publish offline availability on shutdown."""
@@ -531,7 +536,8 @@ class EnergyForecast(hass.Hass):
         # ── Store predictions for adaptive retrain tracking ───────────────────
         # Keep-first: only store a prediction for each target hour the first time
         # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
-        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        # Pruned to 30 days so mae_30d sensor has enough history (#41).
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
         self._pred_history = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff
@@ -541,9 +547,40 @@ class EnergyForecast(hass.Hass):
             if ts not in self._pred_history:
                 self._pred_history[ts] = float(row["predicted_kwh"])
 
+        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
+        # keep-last semantics: fresher actuals overwrite older ones for the same hour
+        if recent_actuals is not None and not recent_actuals.empty:
+            for _, row in recent_actuals.iterrows():
+                ts_key = pd.Timestamp(row["timestamp"]).floor("1h")
+                self._actuals_history[ts_key] = float(row["gross_kwh"])
+        actuals_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        self._actuals_history = {
+            ts: kwh for ts, kwh in self._actuals_history.items()
+            if pd.Timestamp(ts) >= actuals_cutoff
+        }
+
         self._maybe_adaptive_retrain(recent_actuals)
 
+        # ── Compute rolling MAE sensors (#41) ────────────────────────────────
+        actuals_hist_df = None
+        if self._actuals_history:
+            actuals_hist_df = pd.DataFrame(
+                [(ts, kwh) for ts, kwh in self._actuals_history.items()],
+                columns=["timestamp", "gross_kwh"],
+            )
+        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        pred_hist_7d = {
+            ts: kwh for ts, kwh in self._pred_history.items()
+            if pd.Timestamp(ts) >= cutoff_7d
+        }
+        mae_7d,  n_7d  = _compute_live_mae(pred_hist_7d, actuals_hist_df)
+        mae_30d, n_30d = _compute_live_mae(self._pred_history, actuals_hist_df)
+
         aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
+        aggregated["mae_7d"]          = mae_7d
+        aggregated["mae_30d"]         = mae_30d
+        aggregated["mae_7d_n_pairs"]  = n_7d
+        aggregated["mae_30d_n_pairs"] = n_30d
         self._publish(aggregated)
 
     def _read_live_temp(self) -> float | None:
@@ -648,6 +685,9 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_ev_today",
             "sensor.energy_forecast_ev_yesterday",
             "sensor.energy_forecast_model_mae",
+            # Rolling MAE sensors (#41)
+            "sensor.energy_forecast_mae_7d",
+            "sensor.energy_forecast_mae_30d",
             # Interval sensors
             "sensor.energy_forecast_next_3h_low",
             "sensor.energy_forecast_next_3h_high",
@@ -822,6 +862,27 @@ class EnergyForecast(hass.Hass):
                 },
                 replace=True,
             )
+
+        # ── Rolling MAE sensors (#41) ─────────────────────────────────────────
+        for key, label in [("mae_7d", "7-day MAE"), ("mae_30d", "30-day MAE")]:
+            val = data.get(key, float("nan"))
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor(f"energy_forecast_{key}", val)
+            else:
+                self.set_state(
+                    f"sensor.energy_forecast_{key}",
+                    state=str(round(float(val), 4)) if not math.isnan(float(val)) else "0.0",
+                    attributes={
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": f"Energy Forecast {label}",
+                        "unique_id": f"energy_forecast_{key}",
+                        "icon": "mdi:chart-bell-curve-cumulative",
+                        "attribution": ATTRIBUTION,
+                        "n_pairs": data.get(f"{key}_n_pairs", 0),
+                        "model_engine": str(model.engine),
+                    },
+                    replace=True,
+                )
 
     # ── Aggregation ───────────────────────────────────────────────────────────
 

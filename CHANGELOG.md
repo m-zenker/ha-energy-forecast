@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Rolling MAE sensors (#41)** (`energy_forecast.py`): two new sensors track live forecast accuracy
+  over a rolling window using stored prediction-vs-actual pairs:
+  - `sensor.energy_forecast_mae_7d` — mean absolute error over the last 7 days (n_pairs attribute)
+  - `sensor.energy_forecast_mae_30d` — mean absolute error over the last 30 days (n_pairs attribute)
+  Both sensors are published in set_state and MQTT Discovery modes; state is `"0.0"` until enough
+  history accumulates (~15 days to fill the 30d window).  The `_pred_history` prune window is
+  extended from 7 to 30 days to support the longer sensor.  Adaptive retrain behaviour is unchanged.
 - **Vacation / away flag (#25)** (`model.py`, `ha_data.py`, `energy_forecast.py`): new binary
   `is_away` feature lets the model learn lower consumption during vacations and predict accordingly.
   Two optional config keys: `away_mode_entity` (e.g. `input_boolean.vacation_mode`) and

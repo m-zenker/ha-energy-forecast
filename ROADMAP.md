@@ -13,7 +13,7 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor | planned |
+| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done) | ✓ done |
 | Anomaly + dashboards | v0.8.0 | #39 Anomaly detection sensor, #43 ApexCharts config snippet | planned |
 | Explainability | v0.9.0 | #42 SHAP feature importance, quantile interval calibration | planned |
 | Solar + battery | v0.10.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |

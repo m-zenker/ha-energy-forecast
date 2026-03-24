@@ -746,6 +746,9 @@ class TestCleanupLegacyStates:
         for key in ["setup_status", "next_1h", "next_3h", "today", "tomorrow",
                     "ev_today", "ev_yesterday", "model_mae"]:
             assert f"sensor.energy_forecast_{key}" in removed
+        # Rolling MAE sensors (#41)
+        assert "sensor.energy_forecast_mae_7d" in removed
+        assert "sensor.energy_forecast_mae_30d" in removed
         # Block sensors
         for day in ("today", "tomorrow"):
             for slot in BLOCK_SLOTS:
@@ -845,3 +848,136 @@ class TestBuildAwayPredictionSeries:
         )
         result = EnergyForecast._build_away_prediction_series(fake, now_ts)
         assert (result == 1).all()
+
+
+# ── #41 Rolling MAE sensors (mae_7d / mae_30d) ───────────────────────────────
+
+class TestRollingMaeSensors:
+    """Tests for _actuals_history population, mae_7d/mae_30d computation, publish,
+    and discovery registration."""
+
+    # ── helpers ──
+
+    def _make_pred_history(self, start: pd.Timestamp, n: int, kwh: float = 2.0) -> dict:
+        """n hourly predictions starting at start, all equal to kwh."""
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t: kwh for t in ts}
+
+    def _make_actuals_df(self, start: pd.Timestamp, n: int, kwh: float = 3.0) -> pd.DataFrame:
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [kwh] * n})
+
+    # ── actuals_history keep-last semantics ──
+
+    def test_actuals_history_keep_last_semantics(self):
+        """Same-hour key written twice: the newer (later) value must win."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # Simulate two rounds of recent_actuals for the same hour
+        hour = pd.Timestamp("2026-03-20 10:00")
+        actuals_history: dict = {}
+
+        # First write: value 1.0
+        actuals_history[hour.floor("1h")] = 1.0
+        # Second write (keep-last): value 2.5 overwrites
+        actuals_history[hour.floor("1h")] = 2.5
+
+        assert actuals_history[hour.floor("1h")] == 2.5
+
+    # ── mae_7d excludes predictions older than 7 days ──
+
+    def test_mae_7d_excludes_predictions_older_than_7d(self):
+        """pred_hist_7d filter must exclude entries older than 7 days."""
+        from energy_forecast.energy_forecast import _compute_live_mae
+
+        now = pd.Timestamp.now().normalize()
+        cutoff_7d = now - pd.Timedelta(days=7)
+
+        # 24 predictions within 7d window
+        recent_preds = self._make_pred_history(cutoff_7d + pd.Timedelta(hours=1), 24, kwh=2.0)
+        # 24 predictions older than 7d (should be excluded)
+        old_preds = self._make_pred_history(cutoff_7d - pd.Timedelta(days=2), 24, kwh=2.0)
+
+        pred_hist_7d = {ts: kwh for ts, kwh in recent_preds.items()}
+        # old_preds excluded — not added to pred_hist_7d
+
+        actuals = self._make_actuals_df(cutoff_7d + pd.Timedelta(hours=1), 24, kwh=3.0)
+        mae, n = _compute_live_mae(pred_hist_7d, actuals)
+
+        assert n == 24
+        assert abs(mae - 1.0) < 1e-6
+
+    # ── mae_30d uses full 30d window ──
+
+    def test_mae_30d_uses_full_30d_window(self):
+        """mae_30d must match all pairs within the 30d pred_history."""
+        from energy_forecast.energy_forecast import _compute_live_mae
+
+        now = pd.Timestamp.now().normalize()
+        start = now - pd.Timedelta(days=29)
+        pred_history = self._make_pred_history(start, 48, kwh=2.0)
+        actuals = self._make_actuals_df(start, 48, kwh=3.0)
+
+        mae, n = _compute_live_mae(pred_history, actuals)
+
+        assert n == 48
+        assert abs(mae - 1.0) < 1e-6
+
+    # ── publish in set_state mode ──
+
+    def test_publish_mae_sensors_set_state_mode(self):
+        """_publish() must call set_state for both mae_7d and mae_30d when mqtt_discovery=False."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+        EnergyForecast._publish(fake, data)
+
+        assert "sensor.energy_forecast_mae_7d" in fake._states
+        assert "sensor.energy_forecast_mae_30d" in fake._states
+        assert fake._states["sensor.energy_forecast_mae_7d"]["state"] == "0.25"
+        assert fake._states["sensor.energy_forecast_mae_30d"]["state"] == "0.3"
+        assert fake._states["sensor.energy_forecast_mae_7d"]["attributes"]["n_pairs"] == 24
+        assert fake._states["sensor.energy_forecast_mae_30d"]["attributes"]["n_pairs"] == 120
+
+    # ── publish in MQTT mode ──
+
+    def test_publish_mae_sensors_mqtt_mode(self):
+        """_publish() must call mqtt_publish for both mae_7d and mae_30d when mqtt_discovery=True."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+        EnergyForecast._publish(fake, data)
+
+        state_topics = [p["topic"] for p in fake._publishes if "/state" in p["topic"]]
+        assert any("energy_forecast_mae_7d" in t for t in state_topics), \
+            f"mae_7d state topic not found in: {state_topics}"
+        assert any("energy_forecast_mae_30d" in t for t in state_topics), \
+            f"mae_30d state topic not found in: {state_topics}"
+
+    # ── MQTT discovery ──
+
+    def test_mqtt_discovery_includes_mae_sensors(self):
+        """_mqtt_publish_all_discovery() must publish config topics for mae_7d and mae_30d."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
+        assert any("energy_forecast_mae_7d/config" in t for t in config_topics), \
+            f"mae_7d config topic not found in: {config_topics}"
+        assert any("energy_forecast_mae_30d/config" in t for t in config_topics), \
+            f"mae_30d config topic not found in: {config_topics}"
