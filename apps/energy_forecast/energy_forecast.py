@@ -63,9 +63,21 @@ class EnergyForecast(hass.Hass):
         # Optional sub-sensors: cumulative kWh meters (heat pump, dishwasher, etc.)
         # whose consumption is tracked as lag features to improve forecast accuracy.
         self._sub_energy_sensors: list[str] = list(self.args.get("sub_energy_sensors") or [])
+        # Optional away / vacation mode entities:
+        # away_mode_entity    — input_boolean whose "on" state marks a vacation period
+        # away_return_entity  — input_datetime holding the expected return (for prediction only)
+        self._away_mode_entity: str | None   = self.args.get("away_mode_entity") or None
+        self._away_return_entity: str | None = self.args.get("away_return_entity") or None
+        # Anomaly detection: fire binary sensor when residual > sigma_threshold × std(residuals)
+        self._anomaly_sigma_threshold: float = float(
+            self.args.get("anomaly_sigma_threshold", 3.0)
+        )
+        # SHAP feature importance: top-N features exposed as sensor attribute (0 = off)
+        self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
-        self._pred_history: dict        = {}
+        self._pred_history: dict[Any, float]    = {}
+        self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
         # MQTT Discovery (opt-in)
@@ -122,6 +134,12 @@ class EnergyForecast(hass.Hass):
             raise ValueError(
                 f"adaptive_retrain_threshold must be ≥ 0, got {self._adaptive_retrain_threshold}"
             )
+        if self._anomaly_sigma_threshold <= 0:
+            raise ValueError(
+                f"anomaly_sigma_threshold must be > 0, got {self._anomaly_sigma_threshold}"
+            )
+        if self._shap_top_n < 0:
+            raise ValueError(f"shap_top_n must be >= 0, got {self._shap_top_n}")
         if self._ev_threshold >= self._ev_charger_kw:
             self.log(
                 f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
@@ -139,6 +157,8 @@ class EnergyForecast(hass.Hass):
             f"weight_halflife={self._weight_halflife}d, "
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
+            f"anomaly_sigma_threshold={self._anomaly_sigma_threshold}, "
+            f"shap_top_n={self._shap_top_n}, "
             f"mqtt_discovery={self._mqtt_discovery}"
         )
 
@@ -216,6 +236,7 @@ class EnergyForecast(hass.Hass):
         icon: str,
         device_class: str | None,
         state_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> dict:
         """Return the HA MQTT Discovery config dict for a single sensor."""
         payload: dict = {
@@ -236,7 +257,62 @@ class EnergyForecast(hass.Hass):
             payload["device_class"] = device_class
         if state_class is not None:
             payload["state_class"] = state_class
+        if json_attributes_topic is not None:
+            payload["json_attributes_topic"] = json_attributes_topic
         return payload
+
+    def _build_binary_sensor_discovery_payload(
+        self,
+        unique_id: str,
+        friendly_name: str,
+        icon: str,
+        device_class: str | None,
+    ) -> dict:
+        """Return the HA MQTT Discovery config dict for a single binary sensor."""
+        payload: dict = {
+            "name": friendly_name,
+            "unique_id": unique_id,
+            "state_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/state",
+            "availability_topic": f"{self._mqtt_discovery_prefix}/energy_forecast/availability",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "icon": icon,
+            "device": {
+                "identifiers": ["ha_energy_forecast"],
+                "name": "HA Energy Forecast",
+                "model": "AppDaemon App",
+                "sw_version": "0.6.0",
+            },
+        }
+        if device_class is not None:
+            payload["device_class"] = device_class
+        return payload
+
+    def _mqtt_publish_binary_sensor_discovery(
+        self,
+        unique_id: str,
+        friendly_name: str,
+        icon: str,
+        device_class: str | None,
+    ) -> None:
+        """Publish a retained MQTT Discovery config payload for one binary sensor."""
+        try:
+            payload = self._build_binary_sensor_discovery_payload(
+                unique_id, friendly_name, icon, device_class
+            )
+            topic = f"{self._mqtt_discovery_prefix}/binary_sensor/{unique_id}/config"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=json.dumps(payload),
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(
+                f"MQTT binary sensor discovery publish failed for {unique_id}: {exc}",
+                level="WARNING",
+            )
 
     def _mqtt_publish_discovery(
         self,
@@ -246,11 +322,13 @@ class EnergyForecast(hass.Hass):
         icon: str,
         device_class: str | None,
         state_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> None:
         """Publish a retained MQTT Discovery config payload for one sensor."""
         try:
             payload = self._build_sensor_discovery_payload(
-                unique_id, friendly_name, unit, icon, device_class, state_class
+                unique_id, friendly_name, unit, icon, device_class, state_class,
+                json_attributes_topic=json_attributes_topic,
             )
             topic = f"{self._mqtt_discovery_prefix}/sensor/{unique_id}/config"
             self.call_service(
@@ -294,6 +372,20 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
 
+    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict) -> None:
+        """Publish a JSON attributes dict to the sensor's json_attributes_topic (retained)."""
+        try:
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/attributes"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=json.dumps(attrs),
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT attributes publish failed for {unique_id}: {exc}", level="WARNING")
+
     def _mqtt_publish_availability(self, payload: str) -> None:
         """Publish 'online' or 'offline' to the shared availability topic."""
         try:
@@ -321,6 +413,10 @@ class EnergyForecast(hass.Hass):
         )
         # Forecast totals
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+            attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_today/attributes"
+                if key == "today" else None
+            )
             self._mqtt_publish_discovery(
                 f"energy_forecast_{key}",
                 label,
@@ -328,6 +424,7 @@ class EnergyForecast(hass.Hass):
                 "mdi:lightning-bolt",
                 "energy",
                 "measurement",
+                json_attributes_topic=attrs_topic,
             )
         # 3h blocks — today and tomorrow, 8 slots each
         for day in ("today", "tomorrow"):
@@ -360,6 +457,17 @@ class EnergyForecast(hass.Hass):
             "mdi:chart-bell-curve-cumulative",
             "energy",
             "measurement",
+        )
+        # Rolling MAE sensors (#41)
+        for uid, name in [("energy_forecast_mae_7d", "Energy Forecast MAE 7d"),
+                          ("energy_forecast_mae_30d", "Energy Forecast MAE 30d")]:
+            self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", "energy", "measurement")
+        # Anomaly detection sensor (#39)
+        self._mqtt_publish_binary_sensor_discovery(
+            "energy_forecast_unusual_consumption",
+            "Unusual Consumption",
+            "mdi:alert-circle-outline",
+            "problem",
         )
 
     def terminate(self) -> None:
@@ -446,6 +554,12 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
+        away_df = ha_data.fetch_boolean_entity_history(
+            self, self._away_mode_entity, days=30
+        )
+        if not away_df.empty:
+            away_df = _strip_tz(away_df)
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -454,6 +568,7 @@ class EnergyForecast(hass.Hass):
             canton=self._holiday_canton,
             ev_df=ev_df,
             sub_sensors_dict=sub_sensors_dict or None,
+            away_df=away_df if not away_df.empty else None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -497,20 +612,30 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
 
-        live_temp   = self._read_live_temp()
-        predictions = self._ml_model.predict(forecast_df, live_temp, recent_actuals,
-                                             sub_sensors_recent=sub_sensors_recent or None)
+        live_temp  = self._read_live_temp()
+        now_ts     = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+        away_series = self._build_away_prediction_series(now_ts)
+
+        predictions = self._ml_model.predict(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+        )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
-        intervals = self._ml_model.predict_intervals(forecast_df, live_temp, recent_actuals,
-                                                     sub_sensors_recent=sub_sensors_recent or None)
+        intervals = self._ml_model.predict_intervals(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+        )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
 
         # ── Store predictions for adaptive retrain tracking ───────────────────
         # Keep-first: only store a prediction for each target hour the first time
         # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
-        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        # Pruned to 30 days so mae_30d sensor has enough history (#41).
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
         self._pred_history = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff
@@ -520,9 +645,66 @@ class EnergyForecast(hass.Hass):
             if ts not in self._pred_history:
                 self._pred_history[ts] = float(row["predicted_kwh"])
 
+        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
+        # keep-last semantics: fresher actuals overwrite older ones for the same hour
+        if recent_actuals is not None and not recent_actuals.empty:
+            self._actuals_history.update(dict(zip(
+                pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
+                recent_actuals["gross_kwh"].astype(float),
+            )))
+        actuals_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        self._actuals_history = {
+            ts: kwh for ts, kwh in self._actuals_history.items()
+            if pd.Timestamp(ts) >= actuals_cutoff
+        }
+
         self._maybe_adaptive_retrain(recent_actuals)
 
+        # ── Compute rolling MAE sensors (#41) ────────────────────────────────
+        actuals_hist_df = None
+        if self._actuals_history:
+            actuals_hist_df = pd.DataFrame(
+                [(ts, kwh) for ts, kwh in self._actuals_history.items()],
+                columns=["timestamp", "gross_kwh"],
+            )
+        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        pred_hist_7d = {
+            ts: kwh for ts, kwh in self._pred_history.items()
+            if pd.Timestamp(ts) >= cutoff_7d
+        }
+        mae_7d,  n_7d  = _compute_live_mae(pred_hist_7d, actuals_hist_df)
+        mae_30d, n_30d = _compute_live_mae(self._pred_history, actuals_hist_df)
+
+        # ── Anomaly detection (#39) ───────────────────────────────────────────
+        is_anomaly, anomaly_residual, anomaly_std, anomaly_n = _compute_anomaly(
+            self._pred_history,
+            self._actuals_history,
+            self._anomaly_sigma_threshold,
+        )
+
+        # ── SHAP feature importance (#42) ─────────────────────────────────────
+        shap_data: dict = {}
+        if self._shap_top_n > 0:
+            try:
+                shap_data = self._ml_model.shap_summary(
+                    forecast_df, live_temp, recent_actuals,
+                    sub_sensors_recent=sub_sensors_recent or None,
+                    away_series=away_series,
+                    n=self._shap_top_n,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"SHAP summary failed: {exc}", level="WARNING")
+
         aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
+        aggregated["shap_top_features"] = shap_data
+        aggregated["mae_7d"]          = mae_7d
+        aggregated["mae_30d"]         = mae_30d
+        aggregated["mae_7d_n_pairs"]  = n_7d
+        aggregated["mae_30d_n_pairs"] = n_30d
+        aggregated["is_anomaly"]        = is_anomaly
+        aggregated["anomaly_residual"]  = anomaly_residual
+        aggregated["anomaly_std"]       = anomaly_std
+        aggregated["anomaly_n"]         = anomaly_n
         self._publish(aggregated)
 
     def _read_live_temp(self) -> float | None:
@@ -535,6 +717,53 @@ class EnergyForecast(hass.Hass):
             return float(state)
         except (ValueError, TypeError):
             return None
+
+    def _build_away_prediction_series(self, now_ts: Any) -> Any:
+        """Return a 48-value pd.Series (indexed by naive prediction timestamps) of is_away flags.
+
+        Logic:
+        - Entity is "off" (or not configured)  → all zeros.
+        - Entity is "on", no return entity or return datetime already past → all ones.
+        - Entity is "on", return datetime in the future → 1 before return_dt, 0 at/after.
+        """
+        import pandas as pd
+
+        future_hours = pd.date_range(
+            start=pd.Timestamp(now_ts).floor("1h"), periods=48, freq="1h"
+        )
+        is_away = pd.Series(0, index=future_hours, dtype=int)
+
+        if not self._away_mode_entity:
+            return is_away
+
+        state = self.get_state(self._away_mode_entity)
+        if state not in ("on",):
+            return is_away  # "off", "unavailable", "unknown", None → all zeros
+
+        # Entity is "on" — determine when the away period ends
+        return_dt: pd.Timestamp | None = None
+        if self._away_return_entity:
+            try:
+                raw_return = self.get_state(self._away_return_entity)
+                if raw_return not in (None, "unavailable", "unknown", ""):
+                    return_dt = pd.Timestamp(raw_return)
+                    # Strip tz if present, normalise to naive Europe/Zurich
+                    if return_dt.tzinfo is not None:
+                        return_dt = return_dt.tz_convert("Europe/Zurich").tz_localize(None)
+            except (ValueError, TypeError) as exc:
+                self.log(
+                    f"Could not parse away_return_entity state as datetime: {exc}",
+                    level="WARNING",
+                )
+                return_dt = None
+
+        if return_dt is None or return_dt <= pd.Timestamp(now_ts):
+            # No valid return time → away for the whole 48h window
+            is_away[:] = 1
+        else:
+            is_away[future_hours < return_dt] = 1
+
+        return is_away
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""
@@ -580,6 +809,11 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_ev_today",
             "sensor.energy_forecast_ev_yesterday",
             "sensor.energy_forecast_model_mae",
+            # Rolling MAE sensors (#41)
+            "sensor.energy_forecast_mae_7d",
+            "sensor.energy_forecast_mae_30d",
+            # Anomaly detection sensor (#39)
+            "binary_sensor.energy_forecast_unusual_consumption",
             # Interval sensors
             "sensor.energy_forecast_next_3h_low",
             "sensor.energy_forecast_next_3h_high",
@@ -668,8 +902,17 @@ class EnergyForecast(hass.Hass):
                 )
 
         # ── Forecast totals ───────────────────────────────────────────────────
+        shap_features = data.get("shap_top_features") or {}
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
-            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
+            extra = {"shap_top_features": shap_features} if key == "today" and shap_features else None
+            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}",
+                     extra_attrs=extra, icon="mdi:lightning-bolt")
+        # In MQTT mode, publish shap_top_features as json_attributes for energy_forecast_today
+        if self._mqtt_discovery and shap_features:
+            self._mqtt_publish_sensor_attributes(
+                "energy_forecast_today",
+                {"shap_top_features": shap_features},
+            )
 
         # ── Prediction intervals (only published when quantile models trained) ─
         _any_intervals = any(
@@ -751,6 +994,55 @@ class EnergyForecast(hass.Hass):
                     "cv_mae": str(model.last_cv_mae) if model.last_cv_mae is not None else "n/a",
                     "model_engine": str(model.engine),
                     "last_trained": trained_str,
+                },
+                replace=True,
+            )
+
+        # ── Rolling MAE sensors (#41) ─────────────────────────────────────────
+        for key, label in [("mae_7d", "7-day MAE"), ("mae_30d", "30-day MAE")]:
+            val = data.get(key, float("nan"))
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor(f"energy_forecast_{key}", val)
+            else:
+                self.set_state(
+                    f"sensor.energy_forecast_{key}",
+                    state=str(round(float(val), 4)) if not math.isnan(float(val)) else "0.0",
+                    attributes={
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": f"Energy Forecast {label}",
+                        "unique_id": f"energy_forecast_{key}",
+                        "icon": "mdi:chart-bell-curve-cumulative",
+                        "attribution": ATTRIBUTION,
+                        "n_pairs": data.get(f"{key}_n_pairs", 0),
+                        "model_engine": str(model.engine),
+                    },
+                    replace=True,
+                )
+
+        # ── Anomaly detection sensor (#39) ────────────────────────────────────
+        is_anomaly = data.get("is_anomaly", False)
+        anomaly_attrs = {
+            "residual_kwh":      data.get("anomaly_residual", float("nan")),
+            "residual_std_kwh":  data.get("anomaly_std",      float("nan")),
+            "sigma_threshold":   self._anomaly_sigma_threshold,
+            "n_pairs":           data.get("anomaly_n", 0),
+        }
+        if self._mqtt_discovery:
+            self._mqtt_set_sensor_raw(
+                "energy_forecast_unusual_consumption",
+                "ON" if is_anomaly else "OFF",
+            )
+        else:
+            self.set_state(
+                "binary_sensor.energy_forecast_unusual_consumption",
+                state="on" if is_anomaly else "off",
+                attributes={
+                    "friendly_name": "Unusual Consumption",
+                    "unique_id": "energy_forecast_unusual_consumption",
+                    "device_class": "problem",
+                    "icon": "mdi:alert-circle-outline",
+                    "attribution": ATTRIBUTION,
+                    **anomaly_attrs,
                 },
                 replace=True,
             )
@@ -954,3 +1246,48 @@ def _compute_live_mae(
     if n == 0:
         return float("nan"), 0
     return round(sum(errors) / n, 4), n
+
+
+def _compute_anomaly(
+    pred_history: dict,      # {timestamp-like: predicted_kwh}  keep-first, raw ts keys
+    actuals_history: dict,   # {pd.Timestamp: float}            keep-last, floored 1h keys
+    sigma_threshold: float,
+    min_pairs: int = 10,
+) -> tuple[bool, float, float, int]:
+    """Return (is_anomaly, latest_abs_residual, residual_std, n_pairs).
+
+    Fires when |latest actual − latest prediction| > sigma_threshold × std(all residuals).
+    Returns (False, nan, nan, 0) during cold start (< min_pairs matched pairs).
+
+    DST fall-back caveat: the naive 02:xx hour appears twice in October; both map to
+    the same floor("1h") key in pred_map, so the second overwrites the first — accepted
+    edge case (one hour per year).
+    """
+    import numpy as np
+    import pandas as pd
+
+    if not pred_history or not actuals_history:
+        return False, float("nan"), float("nan"), 0
+
+    pred_map = {pd.Timestamp(ts).floor("1h"): kwh for ts, kwh in pred_history.items()}
+
+    matched: dict = {}
+    for ts, actual in actuals_history.items():
+        key = pd.Timestamp(ts).floor("1h")
+        if key in pred_map:
+            matched[key] = actual - pred_map[key]
+
+    n = len(matched)
+    if n < min_pairs:
+        return False, float("nan"), float("nan"), n
+
+    latest_ts = max(matched.keys())
+    latest_residual = matched[latest_ts]
+    std = float(np.std(list(matched.values())))
+
+    # Guard: near-perfect model → avoid spurious fires from floating-point noise
+    if std < 0.01:
+        return False, round(abs(latest_residual), 4), round(std, 4), n
+
+    is_anomaly = abs(latest_residual) > sigma_threshold * std
+    return is_anomaly, round(abs(latest_residual), 4), round(std, 4), n

@@ -13,6 +13,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.6.0] — 2026-03-23
 
 ### Fixed
+- **`_load_interval_correction` stale-value bug** (`model.py`): `_interval_correction` is now
+  reset to `0.0` before attempting to parse the JSON file, so a corrupted or unreadable file
+  can never leave a stale value from a previous run in place.  `json.JSONDecodeError` added
+  explicitly to the except tuple (it is a `ValueError` subclass, so behaviour is unchanged,
+  but intent is clearer).
+- **SHAP summary early-day fallback** (`model.py`): `shap_summary` now falls back to all 48
+  prediction rows when fewer than 3 rows match today's date slice (previously fell back only
+  when zero rows matched, producing a misleading 1-hour average late in the day).
+
+### Tests
+- `TestPredictIntervals::test_calibrated_intervals_wider_than_raw`: added `assert m._log_transform`
+  guard so the interval-widening assertion cannot pass vacuously if log-transform is disabled.
+- `TestAwayFeature::test_predict_with_away_series`: rewritten to verify `is_away` propagation
+  at the feature-matrix level via `_prepare_prediction_X`, proving a regression that silently
+  ignores `away_series` would be caught.
+
+
+
+### Added
+- **Quantile interval calibration (CQR)** (`model.py`): prediction intervals (10th–90th percentile)
+  are now calibrated via split conformal prediction (Conformalized Quantile Regression).  The last
+  15% of training rows (≥ 20) are held out as a calibration split; q10/q90 are trained on the
+  remaining 85%.  A conformity score `max(q10(x)−y, y−q90(x))` is computed in log-space for each
+  calibration row, and the empirical `⌈(n+1)·0.8⌉/n` quantile (`q_hat`) is applied as a symmetric
+  additive correction before `expm1` at predict time.  This gives ≥80% marginal coverage on
+  held-out data.  `q_hat` is persisted to `energy_model_interval_correction.json` and reloaded on
+  startup.  A log line `CQR correction: q_hat=<value> (cal_n=<N>)` is emitted after every retrain.
+- **SHAP feature importance (#42)** (`model.py`, `energy_forecast.py`): the top-N driving features
+  behind each prediction are exposed as a `shap_top_features` attribute on
+  `sensor.energy_forecast_today`.  LightGBM uses native TreeSHAP (`pred_contrib=True`) for
+  per-prediction values; sklearn GBR falls back to global `feature_importances_`.  Features are
+  ranked by mean absolute contribution over today's prediction slice and returned as a
+  `{feature_name: importance}` dict (descending).  New config key: `shap_top_n` (int ≥ 0,
+  default 5; set to 0 to disable).  MQTT Discovery mode publishes attributes via
+  `json_attributes_topic` on the `energy_forecast_today` discovery payload.
+- **Anomaly detection sensor (#39)** (`energy_forecast.py`): new binary sensor
+  `binary_sensor.energy_forecast_unusual_consumption` fires when the latest actual consumption
+  deviates more than `anomaly_sigma_threshold` (default 3.0) standard deviations from the stored
+  day-ahead prediction.  State is `off` during cold-start (< 10 matched pairs).  Attributes:
+  `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`.  Published in both set_state
+  and MQTT Discovery modes (`binary_sensor/<uid>/config` topic).  New config key:
+  `anomaly_sigma_threshold` (float > 0, default 3.0, validated at startup).
+- **Rolling MAE sensors (#41)** (`energy_forecast.py`): two new sensors track live forecast accuracy
+  over a rolling window using stored prediction-vs-actual pairs:
+  - `sensor.energy_forecast_mae_7d` — mean absolute error over the last 7 days (n_pairs attribute)
+  - `sensor.energy_forecast_mae_30d` — mean absolute error over the last 30 days (n_pairs attribute)
+  Both sensors are published in set_state and MQTT Discovery modes; state is `"0.0"` until enough
+  history accumulates (~15 days to fill the 30d window).  The `_pred_history` prune window is
+  extended from 7 to 30 days to support the longer sensor.  Adaptive retrain behaviour is unchanged.
+- **Vacation / away flag (#25)** (`model.py`, `ha_data.py`, `energy_forecast.py`): new binary
+  `is_away` feature lets the model learn lower consumption during vacations and predict accordingly.
+  Two optional config keys: `away_mode_entity` (e.g. `input_boolean.vacation_mode`) and
+  `away_return_entity` (e.g. `input_datetime.vacation_return`).  Both are independent and fully
+  backward-compatible — when unconfigured `is_away` is 0 everywhere.
+  - Training: 30-day state history of `away_mode_entity` is fetched via `fetch_boolean_entity_history`
+    and joined to the training DataFrame as hourly `is_away` flags.
+  - Prediction: `_build_away_prediction_series` projects `is_away` across the 48-hour window;
+    if `away_return_entity` holds a future datetime, `is_away` flips to 0 at the return hour.
+
+---
+
+## [0.6.0] — 2026-03-23
+
+### Fixed
 - **Doubled "Energy Forecast" prefix in MQTT Discovery sensor names** (`energy_forecast.py`): HA
   prepends the device name ("HA Energy Forecast") to the sensor `name` field, so names like
   `"Energy Forecast Model MAE"` were displayed as `"HA Energy Forecast Energy Forecast Model MAE"`.

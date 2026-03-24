@@ -61,6 +61,16 @@ energy_forecast:
   # Set higher to retrain less aggressively; 0 disables the feature.
   # adaptive_retrain_threshold: 2.0
 
+  # Optional: anomaly detection threshold (default: 3.0).
+  # binary_sensor.energy_forecast_unusual_consumption fires when the latest
+  # actual consumption deviates more than this many std-deviations from the
+  # model's day-ahead prediction. Requires ≥10 matched pairs (cold-start safe).
+  # anomaly_sigma_threshold: 3.0
+
+  # Optional: number of top SHAP features exposed as sensor attributes on
+  # sensor.energy_forecast_today (default: 5). Set to 0 to disable.
+  # shap_top_n: 5
+
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
   # Must be total_increasing kWh meters (e.g. heat pump, dishwasher monitor).
@@ -75,6 +85,16 @@ energy_forecast:
   # before training so household baseline accuracy is preserved.
   # ev_charging_threshold_kwh: 7    # default: 7 kWh/h
   # ev_charger_kw: 9                # default: 9 kW (e.g. 11 kW Type 2 at ~80% efficiency)
+
+  # Optional: entity that signals vacation / away mode.
+  # When "on", the model learns lower consumption patterns from historical away periods
+  # and predicts accordingly.
+  # away_mode_entity: input_boolean.vacation_mode
+
+  # Optional: entity holding the expected return datetime (input_datetime).
+  # Used to project is_away=0 for hours after the return within the 48h forecast.
+  # Requires away_mode_entity to be configured.
+  # away_return_entity: input_datetime.vacation_return
 
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).

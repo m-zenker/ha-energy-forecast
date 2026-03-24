@@ -348,6 +348,78 @@ def fetch_recent_sub_sensor(
     return combined
 
 
+def fetch_boolean_entity_history(
+    app: "hass.Hass",
+    entity_id: str | None,
+    days: int = 30,
+) -> "pd.DataFrame":
+    """Return hourly is_away flags from a boolean entity's state history.
+
+    Fetches up to *days* of history for *entity_id* (e.g. input_boolean.vacation_mode),
+    forward-fills state changes onto an hourly grid, and returns a DataFrame with
+    one row per hour.
+
+    Returns:
+        pd.DataFrame with columns {"timestamp" (naive Europe/Zurich), "is_away" (0/1)}.
+        Returns an empty DataFrame (no rows) when entity_id is None or the fetch fails.
+    """
+    import pandas as pd
+
+    if entity_id is None:
+        return pd.DataFrame(columns=["timestamp", "is_away"])
+
+    try:
+        raw = app.get_history(entity_id=entity_id, days=days)
+    except Exception as exc:  # noqa: BLE001
+        app.log(f"get_history failed for away entity {entity_id}: {exc}", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "is_away"])
+
+    if isinstance(raw, dict):
+        states = raw.get(entity_id, [])
+    elif isinstance(raw, list) and raw:
+        states = raw[0] if isinstance(raw[0], list) else raw
+    else:
+        states = []
+
+    events = []
+    for state in states:
+        try:
+            s = str(state.get("state", "")).lower()
+            if s not in ("on", "off"):
+                continue
+            ts = pd.to_datetime(state["last_changed"]).tz_convert("Europe/Zurich")
+            events.append({"timestamp": ts, "state": s})
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    if not events:
+        app.log(
+            f"No usable history for away entity {entity_id} — is_away will be 0.",
+            level="WARNING",
+        )
+        return pd.DataFrame(columns=["timestamp", "is_away"])
+
+    events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True)
+    ev_ser = events_df.set_index("timestamp")["state"]
+
+    # Hourly grid: span from first to last event
+    start = ev_ser.index[0].floor("1h")
+    end   = ev_ser.index[-1].floor("1h")
+    hourly = pd.date_range(start, end, freq="1h", tz="Europe/Zurich")
+
+    # Forward-fill state changes onto the grid; hours before first event default to "off"
+    combined_idx = ev_ser.index.union(hourly)
+    filled = ev_ser.reindex(combined_idx).ffill().reindex(hourly).fillna("off")
+
+    # Convert to naive Europe/Zurich (strip tz, local time already correct)
+    timestamps_naive = hourly.tz_localize(None)
+
+    return pd.DataFrame({
+        "timestamp": timestamps_naive,
+        "is_away": (filled == "on").astype(int).values,
+    })
+
+
 def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd

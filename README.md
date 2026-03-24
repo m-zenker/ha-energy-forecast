@@ -2,7 +2,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.6.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.7.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -23,6 +23,7 @@ Plan EV charging, avoid bill surprises, and know your daily energy use before th
 - [Weather sources](#weather-sources)
 - [EV charging detection](#ev-charging-detection)
 - [Sub-energy sensors](#sub-energy-sensors)
+- [Vacation / Away mode](#vacation--away-mode)
 - [MQTT Discovery](#mqtt-discovery-optional)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
@@ -75,6 +76,10 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Exponential sample weighting** — recent data influences the model more than old data
 - **Self-healing** — graceful fallbacks at every external dependency (weather API, HA history, ML packages)
 - **MQTT Discovery** (optional) — registers all sensors in the HA entity registry so you can assign them to areas, add labels, and rename them in the UI
+- **Vacation / away mode** — `is_away` binary flag teaches the model your lower holiday consumption so predictions stay accurate while you travel
+- **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
+- **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
+- **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
 
 ---
 
@@ -206,6 +211,21 @@ energy_forecast:
   # sub_energy_sensors:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
+
+  # Vacation / away mode (optional).
+  # away_mode_entity: input_boolean.vacation_mode
+  # away_return_entity: input_datetime.vacation_return
+
+  # Anomaly detection threshold (optional, default: 3.0).
+  # binary_sensor.energy_forecast_unusual_consumption fires when the latest
+  # actual consumption deviates more than this many std-deviations from the
+  # day-ahead prediction. Requires ≥10 matched hours (cold-start safe).
+  # anomaly_sigma_threshold: 3.0
+
+  # SHAP feature importance (optional, default: 5).
+  # Top-N driving features exposed as shap_top_features attribute on
+  # sensor.energy_forecast_today. Set to 0 to disable.
+  # shap_top_n: 5
 ```
 
 > **Note:** To find your `energy_sensor` entity ID, go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for your grid-import meter — a sensor whose state increases continuously and never resets to zero each day.
@@ -228,6 +248,10 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
+| `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
+| `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
+| `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
@@ -254,12 +278,16 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attribute `shap_top_features` lists the top driving features and their mean absolute SHAP contributions (`{temp_c: 0.42, lag_24h: 0.31, ...}`). |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
-### Prediction intervals (80% confidence)
+### Prediction intervals (calibrated 80% coverage)
 
-Published once quantile models are trained (first retrain cycle after install). Elapsed hours use actuals for both bounds; the interval applies only to the forecast portion.
+Published once quantile models are trained (first retrain cycle after install).
+Intervals are calibrated via split conformal prediction (CQR): q10/q90 quantile models are
+trained on the first 85% of history; the remaining 15% serves as a held-out calibration set
+that derives an additive log-space correction `q_hat` ensuring ≥80% marginal coverage.
+Elapsed hours use actuals for both bounds; the interval applies only to the forecast portion.
 
 | Entity ID | Description |
 |-----------|-------------|
@@ -295,7 +323,15 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | Entity ID | Description |
 |-----------|-------------|
 | `sensor.energy_forecast_model_mae` | Model mean absolute error (kWh). Attributes include `cv_mae`, `model_engine`, `last_trained` |
+| `sensor.energy_forecast_mae_7d` | Rolling mean absolute error over the last 7 days. Attribute `n_pairs` shows how many prediction–actual pairs were used. State is `"0.0"` until enough history accumulates. |
+| `sensor.energy_forecast_mae_30d` | Rolling MAE over the last 30 days (`n_pairs` attribute). Reaches full depth after ~30 days. |
 | `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
+
+### Anomaly detection
+
+| Entity ID | Description |
+|-----------|-------------|
+| `binary_sensor.energy_forecast_unusual_consumption` | `on` when the latest actual consumption deviates more than `anomaly_sigma_threshold` std-deviations from the stored day-ahead prediction. `off` during cold-start (< 10 matched hours). Attributes: `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`. |
 
 ---
 
@@ -357,6 +393,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
+| Away / vacation | `is_away` — binary flag; 1 during periods when `away_mode_entity` is "on"; teaches the model lower vacation-period consumption |
 
 When `sub_energy_sensors` is configured, each sub-sensor adds four features: `lag_24h` (same hour yesterday), `lag_168h` (same hour last week, requires ≥ 268 rows of sub-sensor history), `{prefix}_active_24h` (was the appliance active in the past 24 h?), and `{prefix}_runs_7d` (how many on/off cycles in the past 7 days).
 
@@ -455,6 +492,35 @@ For each sensor the model gains four features:
 
 ---
 
+## Vacation / Away mode
+
+When you go on holiday your household consumption drops significantly — the model would otherwise see those low-consumption days as noise and regress toward them over time. The vacation/away feature teaches the model that these are distinct conditions by adding an `is_away` binary flag to every training row and every prediction row.
+
+### Configuration
+
+Add the optional keys to `apps.yaml`:
+
+```yaml
+  # Vacation / away mode (optional).
+  away_mode_entity: input_boolean.vacation_mode
+  away_return_entity: input_datetime.vacation_return   # optional; requires away_mode_entity
+```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `away_mode_entity` | No | Entity ID of a `input_boolean` (or any boolean-like entity). When its state is `"on"`, `is_away` is set to 1 for training rows and prediction rows alike. |
+| `away_return_entity` | No | Entity ID of an `input_datetime`. When set, `is_away` flips back to 0 at the configured return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
+
+### How it works
+
+- During training, every historical hour when `away_mode_entity` was `"on"` is labelled `is_away = 1`. The model learns that those hours have characteristically lower consumption.
+- During prediction, if `away_mode_entity` is currently `"on"`, all 48 forecast hours are initially marked `is_away = 1`.
+- If `away_return_entity` is also set and contains a valid future datetime within the 48-hour window, the hours from the return time onward are flipped back to `is_away = 0` — so the forecast transitions from vacation-level to normal consumption at the expected return hour.
+
+**Backward compatibility:** Omitting both keys (or leaving them commented out) produces no behaviour change — `is_away` defaults to 0 for all rows and the model behaves identically to prior versions.
+
+---
+
 ## MQTT Discovery (optional)
 
 By default the app publishes all sensors via AppDaemon's `set_state()` API, which writes values to the HA **state machine** only. This means sensors appear in **Developer Tools → States** and can be used in dashboards and automations, but they are **not** registered in the **entity registry** — so you cannot assign them to an area, add labels, or rename them from the HA UI.
@@ -505,10 +571,11 @@ All sensors are registered at startup. The 6 prediction-interval sensors (`*_low
 | Forecast totals (`next_1h`, `next_3h`, `today`, `tomorrow`) | 4 |
 | 3-hour blocks (today + tomorrow) | 16 |
 | EV actuals (`ev_today`, `ev_yesterday`) | 2 |
-| Model MAE | 1 |
+| Model diagnostics (`mae`, `mae_7d`, `mae_30d`) | 3 |
 | Setup status | 1 |
+| Anomaly detection (`unusual_consumption`) | 1 |
 | Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
-| **Total** | **30** |
+| **Total** | **33** |
 
 ### Availability
 

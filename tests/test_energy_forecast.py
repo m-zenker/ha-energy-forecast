@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from energy_forecast.energy_forecast import _blend_today_totals, _compute_live_mae
+from energy_forecast.energy_forecast import _blend_today_totals, _compute_live_mae, _compute_anomaly
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -389,6 +389,8 @@ class _FakeValidateSelf:
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
         self._adaptive_retrain_threshold = 2.0
+        self._anomaly_sigma_threshold    = 3.0
+        self._shap_top_n                 = 5
         self._sub_energy_sensors         = []
         self._mqtt_discovery             = False
         self._mqtt_namespace             = "mqtt"
@@ -501,6 +503,7 @@ class _FakeMqttSelf:
         self._ml_model.engine = "lgbm"
         self._ev_threshold = 7.0
         self._ev_charger_kw = 9.0
+        self._anomaly_sigma_threshold = 3.0
         self._states: dict = {}
 
     def call_service(self, service: str, **kwargs) -> None:
@@ -545,6 +548,14 @@ class _FakeMqttSelf:
     def _mqtt_publish_all_discovery(self) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
         EnergyForecast._mqtt_publish_all_discovery(self)
+
+    def _build_binary_sensor_discovery_payload(self, *args, **kwargs) -> dict:
+        from energy_forecast.energy_forecast import EnergyForecast
+        return EnergyForecast._build_binary_sensor_discovery_payload(self, *args, **kwargs)
+
+    def _mqtt_publish_binary_sensor_discovery(self, *args, **kwargs) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_publish_binary_sensor_discovery(self, *args, **kwargs)
 
 
 class TestMqttPublishDiscovery:
@@ -746,6 +757,11 @@ class TestCleanupLegacyStates:
         for key in ["setup_status", "next_1h", "next_3h", "today", "tomorrow",
                     "ev_today", "ev_yesterday", "model_mae"]:
             assert f"sensor.energy_forecast_{key}" in removed
+        # Rolling MAE sensors (#41)
+        assert "sensor.energy_forecast_mae_7d" in removed
+        assert "sensor.energy_forecast_mae_30d" in removed
+        # Anomaly detection sensor (#39)
+        assert "binary_sensor.energy_forecast_unusual_consumption" in removed
         # Block sensors
         for day in ("today", "tomorrow"):
             for slot in BLOCK_SLOTS:
@@ -759,3 +775,377 @@ class TestCleanupLegacyStates:
         from energy_forecast.energy_forecast import EnergyForecast
         # Must not raise
         EnergyForecast._cleanup_legacy_states(fake)
+
+# ── #25 Vacation / Away Flag — _build_away_prediction_series ─────────────────
+
+class _FakeAwaySelf:
+    """Stand-in for EnergyForecast for _build_away_prediction_series tests."""
+
+    def __init__(
+        self,
+        away_mode_entity: str | None = None,
+        away_return_entity: str | None = None,
+        away_mode_state: str = "off",
+        away_return_state: str | None = None,
+    ):
+        self._away_mode_entity   = away_mode_entity
+        self._away_return_entity = away_return_entity
+        self._states: dict[str, str] = {}
+        if away_mode_entity:
+            self._states[away_mode_entity] = away_mode_state
+        if away_return_entity and away_return_state is not None:
+            self._states[away_return_entity] = away_return_state
+        self._warnings: list[str] = []
+
+    def get_state(self, entity_id: str) -> str | None:
+        return self._states.get(entity_id)
+
+    def log(self, msg: str, level: str = "INFO") -> None:
+        if level == "WARNING":
+            self._warnings.append(msg)
+
+
+class TestBuildAwayPredictionSeries:
+    """_build_away_prediction_series: correct is_away projections for all cases."""
+
+    def _now_ts(self):
+        return pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+
+    def test_no_entity_returns_all_zeros(self):
+        """With no away_mode_entity configured, all 48 values must be 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity=None)
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert len(result) == 48
+        assert (result == 0).all()
+
+    def test_entity_off_returns_all_zeros(self):
+        """When away_mode_entity is 'off', all 48 values must be 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="off")
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert (result == 0).all()
+
+    def test_entity_on_no_return_entity_returns_all_ones(self):
+        """When entity is 'on' and no return entity, all 48 values must be 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="on",
+                             away_return_entity=None)
+        result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
+        assert (result == 1).all()
+
+    def test_entity_on_return_in_future_splits_at_return_dt(self):
+        """When entity is 'on' and return_dt is 24h ahead, first 24 rows = 1, rest = 0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        now_ts    = pd.Timestamp("2026-04-01 10:00")
+        return_dt = now_ts + pd.Timedelta(hours=24)
+        fake = _FakeAwaySelf(
+            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_return_entity="input_datetime.return",
+            away_return_state=str(return_dt),
+        )
+        result = EnergyForecast._build_away_prediction_series(fake, now_ts)
+        # Hours before return_dt: is_away=1; at/after return_dt: is_away=0
+        assert (result.iloc[:24] == 1).all(), f"Expected first 24 = 1, got {result.iloc[:24].tolist()}"
+        assert (result.iloc[24:] == 0).all(), f"Expected rows 24+ = 0, got {result.iloc[24:].tolist()}"
+
+    def test_entity_on_return_dt_in_past_returns_all_ones(self):
+        """When entity is 'on' and return_dt is in the past, all 48 values must be 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        now_ts    = pd.Timestamp("2026-04-01 10:00")
+        return_dt = now_ts - pd.Timedelta(hours=1)   # 1h ago — already past
+        fake = _FakeAwaySelf(
+            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_return_entity="input_datetime.return",
+            away_return_state=str(return_dt),
+        )
+        result = EnergyForecast._build_away_prediction_series(fake, now_ts)
+        assert (result == 1).all()
+
+
+# ── #41 Rolling MAE sensors (mae_7d / mae_30d) ───────────────────────────────
+
+class TestRollingMaeSensors:
+    """Tests for _actuals_history population, mae_7d/mae_30d computation, publish,
+    and discovery registration."""
+
+    # ── helpers ──
+
+    def _make_pred_history(self, start: pd.Timestamp, n: int, kwh: float = 2.0) -> dict:
+        """n hourly predictions starting at start, all equal to kwh."""
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t: kwh for t in ts}
+
+    def _make_actuals_df(self, start: pd.Timestamp, n: int, kwh: float = 3.0) -> pd.DataFrame:
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [kwh] * n})
+
+    # ── actuals_history keep-last semantics ──
+
+    def test_actuals_history_keep_last_semantics(self):
+        """Same-hour key written twice: the newer (later) value must win."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # Simulate two rounds of recent_actuals for the same hour
+        hour = pd.Timestamp("2026-03-20 10:00")
+        actuals_history: dict = {}
+
+        # First write: value 1.0
+        actuals_history[hour.floor("1h")] = 1.0
+        # Second write (keep-last): value 2.5 overwrites
+        actuals_history[hour.floor("1h")] = 2.5
+
+        assert actuals_history[hour.floor("1h")] == 2.5
+
+    # ── mae_7d excludes predictions older than 7 days ──
+
+    def test_mae_7d_excludes_predictions_older_than_7d(self):
+        """pred_hist_7d filter must exclude entries older than 7 days."""
+        from energy_forecast.energy_forecast import _compute_live_mae
+
+        now = pd.Timestamp.now().normalize()
+        cutoff_7d = now - pd.Timedelta(days=7)
+
+        # 24 predictions within 7d window
+        recent_preds = self._make_pred_history(cutoff_7d + pd.Timedelta(hours=1), 24, kwh=2.0)
+        # 24 predictions older than 7d (should be excluded)
+        old_preds = self._make_pred_history(cutoff_7d - pd.Timedelta(days=2), 24, kwh=2.0)
+
+        pred_hist_7d = {ts: kwh for ts, kwh in recent_preds.items()}
+        # old_preds excluded — not added to pred_hist_7d
+
+        actuals = self._make_actuals_df(cutoff_7d + pd.Timedelta(hours=1), 24, kwh=3.0)
+        mae, n = _compute_live_mae(pred_hist_7d, actuals)
+
+        assert n == 24
+        assert abs(mae - 1.0) < 1e-6
+
+    # ── mae_30d uses full 30d window ──
+
+    def test_mae_30d_uses_full_30d_window(self):
+        """mae_30d must match all pairs within the 30d pred_history."""
+        from energy_forecast.energy_forecast import _compute_live_mae
+
+        now = pd.Timestamp.now().normalize()
+        start = now - pd.Timedelta(days=29)
+        pred_history = self._make_pred_history(start, 48, kwh=2.0)
+        actuals = self._make_actuals_df(start, 48, kwh=3.0)
+
+        mae, n = _compute_live_mae(pred_history, actuals)
+
+        assert n == 48
+        assert abs(mae - 1.0) < 1e-6
+
+    # ── publish in set_state mode ──
+
+    def test_publish_mae_sensors_set_state_mode(self):
+        """_publish() must call set_state for both mae_7d and mae_30d when mqtt_discovery=False."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+        EnergyForecast._publish(fake, data)
+
+        assert "sensor.energy_forecast_mae_7d" in fake._states
+        assert "sensor.energy_forecast_mae_30d" in fake._states
+        assert fake._states["sensor.energy_forecast_mae_7d"]["state"] == "0.25"
+        assert fake._states["sensor.energy_forecast_mae_30d"]["state"] == "0.3"
+        assert fake._states["sensor.energy_forecast_mae_7d"]["attributes"]["n_pairs"] == 24
+        assert fake._states["sensor.energy_forecast_mae_30d"]["attributes"]["n_pairs"] == 120
+
+    # ── publish in MQTT mode ──
+
+    def test_publish_mae_sensors_mqtt_mode(self):
+        """_publish() must call mqtt_publish for both mae_7d and mae_30d when mqtt_discovery=True."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        data = {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+        EnergyForecast._publish(fake, data)
+
+        state_topics = [p["topic"] for p in fake._publishes if "/state" in p["topic"]]
+        assert any("energy_forecast_mae_7d" in t for t in state_topics), \
+            f"mae_7d state topic not found in: {state_topics}"
+        assert any("energy_forecast_mae_30d" in t for t in state_topics), \
+            f"mae_30d state topic not found in: {state_topics}"
+
+    # ── MQTT discovery ──
+
+    def test_mqtt_discovery_includes_mae_sensors(self):
+        """_mqtt_publish_all_discovery() must publish config topics for mae_7d and mae_30d."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
+        assert any("energy_forecast_mae_7d/config" in t for t in config_topics), \
+            f"mae_7d config topic not found in: {config_topics}"
+        assert any("energy_forecast_mae_30d/config" in t for t in config_topics), \
+            f"mae_30d config topic not found in: {config_topics}"
+
+
+# ── #39 Anomaly detection sensor ──────────────────────────────────────────────
+
+class TestAnomalyDetection:
+    """Tests for _compute_anomaly and its integration with _publish / discovery."""
+
+    # ── helpers ──
+
+    def _make_pred_history(self, n: int, kwh: float = 2.0, start: pd.Timestamp | None = None) -> dict:
+        """n hourly predictions, all equal to kwh."""
+        if start is None:
+            start = pd.Timestamp("2026-03-01 00:00")
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t: kwh for t in ts}
+
+    def _make_actuals_history(self, n: int, kwh: float = 2.0, start: pd.Timestamp | None = None) -> dict:
+        """n floored-1h actuals, all equal to kwh."""
+        if start is None:
+            start = pd.Timestamp("2026-03-01 00:00")
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t.floor("1h"): kwh for t in ts}
+
+    # ── _compute_anomaly unit tests ──
+
+    def test_fires_above_threshold(self):
+        """Latest residual far above std must return is_anomaly=True."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        # 20 pairs with residual ≈ 0.0 (pred=2.0, actual=2.0), then 1 spike
+        pred_history = self._make_pred_history(21, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.0, start=start)  # all match at 0.0 residual
+        # Override last prediction to be very far from actual
+        latest_ts = start + pd.Timedelta(hours=20)
+        pred_history[latest_ts] = 2.0
+        actuals_history[latest_ts.floor("1h")] = 7.0  # residual = 5.0 kWh
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is True, f"Expected anomaly=True, got residual={residual}, std={std}"
+        assert abs(residual - 5.0) < 1e-6
+
+    def test_silent_below_threshold(self):
+        """Residuals all similar — latest within threshold — must return is_anomaly=False."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        pred_history = self._make_pred_history(20, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.1, start=start)  # residual = 0.1 everywhere
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 20
+
+    def test_cold_start_returns_false(self):
+        """Fewer than min_pairs matched pairs → (False, nan, nan, n)."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        pred_history = self._make_pred_history(5, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(5, kwh=3.0, start=start)
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 5
+        assert math.isnan(residual)
+        assert math.isnan(std)
+
+    def test_empty_histories_return_false(self):
+        """Both empty → (False, nan, nan, 0)."""
+        is_anomaly, residual, std, n = _compute_anomaly({}, {}, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 0
+        assert math.isnan(residual)
+        assert math.isnan(std)
+
+    def test_near_zero_std_guard(self):
+        """Perfect model (std < 0.01) must not fire anomaly even if latest residual is large."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        # All residuals exactly 0 → std = 0
+        pred_history = self._make_pred_history(20, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.0, start=start)
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert std < 0.01
+
+    # ── _publish integration tests ──
+
+    def _base_data(self) -> dict:
+        return {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+
+    def test_publish_set_state_mode_anomaly_on(self):
+        """_publish() in set_state mode must write binary_sensor state 'on' when is_anomaly=True."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {**self._base_data(), "is_anomaly": True,
+                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        eid = "binary_sensor.energy_forecast_unusual_consumption"
+        assert eid in fake._states, f"Expected {eid} in states"
+        assert fake._states[eid]["state"] == "on"
+        assert fake._states[eid]["attributes"]["device_class"] == "problem"
+
+    def test_publish_set_state_mode_anomaly_off(self):
+        """_publish() in set_state mode must write binary_sensor state 'off' when is_anomaly=False."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {**self._base_data(), "is_anomaly": False,
+                "anomaly_residual": 0.1, "anomaly_std": 0.1, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        eid = "binary_sensor.energy_forecast_unusual_consumption"
+        assert fake._states[eid]["state"] == "off"
+
+    def test_publish_mqtt_mode(self):
+        """_publish() in MQTT mode must publish 'ON' or 'OFF' to the anomaly state topic."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        data = {**self._base_data(), "is_anomaly": True,
+                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        state_topics = {p["topic"]: p["payload"] for p in fake._publishes if "/state" in p["topic"]}
+        anomaly_topic = next(
+            (t for t in state_topics if "unusual_consumption" in t), None
+        )
+        assert anomaly_topic is not None, f"Anomaly state topic not found in: {list(state_topics)}"
+        assert state_topics[anomaly_topic] == "ON"
+
+    def test_mqtt_discovery_includes_anomaly_sensor(self):
+        """_mqtt_publish_all_discovery() must publish a binary_sensor config topic for unusual_consumption."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
+        assert any("binary_sensor/energy_forecast_unusual_consumption/config" in t for t in config_topics), \
+            f"anomaly binary sensor config topic not found in: {config_topics}"
+
+    def test_cleanup_legacy_includes_anomaly_sensor(self):
+        """_cleanup_legacy_states() must include binary_sensor.energy_forecast_unusual_consumption."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf()
+        EnergyForecast._cleanup_legacy_states(fake)
+        assert "binary_sensor.energy_forecast_unusual_consumption" in fake._removed_entities
