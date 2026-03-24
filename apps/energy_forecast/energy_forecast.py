@@ -70,8 +70,8 @@ class EnergyForecast(hass.Hass):
         self._away_return_entity: str | None = self.args.get("away_return_entity") or None
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
-        self._pred_history: dict        = {}
-        self._actuals_history: dict     = {}   # {pd.Timestamp (floored 1h): float} rolling 30d actuals
+        self._pred_history: dict[Any, float]    = {}
+        self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
         # MQTT Discovery (opt-in)
@@ -550,9 +550,10 @@ class EnergyForecast(hass.Hass):
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour
         if recent_actuals is not None and not recent_actuals.empty:
-            for _, row in recent_actuals.iterrows():
-                ts_key = pd.Timestamp(row["timestamp"]).floor("1h")
-                self._actuals_history[ts_key] = float(row["gross_kwh"])
+            self._actuals_history.update(dict(zip(
+                pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
+                recent_actuals["gross_kwh"].astype(float),
+            )))
         actuals_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items()

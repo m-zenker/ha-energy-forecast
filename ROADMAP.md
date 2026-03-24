@@ -227,17 +227,13 @@ Three sub-items (B1, B2, B9):
 
 User is on a fixed flat tariff; price-driven load shifting is out of scope. Retained for reference only.
 
-### 25. Vacation / away flag *(long-term backlog)*
+### 25. Vacation / away flag *(✓ done — v0.7.0)*
 Multi-day absences cause baseline drops that look like anomalies to the rolling lag features and bias the model until history catches up.
 
 Two optional, independent config keys:
 
 - `away_mode_entity` (e.g. `input_boolean.vacation_mode`) → binary `is_away` feature. Sufficient on its own to give the model the basic home/away signal.
-- `away_return_entity` (e.g. `input_datetime.vacation_return`) → numeric `hours_until_return` feature, rules:
-  - **0** when `is_away` is off (home).
-  - **0** when the stored return datetime is in the past — the entity retains its last-used value between trips and must be treated as stale once the date has passed.
-  - **Positive integer (hours)** when the return is in the future; capped at **168 h (7 days)** to bound the range.
-  - Gives the model a forward signal for the pre-heat consumption spike, which starts a few hours before return (not days ahead).
+- `away_return_entity` (e.g. `input_datetime.vacation_return`) → used to flip `is_away` to 0 at the stored return hour during prediction, so the model sees the correct home/away state for future hours. The simpler binary approach was chosen deliberately. A `hours_until_return` numeric feature (pre-return consumption spike signal) can be added as a future enhancement if the pattern proves significant in residuals.
 
 Both keys are optional and independent; `away_mode_entity` alone is enough for the basic feature.
 
