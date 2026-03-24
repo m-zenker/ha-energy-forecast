@@ -616,6 +616,59 @@ class EnergyForecastModel:
         low, high = np.minimum(low, high), np.maximum(low, high)
         return pd.DataFrame({"timestamp": future_hours, "low_kwh": low, "high_kwh": high})
 
+    def shap_summary(
+        self,
+        forecast_df: "pd.DataFrame",
+        live_temp: float | None,
+        recent_actuals: "pd.DataFrame | None" = None,
+        sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,
+        n: int = 5,
+    ) -> dict[str, float]:
+        """Return the top-N driving features for today's prediction slice.
+
+        Uses LightGBM's native TreeSHAP (``pred_contrib=True``) when the engine
+        is LightGBM; falls back to global ``feature_importances_`` for GBR.
+        Values are mean absolute SHAP contributions over today's hours (or all
+        48 hours if today's slice is empty).  When ``_log_transform=True`` the
+        contributions are in log-space — still valid for ranking.
+
+        Returns an empty dict when the model is not trained or ``n <= 0``.
+        """
+        import numpy as np
+        import pandas as pd
+
+        if self.model is None or n <= 0:
+            return {}
+
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
+
+        # Filter to today's local date; fall back to all rows if none match
+        today = pd.Timestamp.now().normalize()
+        mask = (pd.Series(future_hours) >= today) & (
+            pd.Series(future_hours) < today + pd.Timedelta(days=1)
+        )
+        X_slice = X[mask.values] if mask.any() else X
+
+        if self.engine == "LightGBM":
+            # pred_contrib=True → shape (n_rows, n_features + 1); last column is bias
+            contrib = self.model.predict(X_slice, pred_contrib=True)
+            mean_abs = np.abs(contrib[:, :-1]).mean(axis=0)
+        else:
+            # GBR: global feature_importances_ (no per-prediction SHAP)
+            _LOGGER.debug("shap_summary: GBR engine uses global feature_importances_ (not per-prediction SHAP)")
+            mean_abs = self.model.feature_importances_.astype(float)
+
+        # Pair with feature names and return top-N descending
+        pairs = sorted(
+            zip(self.feature_cols, mean_abs.tolist()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return {name: round(float(val), 6) for name, val in pairs[:n]}
+
     def hours_since_trained(self) -> float:
         if self.last_trained == datetime.min:
             return float("inf")

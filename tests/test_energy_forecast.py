@@ -390,6 +390,7 @@ class _FakeValidateSelf:
         self._ev_charger_kw              = ev_charger_kw
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold    = 3.0
+        self._shap_top_n                 = 5
         self._sub_energy_sensors         = []
         self._mqtt_discovery             = False
         self._mqtt_namespace             = "mqtt"

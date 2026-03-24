@@ -1343,3 +1343,48 @@ class TestAwayFeature:
         assert len(result) == 48
         assert result["predicted_kwh"].notna().all()
         assert result["predicted_kwh"].ge(0).all()
+
+
+# ── #42 SHAP feature importance ───────────────────────────────────────────────
+
+class TestShapSummary:
+    """shap_summary(): returns top-N features, sorted, guards cold-start and n=0."""
+
+    def test_returns_n_features(self, tmp_path):
+        """shap_summary() returns exactly n entries when model is trained."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        assert isinstance(result, dict)
+        assert len(result) == 5
+
+    def test_sorted_by_importance_descending(self, tmp_path):
+        """Returned dict values must be in descending order."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        values = list(result.values())
+        assert values == sorted(values, reverse=True), (
+            f"Values not descending: {values}"
+        )
+
+    def test_cold_start_returns_empty(self, tmp_path):
+        """shap_summary() on an untrained model must return {}."""
+        m = EnergyForecastModel(tmp_path)
+        # Build a minimal forecast_df
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp":            future_ts,
+            "temp_c":               [10.0] * 48,
+            "precipitation_mm":     [0.0]  * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0]* 48,
+        })
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        assert result == {}
+
+    def test_n_zero_returns_empty(self, tmp_path):
+        """n=0 disables SHAP and must return {}."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=0)
+        assert result == {}

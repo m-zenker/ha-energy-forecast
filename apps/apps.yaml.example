@@ -67,6 +67,10 @@ energy_forecast:
   # model's day-ahead prediction. Requires ≥10 matched pairs (cold-start safe).
   # anomaly_sigma_threshold: 3.0
 
+  # Optional: number of top SHAP features exposed as sensor attributes on
+  # sensor.energy_forecast_today (default: 5). Set to 0 to disable.
+  # shap_top_n: 5
+
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
   # Must be total_increasing kWh meters (e.g. heat pump, dishwasher monitor).

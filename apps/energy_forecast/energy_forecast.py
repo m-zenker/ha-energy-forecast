@@ -72,6 +72,8 @@ class EnergyForecast(hass.Hass):
         self._anomaly_sigma_threshold: float = float(
             self.args.get("anomaly_sigma_threshold", 3.0)
         )
+        # SHAP feature importance: top-N features exposed as sensor attribute (0 = off)
+        self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float]    = {}
@@ -136,6 +138,8 @@ class EnergyForecast(hass.Hass):
             raise ValueError(
                 f"anomaly_sigma_threshold must be > 0, got {self._anomaly_sigma_threshold}"
             )
+        if self._shap_top_n < 0:
+            raise ValueError(f"shap_top_n must be >= 0, got {self._shap_top_n}")
         if self._ev_threshold >= self._ev_charger_kw:
             self.log(
                 f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
@@ -154,6 +158,7 @@ class EnergyForecast(hass.Hass):
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
             f"anomaly_sigma_threshold={self._anomaly_sigma_threshold}, "
+            f"shap_top_n={self._shap_top_n}, "
             f"mqtt_discovery={self._mqtt_discovery}"
         )
 
@@ -231,6 +236,7 @@ class EnergyForecast(hass.Hass):
         icon: str,
         device_class: str | None,
         state_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> dict:
         """Return the HA MQTT Discovery config dict for a single sensor."""
         payload: dict = {
@@ -251,6 +257,8 @@ class EnergyForecast(hass.Hass):
             payload["device_class"] = device_class
         if state_class is not None:
             payload["state_class"] = state_class
+        if json_attributes_topic is not None:
+            payload["json_attributes_topic"] = json_attributes_topic
         return payload
 
     def _build_binary_sensor_discovery_payload(
@@ -314,11 +322,13 @@ class EnergyForecast(hass.Hass):
         icon: str,
         device_class: str | None,
         state_class: str | None,
+        json_attributes_topic: str | None = None,
     ) -> None:
         """Publish a retained MQTT Discovery config payload for one sensor."""
         try:
             payload = self._build_sensor_discovery_payload(
-                unique_id, friendly_name, unit, icon, device_class, state_class
+                unique_id, friendly_name, unit, icon, device_class, state_class,
+                json_attributes_topic=json_attributes_topic,
             )
             topic = f"{self._mqtt_discovery_prefix}/sensor/{unique_id}/config"
             self.call_service(
@@ -362,6 +372,20 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
 
+    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict) -> None:
+        """Publish a JSON attributes dict to the sensor's json_attributes_topic (retained)."""
+        try:
+            topic = f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{unique_id}/attributes"
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=json.dumps(attrs),
+                retain=True,
+                namespace=self._mqtt_namespace,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"MQTT attributes publish failed for {unique_id}: {exc}", level="WARNING")
+
     def _mqtt_publish_availability(self, payload: str) -> None:
         """Publish 'online' or 'offline' to the shared availability topic."""
         try:
@@ -389,6 +413,10 @@ class EnergyForecast(hass.Hass):
         )
         # Forecast totals
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+            attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_today/attributes"
+                if key == "today" else None
+            )
             self._mqtt_publish_discovery(
                 f"energy_forecast_{key}",
                 label,
@@ -396,6 +424,7 @@ class EnergyForecast(hass.Hass):
                 "mdi:lightning-bolt",
                 "energy",
                 "measurement",
+                json_attributes_topic=attrs_topic,
             )
         # 3h blocks — today and tomorrow, 8 slots each
         for day in ("today", "tomorrow"):
@@ -653,7 +682,21 @@ class EnergyForecast(hass.Hass):
             self._anomaly_sigma_threshold,
         )
 
+        # ── SHAP feature importance (#42) ─────────────────────────────────────
+        shap_data: dict = {}
+        if self._shap_top_n > 0:
+            try:
+                shap_data = self._ml_model.shap_summary(
+                    forecast_df, live_temp, recent_actuals,
+                    sub_sensors_recent=sub_sensors_recent or None,
+                    away_series=away_series,
+                    n=self._shap_top_n,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"SHAP summary failed: {exc}", level="WARNING")
+
         aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
+        aggregated["shap_top_features"] = shap_data
         aggregated["mae_7d"]          = mae_7d
         aggregated["mae_30d"]         = mae_30d
         aggregated["mae_7d_n_pairs"]  = n_7d
@@ -859,8 +902,17 @@ class EnergyForecast(hass.Hass):
                 )
 
         # ── Forecast totals ───────────────────────────────────────────────────
+        shap_features = data.get("shap_top_features") or {}
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
-            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}", icon="mdi:lightning-bolt")
+            extra = {"shap_top_features": shap_features} if key == "today" and shap_features else None
+            safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}",
+                     extra_attrs=extra, icon="mdi:lightning-bolt")
+        # In MQTT mode, publish shap_top_features as json_attributes for energy_forecast_today
+        if self._mqtt_discovery and shap_features:
+            self._mqtt_publish_sensor_attributes(
+                "energy_forecast_today",
+                {"shap_top_features": shap_features},
+            )
 
         # ── Prediction intervals (only published when quantile models trained) ─
         _any_intervals = any(

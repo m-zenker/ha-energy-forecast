@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **SHAP feature importance (#42)** (`model.py`, `energy_forecast.py`): the top-N driving features
+  behind each prediction are exposed as a `shap_top_features` attribute on
+  `sensor.energy_forecast_today`.  LightGBM uses native TreeSHAP (`pred_contrib=True`) for
+  per-prediction values; sklearn GBR falls back to global `feature_importances_`.  Features are
+  ranked by mean absolute contribution over today's prediction slice and returned as a
+  `{feature_name: importance}` dict (descending).  New config key: `shap_top_n` (int ≥ 0,
+  default 5; set to 0 to disable).  MQTT Discovery mode publishes attributes via
+  `json_attributes_topic` on the `energy_forecast_today` discovery payload.
 - **Anomaly detection sensor (#39)** (`energy_forecast.py`): new binary sensor
   `binary_sensor.energy_forecast_unusual_consumption` fires when the latest actual consumption
   deviates more than `anomaly_sigma_threshold` (default 3.0) standard deviations from the stored

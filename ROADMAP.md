@@ -13,9 +13,8 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done) | planned |
-| Explainability | v0.8.0 | #42 SHAP feature importance, quantile interval calibration | planned |
-| Solar + battery | v0.9.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
+| Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration | planned |
+| Solar + battery | v0.8.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #43 ApexCharts snippet, #44 Model versioning, #45 CSV health checks | backlog |
 
 ### Deployment workflow (per release)
@@ -185,7 +184,7 @@ Required changes:
 
 No code changes required — `apps/energy_forecast/` is already in the correct location for HACS AppDaemon installs. Semver tags are already present.
 
-### 17. Setup checker sensor ✓ done (feature branches)
+### 17. Setup checker sensor ✓ done
 Bake a startup self-check into the main app that surfaces setup problems as a visible HA entity rather than silent log failures.
 
 - On initialisation, attempt `import pandas, numpy, lightgbm, sklearn, requests, holidays` and log a clear error for each missing package.
@@ -195,12 +194,12 @@ Bake a startup self-check into the main app that surfaces setup problems as a vi
 
 This converts silent failure after a fresh HACS install into actionable, user-visible feedback without requiring any Supervisor access.
 
-### 19. CSV cache: append-only writes ✓ done (feature branches)
+### 19. CSV cache: append-only writes ✓ done
 For long-running installs with months of history, `fetch_recent_energy` rewrites the entire `energy_history.csv` on every hourly update. At ~8 760 rows/year this is already measurable I/O and will compound over time.
 
 Improvement: write only new rows using `df.to_csv(..., mode='a', header=False)` in `fetch_recent_energy`, and perform a periodic compaction (dedup + sort) in `fetch_energy_history` (the weekly full-read path) rather than on every update. Requires care around the merge-winner rule to avoid duplicating rows that already exist in the CSV.
 
-### 20. Config validation: warn when `ev_charging_threshold_kwh >= ev_charger_kw` ✓ done (feature branches)
+### 20. Config validation: warn when `ev_charging_threshold_kwh >= ev_charger_kw` ✓ done
 When the detection threshold is set at or above the charger power (e.g. threshold=10, charger=9), every detected EV hour produces `max(0, gross - charger_kw) = 0`, so the EV sensors always read zero while the model still strips those hours from training data. The combination is silently confusing.
 
 Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
@@ -250,7 +249,7 @@ This is the only path to fully zero-manual-step installation. Significant effort
 
 ## Tier 5 — Diagnostics, Performance & Minor Features
 
-### 27. Short-horizon lags (`lag_1h`, `lag_2h`, `lag_6h`, `lag_12h`) ✓ done (feature branches)
+### 27. Short-horizon lags (`lag_1h`, `lag_2h`, `lag_6h`, `lag_12h`) ✓ done
 The current lag set jumps from `lag_24h` to `lag_48h`, leaving a blind spot in the
 1–12 h range that matters most for same-day intra-day prediction. Adding `lag_1h`,
 `lag_2h`, `lag_6h`, and `lag_12h` to `_add_lag_features` (training) and
@@ -258,28 +257,28 @@ The current lag set jumps from `lag_24h` to `lag_48h`, leaving a blind spot in t
 data-volume cost — all four are available as soon as a single day of history exists.
 Expected impact: **HIGH** for hours 1–6 ahead; Low effort.
 
-### 28. `num_leaves` hyperparameter sweep — complete ROADMAP #6 ✓ done (feature branches)
+### 28. `num_leaves` hyperparameter sweep — complete ROADMAP #6 ✓ done
 ROADMAP item #6 added early stopping but left the `num_leaves` sweep (`16 / 31 / 63`)
 as a follow-up. A narrow grid search on the final CV split can be wired into the
 existing `_cross_validate` path without changing the training API. Prevents the model
 from being locked into the LightGBM default of 31 leaves regardless of data volume.
 Expected impact: **MEDIUM**; Low effort (sweep is already sketched in the #6 description).
 
-### 29. Feature importance logging after training ✓ done (feature branches)
+### 29. Feature importance logging after training ✓ done
 After `model.fit()` in `_train_model`, log `model.feature_importances_` sorted by
 weight. Currently there is no visibility into which features the model actually uses.
 One `logger.debug` call with the sorted list adds zero runtime cost and makes
 under-contributing features immediately visible in the AppDaemon log.
 Expected impact: Diagnostic; Trivial effort.
 
-### 30. CV fold std logging alongside mean ✓ done (feature branches)
+### 30. CV fold std logging alongside mean ✓ done
 `_cross_validate` currently logs only the mean MAE across folds. Adding the standard
 deviation (and optionally the per-fold breakdown at DEBUG level) surfaces high-variance
 training runs — an early signal of insufficient data or a degraded feature — without
 changing any model logic.
 Expected impact: Diagnostic; Trivial effort.
 
-### 31. Per-hour-of-week NaN fill medians ✓ done (feature branches)
+### 31. Per-hour-of-week NaN fill medians ✓ done
 NaN values in rolling/lag features are currently filled with the global training
 median. A per-`hour_of_week` median (168 cells) is a much tighter imputation for the
 warm-up period at install time, where the model would otherwise use a "typical any
@@ -287,14 +286,14 @@ hour" stand-in for a specifically 3 a.m. Tuesday slot. Requires computing and ca
 a `(168,)` lookup table during training and applying it in `_build_prediction_features`.
 Expected impact: **LOW–MEDIUM** (mainly during first week of data); Medium effort.
 
-### 32. Holiday `apply` → `np.searchsorted` vectorization ✓ done (feature branches)
+### 32. Holiday `apply` → `np.searchsorted` vectorization ✓ done
 `_add_holiday_feature` calls `pd.Series.apply(lambda ts: ts.date() in holiday_set)`,
 which is a Python loop over every row in the training frame. Replacing it with
 `np.searchsorted` on a sorted date array (or a boolean index join) reduces the
 holiday computation from O(n) Python-level iterations to a vectorised C operation.
 Expected impact: Performance (training speed); Low effort.
 
-### 33. Day-of-year cyclical feature (`doy_sin` / `doy_cos`) ✓ done (feature branches)
+### 33. Day-of-year cyclical feature (`doy_sin` / `doy_cos`) ✓ done
 The model captures seasonality through rolling temperature features and calendar
 proxies, but has no smooth cyclic encoding of position within the year. Adding
 `doy_sin = sin(2π·doy/365)` and `doy_cos = cos(2π·doy/365)` to `_FEATURES_BASE`
@@ -302,7 +301,7 @@ gives the model a continuous signal for seasonal baseline that avoids the
 discontinuity at New Year's Day.
 Expected impact: **LOW**; Low effort.
 
-### 34. `hours_ahead` feature for horizon-aware prediction ✓ done (feature branches)
+### 34. `hours_ahead` feature for horizon-aware prediction ✓ done
 All 48 prediction rows currently receive identical feature vectors; the model cannot
 distinguish whether it is predicting 1 h ahead or 47 h ahead. Adding `hours_ahead`
 (0–47) as a numeric feature lets the model learn horizon-specific biases — e.g. that
@@ -311,7 +310,7 @@ rolling features decay in reliability with distance. Requires adding the feature
 (or omitting from training to avoid leakage — needs careful scoping).
 Expected impact: **LOW**; Low effort.
 
-### 35. Sub-sensor binary activity flag (`{prefix}_active_24h`) ✓ done (feature branches)
+### 35. Sub-sensor binary activity flag (`{prefix}_active_24h`) ✓ done
 With ~95% zero hours in dishwasher/washer data, the raw `{prefix}_lag_24h` feature is
 almost always 0 and carries near-zero signal for those appliances. A binary
 "was it used in the last 24 hours?" flag is more robust to sparsity and provides a
@@ -321,7 +320,7 @@ compute `(kwh_lag > 0).astype(int)` for each sub-sensor prefix and add
 `{prefix}_active_24h` to the feature list.
 Expected impact: **LOW–MEDIUM** (mainly during warm-up); Low effort.
 
-### 36. Sub-sensor rolling run count (`{prefix}_runs_7d`) ✓ done (feature branches)
+### 36. Sub-sensor rolling run count (`{prefix}_runs_7d`) ✓ done
 Weekly appliance usage frequency (dishwasher 1–2×/day, washer 1–2×/week) is more
 predictable than a point-in-time lag. A count of non-zero hours in the trailing 7 days
 captures the weekly rhythm more stably than `lag_168h` alone, especially during the
@@ -377,7 +376,7 @@ vs actuals: publish `sensor.energy_forecast_mae_7d` and `sensor.energy_forecast_
 on each hourly update. Enables a trend chart of model quality over time in Lovelace.
 Expected impact: Visibility / diagnostic; Low effort.
 
-### 42. SHAP feature importance per prediction *(planned — v0.9.0)*
+### 42. SHAP feature importance per prediction *(planned — v0.7.0)*
 LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After each
 48 h prediction, compute the top-N driving features and expose them as attributes on
 `sensor.energy_forecast_today` (e.g. `shap_top_features: ["temp_c", "lag_24h", ...]`).
@@ -468,7 +467,7 @@ Migration reference:
 | 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | planned v0.7.0 |
 | 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | planned v0.7.0 |
-| 42 | SHAP feature importance per prediction | explainability | 3 h | planned v0.9.0 |
+| 42 | SHAP feature importance per prediction | explainability | 3 h | planned v0.7.0 |
 | 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | long-term backlog |
 | 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
 | 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |
