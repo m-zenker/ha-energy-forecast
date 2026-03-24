@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.7.1] — 2026-03-24
+
 ### Fixed
 - **404 DELETE spam on startup** (`energy_forecast.py`): `_cleanup_legacy_states` now guards
   each `remove_entity` call with `entity_exists`, eliminating ~30 `[404] HTTP DELETE: Not Found`
@@ -34,7 +38,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.6.0] — 2026-03-23
+## [0.7.0] — 2026-03-23
 
 ### Fixed
 - **`_load_interval_correction` stale-value bug** (`model.py`): `_interval_correction` is now
@@ -464,7 +468,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.6.0...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.1...HEAD
+[0.7.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.0...v0.7.1
+[0.7.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.6.0...v0.7.0
 [0.6.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.2...v0.6.0
 [0.5.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.1...v0.5.2
 [0.5.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.5.0...v0.5.1
