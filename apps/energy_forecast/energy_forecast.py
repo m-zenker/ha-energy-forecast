@@ -840,7 +840,8 @@ class EnergyForecast(hass.Hass):
 
         for entity_id in legacy_ids:
             try:
-                self.remove_entity(entity_id)
+                if self.entity_exists(entity_id):
+                    self.remove_entity(entity_id)
             except Exception:  # noqa: BLE001
                 pass
 

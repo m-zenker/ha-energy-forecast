@@ -518,6 +518,9 @@ class _FakeMqttSelf:
     def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes or {}}
 
+    def entity_exists(self, entity_id: str) -> bool:
+        return True
+
     def remove_entity(self, entity_id: str) -> None:
         self._removed_entities.append(entity_id)
 
@@ -775,6 +778,13 @@ class TestCleanupLegacyStates:
         from energy_forecast.energy_forecast import EnergyForecast
         # Must not raise
         EnergyForecast._cleanup_legacy_states(fake)
+
+    def test_skips_remove_when_entity_does_not_exist(self):
+        fake = _FakeMqttSelf()
+        fake.entity_exists = lambda entity_id: False
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._cleanup_legacy_states(fake)
+        assert fake._removed_entities == []
 
 # ── #25 Vacation / Away Flag — _build_away_prediction_series ─────────────────
 
