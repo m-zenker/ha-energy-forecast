@@ -1,7 +1,7 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibility).
+Current baseline: v0.7.1 on feature branch, pending dev merge.
 
 ---
 
@@ -13,9 +13,10 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done) | ✓ done |
+| Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
+| Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
 | Solar + battery | v0.8.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
-| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #43 ApexCharts snippet, #44 Model versioning, #45 CSV health checks | backlog |
+| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #44 Model versioning, #45 CSV health checks | backlog |
 
 ### Deployment workflow (per release)
 
@@ -391,6 +392,23 @@ that will not exist on other installations. Before any wider sharing or HACS inc
   directing users to substitute their own entities.
 - Add a header comment in each file: `# EDIT: replace entity IDs below with your own`.
 
+### 47. Fix 404 DELETE spam in `_cleanup_legacy_states()` *(pre-merge gate — dev → main)*
+
+On startup with `mqtt_discovery: true`, `_cleanup_legacy_states()` calls
+`self.remove_entity()` for each of ~30 legacy entity IDs unconditionally. AppDaemon
+issues an HTTP DELETE to HA for every call; on a fresh install (or when the entities
+never existed), HA returns 404 and AppDaemon logs `ERROR HASS: [404] HTTP DELETE:
+Not Found {}` ~30 times. The app-level `except Exception: pass` does not suppress
+the HTTP-layer log.
+
+Fix: guard each deletion with `self.entity_exists(entity_id)` before calling
+`self.remove_entity()`. Prevents the HTTP round-trip entirely when the entity is absent.
+Also add a test asserting `remove_entity` is **not** called when `entity_exists`
+returns False.
+
+Observed in v0.7.0 test deploy 2026-03-24. Must fix before merging `dev` → `main`.
+Expected impact: Log cleanliness; Trivial effort (~5 min).
+
 ### 43. ApexCharts / Lovelace config snippet *(long-term backlog)*
 A documented, copy-paste YAML config for an ApexCharts card showing forecast vs actual
 consumption. Not a custom card — uses `sensor.energy_forecast_*` sensors that already
@@ -472,10 +490,13 @@ Migration reference:
 | 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | ✓ done |
 | 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
 | 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | ✓ done |
-| 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | planned v0.7.0 |
+| 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | ✓ done v0.7.0 |
 | 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
-| 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | planned v0.7.0 |
-| 42 | SHAP feature importance per prediction | explainability | 3 h | planned v0.7.0 |
-| 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | long-term backlog |
+| 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | ✓ done v0.7.0 |
+| 42 | SHAP feature importance per prediction | explainability | 3 h | ✓ done v0.7.0 |
+| 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | ✓ done v0.7.0 |
 | 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
 | 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |
+| 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
+| 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | ✓ done v0.7.1 |
+| 48 | Anomaly binary sensor MQTT attrs + discovery fix | correctness / UX | 30 min | ✓ done v0.7.1 |

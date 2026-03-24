@@ -518,6 +518,9 @@ class _FakeMqttSelf:
     def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes or {}}
 
+    def entity_exists(self, entity_id: str) -> bool:
+        return True
+
     def remove_entity(self, entity_id: str) -> None:
         self._removed_entities.append(entity_id)
 
@@ -775,6 +778,13 @@ class TestCleanupLegacyStates:
         from energy_forecast.energy_forecast import EnergyForecast
         # Must not raise
         EnergyForecast._cleanup_legacy_states(fake)
+
+    def test_skips_remove_when_entity_does_not_exist(self):
+        fake = _FakeMqttSelf()
+        fake.entity_exists = lambda entity_id: False
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._cleanup_legacy_states(fake)
+        assert fake._removed_entities == []
 
 # ── #25 Vacation / Away Flag — _build_away_prediction_series ─────────────────
 
@@ -1119,7 +1129,7 @@ class TestAnomalyDetection:
         assert fake._states[eid]["state"] == "off"
 
     def test_publish_mqtt_mode(self):
-        """_publish() in MQTT mode must publish 'ON' or 'OFF' to the anomaly state topic."""
+        """_publish() in MQTT mode must publish 'ON'/'OFF' to the anomaly state topic and attributes."""
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=True)
@@ -1134,13 +1144,29 @@ class TestAnomalyDetection:
         assert anomaly_topic is not None, f"Anomaly state topic not found in: {list(state_topics)}"
         assert state_topics[anomaly_topic] == "ON"
 
+        attr_topics = {p["topic"]: p["payload"] for p in fake._publishes if "/attributes" in p["topic"]}
+        anomaly_attr_topic = next(
+            (t for t in attr_topics if "unusual_consumption" in t), None
+        )
+        assert anomaly_attr_topic is not None, "Anomaly attributes topic not found"
+        import json as _json
+        attrs = _json.loads(attr_topics[anomaly_attr_topic])
+        assert "residual_kwh" in attrs
+        assert attrs["n_pairs"] == 20
+
     def test_mqtt_discovery_includes_anomaly_sensor(self):
-        """_mqtt_publish_all_discovery() must publish a binary_sensor config topic for unusual_consumption."""
+        """_mqtt_publish_all_discovery() must publish a binary_sensor config with json_attributes_topic."""
         fake = _FakeMqttSelf()
         fake._mqtt_publish_all_discovery()
-        config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
-        assert any("binary_sensor/energy_forecast_unusual_consumption/config" in t for t in config_topics), \
-            f"anomaly binary sensor config topic not found in: {config_topics}"
+        config_publishes = {p["topic"]: p["payload"] for p in fake._publishes if "/config" in p["topic"]}
+        anomaly_config_topic = next(
+            (t for t in config_publishes if "binary_sensor/energy_forecast_unusual_consumption/config" in t), None
+        )
+        assert anomaly_config_topic is not None, \
+            f"anomaly binary sensor config topic not found in: {list(config_publishes)}"
+        import json as _json
+        cfg = _json.loads(config_publishes[anomaly_config_topic])
+        assert "json_attributes_topic" in cfg, "Missing json_attributes_topic in anomaly discovery payload"
 
     def test_cleanup_legacy_includes_anomaly_sensor(self):
         """_cleanup_legacy_states() must include binary_sensor.energy_forecast_unusual_consumption."""
