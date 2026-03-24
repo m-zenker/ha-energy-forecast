@@ -13,11 +13,10 @@ Current baseline: v0.6.0 on `main` (next milestone: v0.7.0 — accuracy + visibi
 |-----------|---------|----------|--------|
 | Hotfix merge | v0.5.3 | Merge `dev` → `main`: log noise reduction, XX:01 hourly alignment | done |
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
-| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done) | ✓ done |
-| Anomaly + dashboards | v0.8.0 | #39 Anomaly detection sensor, #43 ApexCharts config snippet | planned |
-| Explainability | v0.9.0 | #42 SHAP feature importance, quantile interval calibration | planned |
-| Solar + battery | v0.10.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
-| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #44 Model versioning, #45 CSV health checks | backlog |
+| Accuracy + visibility | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done) | planned |
+| Explainability | v0.8.0 | #42 SHAP feature importance, quantile interval calibration | planned |
+| Solar + battery | v0.9.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
+| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #43 ApexCharts snippet, #44 Model versioning, #45 CSV health checks | backlog |
 
 ### Deployment workflow (per release)
 
@@ -355,7 +354,7 @@ Regression tests added in `TestWeatherPerHourVariation` (`tests/test_model.py`) 
 guard against future regressions: each column must have `nunique() > 1` across 48 h,
 and `temp_c` at h=0 and h=47 must match the input forecast values exactly.
 
-### 39. Anomaly detection on forecast residuals *(planned — v0.8.0)*
+### 39. Anomaly detection on forecast residuals *(planned — v0.7.0)*
 Publish `binary_sensor.energy_forecast_unusual_consumption` that fires when the latest
 actual reading deviates by more than N standard deviations from the model's prediction
 made 1 h earlier. Uses the existing `_compute_live_mae` residual series; threshold N
@@ -385,7 +384,7 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
-### 43. ApexCharts / Lovelace config snippet *(planned — v0.8.0)*
+### 43. ApexCharts / Lovelace config snippet *(long-term backlog)*
 A documented, copy-paste YAML config for an ApexCharts card showing forecast vs actual
 consumption. Not a custom card — uses `sensor.energy_forecast_*` sensors that already
 exist. Include a sample screenshot and instructions in README under a new "Dashboard"
@@ -466,10 +465,10 @@ Migration reference:
 | 36 | Sub-sensor rolling run count (`{prefix}_runs_7d`) | low–medium | 30 min | ✓ done |
 | 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
 | 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | ✓ done |
-| 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | planned v0.8.0 |
+| 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | planned v0.7.0 |
 | 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | planned v0.7.0 |
 | 42 | SHAP feature importance per prediction | explainability | 3 h | planned v0.9.0 |
-| 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | planned v0.8.0 |
+| 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | long-term backlog |
 | 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
 | 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |

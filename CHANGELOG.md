@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Anomaly detection sensor (#39)** (`energy_forecast.py`): new binary sensor
+  `binary_sensor.energy_forecast_unusual_consumption` fires when the latest actual consumption
+  deviates more than `anomaly_sigma_threshold` (default 3.0) standard deviations from the stored
+  day-ahead prediction.  State is `off` during cold-start (< 10 matched pairs).  Attributes:
+  `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`.  Published in both set_state
+  and MQTT Discovery modes (`binary_sensor/<uid>/config` topic).  New config key:
+  `anomaly_sigma_threshold` (float > 0, default 3.0, validated at startup).
 - **Rolling MAE sensors (#41)** (`energy_forecast.py`): two new sensors track live forecast accuracy
   over a rolling window using stored prediction-vs-actual pairs:
   - `sensor.energy_forecast_mae_7d` — mean absolute error over the last 7 days (n_pairs attribute)

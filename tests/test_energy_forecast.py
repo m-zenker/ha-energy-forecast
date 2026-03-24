@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from energy_forecast.energy_forecast import _blend_today_totals, _compute_live_mae
+from energy_forecast.energy_forecast import _blend_today_totals, _compute_live_mae, _compute_anomaly
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -389,6 +389,7 @@ class _FakeValidateSelf:
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
         self._adaptive_retrain_threshold = 2.0
+        self._anomaly_sigma_threshold    = 3.0
         self._sub_energy_sensors         = []
         self._mqtt_discovery             = False
         self._mqtt_namespace             = "mqtt"
@@ -501,6 +502,7 @@ class _FakeMqttSelf:
         self._ml_model.engine = "lgbm"
         self._ev_threshold = 7.0
         self._ev_charger_kw = 9.0
+        self._anomaly_sigma_threshold = 3.0
         self._states: dict = {}
 
     def call_service(self, service: str, **kwargs) -> None:
@@ -545,6 +547,14 @@ class _FakeMqttSelf:
     def _mqtt_publish_all_discovery(self) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
         EnergyForecast._mqtt_publish_all_discovery(self)
+
+    def _build_binary_sensor_discovery_payload(self, *args, **kwargs) -> dict:
+        from energy_forecast.energy_forecast import EnergyForecast
+        return EnergyForecast._build_binary_sensor_discovery_payload(self, *args, **kwargs)
+
+    def _mqtt_publish_binary_sensor_discovery(self, *args, **kwargs) -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+        EnergyForecast._mqtt_publish_binary_sensor_discovery(self, *args, **kwargs)
 
 
 class TestMqttPublishDiscovery:
@@ -749,6 +759,8 @@ class TestCleanupLegacyStates:
         # Rolling MAE sensors (#41)
         assert "sensor.energy_forecast_mae_7d" in removed
         assert "sensor.energy_forecast_mae_30d" in removed
+        # Anomaly detection sensor (#39)
+        assert "binary_sensor.energy_forecast_unusual_consumption" in removed
         # Block sensors
         for day in ("today", "tomorrow"):
             for slot in BLOCK_SLOTS:
@@ -981,3 +993,158 @@ class TestRollingMaeSensors:
             f"mae_7d config topic not found in: {config_topics}"
         assert any("energy_forecast_mae_30d/config" in t for t in config_topics), \
             f"mae_30d config topic not found in: {config_topics}"
+
+
+# ── #39 Anomaly detection sensor ──────────────────────────────────────────────
+
+class TestAnomalyDetection:
+    """Tests for _compute_anomaly and its integration with _publish / discovery."""
+
+    # ── helpers ──
+
+    def _make_pred_history(self, n: int, kwh: float = 2.0, start: pd.Timestamp | None = None) -> dict:
+        """n hourly predictions, all equal to kwh."""
+        if start is None:
+            start = pd.Timestamp("2026-03-01 00:00")
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t: kwh for t in ts}
+
+    def _make_actuals_history(self, n: int, kwh: float = 2.0, start: pd.Timestamp | None = None) -> dict:
+        """n floored-1h actuals, all equal to kwh."""
+        if start is None:
+            start = pd.Timestamp("2026-03-01 00:00")
+        ts = pd.date_range(start, periods=n, freq="1h")
+        return {t.floor("1h"): kwh for t in ts}
+
+    # ── _compute_anomaly unit tests ──
+
+    def test_fires_above_threshold(self):
+        """Latest residual far above std must return is_anomaly=True."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        # 20 pairs with residual ≈ 0.0 (pred=2.0, actual=2.0), then 1 spike
+        pred_history = self._make_pred_history(21, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.0, start=start)  # all match at 0.0 residual
+        # Override last prediction to be very far from actual
+        latest_ts = start + pd.Timedelta(hours=20)
+        pred_history[latest_ts] = 2.0
+        actuals_history[latest_ts.floor("1h")] = 7.0  # residual = 5.0 kWh
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is True, f"Expected anomaly=True, got residual={residual}, std={std}"
+        assert abs(residual - 5.0) < 1e-6
+
+    def test_silent_below_threshold(self):
+        """Residuals all similar — latest within threshold — must return is_anomaly=False."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        pred_history = self._make_pred_history(20, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.1, start=start)  # residual = 0.1 everywhere
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 20
+
+    def test_cold_start_returns_false(self):
+        """Fewer than min_pairs matched pairs → (False, nan, nan, n)."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        pred_history = self._make_pred_history(5, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(5, kwh=3.0, start=start)
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 5
+        assert math.isnan(residual)
+        assert math.isnan(std)
+
+    def test_empty_histories_return_false(self):
+        """Both empty → (False, nan, nan, 0)."""
+        is_anomaly, residual, std, n = _compute_anomaly({}, {}, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert n == 0
+        assert math.isnan(residual)
+        assert math.isnan(std)
+
+    def test_near_zero_std_guard(self):
+        """Perfect model (std < 0.01) must not fire anomaly even if latest residual is large."""
+        start = pd.Timestamp("2026-03-01 00:00")
+        # All residuals exactly 0 → std = 0
+        pred_history = self._make_pred_history(20, kwh=2.0, start=start)
+        actuals_history = self._make_actuals_history(20, kwh=2.0, start=start)
+
+        is_anomaly, residual, std, n = _compute_anomaly(pred_history, actuals_history, sigma_threshold=3.0)
+
+        assert is_anomaly is False
+        assert std < 0.01
+
+    # ── _publish integration tests ──
+
+    def _base_data(self) -> dict:
+        return {
+            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "mae_7d": 0.25, "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+        }
+
+    def test_publish_set_state_mode_anomaly_on(self):
+        """_publish() in set_state mode must write binary_sensor state 'on' when is_anomaly=True."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {**self._base_data(), "is_anomaly": True,
+                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        eid = "binary_sensor.energy_forecast_unusual_consumption"
+        assert eid in fake._states, f"Expected {eid} in states"
+        assert fake._states[eid]["state"] == "on"
+        assert fake._states[eid]["attributes"]["device_class"] == "problem"
+
+    def test_publish_set_state_mode_anomaly_off(self):
+        """_publish() in set_state mode must write binary_sensor state 'off' when is_anomaly=False."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = {**self._base_data(), "is_anomaly": False,
+                "anomaly_residual": 0.1, "anomaly_std": 0.1, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        eid = "binary_sensor.energy_forecast_unusual_consumption"
+        assert fake._states[eid]["state"] == "off"
+
+    def test_publish_mqtt_mode(self):
+        """_publish() in MQTT mode must publish 'ON' or 'OFF' to the anomaly state topic."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        data = {**self._base_data(), "is_anomaly": True,
+                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        EnergyForecast._publish(fake, data)
+
+        state_topics = {p["topic"]: p["payload"] for p in fake._publishes if "/state" in p["topic"]}
+        anomaly_topic = next(
+            (t for t in state_topics if "unusual_consumption" in t), None
+        )
+        assert anomaly_topic is not None, f"Anomaly state topic not found in: {list(state_topics)}"
+        assert state_topics[anomaly_topic] == "ON"
+
+    def test_mqtt_discovery_includes_anomaly_sensor(self):
+        """_mqtt_publish_all_discovery() must publish a binary_sensor config topic for unusual_consumption."""
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
+        assert any("binary_sensor/energy_forecast_unusual_consumption/config" in t for t in config_topics), \
+            f"anomaly binary sensor config topic not found in: {config_topics}"
+
+    def test_cleanup_legacy_includes_anomaly_sensor(self):
+        """_cleanup_legacy_states() must include binary_sensor.energy_forecast_unusual_consumption."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf()
+        EnergyForecast._cleanup_legacy_states(fake)
+        assert "binary_sensor.energy_forecast_unusual_consumption" in fake._removed_entities
