@@ -36,6 +36,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `test_mqtt_discovery_includes_anomaly_sensor`: extended to verify `json_attributes_topic`
   is present in the binary sensor discovery config payload.
 
+### Docs
+- **`assets/` folder**: logo (light + dark), icon (light + dark), and two dashboard screenshots
+  added to the repository.
+- **README.md**: project logo at top (dark-mode aware via `<picture>`), version badge updated
+  to v0.7.1, new **Dashboard** section with side-by-side screenshots of the forecast overview
+  card and the SHAP feature importance table.
+
 ---
 
 ## [0.7.0] — 2026-03-23
