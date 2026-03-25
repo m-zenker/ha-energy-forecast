@@ -1,12 +1,25 @@
-# HA Energy Forecast
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo_dark.png">
+  <img alt="HA Energy Forecast" src="assets/logo.png" height="60">
+</picture>
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.7.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.7.1-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
+
+---
+
+## Dashboard
+
+| Forecast overview | SHAP feature importance |
+|---|---|
+| ![Forecast overview](assets/dashboard_overview.png) | ![SHAP feature importance](assets/dashboard_shap.png) |
+
+The left card shows today/tomorrow forecasts with prediction-interval min/max and the live ApexCharts "Forecast vs. Real" graph. The right card shows the SHAP feature importance table (rendered via native Lovelace Jinja2 — no custom cards needed). Dashboard YAML is in `dashboard/`.
 
 ---
 
