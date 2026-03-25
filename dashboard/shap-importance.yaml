@@ -1,0 +1,16 @@
+type: markdown
+content: |
+  **SHAP Feature Importance — Today's Forecast**
+
+  {%- set shap = state_attr('sensor.ha_energy_forecast_energy_forecast_today', 'shap_top_features') %}
+  {%- if shap %}
+  | Feature | Contribution |
+  |---------|-------------|
+  {%- for feat, val in shap.items() %}
+  | `{{ feat }}` | {{ val | round(4) }} |
+  {%- endfor %}
+  {%- else %}
+  *Not available — model warming up or shap_top_n = 0*
+  {%- endif %}
+
+# Non-MQTT: replace entity with sensor.energy_forecast_today

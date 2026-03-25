@@ -16,6 +16,7 @@ Feature set:
   - Calendar extras: is_public_holiday, days_to_next_holiday,
     days_since_last_holiday (Swiss federal + optional cantonal)
   - EV charging pattern: likely_ev_hour binary flag
+  - Vacation / away: is_away binary flag (0/1, via away_mode_entity)
 
 Model:
   LightGBM preferred; scikit-learn GBR automatic fallback (e.g. armv7).
@@ -32,6 +33,7 @@ Persistence:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import pickle
 from datetime import datetime
@@ -93,6 +95,8 @@ _FEATURES_BASE = [
     "days_since_last_holiday",
     # EV charging pattern
     "likely_ev_hour",
+    # Vacation / away flag
+    "is_away",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -178,6 +182,9 @@ class EnergyForecastModel:
         self._model_q90 = None
         self._model_q10_path = model_dir / "energy_model_q10.pkl"
         self._model_q90_path = model_dir / "energy_model_q90.pkl"
+        # CQR interval correction scalar (log-space additive offset)
+        self._interval_correction: float = 0.0
+        self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
         # Sub-energy sensor prefixes used in last training run
         self._sub_sensor_prefixes: list[str] = []
 
@@ -194,6 +201,7 @@ class EnergyForecastModel:
         canton: str | None = None,
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
+        away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -241,7 +249,7 @@ class EnergyForecastModel:
 
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
-                                likely_ev_hours=likely_ev_hours)
+                                likely_ev_hours=likely_ev_hours, away_df=away_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -464,21 +472,32 @@ class EnergyForecastModel:
             len(df), engine_name, len(feature_cols), mae_str,
         )
 
-        # ── Quantile models for prediction intervals ─────────────────────────
-        # Trained on same X/y_fit/sample_weight; n_estimators from early stopping.
+        # ── Quantile models for prediction intervals (CQR) ───────────────────
+        # q10/q90 trained on first 85% of rows; last 15% (≥20 rows) used for
+        # split-conformal calibration to achieve ≥80% marginal coverage.
         # Wrapped so a quantile failure never interrupts normal operation.
         try:
+            cal_size  = max(20, int(len(X) * 0.15))
+            split_idx = len(X) - cal_size
+            X_qtrain  = X.iloc[:split_idx]
+            y_qtrain  = y_fit[:split_idx]
+            X_cal     = X.iloc[split_idx:]
+            y_cal_log = y_fit[split_idx:]
+            sw_qtrain = sample_weight[:split_idx] if sample_weight is not None else None
+
             q10 = _build_quantile_model(lgb, GBR, alpha=0.1, n_estimators=best_n_est)
             q90 = _build_quantile_model(lgb, GBR, alpha=0.9, n_estimators=best_n_est)
-            if sample_weight is not None:
-                q10.fit(X, y_fit, sample_weight=sample_weight)
-                q90.fit(X, y_fit, sample_weight=sample_weight)
+            if sw_qtrain is not None:
+                q10.fit(X_qtrain, y_qtrain, sample_weight=sw_qtrain)
+                q90.fit(X_qtrain, y_qtrain, sample_weight=sw_qtrain)
             else:
-                q10.fit(X, y_fit)
-                q90.fit(X, y_fit)
+                q10.fit(X_qtrain, y_qtrain)
+                q90.fit(X_qtrain, y_qtrain)
             self._model_q10 = q10
             self._model_q90 = q90
+            self._calibrate_intervals(X_cal, y_cal_log)
             self._save_quantile_models()
+            self._save_interval_correction()
             _LOGGER.info("Quantile models trained (q10, q90) — prediction intervals available")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Quantile model training failed: %s — prediction intervals unavailable", exc)
@@ -492,6 +511,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None,
         sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -516,6 +536,15 @@ class EnergyForecastModel:
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours)
+
+        # ── Away / vacation flag ─────────────────────────────────────────────
+        # away_series is a 48-value Series indexed by naive prediction timestamps.
+        # Merge by timestamp; fill unmatched rows with 0 (default: not away).
+        if away_series is not None and not away_series.empty:
+            away_map = away_series.reindex(pd.to_datetime(feat_df["timestamp"])).fillna(0)
+            feat_df["is_away"] = away_map.values.astype(int)
+        else:
+            feat_df["is_away"] = 0
 
         # Overwrite hours_ahead with the actual prediction horizon (0–47).
         # _engineer_features sets it to 0 (training-row semantics); here we
@@ -551,6 +580,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
+        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -559,7 +589,9 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
@@ -572,6 +604,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -584,10 +617,15 @@ class EnergyForecastModel:
         if self._model_q10 is None or self._model_q90 is None:
             return None
 
-        future_hours, X = self._prepare_prediction_X(forecast_df, live_temp, recent_actuals, sub_sensors_recent)
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
+            correction = self._interval_correction  # 0.0 when uncalibrated
+            low  -= correction
+            high += correction
             low  = np.expm1(low)
             high = np.expm1(high)
         low  = np.maximum(0, low)
@@ -595,6 +633,59 @@ class EnergyForecastModel:
         # Enforce ordering in case of quantile crossing
         low, high = np.minimum(low, high), np.maximum(low, high)
         return pd.DataFrame({"timestamp": future_hours, "low_kwh": low, "high_kwh": high})
+
+    def shap_summary(
+        self,
+        forecast_df: "pd.DataFrame",
+        live_temp: float | None,
+        recent_actuals: "pd.DataFrame | None" = None,
+        sub_sensors_recent: dict | None = None,
+        away_series: "pd.Series | None" = None,
+        n: int = 5,
+    ) -> dict[str, float]:
+        """Return the top-N driving features for today's prediction slice.
+
+        Uses LightGBM's native TreeSHAP (``pred_contrib=True``) when the engine
+        is LightGBM; falls back to global ``feature_importances_`` for GBR.
+        Values are mean absolute SHAP contributions over today's hours (or all
+        48 hours if today's slice is empty).  When ``_log_transform=True`` the
+        contributions are in log-space — still valid for ranking.
+
+        Returns an empty dict when the model is not trained or ``n <= 0``.
+        """
+        import numpy as np
+        import pandas as pd
+
+        if self.model is None or n <= 0:
+            return {}
+
+        future_hours, X = self._prepare_prediction_X(
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+        )
+
+        # Filter to today's local date; fall back to all rows if none match
+        today = pd.Timestamp.now().normalize()
+        mask = (pd.Series(future_hours) >= today) & (
+            pd.Series(future_hours) < today + pd.Timedelta(days=1)
+        )
+        X_slice = X[mask.values] if mask.sum() >= 3 else X
+
+        if self.engine == "LightGBM":
+            # pred_contrib=True → shape (n_rows, n_features + 1); last column is bias
+            contrib = self.model.predict(X_slice, pred_contrib=True)
+            mean_abs = np.abs(contrib[:, :-1]).mean(axis=0)
+        else:
+            # GBR: global feature_importances_ (no per-prediction SHAP)
+            _LOGGER.debug("shap_summary: GBR engine uses global feature_importances_ (not per-prediction SHAP)")
+            mean_abs = self.model.feature_importances_.astype(float)
+
+        # Pair with feature names and return top-N descending
+        pairs = sorted(
+            zip(self.feature_cols, mean_abs.tolist()),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        return {name: round(float(val), 6) for name, val in pairs[:n]}
 
     def hours_since_trained(self) -> float:
         if self.last_trained == datetime.min:
@@ -652,6 +743,48 @@ class EnergyForecastModel:
                     setattr(self, attr, pickle.load(fh))
             except (pickle.UnpicklingError, EOFError, OSError) as exc:
                 _LOGGER.warning("Could not load quantile model %s: %s", path.name, exc)
+        self._load_interval_correction()
+
+    def _calibrate_intervals(self, X_cal: "pd.DataFrame", y_cal_log: "np.ndarray") -> None:
+        """Compute CQR correction scalar from the calibration split and store it.
+
+        Conformity score: s_i = max(q10(x_i) − y_i,  y_i − q90(x_i)) in log-space.
+        q_hat is the ⌈(n+1)·0.8⌉/n empirical quantile of scores — the additive
+        correction applied symmetrically before expm1 in predict_intervals().
+        """
+        import numpy as np
+
+        n = len(X_cal)
+        if n < 20:
+            _LOGGER.info("CQR calibration skipped (cal_n=%d < 20)", n)
+            self._interval_correction = 0.0
+            return
+
+        q10_pred = self._model_q10.predict(X_cal)
+        q90_pred = self._model_q90.predict(X_cal)
+        scores   = np.maximum(q10_pred - y_cal_log, y_cal_log - q90_pred)
+        level    = min(np.ceil((n + 1) * 0.8) / n, 1.0)
+        q_hat    = float(np.quantile(scores, level))
+        self._interval_correction = q_hat
+        _LOGGER.info("CQR correction: q_hat=%.4f (cal_n=%d)", q_hat, n)
+
+    def _save_interval_correction(self) -> None:
+        try:
+            with open(self._interval_correction_path, "w") as fh:
+                json.dump({"correction": self._interval_correction}, fh)
+        except OSError as exc:
+            _LOGGER.warning("Could not save interval correction: %s", exc)
+
+    def _load_interval_correction(self) -> None:
+        if not self._interval_correction_path.exists():
+            return
+        self._interval_correction = 0.0
+        try:
+            with open(self._interval_correction_path) as fh:
+                data = json.load(fh)
+            self._interval_correction = float(data.get("correction", 0.0))
+        except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+            _LOGGER.warning("Could not load interval correction: %s", exc)
 
     def _load(self) -> None:
         if self._model_path.exists():
@@ -950,6 +1083,7 @@ def _engineer_features(
     outdoor_df: pd.DataFrame | None,    # naive timestamps
     canton: str | None = None,
     likely_ev_hours: set | None = None,
+    away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1037,6 +1171,18 @@ def _engineer_features(
     else:
         df["outdoor_temp_live"] = df["temp_c"]
         df["temp_bias"] = 0.0
+
+    # ── Away / vacation flag ─────────────────────────────────────────────────
+    if away_df is not None and not away_df.empty:
+        a = away_df[["timestamp", "is_away"]].copy()
+        a["timestamp"] = pd.to_datetime(a["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(a, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_aw"))
+        df.drop(columns=["timestamp_aw", "_ts_floor"], errors="ignore", inplace=True)
+        df["is_away"] = df["is_away"].fillna(0).astype(int)
+    else:
+        df["is_away"] = 0
 
     return df
 

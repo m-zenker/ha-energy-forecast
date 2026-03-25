@@ -600,6 +600,34 @@ class TestPredictIntervals:
         assert result is not None
         assert (result["low_kwh"] <= result["high_kwh"]).all()
 
+    def test_interval_correction_stored(self, tmp_path):
+        """After train(), _interval_correction must be a finite float."""
+        m, _ = _make_trained_model(tmp_path)
+        assert isinstance(m._interval_correction, float)
+        assert np.isfinite(m._interval_correction)
+
+    def test_interval_correction_persisted(self, tmp_path):
+        """_interval_correction survives a save/reload round-trip."""
+        m, _ = _make_trained_model(tmp_path)
+        saved_val = m._interval_correction
+        # Reload from disk
+        m2 = EnergyForecastModel(tmp_path)
+        assert np.isclose(m2._interval_correction, saved_val, atol=1e-9)
+
+    def test_calibrated_intervals_wider_than_raw(self, tmp_path):
+        """A positive _interval_correction must widen predict_intervals() output."""
+        m, forecast = _make_trained_model(tmp_path)
+        assert m._log_transform
+        # Raw intervals (no correction)
+        m._interval_correction = 0.0
+        raw = m.predict_intervals(forecast, live_temp=None)
+        # Calibrated intervals (positive correction in log-space)
+        m._interval_correction = 0.3
+        calibrated = m.predict_intervals(forecast, live_temp=None)
+        assert calibrated is not None and raw is not None
+        assert (calibrated["high_kwh"] >= raw["high_kwh"]).all()
+        assert (calibrated["low_kwh"]  <= raw["low_kwh"]).all()
+
 
 # ── EV session probability feature (#12) ─────────────────────────────────────
 
@@ -1233,3 +1261,175 @@ class TestHowMedians:
         # At minimum one lag column should be present
         assert any(k.startswith("lag_") for k in sample)
 
+
+# ── #38 Regression: per-hour weather variation in _engineer_features ──────────
+
+class TestWeatherPerHourVariation:
+    """Regression guard: weather columns must not be scalar-broadcast in prediction."""
+
+    def _make_varied_forecast(self) -> pd.DataFrame:
+        """48 h forecast where every weather variable has a unique value per hour."""
+        start = pd.Timestamp("2026-03-12 08:00")
+        n = 48
+        hours = pd.date_range(start, periods=n, freq="1h")
+        return pd.DataFrame({
+            "timestamp":            hours,
+            "temp_c":               np.linspace(5.0, 20.0, n),
+            "precipitation_mm":     np.linspace(0.0, 5.0, n),
+            "sunshine_min":         np.linspace(0.0, 60.0, n),
+            "wind_kmh":             np.linspace(5.0, 30.0, n),
+            "cloud_cover_pct":      np.linspace(0.0, 100.0, n),
+            "direct_radiation_wm2": np.linspace(0.0, 800.0, n),
+        })
+
+    def test_all_weather_cols_vary_per_hour(self):
+        """Each weather column must have more than one unique value across 48 h."""
+        forecast = self._make_varied_forecast()
+        future_df = pd.DataFrame({"timestamp": forecast["timestamp"], "gross_kwh": np.nan})
+        result = _engineer_features(future_df, forecast, outdoor_df=None)
+        for col in ["temp_c", "precipitation_mm", "sunshine_min",
+                    "wind_kmh", "cloud_cover_pct", "direct_radiation_wm2"]:
+            vals = result[col].dropna()
+            assert vals.nunique() > 1, (
+                f"{col} is flat across 48 h — scalar-broadcast bug present"
+            )
+
+    def test_temp_c_matches_forecast_values(self):
+        """Spot-check: temp_c at h=0 and h=47 must equal the input forecast values."""
+        forecast = self._make_varied_forecast()
+        future_df = pd.DataFrame({"timestamp": forecast["timestamp"], "gross_kwh": np.nan})
+        result = _engineer_features(future_df, forecast, outdoor_df=None)
+        result = result.reset_index(drop=True)
+        assert abs(float(result.loc[0, "temp_c"]) - 5.0) < 1e-6, (
+            "temp_c at h=0 does not match forecast input"
+        )
+        assert abs(float(result.loc[47, "temp_c"]) - 20.0) < 1e-6, (
+            "temp_c at h=47 does not match forecast input"
+        )
+
+
+# ── #25 Vacation / Away Flag ───────────────────────────────────────────────────
+
+class TestAwayFeature:
+    """is_away binary feature: presence, zero default, value propagation, predict."""
+
+    def _make_weather(self, ts):
+        return pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [10.0] * len(ts),
+            "precipitation_mm":     [0.0]  * len(ts),
+            "sunshine_min":         [30.0] * len(ts),
+            "wind_kmh":             [10.0] * len(ts),
+            "cloud_cover_pct":      [50.0] * len(ts),
+            "direct_radiation_wm2": [100.0]* len(ts),
+        })
+
+    def _make_bare(self, ts):
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.5] * len(ts)})
+
+    def test_is_away_in_features_base(self):
+        assert "is_away" in _FEATURES_BASE
+
+    def test_is_away_column_present_with_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [1, 1, 0, 0]})
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=away_df)
+        assert "is_away" in result.columns
+
+    def test_is_away_zero_without_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=None)
+        assert "is_away" in result.columns
+        assert (result["is_away"] == 0).all()
+
+    def test_is_away_values_match_away_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [1, 0, 1, 0]})
+        result = _engineer_features(self._make_bare(ts), self._make_weather(ts), None,
+                                    away_df=away_df)
+        assert list(result["is_away"].values) == [1, 0, 1, 0]
+
+    def test_is_away_in_feature_cols_after_train(self, tmp_path):
+        n = 600
+        rng = np.random.default_rng(5)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = self._make_weather(ts)
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [0] * n})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, away_df=away_df)
+        assert "is_away" in m.feature_cols
+
+    def test_predict_with_away_series(self, tmp_path):
+        """predict() must propagate away_series into the is_away feature column,
+        and predictions must be valid (non-NaN, non-negative)."""
+        n = 600
+        rng = np.random.default_rng(5)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = self._make_weather(ts)
+        away_df = pd.DataFrame({"timestamp": ts, "is_away": [0] * n})
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, away_df=away_df)
+        assert "is_away" in m.feature_cols
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast = self._make_weather(future_ts)
+        away_ones  = pd.Series(1, index=future_ts, dtype=int)
+        away_zeros = pd.Series(0, index=future_ts, dtype=int)
+        # Verify feature propagation at the matrix level
+        _, X_away = m._prepare_prediction_X(forecast, None, None, away_series=away_ones)
+        _, X_home = m._prepare_prediction_X(forecast, None, None, away_series=away_zeros)
+        assert (X_away["is_away"] == 1).all(), "is_away must be 1 when away_series=all-ones"
+        assert (X_home["is_away"] == 0).all(), "is_away must be 0 when away_series=all-zeros"
+        # Verify predict() returns valid results
+        result = m.predict(forecast, live_temp=None, away_series=away_ones)
+        assert len(result) == 48
+        assert result["predicted_kwh"].notna().all()
+        assert result["predicted_kwh"].ge(0).all()
+
+
+# ── #42 SHAP feature importance ───────────────────────────────────────────────
+
+class TestShapSummary:
+    """shap_summary(): returns top-N features, sorted, guards cold-start and n=0."""
+
+    def test_returns_n_features(self, tmp_path):
+        """shap_summary() returns exactly n entries when model is trained."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        assert isinstance(result, dict)
+        assert len(result) == 5
+
+    def test_sorted_by_importance_descending(self, tmp_path):
+        """Returned dict values must be in descending order."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        values = list(result.values())
+        assert values == sorted(values, reverse=True), (
+            f"Values not descending: {values}"
+        )
+
+    def test_cold_start_returns_empty(self, tmp_path):
+        """shap_summary() on an untrained model must return {}."""
+        m = EnergyForecastModel(tmp_path)
+        # Build a minimal forecast_df
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp":            future_ts,
+            "temp_c":               [10.0] * 48,
+            "precipitation_mm":     [0.0]  * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0]* 48,
+        })
+        result = m.shap_summary(forecast, live_temp=None, n=5)
+        assert result == {}
+
+    def test_n_zero_returns_empty(self, tmp_path):
+        """n=0 disables SHAP and must return {}."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.shap_summary(forecast, live_temp=None, n=0)
+        assert result == {}
