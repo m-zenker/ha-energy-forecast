@@ -399,6 +399,8 @@ class _FakeValidateSelf:
         self._sub_energy_sensors         = []
         self._solar_sensor               = None
         self._grid_export_sensor         = None
+        self._battery_charge_sensor      = None
+        self._battery_discharge_sensor   = None
         self._mqtt_discovery             = False
         self._mqtt_namespace             = "mqtt"
         self._mqtt_discovery_prefix      = "homeassistant"
@@ -429,6 +431,25 @@ class TestValidateConfig:
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         EnergyForecast._validate_config(fake)
         assert not fake._warnings, "No warning expected when ev_threshold < ev_charger_kw"
+
+    def test_warns_solar_sensor_without_grid_export(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._solar_sensor = "sensor.solar_production"
+        EnergyForecast._validate_config(fake)
+        assert any("grid_export_sensor" in w for w in fake._warnings), (
+            "Expected WARNING when solar_production_sensor is set without grid_export_sensor"
+        )
+
+    def test_no_warning_solar_sensor_with_grid_export(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._solar_sensor = "sensor.solar_production"
+        fake._grid_export_sensor = "sensor.grid_export"
+        EnergyForecast._validate_config(fake)
+        assert not any("grid_export_sensor" in w for w in fake._warnings), (
+            "No grid_export warning expected when both solar and export sensors are configured"
+        )
 
 
 # ── Setup checker sensor (#17) ────────────────────────────────────────────────
