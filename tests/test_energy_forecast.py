@@ -396,6 +396,7 @@ class _FakeValidateSelf:
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold    = 3.0
         self._shap_top_n                 = 5
+        self._model_archive_count        = 3
         self._sub_energy_sensors         = []
         self._solar_sensor               = None
         self._grid_export_sensor         = None

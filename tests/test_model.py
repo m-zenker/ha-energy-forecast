@@ -1433,3 +1433,107 @@ class TestShapSummary:
         m, forecast = _make_trained_model(tmp_path)
         result = m.shap_summary(forecast, live_temp=None, n=0)
         assert result == {}
+
+
+# ── #44 Model versioning ───────────────────────────────────────────────────────
+
+class TestModelVersioning:
+    """EnergyForecastModel._archive_current() and rollback_model()."""
+
+    def test_no_archive_on_first_save(self, tmp_path):
+        """First-ever train() must not create an archive directory."""
+        _make_trained_model(tmp_path)
+        archive_dir = tmp_path / "archive"
+        assert not archive_dir.exists() or not list(archive_dir.iterdir())
+
+    def test_archive_created_on_second_save(self, tmp_path):
+        """Second train() must create exactly one archive snapshot."""
+        import re
+        m, _ = _make_trained_model(tmp_path)
+        m.train(*_make_trained_model.__wrapped__(tmp_path)[0].train.__self__) if False else None
+        # Re-use helper: train the same instance a second time
+        rng = np.random.default_rng(1)
+        n = 600
+        ts = pd.date_range("2024-06-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_dir = tmp_path / "archive"
+        assert archive_dir.exists()
+        subdirs = list(archive_dir.iterdir())
+        assert len(subdirs) == 1
+        assert re.match(r"\d{8}T\d{6}$", subdirs[0].name)
+
+    def test_only_last_n_archives_retained(self, tmp_path):
+        """With model_archive_count=2, four trains must leave ≤2 archive dirs."""
+        rng = np.random.default_rng(42)
+        m = EnergyForecastModel(tmp_path, model_archive_count=2)
+        for i in range(4):
+            n = 600
+            ts = pd.date_range(f"2024-0{i+1}-01", periods=n, freq="1h")
+            energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+            weather = pd.DataFrame({
+                "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+                "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+                "direct_radiation_wm2": [100.0]*n,
+            })
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_dir = tmp_path / "archive"
+        assert archive_dir.exists()
+        assert len(list(archive_dir.iterdir())) <= 2
+
+    def test_rollback_restores_previous_model(self, tmp_path):
+        """rollback_model() after two trains must restore the first training time."""
+        m, _ = _make_trained_model(tmp_path)
+        t1 = m.last_trained
+
+        rng = np.random.default_rng(7)
+        n = 600
+        ts = pd.date_range("2024-07-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        t2 = m.last_trained
+        assert t2 >= t1
+
+        success = m.rollback_model()
+        assert success is True
+
+        m2 = EnergyForecastModel(tmp_path)
+        assert m2.last_trained == t1
+
+    def test_rollback_no_archive_returns_false(self, tmp_path):
+        """rollback_model() on a fresh (never-trained) instance returns False."""
+        m = EnergyForecastModel(tmp_path)
+        assert m.rollback_model() is False
+
+    def test_rollback_logs_warning(self, tmp_path, caplog):
+        """rollback_model() after two trains must log a WARNING with the archive name."""
+        import logging
+        m, _ = _make_trained_model(tmp_path)
+        rng = np.random.default_rng(99)
+        n = 600
+        ts = pd.date_range("2024-09-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_name = sorted((tmp_path / "archive").iterdir())[-1].name
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            m.rollback_model()
+        assert any(archive_name in r.message for r in caplog.records)

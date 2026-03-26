@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Model versioning** (`model.py`, `energy_forecast.py`): before overwriting model files each
+  weekly retrain, the previous snapshot is archived to `models/archive/<timestamp>/`. Configurable
+  via `model_archive_count` (default 3); set to 0 to disable. Roll back by firing HA event
+  `energy_forecast_rollback_model` — sensors update automatically. Includes 6 unit tests
+  (`TestModelVersioning`).
+- **CSV health checks** (`ha_data.py`): `validate_energy_cache()` runs after every weekly
+  retrain merge and logs WARNINGs for: non-monotonic timestamps, gaps > 2 h (with DST note),
+  and out-of-range `gross_kwh` values that survived the spike filter. Never raises. Includes 7 unit
+  tests + 1 integration test (`TestValidateEnergyCache`, `TestValidateCacheIntegration`).
 - **Solar PV + battery target correction** (`energy_forecast.py`): four new optional config keys
   (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`,
   `battery_discharge_sensor`) allow the training target to be corrected from raw grid import

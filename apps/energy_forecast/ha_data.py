@@ -48,6 +48,63 @@ def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:
         )
 
 
+def validate_energy_cache(df: "pd.DataFrame", logger: logging.Logger) -> None:
+    """Run defensive health checks on the merged energy cache DataFrame.
+
+    Logs WARNINGs for detected issues; never raises.  Intended to catch
+    problems in the cached CSV that should have been filtered upstream
+    (meter resets, corrupt rows, clock drift).
+
+    Three checks:
+      1. Non-monotonic timestamps — rows where timestamp decreases.
+      2. Gaps > 2h between consecutive rows (includes DST spring-forward).
+      3. Out-of-range gross_kwh: values outside (0, MAX_HOURLY_KWH].
+    """
+    import pandas as pd
+
+    if df.empty or "timestamp" not in df.columns:
+        return
+    try:
+        diffs = df["timestamp"].diff()
+
+        # Check 1: non-monotonic timestamps (NaT on first row evaluates False, correct)
+        n_bad = int((diffs < pd.Timedelta(0)).sum())
+        if n_bad:
+            example = df.loc[diffs < pd.Timedelta(0), "timestamp"].iloc[0]
+            logger.warning(
+                "Cache health: %d non-monotonic timestamp(s) detected (e.g. %s). "
+                "Cache may have been written out-of-order.",
+                n_bad, example,
+            )
+
+        # Check 2: gaps > 2h (strict)
+        gap_mask = diffs > pd.Timedelta(hours=2)
+        n_gaps = int(gap_mask.sum())
+        if n_gaps:
+            first_gap = df.loc[gap_mask, "timestamp"].iloc[0]
+            logger.warning(
+                "Cache health: %d gap(s) > 2h in energy history. "
+                "First gap ends at %s. "
+                "DST spring-forward (late March) causes a natural ~2h gap — "
+                "check if expected.",
+                n_gaps, first_gap,
+            )
+
+        # Check 3: out-of-range gross_kwh values
+        if "gross_kwh" in df.columns:
+            bad_mask = ~((df["gross_kwh"] > 0) & (df["gross_kwh"] <= MAX_HOURLY_KWH))
+            n_bad_vals = int(bad_mask.sum())
+            if n_bad_vals:
+                example_val = df.loc[bad_mask, "gross_kwh"].iloc[0]
+                logger.warning(
+                    "Cache health: %d row(s) with gross_kwh outside (0, %.1f] "
+                    "(e.g. %.4f). Spike filter may have missed these.",
+                    n_bad_vals, MAX_HOURLY_KWH, example_val,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("validate_energy_cache raised unexpectedly: %s", exc)
+
+
 def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
 
@@ -107,6 +164,7 @@ def fetch_energy_history(
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
+    validate_energy_cache(combined, _LOGGER)
 
     # 5. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
     # This also corrects any stale values that slipped through fetch_recent_energy's

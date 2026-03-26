@@ -83,6 +83,8 @@ class EnergyForecast(hass.Hass):
         )
         # SHAP feature importance: top-N features exposed as sensor attribute (0 = off)
         self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
+        # Model versioning: number of archived model snapshots to retain
+        self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float]    = {}
@@ -103,10 +105,11 @@ class EnergyForecast(hass.Hass):
             self._mqtt_publish_availability("online")
 
         model_dir = Path(__file__).parent / "models"
-        self._ml_model = EnergyForecastModel(model_dir)
+        self._ml_model = EnergyForecastModel(model_dir, model_archive_count=self._model_archive_count)
         self._lock = threading.Lock()
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
+        self.listen_event(self._rollback_model_cb, "energy_forecast_rollback_model")
 
         self._check_setup()
         self._publish_unavailable()
@@ -149,6 +152,10 @@ class EnergyForecast(hass.Hass):
             )
         if self._shap_top_n < 0:
             raise ValueError(f"shap_top_n must be >= 0, got {self._shap_top_n}")
+        if self._model_archive_count < 0:
+            raise ValueError(
+                f"model_archive_count must be >= 0, got {self._model_archive_count}"
+            )
         if self._ev_threshold >= self._ev_charger_kw:
             self.log(
                 f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
@@ -516,6 +523,20 @@ class EnergyForecast(hass.Hass):
                 self._update_sensors()
         except Exception as exc:  # noqa: BLE001
             self.log(f"Retraining failed: {exc}", level="ERROR")
+        finally:
+            self._lock.release()
+
+    def _rollback_model_cb(self, event_name=None, data=None, kwargs=None) -> None:
+        """Restore the previous model snapshot and refresh sensors."""
+        if not self._lock.acquire(blocking=False):
+            self.log("Rollback skipped — another operation is running.", level="DEBUG")
+            return
+        try:
+            success = self._ml_model.rollback_model()
+            if success and self._ml_model.model is not None:
+                self._update_sensors()
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Model rollback failed: {exc}", level="ERROR")
         finally:
             self._lock.release()
 

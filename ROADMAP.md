@@ -15,8 +15,8 @@ Current baseline: v0.7.1 on feature branch, pending dev merge.
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
-| Solar + battery | v0.8.0 | #23 B1 target correction (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`, `battery_discharge_sensor`) | planned (branch ready) |
-| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #44 Model versioning, #45 CSV health checks | backlog |
+| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | planned (branch ready) |
+| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
 
@@ -423,7 +423,7 @@ exist. Include a sample screenshot and instructions in README under a new "Dashb
 section.
 Expected impact: Visibility / UX; Low effort (docs only).
 
-### 44. Model versioning — keep last N, rollback *(long-term backlog)*
+### 44. Model versioning — keep last N, rollback *(planned — v0.8.0)*
 When a new model is trained, archive the previous `energy_model.pkl` / `meta.pkl` pair
 under a timestamped filename (e.g. `energy_model_20260324T1200.pkl`). Keep the last N
 versions (configurable, default 3). Add a `rollback_model()` helper that loads the
@@ -431,7 +431,7 @@ previous version and logs a WARNING. Useful when experimenting with new features
 accuracy regression.
 Expected impact: Ops safety; Low effort.
 
-### 45. CSV health checks + gap repair *(long-term backlog)*
+### 45. CSV health checks + gap repair *(planned — v0.8.0)*
 On startup (and optionally on each weekly retrain), validate `energy_history.csv` for:
 - Monotonically increasing timestamps (detect clock resets or duplicated rows).
 - Gaps > 2 h that are not explained by DST (log WARNING; optionally back-fill from HA).
@@ -502,8 +502,8 @@ Migration reference:
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | ✓ done v0.7.0 |
 | 42 | SHAP feature importance per prediction | explainability | 3 h | ✓ done v0.7.0 |
 | 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | ✓ done v0.7.0 |
-| 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
-| 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |
+| 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | ✓ done v0.8.0 |
+| 45 | CSV health checks + gap repair | correctness / defensive | 2 h | ✓ done v0.8.0 |
 | 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
 | 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | ✓ done v0.7.1 |
 | 48 | Anomaly binary sensor MQTT attrs + discovery fix | correctness / UX | 30 min | ✓ done v0.7.1 |
