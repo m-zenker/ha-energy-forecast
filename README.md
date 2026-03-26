@@ -107,7 +107,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - [AppDaemon 4.x](https://github.com/AppDaemon/appdaemon) installed as an HA add-on or standalone
 
 ### AppDaemon add-on configuration
-The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must be declared in the add-on's own configuration, which is edited via the HA UI under **Settings → Add-ons → AppDaemon → Configuration**:
+The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must be declared in the add-on's own configuration, edited via **Settings → Add-ons → AppDaemon → Configuration** in the HA UI:
 
 ```yaml
 system_packages:
@@ -119,16 +119,19 @@ python_packages:
   - requests>=2.31.0
   - holidays>=0.46
 init_commands:
-  - >-
-    pip install --extra-index-url https://alpine-wheels.github.io/index pandas
-    numpy scikit-learn lightgbm
+  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy scikit-learn"
+  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
 ```
 
-`system_packages` provides the Alpine build toolchain needed to compile numpy/scipy extensions. `python_packages` handles pure-Python packages. `init_commands` runs the pip install with the extra index URL required for pre-built Alpine/ARM wheels of pandas, numpy, scikit-learn, and LightGBM.
+`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source). `python_packages` handles pure-Python packages.
 
-> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove `lightgbm` from the `init_commands` line. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
+**Why `init_commands` instead of `python_packages`?** AppDaemon runs on Alpine Linux (musl libc). Heavy packages such as LightGBM have no pre-built Alpine wheels on PyPI and must be compiled from source. The add-on's `/data/` volume survives container restarts, so pointing pip's wheel cache there means LightGBM is compiled once (**~5 min on first restart**) and reused on every subsequent start (**~30 sec**). pandas, numpy, and scikit-learn are fetched as pre-built Alpine wheels from the `alpine-wheels` index and do not need compilation.
 
-This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root — it is identical to the block above; copy either source.
+> **Important:** each `init_commands` entry must be a **separate list item**. A single `>-` folded scalar merges all lines into one string, which can pass package names as stray tokens to an earlier pip command.
+
+> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and `system_packages`. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
+
+This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root — copy either source.
 
 ### Python packages reference
 
