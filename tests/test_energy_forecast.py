@@ -15,7 +15,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from energy_forecast.energy_forecast import _blend_today_totals, _compute_live_mae, _compute_anomaly
+from energy_forecast.energy_forecast import (
+    _apply_target_correction,
+    _blend_today_totals,
+    _compute_anomaly,
+    _compute_live_mae,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -392,6 +397,8 @@ class _FakeValidateSelf:
         self._anomaly_sigma_threshold    = 3.0
         self._shap_top_n                 = 5
         self._sub_energy_sensors         = []
+        self._solar_sensor               = None
+        self._grid_export_sensor         = None
         self._mqtt_discovery             = False
         self._mqtt_namespace             = "mqtt"
         self._mqtt_discovery_prefix      = "homeassistant"
@@ -1175,3 +1182,94 @@ class TestAnomalyDetection:
         fake = _FakeMqttSelf()
         EnergyForecast._cleanup_legacy_states(fake)
         assert "binary_sensor.energy_forecast_unusual_consumption" in fake._removed_entities
+
+
+# ── _apply_target_correction ──────────────────────────────────────────────────
+
+def _make_corr_df(timestamps, kwh_values):
+    """Helper: build a correction DataFrame with timestamp + kwh columns."""
+    return pd.DataFrame({"timestamp": pd.DatetimeIndex(timestamps), "kwh": kwh_values})
+
+
+class TestTargetCorrection:
+    """Tests for _apply_target_correction — training target correction for solar + battery."""
+
+    def _base_df(self, n=10, gross=2.0):
+        """Simple energy DataFrame: n hourly rows, all gross_kwh = gross."""
+        ts = pd.date_range("2026-06-01", periods=n, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [gross] * n})
+
+    def test_solar_only_adds_to_gross_kwh(self):
+        df = self._base_df(gross=2.0)
+        solar = _make_corr_df(df["timestamp"], [1.0] * 10)
+        result = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
+                                          battery_charge_df=None, battery_discharge_df=None)
+        assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
+
+    def test_grid_export_subtracts_from_gross_kwh(self):
+        df = self._base_df(gross=3.0)
+        export = _make_corr_df(df["timestamp"], [1.0] * 10)
+        result = _apply_target_correction(df, solar_df=None, grid_export_df=export,
+                                          battery_charge_df=None, battery_discharge_df=None)
+        assert result["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
+
+    def test_solar_and_export_combined(self):
+        df = self._base_df(gross=2.0)
+        solar  = _make_corr_df(df["timestamp"], [3.0] * 10)
+        export = _make_corr_df(df["timestamp"], [1.0] * 10)
+        result = _apply_target_correction(df, solar_df=solar, grid_export_df=export,
+                                          battery_charge_df=None, battery_discharge_df=None)
+        # 2 + 3 - 1 = 4
+        assert result["gross_kwh"].tolist() == pytest.approx([4.0] * 10)
+
+    def test_battery_charge_subtracts(self):
+        df = self._base_df(gross=5.0)
+        charge = _make_corr_df(df["timestamp"], [2.0] * 10)
+        result = _apply_target_correction(df, solar_df=None, grid_export_df=None,
+                                          battery_charge_df=charge, battery_discharge_df=None)
+        assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
+
+    def test_battery_discharge_adds(self):
+        df = self._base_df(gross=1.0)
+        discharge = _make_corr_df(df["timestamp"], [2.0] * 10)
+        result = _apply_target_correction(df, solar_df=None, grid_export_df=None,
+                                          battery_charge_df=None, battery_discharge_df=discharge)
+        assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
+
+    def test_full_correction_all_four_sensors(self):
+        # grid_import=3, solar=5, export=2, charge=1, discharge=0.5
+        # expected: 3 + 5 - 2 - 1 + 0.5 = 5.5
+        df = self._base_df(gross=3.0)
+        solar     = _make_corr_df(df["timestamp"], [5.0] * 10)
+        export    = _make_corr_df(df["timestamp"], [2.0] * 10)
+        charge    = _make_corr_df(df["timestamp"], [1.0] * 10)
+        discharge = _make_corr_df(df["timestamp"], [0.5] * 10)
+        result = _apply_target_correction(df, solar_df=solar, grid_export_df=export,
+                                          battery_charge_df=charge, battery_discharge_df=discharge)
+        assert result["gross_kwh"].tolist() == pytest.approx([5.5] * 10)
+
+    def test_result_clipped_to_zero(self):
+        # gross_kwh=1, export=5 → would be -4 without clip
+        df = self._base_df(gross=1.0)
+        export = _make_corr_df(df["timestamp"], [5.0] * 10)
+        result = _apply_target_correction(df, solar_df=None, grid_export_df=export,
+                                          battery_charge_df=None, battery_discharge_df=None)
+        assert (result["gross_kwh"] >= 0).all()
+        assert result["gross_kwh"].tolist() == pytest.approx([0.0] * 10)
+
+    def test_unmatched_timestamps_get_zero_correction(self):
+        df = self._base_df(gross=2.0)
+        # correction timestamps are 7 days later — no overlap
+        future_ts = df["timestamp"] + pd.Timedelta(days=7)
+        solar = _make_corr_df(future_ts, [5.0] * 10)
+        result = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
+                                          battery_charge_df=None, battery_discharge_df=None)
+        # unmatched hours get zero delta; gross_kwh unchanged
+        assert result["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
+
+    def test_original_df_not_mutated(self):
+        df = self._base_df(gross=2.0)
+        solar = _make_corr_df(df["timestamp"], [1.0] * 10)
+        _ = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
+                                     battery_charge_df=None, battery_discharge_df=None)
+        assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)

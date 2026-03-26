@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Solar PV + battery target correction** (`energy_forecast.py`): four new optional config keys
+  (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`,
+  `battery_discharge_sensor`) allow the training target to be corrected from raw grid import
+  to true household consumption:
+  `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
+  All sensors must be cumulative kWh entities (`state_class: total_increasing`). Any subset of
+  the four sensors can be configured independently; no hardware is required to merge the branch.
+  Documented in `apps.yaml.example` with SolarEdge Modbus Multi and Enphase Envoy examples.
+  Includes 9 unit tests for `_apply_target_correction`.
+
 ---
 
 ## [0.7.1] — 2026-03-24

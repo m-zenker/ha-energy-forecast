@@ -68,6 +68,15 @@ class EnergyForecast(hass.Hass):
         # away_return_entity  — input_datetime holding the expected return (for prediction only)
         self._away_mode_entity: str | None   = self.args.get("away_mode_entity") or None
         self._away_return_entity: str | None = self.args.get("away_return_entity") or None
+        # Optional solar PV + battery target correction sensors.
+        # When configured, gross_kwh (grid import) is corrected to true household
+        # consumption before training:
+        #   total_consumption = grid_import − grid_export + solar_production
+        #                       − battery_charge + battery_discharge
+        self._solar_sensor: str | None             = self.args.get("solar_production_sensor") or None
+        self._grid_export_sensor: str | None       = self.args.get("grid_export_sensor") or None
+        self._battery_charge_sensor: str | None    = self.args.get("battery_charge_sensor") or None
+        self._battery_discharge_sensor: str | None = self.args.get("battery_discharge_sensor") or None
         # Anomaly detection: fire binary sensor when residual > sigma_threshold × std(residuals)
         self._anomaly_sigma_threshold: float = float(
             self.args.get("anomaly_sigma_threshold", 3.0)
@@ -145,6 +154,13 @@ class EnergyForecast(hass.Hass):
                 f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
                 f"({self._ev_charger_kw}). EV sessions may not be detected correctly — "
                 "lower the threshold or raise ev_charger_kw.",
+                level="WARNING",
+            )
+        if self._solar_sensor and not self._grid_export_sensor:
+            self.log(
+                "solar_production_sensor is set but grid_export_sensor is not — "
+                "surplus solar exported to the grid will inflate the training target. "
+                "Add grid_export_sensor for accurate consumption correction.",
                 level="WARNING",
             )
         if self._mqtt_discovery:
@@ -537,6 +553,47 @@ class EnergyForecast(hass.Hass):
                 f"EV filter: {len(ev_df)} charging hours detected "
                 f"({ev_df['gross_kwh'].sum():.1f} kWh gross). "
                 f"Sessions on: {sorted(ev_df['timestamp'].dt.date.unique().tolist())}"
+            )
+
+        # ── Solar / grid-export / battery target correction ───────────────────
+        # Corrects gross_kwh (grid import) to total household consumption.
+        # Each sensor is optional; any combination is valid.
+        _correction_specs = [
+            (self._solar_sensor,             "solar_production.csv"),
+            (self._grid_export_sensor,       "grid_export.csv"),
+            (self._battery_charge_sensor,    "battery_charge.csv"),
+            (self._battery_discharge_sensor, "battery_discharge.csv"),
+        ]
+        correction_dfs: dict[str, Any] = {}
+        for sensor, cache_name in _correction_specs:
+            if sensor:
+                cache = self._cache_path.parent / cache_name
+                try:
+                    cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache)
+                    correction_dfs[cache_name] = _strip_tz(cdf)
+                except (OSError, KeyError, ValueError) as exc:
+                    self.log(
+                        f"Target correction fetch failed ({cache_name}): {exc}",
+                        level="WARNING",
+                    )
+                    correction_dfs[cache_name] = None
+            else:
+                correction_dfs[cache_name] = None
+
+        if any(v is not None for v in correction_dfs.values()):
+            baseline_df = _apply_target_correction(
+                baseline_df,
+                solar_df=correction_dfs["solar_production.csv"],
+                grid_export_df=correction_dfs["grid_export.csv"],
+                battery_charge_df=correction_dfs["battery_charge.csv"],
+                battery_discharge_df=correction_dfs["battery_discharge.csv"],
+            )
+            self.log(
+                "Target corrected: total_consumption = grid_import"
+                + (" + solar" if correction_dfs["solar_production.csv"] is not None else "")
+                + (" − grid_export" if correction_dfs["grid_export.csv"] is not None else "")
+                + (" − battery_charge" if correction_dfs["battery_charge.csv"] is not None else "")
+                + (" + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "")
             )
 
         start_date = baseline_df["timestamp"].min().date()
@@ -1195,6 +1252,55 @@ def _empty_weather_df() -> Any:
             "cloud_cover_pct", "direct_radiation_wm2",
         ]
     )
+
+
+def _apply_target_correction(
+    df: Any,
+    solar_df: Any,
+    grid_export_df: Any,
+    battery_charge_df: Any,
+    battery_discharge_df: Any,
+) -> Any:
+    """Correct gross_kwh (grid import) to total household consumption.
+
+    total_consumption = grid_import
+                        + solar_production
+                        − grid_export
+                        − battery_charge
+                        + battery_discharge
+
+    Each correction DataFrame has columns [timestamp, kwh] and may be None.
+    Timestamps are matched exactly (hourly floor assumed). Unmatched hours
+    receive zero correction — absence of data means no flow, not NaN.
+    The result is clipped to 0 (consumption cannot be negative).
+    Returns a copy of df with corrected gross_kwh.
+    """
+    import pandas as pd
+    import numpy as np
+
+    df = df.copy()
+    ts_index = pd.DatetimeIndex(df["timestamp"])
+    delta = pd.Series(np.zeros(len(df), dtype=float), index=ts_index)
+
+    signed_dfs = [
+        (solar_df,           +1.0),
+        (grid_export_df,     -1.0),
+        (battery_charge_df,  -1.0),
+        (battery_discharge_df, +1.0),
+    ]
+    for correction_df, sign in signed_dfs:
+        if correction_df is None or correction_df.empty:
+            continue
+        corr = (
+            correction_df
+            .set_index(pd.DatetimeIndex(correction_df["timestamp"]))["kwh"]
+            .reindex(ts_index)
+            .fillna(0.0)
+        )
+        delta = delta + sign * corr
+
+    df["gross_kwh"] = (df["gross_kwh"] + delta.values).clip(lower=0.0)
+    return df
 
 
 def _blend_today_totals(

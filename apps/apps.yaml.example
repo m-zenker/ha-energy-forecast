@@ -86,6 +86,30 @@ energy_forecast:
   # ev_charging_threshold_kwh: 7    # default: 7 kWh/h
   # ev_charger_kw: 9                # default: 9 kW (e.g. 11 kW Type 2 at ~80% efficiency)
 
+  # Optional: solar PV + battery target correction.
+  # Corrects the training target from grid-import-only to true household
+  # consumption:
+  #   total_consumption = grid_import − grid_export
+  #                       + solar_production
+  #                       − battery_charge + battery_discharge
+  #
+  # All sensors must be CUMULATIVE kWh entities
+  # (device_class: energy, state_class: total_increasing).
+  # If your inverter only exposes instantaneous power (W/kW), create a
+  # Riemann sum integration helper first (HA > Settings > Helpers).
+  #
+  # SolarEdge Modbus Multi (entity names are user-defined in the integration):
+  # solar_production_sensor:  sensor.solaredge_ac_energy_kwh
+  # grid_export_sensor:       sensor.solaredge_exported_energy_kwh  # required with solar
+  # battery_charge_sensor:    sensor.solaredge_battery_charge_kwh   # may need Riemann sum
+  # battery_discharge_sensor: sensor.solaredge_battery_discharge_kwh
+  #
+  # Enphase Envoy (native cumulative sensors — replace SERIAL with your gateway serial):
+  # solar_production_sensor:  sensor.envoy_SERIAL_lifetime_energy_production
+  # grid_export_sensor:       sensor.envoy_SERIAL_lifetime_net_energy_production
+  # battery_charge_sensor:    sensor.envoy_SERIAL_lifetime_battery_energy_charged
+  # battery_discharge_sensor: sensor.envoy_SERIAL_lifetime_battery_energy_discharged
+
   # Optional: entity that signals vacation / away mode.
   # When "on", the model learns lower consumption patterns from historical away periods
   # and predicts accordingly.
