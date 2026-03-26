@@ -1038,7 +1038,9 @@ def _add_sub_sensor_lags_training(
             sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
             .sort_index()
         )
-        kwh_series = pd.Series(sub_series.reindex(ts_idx).values)
+        kwh_series = pd.Series(
+            pd.to_numeric(sub_series.reindex(ts_idx), errors="coerce").values
+        )
         nan_count = int(kwh_series.isna().sum())
         if nan_count > len(kwh_series) * 0.5:
             _LOGGER.warning(
