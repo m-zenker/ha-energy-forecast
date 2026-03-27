@@ -164,7 +164,12 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
         return srg_df
 
     srg_df = srg_df.copy()
-    _ts = pd.to_datetime(srg_df["timestamp"])
+    try:
+        _ts = pd.to_datetime(srg_df["timestamp"])
+    except ValueError:
+        # SRG strings carry mixed UTC offsets (+01:00 / +02:00 across DST boundary);
+        # utc=True normalises them before converting to local time.
+        _ts = pd.to_datetime(srg_df["timestamp"], utc=True)
     if _ts.dt.tz is not None:
         _ts = _ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
     srg_df["timestamp"] = _ts

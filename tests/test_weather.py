@@ -274,6 +274,28 @@ class TestSupplementFromOpenMeteo:
         assert result["timestamp"].dt.tz is None
         assert len(result) > 0
 
+    def test_mixed_offset_srg_timestamps_do_not_raise(self):
+        """SRG timestamps spanning DST boundary mix +01:00 and +02:00 offsets.
+        _supplement must not raise 'Mixed timezones detected'."""
+        # Simulates a forecast request straddling the spring-forward (CET→CEST)
+        mixed_timestamps = [
+            "2026-03-29T00:00:00+01:00",
+            "2026-03-29T01:00:00+01:00",
+            "2026-03-29T03:00:00+02:00",  # 02:00 doesn't exist; DST skips to 03:00
+            "2026-03-29T04:00:00+02:00",
+        ]
+        srg = pd.DataFrame({
+            "timestamp":        mixed_timestamps,
+            "temp_c":           [5.0] * 4,
+            "precipitation_mm": [0.0] * 4,
+            "sunshine_min":     [0.0] * 4,
+            "wind_kmh":         [3.0] * 4,
+        })
+        om = _make_om_df("2026-03-29 00:00", 6)
+        result = _supplement_from_open_meteo(srg, om)
+        assert result["timestamp"].dt.tz is None
+        assert len(result) > 0
+
 
 # ── fetch_forecast v2 ─────────────────────────────────────────────────────────
 
