@@ -10,6 +10,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.2] — 2026-03-27
+
+### Fixed
+- **Sub-sensor `object` dtype crash** (`model.py`): sub-sensor reindex now wrapped in
+  `pd.to_numeric(..., errors='coerce')` so sensors with mostly-NaN history (e.g. tumbler)
+  produce `float64` lag columns instead of `object`, unblocking LightGBM retraining.
+- **SRG mixed-timezone error at DST boundary** (`weather.py`): `ValueError` from
+  mixed-offset SRG timestamps (spring-forward +01:00/+02:00 mix) is now caught and
+  re-parsed with `utc=True`; existing naive-timestamp path preserved.
+
+### Tests
+- `test_mixed_offset_srg_timestamps_do_not_raise`: covers the spring-forward timestamp
+  mix that triggered the live error.
+
+### Docs
+- **README.md `init_commands` section**: expanded with Alpine/armv7 context, pip cache
+  note, and corrected formatting.
+
+---
+
 ## [0.7.1] — 2026-03-24
 
 ### Fixed
