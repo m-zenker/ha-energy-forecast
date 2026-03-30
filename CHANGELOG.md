@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Temperature sensor blending bias-fade** (`model.py`): the 6-hour outdoor sensor blend now uses
+  bias-fade semantics (`temp = forecast[h] + bias * (1 - alpha)`) instead of linear interpolation,
+  preserving the forecast's temperature trajectory while smoothly fading the current sensor offset.
+  This prevents loss of forecast warming/cooling signals in the blend zone.
+
+### Tests
+- `TestBuildPredictionTempDf`: 7 new tests covering temperature blending zones (full-trust, blend,
+  forecast), trajectory preservation, bias fade semantics, and fallback behavior.
+
 ---
 
 ## [0.7.2] — 2026-03-27
