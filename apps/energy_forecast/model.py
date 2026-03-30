@@ -1322,7 +1322,11 @@ def _build_prediction_temp_df(
         forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
         .sort_index()
     )
-    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we interpolate
+    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we fade bias
+
+    # Compute bias (sensor offset) relative to forecast at h=0
+    fc_temp_0 = float(fc_indexed.iloc[0]) if not fc_indexed.empty else live_temp
+    bias = live_temp - fc_temp_0
 
     rows = []
     for i, ts in enumerate(future_hours):
@@ -1332,10 +1336,12 @@ def _build_prediction_temp_df(
         elif hours_ahead >= SENSOR_BLEND_HOURS:
             temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
         else:
-            # Linear blend: 0 at SENSOR_FULL_TRUST_HOURS → 1 at SENSOR_BLEND_HOURS
+            # Bias fade: anchor to forecast trajectory, fade out sensor offset.
+            # alpha ramps from 0 at SENSOR_FULL_TRUST_HOURS → 1 at SENSOR_BLEND_HOURS.
+            # As alpha → 1, (1-alpha) → 0, so bias contribution shrinks to zero.
             alpha = (hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_range
             fc_temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
-            temp = (1 - alpha) * live_temp + alpha * fc_temp
+            temp = fc_temp + bias * (1 - alpha)
         rows.append({"timestamp": ts, "outdoor_temp_live": temp})
 
     return pd.DataFrame(rows)

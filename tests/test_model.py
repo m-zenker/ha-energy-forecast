@@ -28,6 +28,7 @@ from energy_forecast.model import (
     _add_sub_sensor_lags_prediction,
     _BRIDGE_CAP,
     _build_model,
+    _build_prediction_temp_df,
     _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
@@ -1433,3 +1434,129 @@ class TestShapSummary:
         m, forecast = _make_trained_model(tmp_path)
         result = m.shap_summary(forecast, live_temp=None, n=0)
         assert result == {}
+
+
+# ── Temperature sensor blending: bias fade ──────────────────────────────────────
+
+class TestBuildPredictionTempDf:
+    """Test bias-fade temperature blending: sensor offset fades over 6h window."""
+
+    def test_full_trust_zone_returns_live_temp(self):
+        """Hours 0–2: return live_temp unchanged."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=0, h=1, h=2 must be 11.0 (live_temp)
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 11.0) < 1e-9
+        assert abs(result.iloc[1]["outdoor_temp_live"] - 11.0) < 1e-9
+        assert abs(result.iloc[2]["outdoor_temp_live"] - 11.0) < 1e-9
+
+    def test_full_forecast_zone_returns_forecast(self):
+        """Hours 6+: return forecast[h] unchanged."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=6, h=7, h=8, h=9 must equal forecast temps
+        assert abs(result.iloc[6]["outdoor_temp_live"] - 16.0) < 1e-9
+        assert abs(result.iloc[7]["outdoor_temp_live"] - 17.0) < 1e-9
+        assert abs(result.iloc[8]["outdoor_temp_live"] - 18.0) < 1e-9
+        assert abs(result.iloc[9]["outdoor_temp_live"] - 19.0) < 1e-9
+
+    def test_blend_zone_bias_fade(self):
+        """Hours 2–6: temp = forecast[h] + bias*(1-alpha).
+
+        With live_temp=11, forecast[0]=10, bias=1.
+        Forecast: 10, 11, 12, 13, 14, 15, 16, 17, 18, 19.
+        - h=3: α=0.25 → 13.0 + 1*0.75 = 13.75
+        - h=4: α=0.5  → 14.0 + 1*0.5  = 14.5
+        - h=5: α=0.75 → 15.0 + 1*0.25 = 15.25
+        """
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=3: forecast=13, bias=1, α=0.25 → 13 + 0.75 = 13.75
+        assert abs(result.iloc[3]["outdoor_temp_live"] - 13.75) < 1e-9
+
+        # h=4: forecast=14, bias=1, α=0.5 → 14 + 0.5 = 14.5
+        assert abs(result.iloc[4]["outdoor_temp_live"] - 14.5) < 1e-9
+
+        # h=5: forecast=15, bias=1, α=0.75 → 15 + 0.25 = 15.25
+        assert abs(result.iloc[5]["outdoor_temp_live"] - 15.25) < 1e-9
+
+    def test_rising_forecast_trajectory_visible_in_blend_zone(self):
+        """Blend zone must track the forecast's rising trajectory, not interpolate live→forecast."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0, 10.5, 11.0, 12.0, 13.5, 15.0, 16.0, 16.5, 17.0, 17.5],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # Verify blend zone (h=2..5) follows forecast trajectory and (h=6 onwards pure forecast)
+        blend_vals = [result.iloc[i]["outdoor_temp_live"] for i in range(2, 7)]
+        # With bias=1, values should smoothly rise as forecast rises and bias fades
+        assert blend_vals[0] == 11.0  # h=2: pure live (SENSOR_FULL_TRUST_HOURS boundary)
+        assert blend_vals[1] > blend_vals[0]  # h=3 > h=2 (blending begins)
+        assert blend_vals[2] > blend_vals[1]  # h=4 > h=3
+        assert blend_vals[3] > blend_vals[2]  # h=5 > h=4
+        assert abs(blend_vals[4] - 16.0) < 1e-9  # h=6: pure forecast (SENSOR_BLEND_HOURS boundary)
+
+    def test_empty_forecast_fallback(self):
+        """Empty forecast: all hours return live_temp."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({"timestamp": [], "temp_c": []})
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # All hours must be 11.0 when forecast is empty
+        assert (result["outdoor_temp_live"] == 11.0).all()
+
+    def test_zero_bias_blend_equals_forecast(self):
+        """When sensor == forecast[0], blend/forecast zones equal forecast (no bias contribution)."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        # Set live_temp == forecast[0] → bias = 0
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=10.0)
+
+        # Full-trust zone (h≤2) returns live_temp
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 10.0) < 1e-9
+        assert abs(result.iloc[1]["outdoor_temp_live"] - 10.0) < 1e-9
+        assert abs(result.iloc[2]["outdoor_temp_live"] - 10.0) < 1e-9
+
+        # Blend zone (h>2, h<6) and forecast zone (h≥6) should equal pure forecast
+        for i in range(3, len(future_hours)):
+            expected = 10.0 + i
+            assert abs(result.iloc[i]["outdoor_temp_live"] - expected) < 1e-9
+
+    def test_negative_bias_blend(self):
+        """When sensor < forecast[0], bias is negative; blend must fade properly."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [15.0 + i for i in range(10)],
+        })
+        # live_temp=14 < forecast[0]=15 → bias=-1
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=14.0)
+
+        # Full-trust zone: should be 14.0
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 14.0) < 1e-9
+
+        # Blend zone (h=3): forecast≈18, bias=-1, α=0.25 → 18 + (-1)*0.75 = 17.25
+        assert abs(result.iloc[3]["outdoor_temp_live"] - 17.25) < 1e-9
+
+        # Full-forecast zone (h=6): should be 21.0
+        assert abs(result.iloc[6]["outdoor_temp_live"] - 21.0) < 1e-9
