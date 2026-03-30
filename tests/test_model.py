@@ -13,6 +13,7 @@ Covers:
   - Log-transform: flag set after training, expm1 applied in predict, backward compat
   - _build_model: n_estimators override accepted
   - Cantonal holidays: canton param threaded to country_holidays, invalid falls back
+  - Temperature sensor blending: bias-fade semantics over 6h window preserves forecast trajectory
 """
 from __future__ import annotations
 from unittest.mock import patch
