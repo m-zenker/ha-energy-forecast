@@ -633,3 +633,93 @@ class TestCsvAppendOnlyWrites:
         assert list(saved_ts) == sorted(saved_ts)
         # No duplicates
         assert saved_ts.duplicated().sum() == 0
+
+
+# ── #45 validate_energy_cache ─────────────────────────────────────────────────
+
+from energy_forecast.ha_data import validate_energy_cache  # noqa: E402
+
+
+class TestValidateEnergyCache:
+
+    def test_clean_data_no_warnings(self, caplog):
+        """5 rows, 1h apart, valid values → no WARNING logged."""
+        ts = pd.date_range("2024-03-15 08:00", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5, 2.0, 1.2, 0.8]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)
+        assert not caplog.records
+
+    def test_non_monotonic_timestamp_warns(self, caplog):
+        """A row with an earlier timestamp than its predecessor triggers WARNING."""
+        ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 09:00",
+                              "2024-03-15 08:30",  # goes backwards
+                              "2024-03-15 10:00"])
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5, 0.8, 2.0]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)
+        assert any("non-monotonic" in r.message for r in caplog.records)
+
+    def test_gap_greater_than_2h_warns(self, caplog):
+        """A 3.5h gap between consecutive rows triggers WARNING."""
+        ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 11:30"])
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)
+        assert any("gap" in r.message.lower() for r in caplog.records)
+
+    def test_gap_exactly_2h_not_flagged(self, caplog):
+        """Exactly 2h gap is NOT flagged (threshold is strictly > 2h)."""
+        ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 10:00"])
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)
+        assert not any("gap" in r.message.lower() for r in caplog.records)
+
+    def test_dst_gap_warns_with_dst_note(self, caplog):
+        """A 3h gap at the DST spring-forward hour warns and mentions DST."""
+        # 2024-03-31: clocks spring forward; use 00:00→03:00 (3h gap)
+        ts = pd.to_datetime(["2024-03-31 00:00", "2024-03-31 03:00"])
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)
+        assert any("DST" in r.message for r in caplog.records)
+
+    def test_out_of_range_value_warns(self, caplog):
+        """gross_kwh outside (0, MAX_HOURLY_KWH] triggers WARNING."""
+        ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
+        df_over = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 60.0]})  # 60 > 50
+        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})   # 0 not positive
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df_over, _LOGGER)
+        assert any("gross_kwh" in r.message for r in caplog.records)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df_zero, _LOGGER)
+        assert any("gross_kwh" in r.message for r in caplog.records)
+
+    def test_no_raise_on_missing_column(self, caplog):
+        """DataFrame without gross_kwh column must not raise."""
+        ts = pd.date_range("2024-03-15 08:00", periods=3, freq="1h")
+        df = pd.DataFrame({"timestamp": ts})  # no gross_kwh
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+            validate_energy_cache(df, _LOGGER)  # must not raise
+
+
+class TestValidateCacheIntegration:
+    """validate_energy_cache is called from fetch_energy_history."""
+
+    def test_validate_called_in_fetch_energy_history(self, mock_app, tmp_path):
+        """fetch_energy_history must invoke validate_energy_cache after merging."""
+        cache_path = tmp_path / "energy_history.csv"
+        # Pre-populate cache so the function doesn't hit the empty-history guard
+        make_energy_df(
+            ["2024-01-01 08:00", "2024-01-01 09:00"],
+            [1.0, 1.5],
+        ).to_csv(cache_path, index=False)
+        with (
+            patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()),
+            patch.object(ha_data, "validate_energy_cache") as mock_validate,
+        ):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+        mock_validate.assert_called_once()

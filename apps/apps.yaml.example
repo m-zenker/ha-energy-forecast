@@ -71,6 +71,12 @@ energy_forecast:
   # sensor.energy_forecast_today (default: 5). Set to 0 to disable.
   # shap_top_n: 5
 
+  # Optional: number of archived model snapshots to retain (default: 3).
+  # Each weekly retrain archives the previous model before overwriting it.
+  # To roll back, fire HA event 'energy_forecast_rollback_model' via
+  # Developer Tools → Events. Set to 0 to disable archiving.
+  # model_archive_count: 3
+
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
   # Must be total_increasing kWh meters (e.g. heat pump, dishwasher monitor).
@@ -85,6 +91,30 @@ energy_forecast:
   # before training so household baseline accuracy is preserved.
   # ev_charging_threshold_kwh: 7    # default: 7 kWh/h
   # ev_charger_kw: 9                # default: 9 kW (e.g. 11 kW Type 2 at ~80% efficiency)
+
+  # Optional: solar PV + battery target correction.
+  # Corrects the training target from grid-import-only to true household
+  # consumption:
+  #   total_consumption = grid_import − grid_export
+  #                       + solar_production
+  #                       − battery_charge + battery_discharge
+  #
+  # All sensors must be CUMULATIVE kWh entities
+  # (device_class: energy, state_class: total_increasing).
+  # If your inverter only exposes instantaneous power (W/kW), create a
+  # Riemann sum integration helper first (HA > Settings > Helpers).
+  #
+  # SolarEdge Modbus Multi (entity names are user-defined in the integration):
+  # solar_production_sensor:  sensor.solaredge_ac_energy_kwh
+  # grid_export_sensor:       sensor.solaredge_exported_energy_kwh  # required with solar
+  # battery_charge_sensor:    sensor.solaredge_battery_charge_kwh   # may need Riemann sum
+  # battery_discharge_sensor: sensor.solaredge_battery_discharge_kwh
+  #
+  # Enphase Envoy (native cumulative sensors — replace SERIAL with your gateway serial):
+  # solar_production_sensor:  sensor.envoy_SERIAL_lifetime_energy_production
+  # grid_export_sensor:       sensor.envoy_SERIAL_lifetime_net_energy_production
+  # battery_charge_sensor:    sensor.envoy_SERIAL_lifetime_battery_energy_charged
+  # battery_discharge_sensor: sensor.envoy_SERIAL_lifetime_battery_energy_discharged
 
   # Optional: entity that signals vacation / away mode.
   # When "on", the model learns lower consumption patterns from historical away periods

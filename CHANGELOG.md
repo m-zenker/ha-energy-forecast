@@ -14,9 +14,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   preserving the forecast's temperature trajectory while smoothly fading the current sensor offset.
   This prevents loss of forecast warming/cooling signals in the blend zone.
 
+### Added
+- **Model versioning** (`model.py`, `energy_forecast.py`): before overwriting model files each
+  weekly retrain, the previous snapshot is archived to `models/archive/<timestamp>/`. Configurable
+  via `model_archive_count` (default 3); set to 0 to disable. Roll back by firing HA event
+  `energy_forecast_rollback_model` — sensors update automatically. Includes 6 unit tests
+  (`TestModelVersioning`).
+- **CSV health checks** (`ha_data.py`): `validate_energy_cache()` runs after every weekly
+  retrain merge and logs WARNINGs for: non-monotonic timestamps, gaps > 2 h (with DST note),
+  and out-of-range `gross_kwh` values that survived the spike filter. Never raises. Includes 7 unit
+  tests + 1 integration test (`TestValidateEnergyCache`, `TestValidateCacheIntegration`).
+- **Solar PV + battery target correction** (`energy_forecast.py`): four new optional config keys
+  (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`,
+  `battery_discharge_sensor`) allow the training target to be corrected from raw grid import
+  to true household consumption:
+  `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
+  All sensors must be cumulative kWh entities (`state_class: total_increasing`). Any subset of
+  the four sensors can be configured independently; no hardware is required to merge the branch.
+  Documented in `apps.yaml.example` with SolarEdge Modbus Multi and Enphase Envoy examples.
+  Includes 9 unit tests for `_apply_target_correction`.
+
 ### Tests
 - `TestBuildPredictionTempDf`: 7 new tests covering temperature blending zones (full-trust, blend,
   forecast), trajectory preservation, bias fade semantics, and fallback behavior.
+- `TestModelVersioning`: 6 tests covering model archive creation, rollback, and pruning.
+- `TestValidateEnergyCache` + `TestValidateCacheIntegration`: 8 tests for CSV health validation.
+- `TestApplyTargetCorrection`: 9 tests for solar/battery target correction logic.
 
 ---
 
