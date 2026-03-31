@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.8.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-269%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.8.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-277%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -141,7 +141,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 | `numpy` ≥ 1.24.0 | |
 | `requests` ≥ 2.31.0 | |
 | `holidays` ≥ 0.46 | Swiss public holiday feature |
-| `scikit-learn` ≥ 1.4.0 | Required — GBR fallback engine |
+| `scikit-learn` ≥ 1.4.0, tested with 1.8.0 | Required — GBR fallback engine |
 | `lightgbm` ≥ 4.0.0 | Optional — primary engine |
 
 ---
@@ -267,7 +267,7 @@ energy_forecast:
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
 | `timezone` | No | `Europe/Zurich` | IANA timezone name |
-| `weight_halflife_days` | No | `90` | Sample weight half-life. `0` disables exponential weighting |
+| `weight_halflife_days` | No | `90` | Sample weight half-life. Must be `≥ 1` (lower = recent data weighted more heavily). |
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
 | `solar_production_sensor` | No | — | Entity ID of a cumulative solar production kWh meter (`total_increasing`). Adds solar generation to the training target. See [Solar PV + battery](#solar-pv--battery). |
@@ -282,6 +282,7 @@ energy_forecast:
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
 | `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
+| `model_archive_count` | No | `3` | Number of previous model snapshots to keep in `models/archive/` for rollback. Set to `0` to disable model versioning. Rollback via HA event `energy_forecast_rollback_model` or dashboard. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
@@ -299,6 +300,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 > **Note — MQTT Discovery entity IDs:** When `mqtt_discovery: true` is set, Home Assistant
 > creates entities under the device "HA Energy Forecast". Entity IDs take the form
 > `sensor.ha_energy_forecast_<unique_id>` (e.g. `sensor.ha_energy_forecast_energy_forecast_today`).
+> Block forecast sensors use `HH_MM_HH_MM` format for time slots (e.g. `sensor.ha_energy_forecast_energy_forecast_today_06_00_09_00` for 06:00–09:00).
 > The `sensor.energy_forecast_*` IDs in the table below reflect the `set_state()` path; update
 > any automations accordingly when switching modes.
 
@@ -689,6 +691,13 @@ Set `mqtt_discovery: false` (or remove the key). The app reverts to writing dire
 
 **DST fall-back warning in the log**
 - `DST fall-back: N rows share M duplicate naive timestamp(s) after merge` is expected on the last Sunday of October. It is informational — the merge still completes correctly.
+
+**CSV health check warnings**
+- After the weekly retrain or during history merge, you may see `WARNING` logs mentioning:
+  - `non-monotonic timestamps` — energy meter readings out of order; usually a sensor reset or time jump.
+  - `gap detected` — more than 2 hours between consecutive readings; DST transitions are excluded.
+  - `out-of-range gross_kwh` — readings above 50 kWh/h (spike filter should have caught it).
+- These are diagnostic only and do not stop training. Common causes: sensor reset, power failure during DST, manual meter restart. Check the timestamps and decide if correcting the CSV cache is necessary.
 
 **`Could not fetch recent actuals for lag features`**
 - HA history fetch failed. The sensor update proceeds without lag features; the model fills them with training-set medians. No action required.

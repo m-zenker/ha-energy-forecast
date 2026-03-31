@@ -1,7 +1,7 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.7.1 on feature branch, pending dev merge.
+Current baseline: v0.8.0 on `dev` (merged 2026-03-31).
 
 ---
 
@@ -15,7 +15,7 @@ Current baseline: v0.7.1 on feature branch, pending dev merge.
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
-| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | planned (branch ready) |
+| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on dev) |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
@@ -44,7 +44,7 @@ Captured from user interview (2026-03-24). These constrain scope and feature des
 | Audience | Personal-first; HACS nice-to-have but never at cost of accuracy |
 
 > **Critical definition:** *Consumption* = total household consumption
-> (`grid_import + solar_production − battery_charge + battery_discharge`).
+> (`grid_import − grid_export + solar_production − battery_charge + battery_discharge`).
 > **Not** net load. **Not** grid-only import. This definition applies now and
 > once solar/battery arrive — the forecast target never changes.
 
@@ -211,13 +211,13 @@ Home vs. away is the single largest unmodelled driver of energy consumption — 
 ### 22. EV charging state + SoC feature *(long-term backlog)*
 The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
 
-### 23. Solar PV integration *(planned — v0.8.0)*
+### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
 Target: `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
 The model must always forecast **total consumption**, not net grid import.
 
 Three sub-items (B1, B2, B9):
 
-1. **B1 — Target correction** *(✓ done on `feature/solar-battery-v0-8-0`)*: four optional config
+1. **B1 — Target correction** *(✓ done, merged v0.8.0)*: four optional config
    keys (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`,
    `battery_discharge_sensor`) correct the training target before `model.train()` is called.
    No new model features — solar/battery influence is captured via the corrected target only.
@@ -391,7 +391,7 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
-### 46. Dashboard: personalise entity IDs + icon cleanup *(pre-v0.7.0-release)*
+### 46. Dashboard: personalise entity IDs + icon cleanup *(backlog)*
 `dashboard/dashboard.yaml` and `dashboard/energy-today.yaml` contain user-specific entity
 IDs (`sensor.skoda_enyaq_battery_percentage`, `sensor.kermi_*`, `sensor.gplugk_z_ei`, etc.)
 that will not exist on other installations. Before any wider sharing or HACS inclusion:
@@ -423,7 +423,7 @@ exist. Include a sample screenshot and instructions in README under a new "Dashb
 section.
 Expected impact: Visibility / UX; Low effort (docs only).
 
-### 44. Model versioning — keep last N, rollback *(planned — v0.8.0)*
+### 44. Model versioning — keep last N, rollback *(✓ done — v0.8.0)*
 When a new model is trained, archive the previous `energy_model.pkl` / `meta.pkl` pair
 under a timestamped filename (e.g. `energy_model_20260324T1200.pkl`). Keep the last N
 versions (configurable, default 3). Add a `rollback_model()` helper that loads the
@@ -431,7 +431,7 @@ previous version and logs a WARNING. Useful when experimenting with new features
 accuracy regression.
 Expected impact: Ops safety; Low effort.
 
-### 45. CSV health checks + gap repair *(planned — v0.8.0)*
+### 45. CSV health checks + gap repair *(✓ done — v0.8.0)*
 On startup (and optionally on each weekly retrain), validate `energy_history.csv` for:
 - Monotonically increasing timestamps (detect clock resets or duplicated rows).
 - Gaps > 2 h that are not explained by DST (log WARNING; optionally back-fill from HA).
