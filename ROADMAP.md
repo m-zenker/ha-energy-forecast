@@ -1,7 +1,7 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.8.0 on `dev` (merged 2026-03-31).
+Current baseline: v0.8.1 on `dev` (deployed 2026-04-01).
 
 ---
 

@@ -8,6 +8,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+(No unreleased changes yet.)
+
+---
+
+## [0.8.1] — 2026-04-01
+
+### Fixed
+- **SRG-SSR API quota over-consumption** (`weather.py`): geolocation lookups are now cached at
+  module scope (aux storage alongside OAuth token), reducing daily API quota from ~48 calls
+  (uncached) to ~24 calls (cached). Fixes repeated 429 rate-limit errors during normal operation
+  and aligns with Freemium tier cap (50 calls/day). Includes 1 regression test.
+
+### Tests
+- `test_srg_geolocation_caching`: verifies that repeated calls to `_get_srg_geo_id` reuse the
+  cached `geo_id` instead of making duplicate API requests.
+
+---
+
+## [0.8.0] — 2026-03-31
+
 ### Fixed
 - **Temperature sensor blending bias-fade** (`model.py`): the 6-hour outdoor sensor blend now uses
   bias-fade semantics (`temp = forecast[h] + bias * (1 - alpha)`) instead of linear interpolation,
