@@ -409,3 +409,37 @@ class TestFetchForecastV2:
              ]):
             df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         assert df["timestamp"].dt.tz is None
+
+    def test_geolocation_cached_across_calls(self):
+        """Geolocation lookup must be cached — second fetch_forecast call with same lat/lon skips geo lookup."""
+        # Clear cache to ensure clean test state
+        weather._srg_geo_id.clear()
+
+        # First call: POST (token) + GET (geo) + GET (forecast) + GET (OM) = 4 requests
+        # Second call: GET (forecast) + GET (OM) = 2 requests (NO geo lookup)
+        # Total: 1 POST, 3 GETs for first call, 2 GETs for second = 5 GETs total
+        geo_id = "47.2263,7.5784"
+        with patch("requests.post", return_value=_make_token_response()), \
+             patch("requests.get", side_effect=[
+                 # First call: geo + forecast + OM
+                 _make_geo_latlon_response(geo_id), _make_srg_v2_response(), _om_empty(),
+                 # Second call: forecast + OM (no geo)
+                 _make_srg_v2_response(), _om_empty(),
+             ]) as mock_get:
+            # First call
+            df1 = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+            # Second call with same lat/lon
+            df2 = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+
+        # Verify first call included geolocation lookup
+        geo_call = mock_get.call_args_list[0]
+        assert "geolocations" in geo_call[0][0]
+
+        # Verify second call skipped geolocation (should be forecast URL)
+        # After first 3 GETs (geo, forecast, OM), next GET should be forecast directly
+        second_forecast_call = mock_get.call_args_list[3]
+        assert "forecastpoint" in second_forecast_call[0][0]
+
+        # Verify geo cache is populated
+        assert (47.2, 7.5) in weather._srg_geo_id
+        assert weather._srg_geo_id[(47.2, 7.5)] == geo_id
