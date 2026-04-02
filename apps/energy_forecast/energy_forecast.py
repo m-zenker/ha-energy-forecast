@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 from datetime import datetime, time
 from pathlib import Path
@@ -27,7 +28,7 @@ from typing import Any
 import hassapi as hass
 
 from . import ha_data, weather
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRESENCE_STATE_HOME
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
 from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
@@ -127,6 +128,8 @@ class EnergyForecast(hass.Hass):
             f"EV threshold: {self._ev_threshold} kWh/h, "
             f"charger: {self._ev_charger_kw} kW"
         )
+
+        self._load_pred_history()
 
     # ── Config validation ─────────────────────────────────────────────────────
 
@@ -761,6 +764,8 @@ class EnergyForecast(hass.Hass):
             if pd.Timestamp(ts) >= actuals_cutoff
         }
 
+        self._save_pred_history()
+
         self._maybe_adaptive_retrain(recent_actuals)
 
         # ── Compute rolling MAE sensors (#41) ────────────────────────────────
@@ -1287,6 +1292,66 @@ class EnergyForecast(hass.Hass):
                 result["ev_yesterday"] = _ev_sum(yesterday_np, today_np)
 
         return result
+
+    def _load_pred_history(self) -> None:
+        """Load prediction and actuals history from JSON file.
+
+        Format: {"pred": {"<ISO ts>": float, ...}, "actuals": {"<ISO ts>": float, ...}}
+        Applies 30-day pruning immediately and uses keep-first semantics (loaded entries
+        do not overwrite anything already in memory). On startup, memory dicts are empty,
+        so all loaded entries are accepted. Handles missing or corrupt files gracefully.
+        """
+        import pandas as pd
+
+        if not PRED_HISTORY_PATH.exists():
+            return  # No saved history yet, start fresh
+        try:
+            with open(PRED_HISTORY_PATH, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
+            self.log(f"Failed to load pred_history: {exc}", level="WARNING")
+            return
+
+        try:
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+
+            # Load and prune prediction history
+            for ts_str, kwh in data.get("pred", {}).items():
+                ts = pd.Timestamp(ts_str)
+                if ts >= cutoff and ts not in self._pred_history:
+                    self._pred_history[ts] = float(kwh)
+
+            # Load and prune actuals history
+            for ts_str, kwh in data.get("actuals", {}).items():
+                ts = pd.Timestamp(ts_str)
+                if ts >= cutoff and ts not in self._actuals_history:
+                    self._actuals_history[ts] = float(kwh)
+
+            n_pred = len(self._pred_history)
+            n_actuals = len(self._actuals_history)
+            self.log(f"Loaded pred_history: {n_pred} predictions, {n_actuals} actuals")
+        except (ValueError, TypeError, IndexError) as exc:
+            self.log(f"Failed to parse pred_history data: {exc}", level="WARNING")
+
+    def _save_pred_history(self) -> None:
+        """Serialize prediction and actuals history to JSON file.
+
+        Writes atomically (to .tmp, then os.replace) to avoid corruption on crash.
+        Catches OSError and logs warning — save failure should never break forecast cycle.
+        """
+        import pandas as pd
+
+        try:
+            data = {
+                "pred": {ts.isoformat(): float(kwh) for ts, kwh in self._pred_history.items()},
+                "actuals": {ts.isoformat(): float(kwh) for ts, kwh in self._actuals_history.items()},
+            }
+            tmp_path = PRED_HISTORY_PATH.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, default=str)
+            os.replace(tmp_path, PRED_HISTORY_PATH)
+        except OSError as exc:
+            self.log(f"Failed to save pred_history: {exc}", level="WARNING")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

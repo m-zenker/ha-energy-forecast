@@ -1295,3 +1295,218 @@ class TestTargetCorrection:
         _ = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
                                      battery_charge_df=None, battery_discharge_df=None)
         assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
+
+
+# ── Prediction history persistence ────────────────────────────────────────────
+
+class TestPredHistoryPersistence:
+    """Tests for _load_pred_history and _save_pred_history methods."""
+
+    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+        """Save a known dict, load it back, verify keys and values match."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # Mock PRED_HISTORY_PATH to use tmp_path
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Prepare test data
+        now = pd.Timestamp.now().normalize()
+        pred_data = {
+            now - pd.Timedelta(days=1): 1.5,
+            now - pd.Timedelta(days=5): 2.0,
+        }
+        actuals_data = {
+            now - pd.Timedelta(days=2): 1.4,
+            now - pd.Timedelta(days=3): 2.1,
+        }
+
+        # Manually save
+        import json
+        data = {
+            "pred": {ts.isoformat(): kwh for ts, kwh in pred_data.items()},
+            "actuals": {ts.isoformat(): kwh for ts, kwh in actuals_data.items()},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load back
+        EnergyForecast._load_pred_history(app)
+
+        # Verify
+        assert len(app._pred_history) == 2
+        assert len(app._actuals_history) == 2
+        assert app._pred_history[now - pd.Timedelta(days=1)] == 1.5
+        assert app._actuals_history[now - pd.Timedelta(days=2)] == 1.4
+
+    def test_load_applies_30d_pruning(self, tmp_path, monkeypatch):
+        """Save an entry >30 days old, verify it's discarded on load."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Create data with one old entry (35 days ago) and one recent (5 days ago)
+        now = pd.Timestamp.now().normalize()
+        old_ts = now - pd.Timedelta(days=35)
+        recent_ts = now - pd.Timedelta(days=5)
+
+        import json
+        data = {
+            "pred": {
+                old_ts.isoformat(): 1.0,
+                recent_ts.isoformat(): 2.0,
+            },
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # Only the recent entry should be loaded
+        assert len(app._pred_history) == 1
+        assert recent_ts in app._pred_history
+        assert app._pred_history[recent_ts] == 2.0
+        assert old_ts not in app._pred_history
+
+    def test_load_keep_first_on_conflict(self, tmp_path, monkeypatch):
+        """If in-memory already has a key, loaded value must not overwrite it."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        ts_key = now - pd.Timedelta(days=5)
+
+        # Pre-populate in-memory dict
+        app._pred_history = {ts_key: 1.0}
+        app._actuals_history = {}
+
+        # Write file with different value for the same key
+        import json
+        data = {
+            "pred": {ts_key.isoformat(): 99.0},  # Should be ignored
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # In-memory value should be preserved (keep-first)
+        assert app._pred_history[ts_key] == 1.0
+
+    def test_load_missing_file_is_silent(self, tmp_path, monkeypatch):
+        """No file present → no exception, dicts remain empty."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # File doesn't exist
+        assert not mock_path.exists()
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        app.log.assert_not_called()
+
+    def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch):
+        """Invalid JSON → no exception, dicts remain empty, warning logged."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Write invalid JSON
+        mock_path.write_text("{invalid json}")
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to load" in app.log.call_args[0][0]
+
+    def test_save_creates_file_atomically(self, tmp_path, monkeypatch):
+        """Verify that .tmp file is used (save is atomic)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        app._pred_history = {now - pd.Timedelta(days=1): 1.5}
+        app._actuals_history = {now - pd.Timedelta(days=2): 2.0}
+
+        # Save
+        EnergyForecast._save_pred_history(app)
+
+        # Verify file was created
+        assert mock_path.exists()
+        # Verify .tmp file was cleaned up
+        assert not mock_path.with_suffix(".json.tmp").exists()
+
+        # Verify content
+        import json
+        with open(mock_path) as f:
+            data = json.load(f)
+        assert len(data["pred"]) == 1
+        assert len(data["actuals"]) == 1
+
+    def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch):
+        """Save failure (OSError) is logged, doesn't raise."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Mock open to raise OSError
+        mock_open = MagicMock()
+        mock_open.side_effect = OSError("Disk full")
+        monkeypatch.setattr("builtins.open", mock_open)
+
+        # Should not raise
+        EnergyForecast._save_pred_history(app)
+
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to save" in app.log.call_args[0][0]

@@ -19,6 +19,7 @@ MIN_CV_ROWS       = 500   # Minimum rows for TimeSeriesSplit cross-validation
 
 # Data Storage
 CACHE_PATH = Path(__file__).parent / "energy_history.csv"
+PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
 
 # Occupancy Detection
 PRESENCE_STATE_HOME = "home"
