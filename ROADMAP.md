@@ -1,7 +1,21 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.7.1 on feature branch, pending dev merge.
+Current baseline: v0.8.1 on `dev` (deployed 2026-04-01).
+
+---
+
+## Current Status — Sub-sensor Feature Maturation (Path A: Monitor)
+
+**Decision (2026-04-02):** Wait for natural data maturation of sub-sensor features until ~April 20 rather than accelerating with HVAC state feature (Path B).
+
+**Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — MAE improved from 0.7 to 0.57 kWh/hour (18% improvement), but short-term bouncing pattern (overshooting one hour, undershooting the next) observed. Root cause: lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows); with 14 days of sub-sensor history (~336 rows), these features remain excluded.
+
+**Timeline:** By ~2026-04-20, sub-sensor history reaches 4+ weeks (≥672 rows), triggering full lag feature activation. Bouncing pattern expected to flatten as the model learns temporal stability across multi-day windows.
+
+**Monitoring:** Track MAE and bouncing pattern through April 20. If pattern persists after that date, revisit Path B (HVAC/thermostat state feature to provide anticipatory signal).
+
+**No action required** until after 2026-04-20 if bouncing remains.
 
 ---
 
@@ -15,8 +29,9 @@ Current baseline: v0.7.1 on feature branch, pending dev merge.
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
-| Solar + battery | v0.8.0 | #23 Solar PV features (actual + forecast), #40 Battery SoC feature | planned |
-| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow, #44 Model versioning, #45 CSV health checks | backlog |
+| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on dev) |
+| Occupancy + EV awareness | v0.9.0 | #21 Occupancy (`people_home`), #22 EV SoC + charging state | planned |
+| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
 
@@ -44,7 +59,7 @@ Captured from user interview (2026-03-24). These constrain scope and feature des
 | Audience | Personal-first; HACS nice-to-have but never at cost of accuracy |
 
 > **Critical definition:** *Consumption* = total household consumption
-> (`grid_import + solar_production − battery_charge + battery_discharge`).
+> (`grid_import − grid_export + solar_production − battery_charge + battery_discharge`).
 > **Not** net load. **Not** grid-only import. This definition applies now and
 > once solar/battery arrive — the forecast target never changes.
 
@@ -205,21 +220,28 @@ When the detection threshold is set at or above the charger power (e.g. threshol
 
 Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
 
-### 21. Occupancy feature (`people_home`) *(long-term backlog)*
+### 21. Occupancy feature (`people_home`) *(planned — v0.9.0)*
 Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
 
-### 22. EV charging state + SoC feature *(long-term backlog)*
+### 22. EV charging state + SoC feature *(planned — v0.9.0)*
 The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
 
-### 23. Solar PV integration *(planned — v0.10.0)*
-Target: `total_consumption = grid_import + solar_production − battery_charge + battery_discharge`.
+### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
+Target: `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
 The model must always forecast **total consumption**, not net grid import.
 
 Three sub-items (B1, B2, B9):
 
-1. **B1 — Solar actual as training feature** (when panels arrive): add `solar_production_sensor` as an optional config key; include actual hourly production as a feature during training so the model learns the correlation between solar and consumption behaviour (e.g. battery charging, shade-seeking appliance shifts). Also correct the training target: `total_kwh = grid_import + solar_production − battery_charge + battery_discharge`.
-2. **B2 — Solar forecast as prediction feature**: derive expected production for the 48 h horizon from the already-fetched `direct_radiation_wm2` forecast combined with PV system parameters (`pv_kwp`, `pv_azimuth`, `pv_tilt`). Open-Meteo solar API is already accessible via the existing weather client.
-3. **B9 — Battery SoC as feature** (see #40 below).
+1. **B1 — Target correction** *(✓ done, merged v0.8.0)*: four optional config
+   keys (`solar_production_sensor`, `grid_export_sensor`, `battery_charge_sensor`,
+   `battery_discharge_sensor`) correct the training target before `model.train()` is called.
+   No new model features — solar/battery influence is captured via the corrected target only.
+   Solar production does not drive consumption; only the measurement needs correction.
+2. **B2 — Solar forecast as prediction feature** *(deferred — out of scope for now)*: solar
+   production prediction is explicitly out of scope. `direct_radiation_wm2` already in
+   `_FEATURES_BASE` gives the model the solar irradiance signal.
+3. **B9 — Battery SoC as feature** *(deferred — out of scope for now)*: battery SoC prediction
+   is out of scope. Revisit if residuals show SoC correlation after panels are installed.
 
 ### 24. Electricity spot price feature *(out of scope — fixed tariff)*
 ~~Households on dynamic tariffs (Tibber, Nordpool) actively shift deferrable loads — dishwasher, washing machine, EV charging — to cheap hours. The model currently cannot learn this behaviour because it sees no price signal. Add an optional `price_sensor` config key; include the hourly price (or a `is_cheap_hour` binary derived from a configurable threshold) as a feature. The Tibber and Nordpool HA integrations already expose standardised hourly price sensors.~~
@@ -363,7 +385,7 @@ is configurable via `apps.yaml` (`anomaly_sigma_threshold`, default 3.0).
 Pairs naturally with the rolling MAE sensor (#41) for diagnostic visibility.
 Expected impact: Diagnostic / UX; Low effort.
 
-### 40. Home battery SoC as feature *(planned — v0.10.0, with solar)*
+### 40. Home battery SoC as feature *(deferred — revisit if residuals show SoC correlation after panels installed)*
 When a home battery is present, its state of charge (SoC) shapes consumption: a low SoC
 during a sunny forecast triggers aggressive solar charging (raising consumption); a full
 SoC suppresses it. Add optional `battery_soc_sensor` config key; include current SoC %
@@ -384,7 +406,7 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
-### 46. Dashboard: personalise entity IDs + icon cleanup *(pre-v0.7.0-release)*
+### 46. Dashboard: personalise entity IDs + icon cleanup *(backlog)*
 `dashboard/dashboard.yaml` and `dashboard/energy-today.yaml` contain user-specific entity
 IDs (`sensor.skoda_enyaq_battery_percentage`, `sensor.kermi_*`, `sensor.gplugk_z_ei`, etc.)
 that will not exist on other installations. Before any wider sharing or HACS inclusion:
@@ -416,7 +438,7 @@ exist. Include a sample screenshot and instructions in README under a new "Dashb
 section.
 Expected impact: Visibility / UX; Low effort (docs only).
 
-### 44. Model versioning — keep last N, rollback *(long-term backlog)*
+### 44. Model versioning — keep last N, rollback *(✓ done — v0.8.0)*
 When a new model is trained, archive the previous `energy_model.pkl` / `meta.pkl` pair
 under a timestamped filename (e.g. `energy_model_20260324T1200.pkl`). Keep the last N
 versions (configurable, default 3). Add a `rollback_model()` helper that loads the
@@ -424,7 +446,7 @@ previous version and logs a WARNING. Useful when experimenting with new features
 accuracy regression.
 Expected impact: Ops safety; Low effort.
 
-### 45. CSV health checks + gap repair *(long-term backlog)*
+### 45. CSV health checks + gap repair *(✓ done — v0.8.0)*
 On startup (and optionally on each weekly retrain), validate `energy_history.csv` for:
 - Monotonically increasing timestamps (detect clock resets or duplicated rows).
 - Gaps > 2 h that are not explained by DST (log WARNING; optionally back-fill from HA).
@@ -472,9 +494,9 @@ Migration reference:
 | 18 | Custom component config flow | UX / install | 8+ h | long-term backlog |
 | 19 | CSV append-only writes | performance | 2 h | ✓ done |
 | 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | ✓ done |
-| 21 | Occupancy feature (`people_home`) | **high** | 4 h | long-term backlog |
-| 22 | EV SoC + charging state feature | high (EV households) | 4 h | long-term backlog |
-| 23 | Solar PV integration (B1 actual + B2 forecast) | high (solar households) | 6 h | planned v0.10.0 |
+| 21 | Occupancy feature (`people_home`) | **high** | 4 h | planned v0.9.0 |
+| 22 | EV SoC + charging state feature | high (EV households) | 4 h | planned v0.9.0 |
+| 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done on branch (v0.8.0) |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
 | 25 | Vacation / away flag | medium | 2 h | ✓ done |
 | 26 | Sub-energy sensors (`sub_energy_sensors`) | medium | 4 h | ✓ done |
@@ -491,12 +513,12 @@ Migration reference:
 | 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
 | 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | ✓ done |
 | 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | ✓ done v0.7.0 |
-| 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
+| 40 | Home battery SoC as feature | medium (battery households) | 1 h | deferred |
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | ✓ done v0.7.0 |
 | 42 | SHAP feature importance per prediction | explainability | 3 h | ✓ done v0.7.0 |
 | 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | ✓ done v0.7.0 |
-| 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | long-term backlog |
-| 45 | CSV health checks + gap repair | correctness / defensive | 2 h | long-term backlog |
+| 44 | Model versioning (keep last N, rollback) | ops safety | 2 h | ✓ done v0.8.0 |
+| 45 | CSV health checks + gap repair | correctness / defensive | 2 h | ✓ done v0.8.0 |
 | 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
 | 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | ✓ done v0.7.1 |
 | 48 | Anomaly binary sensor MQTT attrs + discovery fix | correctness / UX | 30 min | ✓ done v0.7.1 |

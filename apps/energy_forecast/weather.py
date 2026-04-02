@@ -13,6 +13,11 @@ _LOGGER = logging.getLogger(__name__)
 _srg_token: str | None = None
 _srg_token_expires_at: float = 0.0  # Unix timestamp after which token is invalid
 
+# Module-level geolocation ID cache.  Since lat/lon are fixed config values,
+# the geolocation endpoint always returns the same station ID per location.
+# Caching avoids ~24 redundant geolocation lookups per day (50% quota savings).
+_srg_geo_id: dict[tuple[float, float], str] = {}  # (lat, lon) → geo station ID
+
 
 def _parse_sunshine_min(sunshine_seconds: list) -> list:
     """Convert Open-Meteo sunshine_duration (seconds) to minutes, clamped to [0, 60].
@@ -96,20 +101,25 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         token = _srg_token
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-        # 2. Resolve geolocation ID — nearest station by lat/lon.
+        # 2. Resolve geolocation ID (cached — station doesn't change for fixed coordinates).
         # The Freemium plan locks a single registered location; using lat/lon ensures
         # we always resolve the same station that was registered in the developer app.
-        geo_res = requests.get(
-            f"https://api.srgssr.ch/srf-meteo/v2/geolocations?latitude={lat}&longitude={lon}",
-            headers=headers, timeout=10,
-        )
-        geo_res.raise_for_status()
-        geo_hits = geo_res.json()
-        geo_id = geo_hits[0]["id"] if geo_hits else None
+        global _srg_geo_id
+        loc_key = (lat, lon)
+        if loc_key not in _srg_geo_id:
+            geo_res = requests.get(
+                f"https://api.srgssr.ch/srf-meteo/v2/geolocations?latitude={lat}&longitude={lon}",
+                headers=headers, timeout=10,
+            )
+            geo_res.raise_for_status()
+            geo_hits = geo_res.json()
+            geo_id = geo_hits[0]["id"] if geo_hits else None
 
-        if not geo_id:
-            _LOGGER.warning("SRG-SSR geolocation lookup returned no results — falling back to Open-Meteo.")
-            return fetch_open_meteo(lat, lon)
+            if not geo_id:
+                _LOGGER.warning("SRG-SSR geolocation lookup returned no results — falling back to Open-Meteo.")
+                return fetch_open_meteo(lat, lon)
+            _srg_geo_id[loc_key] = geo_id
+        geo_id = _srg_geo_id[loc_key]
 
         # 3. Get Forecast (60min intervals)
         forecast_url = f"https://api.srgssr.ch/srf-meteo/v2/forecastpoint/{geo_id}"

@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 import pickle
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -159,7 +160,7 @@ def ensure_ml_packages() -> tuple[bool, str]:
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
-    def __init__(self, model_dir: Path) -> None:
+    def __init__(self, model_dir: Path, model_archive_count: int = 3) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
         self._model_path  = model_dir / "energy_model.pkl"
@@ -187,6 +188,10 @@ class EnergyForecastModel:
         self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
         # Sub-energy sensor prefixes used in last training run
         self._sub_sensor_prefixes: list[str] = []
+
+        # Model versioning — archive dir + how many snapshots to keep
+        self._archive_dir: Path = model_dir / "archive"
+        self._model_archive_count: int = model_archive_count
 
         self._load()
 
@@ -694,7 +699,67 @@ class EnergyForecastModel:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    def _archive_current(self) -> None:
+        """Copy the current model files to a timestamped archive subdirectory.
+
+        Called before overwriting the active model files.  Skipped when no
+        model exists yet (first-ever save).  Prunes the oldest archive
+        directories beyond self._model_archive_count.
+        """
+        if not self._model_path.exists():
+            return  # nothing to archive on first save
+        try:
+            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            snap_dir = self._archive_dir / stamp
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            _artifacts = [
+                self._model_path,
+                self._meta_path,
+                self._model_q10_path,
+                self._model_q90_path,
+                self._interval_correction_path,
+            ]
+            for src in _artifacts:
+                if src.exists():
+                    shutil.copy2(src, snap_dir / src.name)
+            # Copy SHA-256 sidecars for pickle files
+            for src in _artifacts[:-1]:  # skip the .json (no sidecar)
+                sidecar = src.with_suffix(src.suffix + ".sha256")
+                if sidecar.exists():
+                    shutil.copy2(sidecar, snap_dir / sidecar.name)
+            # Prune oldest archives beyond the configured limit
+            dirs = sorted(self._archive_dir.iterdir())
+            while len(dirs) > self._model_archive_count:
+                shutil.rmtree(dirs.pop(0))
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Model archive failed (save will continue): %s", exc)
+
+    def rollback_model(self) -> bool:
+        """Restore model files from the most recent archive and reload in-memory state.
+
+        Returns True on success, False when no archive exists (no-op).
+        Logs a WARNING naming the archive snapshot being restored from.
+        """
+        try:
+            if not self._archive_dir.exists():
+                _LOGGER.warning("rollback_model: no archive available — nothing to restore.")
+                return False
+            dirs = sorted(d for d in self._archive_dir.iterdir() if d.is_dir())
+            if not dirs:
+                _LOGGER.warning("rollback_model: no archive available — nothing to restore.")
+                return False
+            latest = dirs[-1]
+            _LOGGER.warning("rollback_model: restoring from archive %s", latest.name)
+            for src in latest.iterdir():
+                shutil.copy2(src, self._model_dir / src.name)
+            self._load()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("rollback_model failed: %s", exc)
+            return False
+
     def _save(self) -> None:
+        self._archive_current()
         with open(self._model_path, "wb") as fh:
             pickle.dump(self.model, fh)
         _write_hash(self._model_path)
@@ -1322,7 +1387,11 @@ def _build_prediction_temp_df(
         forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
         .sort_index()
     )
-    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we interpolate
+    blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we fade bias
+
+    # Compute bias (sensor offset) relative to forecast at h=0
+    fc_temp_0 = float(fc_indexed.iloc[0]) if not fc_indexed.empty else live_temp
+    bias = live_temp - fc_temp_0
 
     rows = []
     for i, ts in enumerate(future_hours):
@@ -1332,10 +1401,12 @@ def _build_prediction_temp_df(
         elif hours_ahead >= SENSOR_BLEND_HOURS:
             temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
         else:
-            # Linear blend: 0 at SENSOR_FULL_TRUST_HOURS → 1 at SENSOR_BLEND_HOURS
+            # Bias fade: anchor to forecast trajectory, fade out sensor offset.
+            # alpha ramps from 0 at SENSOR_FULL_TRUST_HOURS → 1 at SENSOR_BLEND_HOURS.
+            # As alpha → 1, (1-alpha) → 0, so bias contribution shrinks to zero.
             alpha = (hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_range
             fc_temp = float(fc_indexed.asof(ts)) if not fc_indexed.empty else live_temp
-            temp = (1 - alpha) * live_temp + alpha * fc_temp
+            temp = fc_temp + bias * (1 - alpha)
         rows.append({"timestamp": ts, "outdoor_temp_live": temp})
 
     return pd.DataFrame(rows)

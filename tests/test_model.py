@@ -13,6 +13,7 @@ Covers:
   - Log-transform: flag set after training, expm1 applied in predict, backward compat
   - _build_model: n_estimators override accepted
   - Cantonal holidays: canton param threaded to country_holidays, invalid falls back
+  - Temperature sensor blending: bias-fade semantics over 6h window preserves forecast trajectory
 """
 from __future__ import annotations
 from unittest.mock import patch
@@ -28,6 +29,7 @@ from energy_forecast.model import (
     _add_sub_sensor_lags_prediction,
     _BRIDGE_CAP,
     _build_model,
+    _build_prediction_temp_df,
     _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
@@ -1433,3 +1435,233 @@ class TestShapSummary:
         m, forecast = _make_trained_model(tmp_path)
         result = m.shap_summary(forecast, live_temp=None, n=0)
         assert result == {}
+
+
+# ── Temperature sensor blending: bias fade ──────────────────────────────────────
+
+class TestBuildPredictionTempDf:
+    """Test bias-fade temperature blending: sensor offset fades over 6h window."""
+
+    def test_full_trust_zone_returns_live_temp(self):
+        """Hours 0–2: return live_temp unchanged."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=0, h=1, h=2 must be 11.0 (live_temp)
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 11.0) < 1e-9
+        assert abs(result.iloc[1]["outdoor_temp_live"] - 11.0) < 1e-9
+        assert abs(result.iloc[2]["outdoor_temp_live"] - 11.0) < 1e-9
+
+    def test_full_forecast_zone_returns_forecast(self):
+        """Hours 6+: return forecast[h] unchanged."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=6, h=7, h=8, h=9 must equal forecast temps
+        assert abs(result.iloc[6]["outdoor_temp_live"] - 16.0) < 1e-9
+        assert abs(result.iloc[7]["outdoor_temp_live"] - 17.0) < 1e-9
+        assert abs(result.iloc[8]["outdoor_temp_live"] - 18.0) < 1e-9
+        assert abs(result.iloc[9]["outdoor_temp_live"] - 19.0) < 1e-9
+
+    def test_blend_zone_bias_fade(self):
+        """Hours 2–6: temp = forecast[h] + bias*(1-alpha).
+
+        With live_temp=11, forecast[0]=10, bias=1.
+        Forecast: 10, 11, 12, 13, 14, 15, 16, 17, 18, 19.
+        - h=3: α=0.25 → 13.0 + 1*0.75 = 13.75
+        - h=4: α=0.5  → 14.0 + 1*0.5  = 14.5
+        - h=5: α=0.75 → 15.0 + 1*0.25 = 15.25
+        """
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # h=3: forecast=13, bias=1, α=0.25 → 13 + 0.75 = 13.75
+        assert abs(result.iloc[3]["outdoor_temp_live"] - 13.75) < 1e-9
+
+        # h=4: forecast=14, bias=1, α=0.5 → 14 + 0.5 = 14.5
+        assert abs(result.iloc[4]["outdoor_temp_live"] - 14.5) < 1e-9
+
+        # h=5: forecast=15, bias=1, α=0.75 → 15 + 0.25 = 15.25
+        assert abs(result.iloc[5]["outdoor_temp_live"] - 15.25) < 1e-9
+
+    def test_rising_forecast_trajectory_visible_in_blend_zone(self):
+        """Blend zone must track the forecast's rising trajectory, not interpolate live→forecast."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0, 10.5, 11.0, 12.0, 13.5, 15.0, 16.0, 16.5, 17.0, 17.5],
+        })
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # Verify blend zone (h=2..5) follows forecast trajectory and (h=6 onwards pure forecast)
+        blend_vals = [result.iloc[i]["outdoor_temp_live"] for i in range(2, 7)]
+        # With bias=1, values should smoothly rise as forecast rises and bias fades
+        assert blend_vals[0] == 11.0  # h=2: pure live (SENSOR_FULL_TRUST_HOURS boundary)
+        assert blend_vals[1] > blend_vals[0]  # h=3 > h=2 (blending begins)
+        assert blend_vals[2] > blend_vals[1]  # h=4 > h=3
+        assert blend_vals[3] > blend_vals[2]  # h=5 > h=4
+        assert abs(blend_vals[4] - 16.0) < 1e-9  # h=6: pure forecast (SENSOR_BLEND_HOURS boundary)
+
+    def test_empty_forecast_fallback(self):
+        """Empty forecast: all hours return live_temp."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({"timestamp": [], "temp_c": []})
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=11.0)
+
+        # All hours must be 11.0 when forecast is empty
+        assert (result["outdoor_temp_live"] == 11.0).all()
+
+    def test_zero_bias_blend_equals_forecast(self):
+        """When sensor == forecast[0], blend/forecast zones equal forecast (no bias contribution)."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [10.0 + i for i in range(10)],
+        })
+        # Set live_temp == forecast[0] → bias = 0
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=10.0)
+
+        # Full-trust zone (h≤2) returns live_temp
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 10.0) < 1e-9
+        assert abs(result.iloc[1]["outdoor_temp_live"] - 10.0) < 1e-9
+        assert abs(result.iloc[2]["outdoor_temp_live"] - 10.0) < 1e-9
+
+        # Blend zone (h>2, h<6) and forecast zone (h≥6) should equal pure forecast
+        for i in range(3, len(future_hours)):
+            expected = 10.0 + i
+            assert abs(result.iloc[i]["outdoor_temp_live"] - expected) < 1e-9
+
+    def test_negative_bias_blend(self):
+        """When sensor < forecast[0], bias is negative; blend must fade properly."""
+        future_hours = pd.date_range("2026-03-12 08:00", periods=10, freq="1h")
+        forecast = pd.DataFrame({
+            "timestamp": future_hours,
+            "temp_c": [15.0 + i for i in range(10)],
+        })
+        # live_temp=14 < forecast[0]=15 → bias=-1
+        result = _build_prediction_temp_df(future_hours, forecast, live_temp=14.0)
+
+        # Full-trust zone: should be 14.0
+        assert abs(result.iloc[0]["outdoor_temp_live"] - 14.0) < 1e-9
+
+        # Blend zone (h=3): forecast≈18, bias=-1, α=0.25 → 18 + (-1)*0.75 = 17.25
+        assert abs(result.iloc[3]["outdoor_temp_live"] - 17.25) < 1e-9
+
+        # Full-forecast zone (h=6): should be 21.0
+        assert abs(result.iloc[6]["outdoor_temp_live"] - 21.0) < 1e-9
+
+
+# ── #44 Model versioning ───────────────────────────────────────────────────────
+
+class TestModelVersioning:
+    """EnergyForecastModel._archive_current() and rollback_model()."""
+
+    def test_no_archive_on_first_save(self, tmp_path):
+        """First-ever train() must not create an archive directory."""
+        _make_trained_model(tmp_path)
+        archive_dir = tmp_path / "archive"
+        assert not archive_dir.exists() or not list(archive_dir.iterdir())
+
+    def test_archive_created_on_second_save(self, tmp_path):
+        """Second train() must create exactly one archive snapshot."""
+        import re
+        m, _ = _make_trained_model(tmp_path)
+        m.train(*_make_trained_model.__wrapped__(tmp_path)[0].train.__self__) if False else None
+        # Re-use helper: train the same instance a second time
+        rng = np.random.default_rng(1)
+        n = 600
+        ts = pd.date_range("2024-06-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_dir = tmp_path / "archive"
+        assert archive_dir.exists()
+        subdirs = list(archive_dir.iterdir())
+        assert len(subdirs) == 1
+        assert re.match(r"\d{8}T\d{6}$", subdirs[0].name)
+
+    def test_only_last_n_archives_retained(self, tmp_path):
+        """With model_archive_count=2, four trains must leave ≤2 archive dirs."""
+        rng = np.random.default_rng(42)
+        m = EnergyForecastModel(tmp_path, model_archive_count=2)
+        for i in range(4):
+            n = 600
+            ts = pd.date_range(f"2024-0{i+1}-01", periods=n, freq="1h")
+            energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+            weather = pd.DataFrame({
+                "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+                "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+                "direct_radiation_wm2": [100.0]*n,
+            })
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_dir = tmp_path / "archive"
+        assert archive_dir.exists()
+        assert len(list(archive_dir.iterdir())) <= 2
+
+    def test_rollback_restores_previous_model(self, tmp_path):
+        """rollback_model() after two trains must restore the first training time."""
+        m, _ = _make_trained_model(tmp_path)
+        t1 = m.last_trained
+
+        rng = np.random.default_rng(7)
+        n = 600
+        ts = pd.date_range("2024-07-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        t2 = m.last_trained
+        assert t2 >= t1
+
+        success = m.rollback_model()
+        assert success is True
+
+        m2 = EnergyForecastModel(tmp_path)
+        assert m2.last_trained == t1
+
+    def test_rollback_no_archive_returns_false(self, tmp_path):
+        """rollback_model() on a fresh (never-trained) instance returns False."""
+        m = EnergyForecastModel(tmp_path)
+        assert m.rollback_model() is False
+
+    def test_rollback_logs_warning(self, tmp_path, caplog):
+        """rollback_model() after two trains must log a WARNING with the archive name."""
+        import logging
+        m, _ = _make_trained_model(tmp_path)
+        rng = np.random.default_rng(99)
+        n = 600
+        ts = pd.date_range("2024-09-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame({
+            "timestamp": ts, "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0]*n, "sunshine_min": [30.0]*n,
+            "wind_kmh": [10.0]*n, "cloud_cover_pct": [50.0]*n,
+            "direct_radiation_wm2": [100.0]*n,
+        })
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        archive_name = sorted((tmp_path / "archive").iterdir())[-1].name
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            m.rollback_model()
+        assert any(archive_name in r.message for r in caplog.records)

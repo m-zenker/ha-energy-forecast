@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.7.2-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-245%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.8.1-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-278%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -35,6 +35,7 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 - [Backfilling history](#backfilling-history)
 - [Weather sources](#weather-sources)
 - [EV charging detection](#ev-charging-detection)
+- [Solar PV + battery](#solar-pv--battery)
 - [Sub-energy sensors](#sub-energy-sensors)
 - [Vacation / Away mode](#vacation--away-mode)
 - [MQTT Discovery](#mqtt-discovery-optional)
@@ -84,6 +85,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Works on any hardware** — including armv7 Raspberry Pi (LightGBM with automatic scikit-learn fallback when no C compiler is available)
 - **High-resolution local weather** — SRG-SSR forecast (Switzerland) with automatic Open-Meteo fallback, so a forecast is always available
 - **EV charging detection** — EV sessions are identified and subtracted from the training signal so they don't distort household baseline forecasts; detected kWh are published as separate sensors
+- **Solar PV + battery support** — four optional config keys correct the training target from grid-import-only to true household consumption (`grid_import − grid_export + solar_production − battery_charge + battery_discharge`); any subset of sensors can be configured independently
 - **Appliance-level context** — optional sub-energy sensors (heat pump, dishwasher, etc.) give the model lag features per appliance
 - **Local outdoor temperature blending** — if you have an outdoor sensor, its live reading is blended with the weather forecast for the first few hours
 - **Exponential sample weighting** — recent data influences the model more than old data
@@ -139,7 +141,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 | `numpy` ≥ 1.24.0 | |
 | `requests` ≥ 2.31.0 | |
 | `holidays` ≥ 0.46 | Swiss public holiday feature |
-| `scikit-learn` ≥ 1.4.0 | Required — GBR fallback engine |
+| `scikit-learn` ≥ 1.4.0, tested with 1.8.0 | Required — GBR fallback engine |
 | `lightgbm` ≥ 4.0.0 | Optional — primary engine |
 
 ---
@@ -220,6 +222,14 @@ energy_forecast:
   # ev_charging_threshold_kwh: 7    # hours above this are classified as EV
   # ev_charger_kw: 9.0              # fixed charger load subtracted from those hours
 
+  # Solar PV + battery target correction (optional).
+  # Corrects the training target from grid-import-only to true household consumption.
+  # Any subset of the four sensors may be configured independently.
+  # solar_production_sensor:  sensor.solaredge_ac_energy_kwh
+  # grid_export_sensor:       sensor.solaredge_exported_energy_kwh
+  # battery_charge_sensor:    sensor.solaredge_battery_charge_kwh
+  # battery_discharge_sensor: sensor.solaredge_battery_discharge_kwh
+
   # Path override for the energy history CSV (default: next to energy_forecast.py).
   # cache_path: /config/appdaemon/apps/energy_forecast/energy_history.csv
 
@@ -257,9 +267,13 @@ energy_forecast:
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
 | `timezone` | No | `Europe/Zurich` | IANA timezone name |
-| `weight_halflife_days` | No | `90` | Sample weight half-life. `0` disables exponential weighting |
+| `weight_halflife_days` | No | `90` | Sample weight half-life. Must be `≥ 1` (lower = recent data weighted more heavily). |
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
+| `solar_production_sensor` | No | — | Entity ID of a cumulative solar production kWh meter (`total_increasing`). Adds solar generation to the training target. See [Solar PV + battery](#solar-pv--battery). |
+| `grid_export_sensor` | No | — | Entity ID of a cumulative grid-export kWh meter (`total_increasing`). Subtracts exported energy from the training target. Recommended when solar is configured. |
+| `battery_charge_sensor` | No | — | Entity ID of a cumulative battery charge kWh meter (`total_increasing`). Subtracts battery charging from the training target. |
+| `battery_discharge_sensor` | No | — | Entity ID of a cumulative battery discharge kWh meter (`total_increasing`). Adds battery discharge back to the training target. |
 | `cache_path` | No | Next to `energy_forecast.py` | Override path for the energy history CSV file |
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
@@ -268,6 +282,7 @@ energy_forecast:
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
 | `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
+| `model_archive_count` | No | `3` | Number of previous model snapshots to keep in `models/archive/` for rollback. Set to `0` to disable model versioning. Rollback via HA event `energy_forecast_rollback_model` or dashboard. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
@@ -285,6 +300,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 > **Note — MQTT Discovery entity IDs:** When `mqtt_discovery: true` is set, Home Assistant
 > creates entities under the device "HA Energy Forecast". Entity IDs take the form
 > `sensor.ha_energy_forecast_<unique_id>` (e.g. `sensor.ha_energy_forecast_energy_forecast_today`).
+> Block forecast sensors use `HH_MM_HH_MM` format for time slots (e.g. `sensor.ha_energy_forecast_energy_forecast_today_06_00_09_00` for 06:00–09:00).
 > The `sensor.energy_forecast_*` IDs in the table below reflect the `set_state()` path; update
 > any automations accordingly when switching modes.
 
@@ -362,6 +378,8 @@ energy_history.csv ─┘         (HA wins on conflict)
         │
         ▼
 EV detection  ──► baseline_df (EV hours have charger load subtracted)
+        │
+        ├── solar/battery correction  [_apply_target_correction, if sensors configured]
         │
         ├── fetch_historical_weather()  [Open-Meteo archive]
         │
@@ -475,6 +493,42 @@ Any hour where gross grid import exceeds `ev_charging_threshold_kwh` (default 7 
 This means the model trains on the true household signal even on days with EV sessions. The raw detected EV kWh are published separately as `sensor.energy_forecast_ev_today` and `sensor.energy_forecast_ev_yesterday`.
 
 Tune the threshold in `apps.yaml` to match your charger and household ceiling. The default 7 kWh/h suits a 9–11 kW charger with a household ceiling below 6.5 kWh/h.
+
+---
+
+## Solar PV + battery
+
+If your home has solar panels and/or a home battery, the raw grid-import sensor understates true household consumption — solar self-consumption and battery cycling are invisible to the meter. The four optional sensors below correct the training target so the model learns actual household energy use, not just grid draw:
+
+```
+total_consumption = grid_import − grid_export
+                    + solar_production
+                    − battery_charge + battery_discharge
+```
+
+Any subset can be configured — e.g. solar-only without a battery, or just `grid_export_sensor` to cancel self-consumption. Sensors not configured are treated as zero.
+
+**Sensor requirements:** all sensors must be *cumulative* kWh entities (`device_class: energy`, `state_class: total_increasing`). If your inverter only exposes instantaneous power (W or kW), create a **Riemann sum integration helper** in HA first (**Settings → Helpers → Add helper → Riemann sum integral**).
+
+### Hardware examples
+
+**SolarEdge Modbus Multi** (entity names are user-defined in the integration):
+```yaml
+solar_production_sensor:  sensor.solaredge_ac_energy_kwh
+grid_export_sensor:       sensor.solaredge_exported_energy_kwh
+battery_charge_sensor:    sensor.solaredge_battery_charge_kwh    # may need Riemann sum
+battery_discharge_sensor: sensor.solaredge_battery_discharge_kwh
+```
+
+**Enphase Envoy** (replace `SERIAL` with your gateway serial number):
+```yaml
+solar_production_sensor:  sensor.envoy_SERIAL_lifetime_energy_production
+grid_export_sensor:       sensor.envoy_SERIAL_lifetime_net_energy_production
+battery_charge_sensor:    sensor.envoy_SERIAL_lifetime_battery_energy_charged
+battery_discharge_sensor: sensor.envoy_SERIAL_lifetime_battery_energy_discharged
+```
+
+**Backward compatibility:** Omitting all four keys produces no behaviour change. The feature activates only for sensors that are explicitly configured.
 
 ---
 
@@ -637,6 +691,13 @@ Set `mqtt_discovery: false` (or remove the key). The app reverts to writing dire
 
 **DST fall-back warning in the log**
 - `DST fall-back: N rows share M duplicate naive timestamp(s) after merge` is expected on the last Sunday of October. It is informational — the merge still completes correctly.
+
+**CSV health check warnings**
+- After the weekly retrain or during history merge, you may see `WARNING` logs mentioning:
+  - `non-monotonic timestamps` — energy meter readings out of order; usually a sensor reset or time jump.
+  - `gap detected` — more than 2 hours between consecutive readings; DST transitions are excluded.
+  - `out-of-range gross_kwh` — readings above 50 kWh/h (spike filter should have caught it).
+- These are diagnostic only and do not stop training. Common causes: sensor reset, power failure during DST, manual meter restart. Check the timestamps and decide if correcting the CSV cache is necessary.
 
 **`Could not fetch recent actuals for lag features`**
 - HA history fetch failed. The sensor update proceeds without lag features; the model fills them with training-set medians. No action required.

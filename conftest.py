@@ -4,6 +4,8 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
+import pytest
+
 # Add apps/ to sys.path so tests can import energy_forecast as a package
 # without installing it, mirroring how AppDaemon loads it at runtime.
 sys.path.insert(0, str(Path(__file__).parent / "apps"))
@@ -17,3 +19,20 @@ if "hassapi" not in sys.modules:
     _hassapi_stub = ModuleType("hassapi")
     _hassapi_stub.Hass = MagicMock  # type: ignore[attr-defined]
     sys.modules["hassapi"] = _hassapi_stub
+
+
+@pytest.fixture(autouse=True)
+def _clear_srg_caches():
+    """Clear SRG OAuth token and geolocation caches before each test.
+
+    Module-level caches in weather.py (_srg_token, _srg_geo_id) must be cleared
+    between tests to prevent cache pollution and ensure each test is independent.
+    """
+    from energy_forecast import weather
+
+    yield  # Run the test
+
+    # Clear caches after the test
+    weather._srg_token = None
+    weather._srg_token_expires_at = 0.0
+    weather._srg_geo_id.clear()
