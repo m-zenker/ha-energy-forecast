@@ -479,6 +479,218 @@ class TestNewWeatherFeatures:
         assert abs(float(result["temp_rolling_3d"].iloc[0]) - expected) < 1e-6
 
 
+# ── Thermal modelling features (#49–#52) ──────────────────────────────────────
+
+class TestEWMATemperature:
+    """#49 EWMA temperature features — RC-circuit thermal mass model."""
+
+    def test_temp_ewma_features_in_features_base(self):
+        assert "temp_ewma_24h" in _FEATURES_BASE
+        assert "temp_ewma_72h" in _FEATURES_BASE
+
+    def test_ewma_24h_decays_exponentially(self):
+        """With constant temp = 5.0, ewm(halflife=24) should stabilise near 5.0."""
+        ts = pd.date_range("2026-03-12 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=5.0)
+        result = _engineer_features(df, w, None)
+        # After 200 hours, EWMA should be very close to 5.0
+        assert abs(float(result["temp_ewma_24h"].iloc[-1]) - 5.0) < 0.01
+
+    def test_ewma_72h_slower_than_24h(self):
+        """72h EWMA should respond slower to temp changes than 24h EWMA."""
+        ts = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
+        w_constant = _make_weather_df(ts, temp=5.0)
+        # Override to step-change at t=24: 5.0 → 15.0
+        w_step = w_constant.copy()
+        w_step.loc[w_step["timestamp"] >= pd.Timestamp("2026-03-13 00:00"), "temp_c"] = 15.0
+        df = _make_bare_df(ts)
+        result = _engineer_features(df, w_step, None)
+        # At hour 48, both should have moved toward 15.0 but 72h should be further back
+        ewma_24_at_48 = float(result["temp_ewma_24h"].iloc[-1])
+        ewma_72_at_48 = float(result["temp_ewma_72h"].iloc[-1])
+        assert ewma_24_at_48 > ewma_72_at_48  # 24h reacts faster
+
+    def test_ewma_nan_fill_works(self):
+        """When weather is missing, EWMA columns should be NaN then filled by median."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w = pd.DataFrame({
+            "timestamp":        pd.to_datetime(ts),
+            "temp_c":           [5.0] * 24,
+            "precipitation_mm": [0.0] * 24,
+            "sunshine_min":     [30.0] * 24,
+            "wind_kmh":         [10.0] * 24,
+        })
+        result = _engineer_features(df, w, None)
+        # EWMA columns should exist (created as NaN then filled)
+        assert "temp_ewma_24h" in result.columns
+        assert "temp_ewma_72h" in result.columns
+        # After median fill, no NaN should remain
+        assert not result["temp_ewma_24h"].isna().any()
+        assert not result["temp_ewma_72h"].isna().any()
+
+
+class TestRollingDegreeHourSums:
+    """#50 Accumulated heating/cooling degree-hour sums."""
+
+    def test_heating_deg_sum_features_in_features_base(self):
+        assert "heating_deg_sum_24h" in _FEATURES_BASE
+        assert "heating_deg_sum_168h" in _FEATURES_BASE
+
+    def test_heating_deg_sum_24h_below_18(self):
+        """With constant temp=10°C (below 18°C threshold), sum over 24h should be 24*8=192."""
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=10.0)
+        result = _engineer_features(df, w, None)
+        # At hour 24: rolling sum of (18-10)=8 over 24 hours = 192
+        expected_24h = 24 * (18 - 10)
+        # Allow small tolerance for float precision
+        assert abs(float(result["heating_deg_sum_24h"].iloc[24]) - expected_24h) < 0.1
+
+    def test_heating_deg_sum_zero_when_temp_above_18(self):
+        """With constant temp=25°C (above 18°C threshold), heating_deg_sum should be 0."""
+        ts = pd.date_range("2026-06-15 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=25.0)
+        result = _engineer_features(df, w, None)
+        assert (result["heating_deg_sum_24h"] == 0.0).all()
+
+    def test_heating_deg_sum_168h_accumulates(self):
+        """168h sum (7 days) should be larger than 24h sum for the same conditions."""
+        ts = pd.date_range("2026-01-15 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=5.0)  # (18-5) = 13 degree-hours per hour
+        result = _engineer_features(df, w, None)
+        # At hour 168, should have 168 * 13
+        sum_168 = float(result["heating_deg_sum_168h"].iloc[168])
+        expected = 168 * 13
+        assert abs(sum_168 - expected) < 0.1
+
+
+class TestTemperatureDelta:
+    """#51 Temperature rate of change (delta 1h and 24h)."""
+
+    def test_temp_delta_features_in_features_base(self):
+        assert "temp_delta_1h" in _FEATURES_BASE
+        assert "temp_delta_24h" in _FEATURES_BASE
+
+    def test_temp_delta_1h_tracks_change(self):
+        """Rising temp sequence: 0, 1, 2, 3, ... should have delta=1 after first row."""
+        ts = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
+        df = _make_bare_df(ts)
+        # Temperature increases by 0.5°C per hour
+        temps = [float(i) * 0.5 for i in range(48)]
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               temps,
+            "precipitation_mm":     [0.0] * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+        result = _engineer_features(df, w, None)
+        # delta[1:] should be ~0.5 (small tolerance for float errors)
+        assert abs(float(result["temp_delta_1h"].iloc[5]) - 0.5) < 0.01
+
+    def test_temp_delta_24h_detects_daily_pattern(self):
+        """With 24-hour period shift, temp_delta_24h should show day-over-day change."""
+        ts = pd.date_range("2026-03-12 00:00", periods=72, freq="1h")
+        df = _make_bare_df(ts)
+        # Day 1: 5°C, Day 2: 10°C, Day 3: 5°C again
+        temps = [5.0] * 24 + [10.0] * 24 + [5.0] * 24
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               temps,
+            "precipitation_mm":     [0.0] * 72,
+            "sunshine_min":         [30.0] * 72,
+            "wind_kmh":             [10.0] * 72,
+            "cloud_cover_pct":      [50.0] * 72,
+            "direct_radiation_wm2": [100.0] * 72,
+        })
+        result = _engineer_features(df, w, None)
+        # At hour 24: 10 - 5 = +5 (warmer than day before)
+        assert abs(float(result["temp_delta_24h"].iloc[24]) - 5.0) < 0.01
+        # At hour 48: 5 - 10 = -5 (colder than day before)
+        assert abs(float(result["temp_delta_24h"].iloc[48]) - (-5.0)) < 0.01
+
+
+class TestTemperatureLagFeatures:
+    """#52 Temperature lag features (24h and 168h)."""
+
+    def test_temp_lag_features_in_features_base(self):
+        assert "temp_lag_24h" in _FEATURES_BASE
+        assert "temp_lag_168h" in _FEATURES_BASE
+
+    def test_temp_lag_24h_value_matches(self):
+        """temp_lag_24h[h] should equal temp_c[h-24]."""
+        ts = pd.date_range("2026-03-12 00:00", periods=96, freq="1h")
+        df = _make_bare_df(ts)
+        temps = list(range(96))  # 0, 1, 2, ..., 95
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               [float(t) for t in temps],
+            "precipitation_mm":     [0.0] * 96,
+            "sunshine_min":         [30.0] * 96,
+            "wind_kmh":             [10.0] * 96,
+            "cloud_cover_pct":      [50.0] * 96,
+            "direct_radiation_wm2": [100.0] * 96,
+        })
+        result = _engineer_features(df, w, None)
+        # At index 24, lag_24h should be 0.0
+        assert abs(float(result["temp_lag_24h"].iloc[24]) - 0.0) < 1e-9
+        # At index 50, lag_24h should be 26.0
+        assert abs(float(result["temp_lag_24h"].iloc[50]) - 26.0) < 1e-9
+
+    def test_temp_lag_168h_nan_for_first_week(self):
+        """First 168 hours should initially be NaN for temp_lag_168h (no history),
+        but filled by median during NaN-fill step in _engineer_features."""
+        ts = pd.date_range("2026-03-12 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=10.0)
+        result = _engineer_features(df, w, None)
+        # After NaN-fill with median, no NaN should remain in temp_lag_168h
+        assert not result["temp_lag_168h"].isna().any()
+        # Hour 168+ should have correct values (shifted by exactly 168 hours)
+        # At hour 168: lag should equal temp_c from hour 0 (which is 10.0)
+        assert abs(float(result["temp_lag_168h"].iloc[168]) - 10.0) < 1e-9
+
+
+class TestThermalFeaturesIntegration:
+    """Integration test: all 8 thermal features activate during training."""
+
+    def test_all_thermal_features_in_trained_model(self, tmp_path):
+        """After training with sufficient rows, all 8 thermal features should be in m.feature_cols."""
+        rng = np.random.default_rng(1)
+        ts = pd.date_range("2024-01-01", periods=400, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=400),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=400),
+            "precipitation_mm":     [0.0] * 400,
+            "sunshine_min":         [30.0] * 400,
+            "wind_kmh":             [10.0] * 400,
+            "cloud_cover_pct":      [50.0] * 400,
+            "direct_radiation_wm2": [100.0] * 400,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # All 8 thermal features should be present
+        thermal_features = [
+            "temp_ewma_24h", "temp_ewma_72h",
+            "heating_deg_sum_24h", "heating_deg_sum_168h",
+            "temp_delta_1h", "temp_delta_24h",
+            "temp_lag_24h", "temp_lag_168h",
+        ]
+        for feat in thermal_features:
+            assert feat in m.feature_cols, f"{feat} not found in feature_cols"
+
+
 # ── Log-transform (#7) ────────────────────────────────────────────────────────
 
 class TestLogTransform:

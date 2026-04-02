@@ -84,7 +84,12 @@ _FEATURES_BASE = [
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
-    "temp_rolling_3d",                               # thermal mass proxy
+    "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
+    # Thermal modelling features (#49–#52)
+    "temp_ewma_24h", "temp_ewma_72h",               # #49 EWMA — RC-circuit thermal mass
+    "heating_deg_sum_24h", "heating_deg_sum_168h",  # #50 accumulated heating debt
+    "temp_delta_1h", "temp_delta_24h",              # #51 temperature rate of change
+    "temp_lag_24h", "temp_lag_168h",                # #52 temperature lags
     # Autoregressive lags — always safe (see note above)
     "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
     "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
@@ -1205,13 +1210,36 @@ def _engineer_features(
     w = w.sort_values("timestamp").reset_index(drop=True)
     w["temp_rolling_3d"] = w["temp_c"].rolling(72, min_periods=1).mean()
 
+    # ── Thermal modelling features (#49–#52) ──────────────────────────────────
+    # #49 EWMA — RC-circuit thermal mass model (halflife in hours)
+    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24).mean()
+    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72).mean()
+
+    # #50 Rolling degree-hour sums — accumulated thermal debt
+    _hd = np.maximum(0, 18.0 - w["temp_c"])
+    w["heating_deg_sum_24h"] = _hd.rolling(24, min_periods=1).sum()
+    w["heating_deg_sum_168h"] = _hd.rolling(168, min_periods=1).sum()
+
+    # #51 Temperature rate of change
+    w["temp_delta_1h"] = w["temp_c"].diff(1)
+    w["temp_delta_24h"] = w["temp_c"].diff(24)
+
+    # #52 Temperature lags
+    w["temp_lag_24h"] = w["temp_c"].shift(24)
+    w["temp_lag_168h"] = w["temp_c"].shift(168)
+
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
     df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
     for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
-                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d"]:
+                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d",
+                # Thermal modelling features
+                "temp_ewma_24h", "temp_ewma_72h",
+                "heating_deg_sum_24h", "heating_deg_sum_168h",
+                "temp_delta_1h", "temp_delta_24h",
+                "temp_lag_24h", "temp_lag_168h"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
