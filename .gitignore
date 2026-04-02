@@ -23,6 +23,7 @@ apps/energy_forecast/energy_history.csv
 
 # Temporary files / log drops
 temp/
+logs/
 
 # Claude Code — local only, not for sharing
 CLAUDE.md
