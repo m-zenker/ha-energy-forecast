@@ -30,7 +30,7 @@ Current baseline: v0.8.1 on `dev` (deployed 2026-04-01).
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
 | Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on dev) |
-| Occupancy + EV awareness | v0.9.0 | #21 Occupancy (`people_home`), #22 EV SoC + charging state | planned |
+| Occupancy + thermal modelling | v0.9.0 | #21 Occupancy (`people_home`), #49 EWMA temperature, #50 Rolling degree-hour sums, #51 Temperature rate of change, #52 Temperature lags | planned |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
@@ -223,8 +223,44 @@ Add a validation check in `_validate_config` that logs a `WARNING` when `self._e
 ### 21. Occupancy feature (`people_home`) *(planned — v0.9.0)*
 Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
 
-### 22. EV charging state + SoC feature *(planned — v0.9.0)*
-The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
+### 22. EV charging state + SoC feature *(DEFERRED)*
+EV charging hours are subtracted from the training target during model fitting, so the model never sees EV load. Adding SoC/charging state as a feature provides no direct signal to learn from. Any value as an occupancy proxy is better covered by #21 (`people_home`). Revisit only if EV load is re-included in the target or if there is evidence of improved forecast accuracy.
+
+### 49. Exponentially weighted moving average temperature *(planned — v0.9.0)*
+Replace the current rectangular-window `temp_rolling_3d` with two EWMA features using physically-motivated half-lives:
+- `temp_ewma_24h` (half-life = 24 hours)
+- `temp_ewma_72h` (half-life = 72 hours)
+
+Rational: Building thermal mass decays exponentially, not linearly. EWMA directly implements the first-order RC thermal system equation. Recent temperatures dominate, with a mathematically-justified decay rate. The model can learn the building's actual thermal time constant from data.
+
+**Impact**: Reduces forecast error during sustained cold/heat spells where thermal debt accumulates. Particularly important for heat pump systems.
+
+### 50. Rolling accumulated heating degree-hours *(planned — v0.9.0)*
+Add two cumulative features to capture the "depth of heating/cooling season":
+- `heating_deg_sum_24h` = rolling sum of `heating_degree` over 24 hours
+- `heating_deg_sum_168h` = rolling sum over 168 hours (7 days)
+
+Rational: Instantaneous `heating_degree` (per-hour value only) misses the thermal debt that builds during multi-day cold spells. A heat pump's energy draw over a week depends on *accumulated* cold, not just today's temperature. Same for cooling.
+
+**Impact**: Smooths bouncing patterns in heat pump sub-sensor settling; captures multi-day thermal patterns.
+
+### 51. Temperature rate of change feature *(planned — v0.9.0)*
+Add two rate-of-change features:
+- `temp_delta_1h` = `temp_c - temp_c.shift(1)`
+- `temp_delta_24h` = `temp_c - temp_c.shift(24)`
+
+Rational: HVAC systems are responsive to whether temperature is *rising* or *falling*, not just absolute value. A rising temperature after a cold night triggers different anticipatory behavior than a falling temperature heading into a cold night.
+
+**Impact**: Low-effort signal; medium utility for HVAC-heavy buildings.
+
+### 52. Temperature lag features *(planned — v0.9.0)*
+Add explicit temperature lags using the existing infrastructure:
+- `temp_lag_24h` = `temp_c.shift(24)`
+- `temp_lag_168h` = `temp_c.shift(168)`
+
+Rational: Energy consumption already has 9 explicit lags (`lag_1h` through `lag_336h`). Temperature lags let the model detect "it was this warm yesterday vs. today" patterns. Free implementation; reuses existing lag feature pipeline.
+
+**Impact**: Medium utility; complements rolling statistics.
 
 ### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
 Target: `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
@@ -495,7 +531,7 @@ Migration reference:
 | 19 | CSV append-only writes | performance | 2 h | ✓ done |
 | 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | ✓ done |
 | 21 | Occupancy feature (`people_home`) | **high** | 4 h | planned v0.9.0 |
-| 22 | EV SoC + charging state feature | high (EV households) | 4 h | planned v0.9.0 |
+| 22 | EV SoC + charging state feature | high (EV households) | 4 h | deferred |
 | 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done on branch (v0.8.0) |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
 | 25 | Vacation / away flag | medium | 2 h | ✓ done |
@@ -522,3 +558,7 @@ Migration reference:
 | 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
 | 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | ✓ done v0.7.1 |
 | 48 | Anomaly binary sensor MQTT attrs + discovery fix | correctness / UX | 30 min | ✓ done v0.7.1 |
+| 49 | Exponentially weighted moving average temperature | **high** (thermal model) | 1 h | planned v0.9.0 |
+| 50 | Rolling accumulated heating degree-hours | high (thermal model) | 1.5 h | planned v0.9.0 |
+| 51 | Temperature rate of change feature | medium (thermal model) | 30 min | planned v0.9.0 |
+| 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | planned v0.9.0 |

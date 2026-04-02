@@ -84,7 +84,12 @@ _FEATURES_BASE = [
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
-    "temp_rolling_3d",                               # thermal mass proxy
+    "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
+    # Thermal modelling features (#49–#52)
+    "temp_ewma_24h", "temp_ewma_72h",               # #49 EWMA — RC-circuit thermal mass
+    "heating_deg_sum_24h", "heating_deg_sum_168h",  # #50 accumulated heating debt
+    "temp_delta_1h", "temp_delta_24h",              # #51 temperature rate of change
+    "temp_lag_24h", "temp_lag_168h",                # #52 temperature lags
     # Autoregressive lags — always safe (see note above)
     "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
     "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
@@ -98,6 +103,8 @@ _FEATURES_BASE = [
     "likely_ev_hour",
     # Vacation / away flag
     "is_away",
+    # Occupancy
+    "people_home",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -207,6 +214,7 @@ class EnergyForecastModel:
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
         away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
+        presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -254,7 +262,8 @@ class EnergyForecastModel:
 
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
-                                likely_ev_hours=likely_ev_hours, away_df=away_df)
+                                likely_ev_hours=likely_ev_hours, away_df=away_df,
+                                presence_df=presence_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -517,6 +526,7 @@ class EnergyForecastModel:
         recent_actuals: pd.DataFrame | None,
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -550,6 +560,15 @@ class EnergyForecastModel:
             feat_df["is_away"] = away_map.values.astype(int)
         else:
             feat_df["is_away"] = 0
+
+        # ── Occupancy / people_home ─────────────────────────────────────────
+        # people_home_series is a 48-value Series indexed by naive prediction timestamps.
+        # Merge by timestamp; fill unmatched rows with 0 (default: nobody home).
+        if people_home_series is not None and not people_home_series.empty:
+            ph_map = people_home_series.reindex(pd.to_datetime(feat_df["timestamp"])).fillna(0)
+            feat_df["people_home"] = ph_map.values.astype(int)
+        else:
+            feat_df["people_home"] = 0
 
         # Overwrite hours_ahead with the actual prediction horizon (0–47).
         # _engineer_features sets it to 0 (training-row semantics); here we
@@ -586,6 +605,7 @@ class EnergyForecastModel:
         recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
+        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -595,7 +615,7 @@ class EnergyForecastModel:
             raise RuntimeError("Model not yet trained.")
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -610,6 +630,7 @@ class EnergyForecastModel:
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
+        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -623,7 +644,7 @@ class EnergyForecastModel:
             return None
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1151,6 +1172,7 @@ def _engineer_features(
     canton: str | None = None,
     likely_ev_hours: set | None = None,
     away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
+    presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1205,13 +1227,36 @@ def _engineer_features(
     w = w.sort_values("timestamp").reset_index(drop=True)
     w["temp_rolling_3d"] = w["temp_c"].rolling(72, min_periods=1).mean()
 
+    # ── Thermal modelling features (#49–#52) ──────────────────────────────────
+    # #49 EWMA — RC-circuit thermal mass model (halflife in hours)
+    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24).mean()
+    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72).mean()
+
+    # #50 Rolling degree-hour sums — accumulated thermal debt
+    _hd = np.maximum(0, 18.0 - w["temp_c"])
+    w["heating_deg_sum_24h"] = _hd.rolling(24, min_periods=1).sum()
+    w["heating_deg_sum_168h"] = _hd.rolling(168, min_periods=1).sum()
+
+    # #51 Temperature rate of change
+    w["temp_delta_1h"] = w["temp_c"].diff(1)
+    w["temp_delta_24h"] = w["temp_c"].diff(24)
+
+    # #52 Temperature lags
+    w["temp_lag_24h"] = w["temp_c"].shift(24)
+    w["temp_lag_168h"] = w["temp_c"].shift(168)
+
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
     df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
     for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
-                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d"]:
+                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d",
+                # Thermal modelling features
+                "temp_ewma_24h", "temp_ewma_72h",
+                "heating_deg_sum_24h", "heating_deg_sum_168h",
+                "temp_delta_1h", "temp_delta_24h",
+                "temp_lag_24h", "temp_lag_168h"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
@@ -1250,6 +1295,18 @@ def _engineer_features(
         df["is_away"] = df["is_away"].fillna(0).astype(int)
     else:
         df["is_away"] = 0
+
+    # ── Occupancy / people_home feature ───────────────────────────────────────
+    if presence_df is not None and not presence_df.empty:
+        p = presence_df[["timestamp", "people_home"]].copy()
+        p["timestamp"] = pd.to_datetime(p["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(p, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_ph"))
+        df.drop(columns=["timestamp_ph", "_ts_floor"], errors="ignore", inplace=True)
+        df["people_home"] = df["people_home"].fillna(0).astype(int)
+    else:
+        df["people_home"] = 0
 
     return df
 
