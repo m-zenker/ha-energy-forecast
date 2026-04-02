@@ -27,7 +27,7 @@ from typing import Any
 import hassapi as hass
 
 from . import ha_data, weather
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRESENCE_STATE_HOME
 from .model import EnergyForecastModel
 
 # ── Operational constants l ─────────────────────────────────────────────────────
@@ -68,6 +68,10 @@ class EnergyForecast(hass.Hass):
         # away_return_entity  — input_datetime holding the expected return (for prediction only)
         self._away_mode_entity: str | None   = self.args.get("away_mode_entity") or None
         self._away_return_entity: str | None = self.args.get("away_return_entity") or None
+        # Optional presence sensors for occupancy feature:
+        # presence_sensors    — list of HA person entities (e.g. person.alice, person.bob)
+        #                       to count how many are home at each hour
+        self._presence_sensors: list[str] = list(self.args.get("presence_sensors") or [])
         # Optional solar PV + battery target correction sensors.
         # When configured, gross_kwh (grid import) is corrected to true household
         # consumption before training:
@@ -649,6 +653,12 @@ class EnergyForecast(hass.Hass):
         if not away_df.empty:
             away_df = _strip_tz(away_df)
 
+        presence_df = ha_data.fetch_presence_history(
+            self, self._presence_sensors or None, days=30
+        )
+        if not presence_df.empty:
+            presence_df = _strip_tz(presence_df)
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -658,6 +668,7 @@ class EnergyForecast(hass.Hass):
             ev_df=ev_df,
             sub_sensors_dict=sub_sensors_dict or None,
             away_df=away_df if not away_df.empty else None,
+            presence_df=presence_df if not presence_df.empty else None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -704,11 +715,13 @@ class EnergyForecast(hass.Hass):
         live_temp  = self._read_live_temp()
         now_ts     = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
         away_series = self._build_away_prediction_series(now_ts)
+        people_home_series = self._build_people_home_prediction_series(now_ts)
 
         predictions = self._ml_model.predict(
             forecast_df, live_temp, recent_actuals,
             sub_sensors_recent=sub_sensors_recent or None,
             away_series=away_series,
+            people_home_series=people_home_series,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
@@ -716,6 +729,7 @@ class EnergyForecast(hass.Hass):
             forecast_df, live_temp, recent_actuals,
             sub_sensors_recent=sub_sensors_recent or None,
             away_series=away_series,
+            people_home_series=people_home_series,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
@@ -853,6 +867,30 @@ class EnergyForecast(hass.Hass):
             is_away[future_hours < return_dt] = 1
 
         return is_away
+
+    def _build_people_home_prediction_series(self, now_ts: Any) -> Any:
+        """Return a 48-value pd.Series (indexed by naive prediction timestamps) of people_home counts.
+
+        Counts how many person entities in _presence_sensors are currently in state "home",
+        returns a constant Series with that count replicated across all 48 hours.
+        If no sensors are configured, returns all zeros.
+        """
+        import pandas as pd
+
+        future_hours = pd.date_range(
+            start=pd.Timestamp(now_ts).floor("1h"), periods=48, freq="1h"
+        )
+
+        if not self._presence_sensors:
+            return pd.Series(0, index=future_hours, dtype=int)
+
+        # Count how many person entities are currently home
+        n_home = sum(
+            1 for entity_id in self._presence_sensors
+            if self.get_state(entity_id) == PRESENCE_STATE_HOME
+        )
+
+        return pd.Series(n_home, index=future_hours, dtype=int)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""

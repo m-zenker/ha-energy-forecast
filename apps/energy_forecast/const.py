@@ -20,6 +20,9 @@ MIN_CV_ROWS       = 500   # Minimum rows for TimeSeriesSplit cross-validation
 # Data Storage
 CACHE_PATH = Path(__file__).parent / "energy_history.csv"
 
+# Occupancy Detection
+PRESENCE_STATE_HOME = "home"
+
 # Sensor Blending Logic
 # How many hours to trust the local outdoor sensor before
 # transitioning fully to the weather forecast.

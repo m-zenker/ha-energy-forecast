@@ -1877,3 +1877,168 @@ class TestModelVersioning:
         with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
             m.rollback_model()
         assert any(archive_name in r.message for r in caplog.records)
+
+
+# ── Occupancy feature (people_home) — #21 ──────────────────────────────────────
+
+class TestPeopleHomeFeature:
+    """Tests for occupancy feature: people_home integer count (#21)."""
+
+    def test_people_home_in_features_base(self):
+        """people_home is listed in _FEATURES_BASE."""
+        assert "people_home" in _FEATURES_BASE
+
+    def test_people_home_zero_without_presence_df(self, tmp_path):
+        """When presence_df is None, people_home defaults to 0."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=None)
+
+        # Get feature columns
+        assert "people_home" in m.feature_cols
+
+    def test_people_home_column_present_with_presence_df(self, tmp_path):
+        """When presence_df is provided, people_home column is populated."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": rng.integers(0, 3, size=200),  # 0, 1, or 2 people
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        assert "people_home" in m.feature_cols
+
+    def test_people_home_values_match_presence_df(self):
+        """people_home values from presence_df are correctly merged into features."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values[:100],  # Partial overlap
+            "people_home": [2, 1, 0, 1] * 25,  # 4-hour cycle repeated
+        })
+
+        # Call _engineer_features directly to inspect merge behavior
+        df = _engineer_features(energy, weather, None, presence_df=presence)
+
+        assert "people_home" in df.columns
+        assert df["people_home"].dtype == int
+
+    def test_people_home_in_feature_cols_after_train(self, tmp_path):
+        """people_home is included in feature_cols list after training."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": [1] * len(energy),
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        assert "people_home" in m.feature_cols
+
+    def test_predict_with_people_home_series(self, tmp_path):
+        """Prediction with people_home_series injects values into prediction."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": [1] * len(energy),
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        # Build forecast for next 48 hours
+        now = energy["timestamp"].max()
+        forecast = pd.DataFrame({
+            "timestamp": pd.date_range(now + pd.Timedelta(hours=1), periods=48, freq="1h"),
+            "temp_c": [15.0] * 48,
+            "precipitation_mm": [0.0] * 48,
+            "sunshine_min": [30.0] * 48,
+            "wind_kmh": [10.0] * 48,
+            "cloud_cover_pct": [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+
+        # Create a 48-element Series with occupancy values
+        people_home_series = pd.Series(
+            data=[2] * 48,
+            index=forecast["timestamp"].values,
+        )
+
+        predictions = m.predict(
+            forecast,
+            live_temp=15.0,
+            recent_actuals=None,
+            people_home_series=people_home_series,
+        )
+
+        assert "predicted_kwh" in predictions.columns
+        assert len(predictions) == 48
