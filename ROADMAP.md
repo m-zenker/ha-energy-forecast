@@ -5,6 +5,20 @@ Current baseline: v0.8.1 on `dev` (deployed 2026-04-01).
 
 ---
 
+## Current Status — Sub-sensor Feature Maturation (Path A: Monitor)
+
+**Decision (2026-04-02):** Wait for natural data maturation of sub-sensor features until ~April 20 rather than accelerating with HVAC state feature (Path B).
+
+**Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — MAE improved from 0.7 to 0.57 kWh/hour (18% improvement), but short-term bouncing pattern (overshooting one hour, undershooting the next) observed. Root cause: lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows); with 14 days of sub-sensor history (~336 rows), these features remain excluded.
+
+**Timeline:** By ~2026-04-20, sub-sensor history reaches 4+ weeks (≥672 rows), triggering full lag feature activation. Bouncing pattern expected to flatten as the model learns temporal stability across multi-day windows.
+
+**Monitoring:** Track MAE and bouncing pattern through April 20. If pattern persists after that date, revisit Path B (HVAC/thermostat state feature to provide anticipatory signal).
+
+**No action required** until after 2026-04-20 if bouncing remains.
+
+---
+
 ## Staged Development & Deployment Plan
 
 ### Release milestones
@@ -16,7 +30,8 @@ Current baseline: v0.8.1 on `dev` (deployed 2026-04-01).
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
 | Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on dev) |
-| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #21 Occupancy, #22 EV SoC, #18 Config flow | backlog |
+| Occupancy + EV awareness | v0.9.0 | #21 Occupancy (`people_home`), #22 EV SoC + charging state | planned |
+| Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
 
@@ -205,10 +220,10 @@ When the detection threshold is set at or above the charger power (e.g. threshol
 
 Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
 
-### 21. Occupancy feature (`people_home`) *(long-term backlog)*
+### 21. Occupancy feature (`people_home`) *(planned — v0.9.0)*
 Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
 
-### 22. EV charging state + SoC feature *(long-term backlog)*
+### 22. EV charging state + SoC feature *(planned — v0.9.0)*
 The current `likely_ev_hour` feature is pattern-derived from past sessions. Two optional config keys — `ev_battery_sensor` (SoC %) and `ev_charging_sensor` (binary) — would let the model know *today* whether the car is plugged in and how much charge it needs. At predict time: if the car is home and SoC is low, boost the probability of an EV session tonight; if SoC is full, suppress it. Requires forward-filling sensor state into the prediction horizon.
 
 ### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
@@ -370,7 +385,7 @@ is configurable via `apps.yaml` (`anomaly_sigma_threshold`, default 3.0).
 Pairs naturally with the rolling MAE sensor (#41) for diagnostic visibility.
 Expected impact: Diagnostic / UX; Low effort.
 
-### 40. Home battery SoC as feature *(planned — v0.10.0, with solar)*
+### 40. Home battery SoC as feature *(deferred — revisit if residuals show SoC correlation after panels installed)*
 When a home battery is present, its state of charge (SoC) shapes consumption: a low SoC
 during a sunny forecast triggers aggressive solar charging (raising consumption); a full
 SoC suppresses it. Add optional `battery_soc_sensor` config key; include current SoC %
@@ -479,8 +494,8 @@ Migration reference:
 | 18 | Custom component config flow | UX / install | 8+ h | long-term backlog |
 | 19 | CSV append-only writes | performance | 2 h | ✓ done |
 | 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | ✓ done |
-| 21 | Occupancy feature (`people_home`) | **high** | 4 h | long-term backlog |
-| 22 | EV SoC + charging state feature | high (EV households) | 4 h | long-term backlog |
+| 21 | Occupancy feature (`people_home`) | **high** | 4 h | planned v0.9.0 |
+| 22 | EV SoC + charging state feature | high (EV households) | 4 h | planned v0.9.0 |
 | 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done on branch (v0.8.0) |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
 | 25 | Vacation / away flag | medium | 2 h | ✓ done |
@@ -498,7 +513,7 @@ Migration reference:
 | 37 | MQTT Discovery for entity registry | UX / install | 4 h | ✓ done |
 | 38 | Full 48 h weather forecast features | **high** (tail accuracy) | 2 h | ✓ done |
 | 39 | Anomaly detection on forecast residuals | diagnostic / UX | 1 h | ✓ done v0.7.0 |
-| 40 | Home battery SoC as feature | medium (battery households) | 1 h | planned v0.10.0 |
+| 40 | Home battery SoC as feature | medium (battery households) | 1 h | deferred |
 | 41 | Rolling accuracy history sensor (7d/30d MAE) | visibility | 1 h | ✓ done v0.7.0 |
 | 42 | SHAP feature importance per prediction | explainability | 3 h | ✓ done v0.7.0 |
 | 43 | ApexCharts / Lovelace config snippet | visibility / UX | 1 h | ✓ done v0.7.0 |
