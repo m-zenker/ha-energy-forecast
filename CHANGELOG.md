@@ -8,7 +8,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-(No unreleased changes yet.)
+### Fixed
+- **Rolling MAE sensors volatility** (`energy_forecast.py`): `mae_7d` and `mae_30d` sensors now
+  remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history`
+  dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented
+  JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day
+  pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new
+  tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
 
 ---
 
