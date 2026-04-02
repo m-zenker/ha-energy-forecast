@@ -548,7 +548,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.2...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.1...HEAD
+[0.8.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.0...v0.8.1
+[0.8.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.2...v0.8.0
 [0.7.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.1...v0.7.2
 [0.7.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.0...v0.7.1
 [0.7.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.6.0...v0.7.0
