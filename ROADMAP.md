@@ -107,11 +107,80 @@ configurable via `apps.yaml`, and add `is_school_holiday` to `_FEATURES_BASE`.
 ### ~~13. Prediction intervals as HA sensors~~ ✓ done
 ### ~~14. Intra-day actuals substitution~~ ✓ done
 
-### 15. HVAC / boiler state feature *(long-term backlog)*
-If a thermostat or boiler entity is available in HA (configurable via `apps.yaml`
-as `hvac_sensor`), including its current setpoint or on/off state as a feature
-directly explains heating/cooling load variance that outdoor temperature alone
-cannot capture.
+### 15. HVAC / boiler state — projected flow setpoint *(long-term backlog; escalate if Path A bouncing persists after 2026-04-20)*
+
+**Signal:** Derive a `flow_setpoint` feature from the Kermi heating curve rather than reading a raw
+sensor — this allows accurate 48-hour forward projection using forecast outdoor temps.
+
+**Projection formula (per future hour h):**
+```
+flow_setpoint(h) = np.interp(outdoor_temp[h], curve_x, curve_y)
+                   + parallel_shift          # current HA entity value, projected flat
+                   - 2  if 21 ≤ hour < 24
+                       or  0 ≤ hour < 6     # night setback
+                   → NaN if outdoor_temp[h] ≥ 20  # heating cutoff
+```
+
+**Heating curve breakpoints (from Kermi UI):**
+
+| Outdoor °C | Flow setpoint °C |
+|---|---|
+| -20 | 55.5 |
+| -15 | 52.5 |
+| -10 | 49.5 |
+| -5 | 46.0 |
+| 0 | 43.0 |
+| 5 | 39.5 |
+| 10 | 35.5 |
+| 15 | 31.0 |
+| 20 | 25.0 |
+
+Slope steepens at the warm end — `np.interp` handles piecewise linear exactly; a single slope
+approximation would lose accuracy at the extremes.
+
+**Parallel shift:** Available as a live HA sensor entity (`sensor.kermi_parallel_shift` or similar).
+Read at prediction time; project flat across 48h (changes rarely — a few times per season at most).
+
+**Night setback:** −2°C, 21:00–06:00. Captured as a feature, so the model learns that heat pump
+load drops during setback hours even on cold nights.
+
+**Heating cutoff:** outdoor temp ≥ 20°C → heating circuit off → `flow_setpoint = NaN` (median-filled
+at predict time, same as other NaN features).
+
+**Training path:** apply same formula to historical `temp_c` column + fetched parallel shift history
+→ `flow_setpoint` column in training frame.
+
+**Additional signals available (not in scope for first implementation):**
+- Buffer temperature (h=0 current-state signal; poor projection beyond first hour)
+- Flow temperature (similar to buffer)
+- DHW buffer temperature (usage-driven; poor projection)
+These can be added as a second pass if `flow_setpoint` alone shows limited gain.
+
+**`apps.yaml` config keys:**
+```yaml
+heating_curve_sensor: sensor.kermi_parallel_shift   # HA entity for curve offset
+heating_curve_points:                               # piecewise lookup; user-configurable
+  - [-20, 55.5]
+  - [-15, 52.5]
+  - [-10, 49.5]
+  - [ -5, 46.0]
+  - [  0, 43.0]
+  - [  5, 39.5]
+  - [ 10, 35.5]
+  - [ 15, 31.0]
+  - [ 20, 25.0]
+heating_cutoff_temp: 20       # °C — NaN above this
+night_setback_delta: -2       # °C
+night_setback_start: 21       # hour, inclusive
+night_setback_end: 6          # hour, exclusive
+```
+
+**Effort:** ~3 hours (similar architecture to #21 occupancy — history fetch + feature engineering +
+prediction projection + tests).
+
+**Impact:** HIGH for heat pump buildings. Directly captures system intent rather than just ambient
+temperature pressure. Night setback signal explains the 21:00–06:00 consumption reduction without
+relying on time-of-day features alone.
 
 ---
 
