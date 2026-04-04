@@ -71,75 +71,25 @@ Docker standalone, HA Energy dashboard integration.
 
 ## Tier 1 — High impact, low effort (quick wins)
 
-### ~~1. Fix missing sunshine in Open-Meteo fallback~~ ✓ done (144de78)
-~~`weather.py` hardcodes `sunshine_min = 0` for the Open-Meteo forecast fallback.
-The free Open-Meteo API *does* provide `sunshine_duration`. This is a bug that
-silently degrades any installation without SRG-SSR credentials — summer cooling
-and daylighting-driven consumption patterns become invisible to the model for all
-48 prediction hours. Fix: add `sunshine_duration` to the Open-Meteo forecast URL
-and convert from seconds to minutes, matching the archive fetcher.~~
-
-### ~~2. Add `temp_rolling_3d` to the prediction horizon~~ ✓ done (c9513b8)
-`temp_rolling_3d` is computed only over historical weather. During prediction it
-is populated at the current timestamp but never rolled forward using forecast
-temperatures. Add a forward-projection of this feature using forecast `temp_c`
-so the model sees the *incoming* thermal trend, not just the past one. Particularly
-impactful at the start of cold spells and thaws.
-
-### ~~3. Pre/post-holiday bridge day features~~ ✓ done (d47477f)
-The model uses only a binary `is_public_holiday` flag. Adding
-`days_to_next_holiday` and `days_since_last_holiday` (capped at ±3) captures the
-Brückentag (bridging day) pattern common in Swiss households — consumption
-typically drops the day before a multi-day break and recovers the day after.
-
-### ~~4. Cloud cover / solar irradiance feature~~ ✓ done (c9513b8)
-Open-Meteo provides `cloudcover` and `direct_radiation` at no extra cost.
-Direct solar radiation is a stronger predictor of cooling load than sunshine
-minutes, and cloud cover captures gloom-driven lighting load that the current
-features miss. Add both to `fetch_historical_weather` and `fetch_open_meteo`,
-and include them in `_FEATURES_BASE`.
+### ~~1. Fix missing sunshine in Open-Meteo fallback~~ ✓ done
+### ~~2. Add `temp_rolling_3d` to the prediction horizon~~ ✓ done
+### ~~3. Pre/post-holiday bridge day features~~ ✓ done
+### ~~4. Cloud cover / solar irradiance feature~~ ✓ done
 
 ---
 
 ## Tier 2 — High impact, medium effort
 
-### ~~5. Fix training/prediction mismatch in rolling features~~ ✓ done (144de78)
-~~`rolling_mean_24h`, `rolling_mean_7d`, and `rolling_std_24h` are computed as a
-*single scalar* applied to all 48 prediction hours. During training these are
-time-varying per row. This creates a systematic bias: hours 1–2 ahead get a
-reasonably calibrated feature value, but hours 24–48 ahead get a stale one.
-
-Fix: project these features forward hour-by-hour using the predicted values for
-intermediate hours (auto-regressive unrolling), or at minimum decay them toward
-the training-set median as `hours_ahead` increases.~~
-
+### ~~5. Fix training/prediction mismatch in rolling features~~ ✓ done
 ### ~~6. LightGBM early stopping + validation-set tuning~~ ✓ done
-~~Fixed hyperparameters (`n_estimators=500`, `learning_rate=0.05`, `num_leaves=31`)
-cause the model to under-fit or over-fit depending on data volume. Adding early
-stopping against the last CV fold (already computed during training) gives the
-right tree count for free without grid search. Also consider a narrow sweep of
-`num_leaves` (16 / 31 / 63) on the final CV split.~~
-
 ### ~~7. Log-transform the target~~ ✓ done
-~~Household energy consumption is right-skewed (heating peaks, near-threshold EV
-hours). Training on `log1p(gross_kwh)` and exponentiating predictions reduces the
-outsized influence of rare high-energy hours on the loss, typically improving MAE
-on typical hours at the cost of negligible degradation on peaks.~~
-
 ### ~~8. Adaptive retraining trigger~~ ✓ done
-~~Weekly retraining ignores model drift. A rolling MAPE computed on the last 24
-hourly actuals vs. predictions made 24 h earlier (trackable cheaply in the CSV
-cache) would trigger an early retrain when live error exceeds ~2× the CV MAE.
-Most impactful after seasonal transitions or household behaviour changes.~~
 
 ---
 
 ## Tier 3 — Medium impact, higher effort
 
 ### ~~9. Cantonal public holidays~~ ✓ done
-~~The `holidays` package supports `canton=`. Exposing this as a `holiday_canton`
-key in `apps.yaml` is a one-line change in `_add_holiday_feature` but captures
-cantonal school and bank holidays that differ significantly from federal ones.~~
 
 ### 10. School holiday feature *(long-term backlog)*
 Swiss Schulferien dates are canton-specific but stable year-to-year. During
@@ -147,35 +97,15 @@ school holidays household daytime consumption rises (children at home). None of
 the current features capture this. Implement a static lookup table per canton,
 configurable via `apps.yaml`, and add `is_school_holiday` to `_FEATURES_BASE`.
 
-### ~~11. Additional lag: `lag_72h`~~ ✓ done (d47477f)
-A 72 h lag captures the "same-time-3-days-ago" pattern, useful for transitions
-at the start/end of weekends and public-holiday bridges. It slots between the
-existing `lag_48h` and `lag_168h` with no impact on data-volume requirements
-(comparable to `lag_48h`).
-
+### ~~11. Additional lag: `lag_72h`~~ ✓ done
 ### ~~12. EV charge session probability feature~~ ✓ done
-~~The current EV subtraction assumes a fixed 9 kW charger load for every detected
-hour. Improvements:~~
-~~- Detect EV session start and compute session-average power from actuals.~~
-~~- Add a `likely_ev_hour` binary feature derived from recurring time-of-use
-  patterns so the model can adjust the household-baseline prediction for known
-  charging windows.~~
 
 ---
 
 ## Tier 4 — Longer-term / architectural
 
 ### ~~13. Prediction intervals as HA sensors~~ ✓ done
-~~Publish `sensor.energy_forecast_today_low` / `_high` using LightGBM quantile
-regression (`objective='quantile'`, `alpha=0.1/0.9`). Enables automations like
-"charge EV only if forecast upper bound is below 15 kWh" — higher end-user value
-than marginal point-estimate MAE improvement.~~
-
 ### ~~14. Intra-day actuals substitution~~ ✓ done
-~~As today's hours tick by, `_aggregate()` should replace predicted values for
-elapsed hours with actuals from the CSV cache. Currently the `today` sensor sums
-raw predictions across the full day including already-elapsed hours. Substituting
-actuals makes the `today` total significantly more accurate as the day progresses.~~
 
 ### 15. HVAC / boiler state feature *(long-term backlog)*
 If a thermostat or boiler entity is available in HA (configurable via `apps.yaml`
@@ -220,47 +150,23 @@ When the detection threshold is set at or above the charger power (e.g. threshol
 
 Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
 
-### 21. Occupancy feature (`people_home`) *(planned — v0.9.0)*
-Home vs. away is the single largest unmodelled driver of energy consumption — a weekday with everyone out can draw 30–50% less than a day at home. Add an optional `presence_sensors` list in `apps.yaml` (e.g. `person.alice`, `person.bob`); derive a `people_home` integer feature at each hour by counting how many are in the `home` state. Requires joining HA history for each person entity alongside the energy history fetch.
+### 21. Occupancy feature (`people_home`) *(✓ done — v0.9.0, on dev)*
+Implemented in v0.9.0. See MEMORY.md for details on presence history fetching and feature integration.
 
 ### 22. EV charging state + SoC feature *(DEFERRED)*
 EV charging hours are subtracted from the training target during model fitting, so the model never sees EV load. Adding SoC/charging state as a feature provides no direct signal to learn from. Any value as an occupancy proxy is better covered by #21 (`people_home`). Revisit only if EV load is re-included in the target or if there is evidence of improved forecast accuracy.
 
-### 49. Exponentially weighted moving average temperature *(planned — v0.9.0)*
-Replace the current rectangular-window `temp_rolling_3d` with two EWMA features using physically-motivated half-lives:
-- `temp_ewma_24h` (half-life = 24 hours)
-- `temp_ewma_72h` (half-life = 72 hours)
+### 49. Exponentially weighted moving average temperature *(✓ done — v0.9.0, on dev)*
+Implemented in v0.9.0: `temp_ewma_24h` and `temp_ewma_72h` with physically-motivated half-lives. See MEMORY.md for implementation details.
 
-Rational: Building thermal mass decays exponentially, not linearly. EWMA directly implements the first-order RC thermal system equation. Recent temperatures dominate, with a mathematically-justified decay rate. The model can learn the building's actual thermal time constant from data.
+### 50. Rolling accumulated heating degree-hours *(✓ done — v0.9.0, on dev)*
+Implemented in v0.9.0: `heating_deg_sum_24h` and `heating_deg_sum_168h` for multi-day thermal patterns. See MEMORY.md for details.
 
-**Impact**: Reduces forecast error during sustained cold/heat spells where thermal debt accumulates. Particularly important for heat pump systems.
+### 51. Temperature rate of change feature *(✓ done — v0.9.0, on dev)*
+Implemented in v0.9.0: `temp_delta_1h` and `temp_delta_24h` for HVAC anticipation signals. See MEMORY.md for details.
 
-### 50. Rolling accumulated heating degree-hours *(planned — v0.9.0)*
-Add two cumulative features to capture the "depth of heating/cooling season":
-- `heating_deg_sum_24h` = rolling sum of `heating_degree` over 24 hours
-- `heating_deg_sum_168h` = rolling sum over 168 hours (7 days)
-
-Rational: Instantaneous `heating_degree` (per-hour value only) misses the thermal debt that builds during multi-day cold spells. A heat pump's energy draw over a week depends on *accumulated* cold, not just today's temperature. Same for cooling.
-
-**Impact**: Smooths bouncing patterns in heat pump sub-sensor settling; captures multi-day thermal patterns.
-
-### 51. Temperature rate of change feature *(planned — v0.9.0)*
-Add two rate-of-change features:
-- `temp_delta_1h` = `temp_c - temp_c.shift(1)`
-- `temp_delta_24h` = `temp_c - temp_c.shift(24)`
-
-Rational: HVAC systems are responsive to whether temperature is *rising* or *falling*, not just absolute value. A rising temperature after a cold night triggers different anticipatory behavior than a falling temperature heading into a cold night.
-
-**Impact**: Low-effort signal; medium utility for HVAC-heavy buildings.
-
-### 52. Temperature lag features *(planned — v0.9.0)*
-Add explicit temperature lags using the existing infrastructure:
-- `temp_lag_24h` = `temp_c.shift(24)`
-- `temp_lag_168h` = `temp_c.shift(168)`
-
-Rational: Energy consumption already has 9 explicit lags (`lag_1h` through `lag_336h`). Temperature lags let the model detect "it was this warm yesterday vs. today" patterns. Free implementation; reuses existing lag feature pipeline.
-
-**Impact**: Medium utility; complements rolling statistics.
+### 52. Temperature lag features *(✓ done — v0.9.0, on dev)*
+Implemented in v0.9.0: `temp_lag_24h` and `temp_lag_168h` for day/week temperature patterns. See MEMORY.md for details.
 
 ### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
 Target: `total_consumption = grid_import − grid_export + solar_production − battery_charge + battery_discharge`.
@@ -442,6 +348,19 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
+### 53. "Why today?" SHAP narrative attribute *(planned — v0.9.0)*
+Generate a short human-readable narrative from the top SHAP features, explaining what's
+driving today's forecast. Example: "Today's forecast is shaped primarily by time-of-day
+patterns and a cold 24-hour thermal window (accumulated heating demand is high). Yesterday's
+same-hour consumption is also a strong signal."
+
+Expose as a `shap_narrative` attribute on `sensor.energy_forecast_today`. Compute after
+`shap_summary()` in `energy_forecast.py` using simple template-based substitution (no LLM).
+Map feature names to human-readable descriptions (hour → "time-of-day", heating_deg_sum_24h
+→ "accumulated heating demand", lag_24h → "yesterday's same-hour consumption", etc.).
+
+Expected impact: Explainability / UX; Low effort (template strings + feature name mapping).
+
 ### 46. Dashboard: personalise entity IDs + icon cleanup *(backlog)*
 `dashboard/dashboard.yaml` and `dashboard/energy-today.yaml` contain user-specific entity
 IDs (`sensor.skoda_enyaq_battery_percentage`, `sensor.kermi_*`, `sensor.gplugk_z_ei`, etc.)
@@ -530,7 +449,7 @@ Migration reference:
 | 18 | Custom component config flow | UX / install | 8+ h | long-term backlog |
 | 19 | CSV append-only writes | performance | 2 h | ✓ done |
 | 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | ✓ done |
-| 21 | Occupancy feature (`people_home`) | **high** | 4 h | planned v0.9.0 |
+| 21 | Occupancy feature (`people_home`) | **high** | 4 h | ✓ done (on dev) |
 | 22 | EV SoC + charging state feature | high (EV households) | 4 h | deferred |
 | 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done on branch (v0.8.0) |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
@@ -558,7 +477,7 @@ Migration reference:
 | 46 | Dashboard: personalise entity IDs + icon cleanup | UX / sharing | 30 min | pre-v0.7.0-release |
 | 47 | Fix 404 DELETE spam in `_cleanup_legacy_states()` | log cleanliness | 5 min | ✓ done v0.7.1 |
 | 48 | Anomaly binary sensor MQTT attrs + discovery fix | correctness / UX | 30 min | ✓ done v0.7.1 |
-| 49 | Exponentially weighted moving average temperature | **high** (thermal model) | 1 h | planned v0.9.0 |
-| 50 | Rolling accumulated heating degree-hours | high (thermal model) | 1.5 h | planned v0.9.0 |
-| 51 | Temperature rate of change feature | medium (thermal model) | 30 min | planned v0.9.0 |
-| 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | planned v0.9.0 |
+| 49 | Exponentially weighted moving average temperature | **high** (thermal model) | 1 h | ✓ done (on dev) |
+| 50 | Rolling accumulated heating degree-hours | high (thermal model) | 1.5 h | ✓ done (on dev) |
+| 51 | Temperature rate of change feature | medium (thermal model) | 30 min | ✓ done (on dev) |
+| 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | ✓ done (on dev) |
