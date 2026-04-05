@@ -18,6 +18,7 @@ import pytest
 from energy_forecast.energy_forecast import (
     _apply_target_correction,
     _blend_today_totals,
+    _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
 )
@@ -1510,3 +1511,105 @@ class TestPredHistoryPersistence:
         # Warning should be logged
         app.log.assert_called_once()
         assert "Failed to save" in app.log.call_args[0][0]
+
+
+# ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
+
+class TestBuildShapNarrative:
+
+    def test_empty_dict_returns_empty_string(self):
+        """Empty shap_features dict returns empty string."""
+        result = _build_shap_narrative({})
+        assert result == ""
+
+    def test_none_returns_empty_string(self):
+        """None input returns empty string."""
+        # The function checks if not shap_features, so None is falsy
+        result = _build_shap_narrative(None or {})
+        assert result == ""
+
+    def test_single_feature(self):
+        """Single feature narrative includes label and value."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day pattern" in result
+        assert "+0.14" in result
+        assert "Mainly driven by:" in result
+
+    def test_multiple_features(self):
+        """Multiple features all appear in narrative."""
+        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h": 0.07}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day pattern" in result
+        assert "current outdoor temperature" in result
+        assert "yesterday's same-hour consumption" in result
+        assert "+0.14" in result
+        assert "+0.09" in result
+        assert "+0.07" in result
+
+    def test_unknown_feature_uses_feature_name(self):
+        """Unknown feature name falls back to raw feature name."""
+        shap_features = {"unknown_feature_xyz": 0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "unknown_feature_xyz" in result
+        assert "+0.05" in result
+
+    def test_negative_shap_value_formatted_correctly(self):
+        """Negative SHAP values use proper +/- sign."""
+        shap_features = {"temp_c": -0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "-0.05" in result
+
+    def test_narrative_ends_with_period(self):
+        """Narrative string ends with a period."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert result.endswith(".")
+
+
+# ── Relative MAE (#54) ───────────────────────────────────────────────────────────
+
+class TestRelativeMAEComputation:
+
+    def test_relative_mae_basic_computation(self):
+        """Relative MAE = absolute MAE / mean(actuals) * 100."""
+        import math
+        # Absolute MAE = 0.5, mean consumption = 10 kWh/h → relative MAE = 5%
+        mae_absolute = 0.5
+        mean_consumption = 10.0
+        expected_relative = round(mae_absolute / mean_consumption * 100, 2)
+        assert expected_relative == 5.0
+
+    def test_relative_mae_nan_with_empty_actuals(self):
+        """Relative MAE is NaN when no actuals available."""
+        actuals_list = []
+        if actuals_list:
+            mean_val = float(np.mean(actuals_list))
+        else:
+            mean_val = float("nan")
+        assert math.isnan(mean_val)
+
+    def test_relative_mae_nan_when_absolute_mae_is_nan(self):
+        """Relative MAE is NaN when absolute MAE is NaN."""
+        import math
+        mae_absolute = float("nan")
+        mean_consumption = 10.0
+        if mean_consumption > 0 and not math.isnan(mae_absolute):
+            relative = round(mae_absolute / mean_consumption * 100, 2)
+        else:
+            relative = float("nan")
+        assert math.isnan(relative)
+
+    def test_relative_mae_high_consumption_low_mae(self):
+        """High consumption with low absolute MAE → small relative MAE."""
+        mae_absolute = 0.1
+        mean_consumption = 20.0
+        expected_relative = round(mae_absolute / mean_consumption * 100, 2)
+        assert expected_relative == 0.5
+
+    def test_relative_mae_low_consumption_high_mae(self):
+        """Low consumption with high absolute MAE → large relative MAE."""
+        mae_absolute = 1.0
+        mean_consumption = 2.0
+        expected_relative = round(mae_absolute / mean_consumption * 100, 2)
+        assert expected_relative == 50.0

@@ -37,6 +37,39 @@ MIN_HISTORY_HOURS  = 48
 BLOCK_SLOTS        = [f"{h:02d}_{h+3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION        = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
 
+# SHAP feature labels for narrative generation (#53)
+_SHAP_FEATURE_LABELS: dict[str, str] = {
+    "hour_sin":            "time-of-day pattern",
+    "hour_cos":            "time-of-day pattern",
+    "temp_c":              "current outdoor temperature",
+    "temp_ewma_24h":       "short-term thermal inertia",
+    "temp_ewma_72h":       "multi-day thermal inertia",
+    "heating_deg_sum_24h": "accumulated heating demand (24h)",
+    "heating_deg_sum_168h":"accumulated heating demand (7d)",
+    "temp_delta_1h":       "temperature rate of change",
+    "temp_delta_24h":      "24h temperature trend",
+    "temp_lag_24h":        "yesterday's temperature",
+    "temp_lag_168h":       "last week's temperature",
+    "lag_24h":             "yesterday's same-hour consumption",
+    "lag_48h":             "2 days ago same-hour consumption",
+    "lag_168h":            "last week's same-hour consumption",
+    "is_away":             "vacation / away mode",
+    "people_home":         "number of people home",
+    "cloud_cover_pct":     "cloud cover",
+    "direct_radiation_wm2":"solar irradiance",
+}
+
+
+def _build_shap_narrative(shap_features: dict[str, float]) -> str:
+    """Build a human-readable narrative from top SHAP features (#53)."""
+    if not shap_features:
+        return ""
+    parts = []
+    for feat, val in shap_features.items():
+        label = _SHAP_FEATURE_LABELS.get(feat, feat)
+        parts.append(f"{label} ({val:+.2f} kWh)")
+    return "Mainly driven by: " + "; ".join(parts) + "."
+
 
 class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
@@ -498,6 +531,10 @@ class EnergyForecast(hass.Hass):
         for uid, name in [("energy_forecast_mae_7d", "Energy Forecast MAE 7d"),
                           ("energy_forecast_mae_30d", "Energy Forecast MAE 30d")]:
             self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", "energy", "measurement")
+        # Relative MAE sensors (#54)
+        for uid, name in [("energy_forecast_relative_mae_7d", "Energy Forecast Relative MAE 7d"),
+                          ("energy_forecast_relative_mae_30d", "Energy Forecast Relative MAE 30d")]:
+            self._mqtt_publish_discovery(uid, name, "%", "mdi:percent", None, "measurement")
         # Anomaly detection sensor (#39)
         _anomaly_attrs_topic = (
             f"{self._mqtt_discovery_prefix}/energy_forecast"
@@ -783,6 +820,15 @@ class EnergyForecast(hass.Hass):
         mae_7d,  n_7d  = _compute_live_mae(pred_hist_7d, actuals_hist_df)
         mae_30d, n_30d = _compute_live_mae(self._pred_history, actuals_hist_df)
 
+        # ── Relative MAE sensors (#54) ──────────────────────────────────────────
+        import numpy as np
+        actuals_7d = [v for ts, v in self._actuals_history.items() if pd.Timestamp(ts) >= cutoff_7d]
+        actuals_30d = list(self._actuals_history.values())
+        mean_7d = float(np.mean(actuals_7d)) if actuals_7d else float("nan")
+        mean_30d = float(np.mean(actuals_30d)) if actuals_30d else float("nan")
+        mae_7d_pct  = round(mae_7d  / mean_7d  * 100, 2) if mean_7d  > 0 and not math.isnan(mae_7d)  else float("nan")
+        mae_30d_pct = round(mae_30d / mean_30d * 100, 2) if mean_30d > 0 and not math.isnan(mae_30d) else float("nan")
+
         # ── Anomaly detection (#39) ───────────────────────────────────────────
         is_anomaly, anomaly_residual, anomaly_std, anomaly_n = _compute_anomaly(
             self._pred_history,
@@ -805,8 +851,11 @@ class EnergyForecast(hass.Hass):
 
         aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
         aggregated["shap_top_features"] = shap_data
+        aggregated["shap_narrative"]    = _build_shap_narrative(shap_data)
         aggregated["mae_7d"]          = mae_7d
+        aggregated["mae_7d_pct"]      = mae_7d_pct
         aggregated["mae_30d"]         = mae_30d
+        aggregated["mae_30d_pct"]     = mae_30d_pct
         aggregated["mae_7d_n_pairs"]  = n_7d
         aggregated["mae_30d_n_pairs"] = n_30d
         aggregated["is_anomaly"]        = is_anomaly
@@ -944,6 +993,9 @@ class EnergyForecast(hass.Hass):
             # Rolling MAE sensors (#41)
             "sensor.energy_forecast_mae_7d",
             "sensor.energy_forecast_mae_30d",
+            # Relative MAE sensors (#54)
+            "sensor.energy_forecast_relative_mae_7d",
+            "sensor.energy_forecast_relative_mae_30d",
             # Anomaly detection sensor (#39)
             "binary_sensor.energy_forecast_unusual_consumption",
             # Interval sensors
@@ -1036,16 +1088,31 @@ class EnergyForecast(hass.Hass):
 
         # ── Forecast totals ───────────────────────────────────────────────────
         shap_features = data.get("shap_top_features") or {}
+        shap_narrative = data.get("shap_narrative") or ""
         for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
-            extra = {"shap_top_features": shap_features} if key == "today" and shap_features else None
+            extra = None
+            if key == "today":
+                extra = {}
+                if shap_features:
+                    extra["shap_top_features"] = shap_features
+                if shap_narrative:
+                    extra["shap_narrative"] = shap_narrative
+                if not extra:  # if no attributes, set to None
+                    extra = None
             safe_set(f"sensor.energy_forecast_{key}", data.get(key, 0), f"Energy Forecast {label}",
                      extra_attrs=extra, icon="mdi:lightning-bolt")
-        # In MQTT mode, publish shap_top_features as json_attributes for energy_forecast_today
-        if self._mqtt_discovery and shap_features:
-            self._mqtt_publish_sensor_attributes(
-                "energy_forecast_today",
-                {"shap_top_features": shap_features},
-            )
+        # In MQTT mode, publish shap_top_features and shap_narrative as json_attributes for energy_forecast_today
+        if self._mqtt_discovery and (shap_features or shap_narrative):
+            attrs = {}
+            if shap_features:
+                attrs["shap_top_features"] = shap_features
+            if shap_narrative:
+                attrs["shap_narrative"] = shap_narrative
+            if attrs:
+                self._mqtt_publish_sensor_attributes(
+                    "energy_forecast_today",
+                    attrs,
+                )
 
         # ── Prediction intervals (only published when quantile models trained) ─
         _any_intervals = any(
@@ -1147,6 +1214,26 @@ class EnergyForecast(hass.Hass):
                         "icon": "mdi:chart-bell-curve-cumulative",
                         "attribution": ATTRIBUTION,
                         "n_pairs": data.get(f"{key}_n_pairs", 0),
+                        "model_engine": str(model.engine),
+                    },
+                    replace=True,
+                )
+
+        # ── Relative MAE sensors (#54) ──────────────────────────────────────────
+        for key, label in [("mae_7d_pct", "7-day Rel. MAE"), ("mae_30d_pct", "30-day Rel. MAE")]:
+            val = data.get(key, float("nan"))
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor(f"energy_forecast_relative_{key[:-4]}", val)  # remove '_pct' suffix for UID
+            else:
+                self.set_state(
+                    f"sensor.energy_forecast_relative_{key[:-4]}",
+                    state=str(val) if not math.isnan(float(val)) else "unavailable",
+                    attributes={
+                        "unit_of_measurement": "%",
+                        "friendly_name": f"Energy Forecast {label}",
+                        "unique_id": f"energy_forecast_relative_{key[:-4]}",
+                        "icon": "mdi:percent",
+                        "attribution": ATTRIBUTION,
                         "model_engine": str(model.engine),
                     },
                     replace=True,
