@@ -417,6 +417,29 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
+### 54. Relative MAE sensors (7d / 30d) *(backlog)*
+
+Companion sensors to the existing `sensor.energy_forecast_mae_7d` / `_mae_30d` (#41), expressing
+accuracy as a percentage of mean consumption over the same window rather than in absolute kWh/hour.
+
+**New sensors:**
+- `sensor.energy_forecast_relative_mae_7d` — `mae_7d / mean_consumption_7d * 100` (%)
+- `sensor.energy_forecast_relative_mae_30d` — `mae_30d / mean_consumption_30d * 100` (%)
+
+**Why:** 0.57 kWh/hour MAE is hard to interpret without knowing average consumption. "4.8% error"
+is immediately meaningful. Relative MAE also allows fair comparison across seasons (winter
+consumption is 2–3× summer) and across households.
+
+**Implementation note:** Use `MAE / mean(actuals)` rather than true MAPE
+(`mean(|error| / actual)`). MAPE is unstable when actuals approach zero (night hours with very low
+consumption cause division-by-near-zero, inflating the metric). The mean-normalised form is robust.
+
+Mean actuals are already available from `_actuals_history` (same dict used to compute rolling MAE).
+No new data fetching required — purely a derived metric from existing state.
+
+**Effort:** ~30 min (two extra sensor publishes in `_publish_mae_sensors`, two new MQTT discovery
+registrations). **No model changes.**
+
 ### 53. "Why today?" SHAP narrative attribute *(planned — v0.9.0)*
 Generate a short human-readable narrative from the top SHAP features, explaining what's
 driving today's forecast. Example: "Today's forecast is shaped primarily by time-of-day
@@ -550,3 +573,5 @@ Migration reference:
 | 50 | Rolling accumulated heating degree-hours | high (thermal model) | 1.5 h | ✓ done (on dev) |
 | 51 | Temperature rate of change feature | medium (thermal model) | 30 min | ✓ done (on dev) |
 | 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | ✓ done (on dev) |
+| 53 | "Why today?" SHAP narrative attribute | explainability / UX | 2 h | planned v0.9.0 |
+| 54 | Relative MAE sensors (7d / 30d) | visibility / UX | 30 min | backlog |
