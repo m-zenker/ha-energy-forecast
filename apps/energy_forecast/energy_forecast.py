@@ -39,8 +39,8 @@ ATTRIBUTION        = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
 
 # SHAP feature labels for narrative generation (#53)
 _SHAP_FEATURE_LABELS: dict[str, str] = {
-    "hour_sin":            "time-of-day pattern",
-    "hour_cos":            "time-of-day pattern",
+    "hour_sin":            "time-of-day (sine)",
+    "hour_cos":            "time-of-day (cosine)",
     "temp_c":              "current outdoor temperature",
     "temp_ewma_24h":       "short-term thermal inertia",
     "temp_ewma_72h":       "multi-day thermal inertia",
@@ -714,6 +714,7 @@ class EnergyForecast(hass.Hass):
 
     def _update_sensors(self) -> None:
         import pandas as pd
+        import numpy as np
 
         # ── Fetch weather forecast ────────────────────────────────────────────
         forecast_df = weather.fetch_forecast(
@@ -821,7 +822,6 @@ class EnergyForecast(hass.Hass):
         mae_30d, n_30d = _compute_live_mae(self._pred_history, actuals_hist_df)
 
         # ── Relative MAE sensors (#54) ──────────────────────────────────────────
-        import numpy as np
         actuals_7d = [v for ts, v in self._actuals_history.items() if pd.Timestamp(ts) >= cutoff_7d]
         actuals_30d = list(self._actuals_history.values())
         mean_7d = float(np.mean(actuals_7d)) if actuals_7d else float("nan")
@@ -1222,16 +1222,20 @@ class EnergyForecast(hass.Hass):
         # ── Relative MAE sensors (#54) ──────────────────────────────────────────
         for key, label in [("mae_7d_pct", "7-day Rel. MAE"), ("mae_30d_pct", "30-day Rel. MAE")]:
             val = data.get(key, float("nan"))
+            uid = key.removesuffix("_pct")  # convert "mae_7d_pct" → "mae_7d"
             if self._mqtt_discovery:
-                self._mqtt_set_sensor(f"energy_forecast_relative_{key[:-4]}", val)  # remove '_pct' suffix for UID
+                if math.isnan(float(val)):
+                    self._mqtt_set_sensor_raw(f"energy_forecast_relative_{uid}", "unavailable")
+                else:
+                    self._mqtt_set_sensor(f"energy_forecast_relative_{uid}", val)
             else:
                 self.set_state(
-                    f"sensor.energy_forecast_relative_{key[:-4]}",
+                    f"sensor.energy_forecast_relative_{uid}",
                     state=str(val) if not math.isnan(float(val)) else "unavailable",
                     attributes={
                         "unit_of_measurement": "%",
                         "friendly_name": f"Energy Forecast {label}",
-                        "unique_id": f"energy_forecast_relative_{key[:-4]}",
+                        "unique_id": f"energy_forecast_relative_{uid}",
                         "icon": "mdi:percent",
                         "attribution": ATTRIBUTION,
                         "model_engine": str(model.engine),
