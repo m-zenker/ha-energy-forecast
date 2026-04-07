@@ -35,6 +35,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.1-alpha] — 2026-04-07
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — relative MAE sensors (`mae_7d_pct`, `mae_30d_pct`) express rolling MAE as a percentage of mean consumption, providing a normalized accuracy metric independent of consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling) and across households. Implements same persistence logic as absolute MAE sensors.
+- `apps/energy_forecast/shap_analysis.py` — SHAP narrative attribute (`explanation`) on `sensor.energy_forecast_shap` provides a human-readable "Why today?" summary via SHAP `force_plot` interpretation. Formats feature contributions (base value + top N positive/negative pushes) in a single-line narrative, published as an entity attribute for display in automations/notifications.
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — rolling MAE sensors (`mae_7d`, `mae_30d`) now remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history` dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- `apps/energy_forecast/mqtt_mixin.py` — relative MAE percentages are now safely published even when mean consumption is zero or undefined (e.g., first day of month). Prevents NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0 and logs WARNING.
+- `apps/energy_forecast/mqtt_mixin.py` — topic splitting for sub-entity UID extraction was fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
+
+---
+
 ## [0.9.0-alpha] — 2026-04-02
 
 ### Added
