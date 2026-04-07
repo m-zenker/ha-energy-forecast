@@ -387,7 +387,7 @@ Regression tests added in `TestWeatherPerHourVariation` (`tests/test_model.py`) 
 guard against future regressions: each column must have `nunique() > 1` across 48 h,
 and `temp_c` at h=0 and h=47 must match the input forecast values exactly.
 
-### 39. Anomaly detection on forecast residuals *(planned — v0.7.0)*
+### 39. Anomaly detection on forecast residuals *(✓ done — v0.7.0)*
 Publish `binary_sensor.energy_forecast_unusual_consumption` that fires when the latest
 actual reading deviates by more than N standard deviations from the model's prediction
 made 1 h earlier. Uses the existing `_compute_live_mae` residual series; threshold N
@@ -403,14 +403,14 @@ SoC suppresses it. Add optional `battery_soc_sensor` config key; include current
 as a feature at training and prediction time (forward-fill at constant for horizon).
 Expected impact: **MEDIUM** (battery households only); Low effort once solar is live.
 
-### 41. Rolling accuracy history sensor (7d / 30d MAE) *(planned — v0.7.0)*
+### 41. Rolling accuracy history sensor (7d / 30d MAE) *(✓ done — v0.7.0)*
 The current `sensor.energy_forecast_model_mae` reflects the latest training CV MAE —
 a static snapshot. Add a persistent rolling-window MAE computed from `_pred_history`
 vs actuals: publish `sensor.energy_forecast_mae_7d` and `sensor.energy_forecast_mae_30d`
 on each hourly update. Enables a trend chart of model quality over time in Lovelace.
 Expected impact: Visibility / diagnostic; Low effort.
 
-### 42. SHAP feature importance per prediction *(planned — v0.7.0)*
+### 42. SHAP feature importance per prediction *(✓ done — v0.7.0)*
 LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After each
 48 h prediction, compute the top-N driving features and expose them as attributes on
 `sensor.energy_forecast_today` (e.g. `shap_top_features: ["temp_c", "lag_24h", ...]`).
@@ -573,5 +573,5 @@ Migration reference:
 | 50 | Rolling accumulated heating degree-hours | high (thermal model) | 1.5 h | ✓ done (on dev) |
 | 51 | Temperature rate of change feature | medium (thermal model) | 30 min | ✓ done (on dev) |
 | 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | ✓ done (on dev) |
-| 53 | "Why today?" SHAP narrative attribute | explainability / UX | 2 h | planned v0.9.0 |
-| 54 | Relative MAE sensors (7d / 30d) | visibility / UX | 30 min | backlog |
+| 53 | "Why today?" SHAP narrative attribute | explainability / UX | 2 h | ✓ done (on dev) |
+| 54 | Relative MAE sensors (7d / 30d) | visibility / UX | 30 min | ✓ done (on dev) |
