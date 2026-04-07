@@ -89,6 +89,7 @@ class EnergyForecast(hass.Hass):
         # Fixed charger power in kW — subtracted from charging hours so the
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
+        self._baseline_mode: bool        = bool(self.args.get("baseline_mode", False))
         self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._timezone: str              = str(self.args.get("timezone") or self.get_timezone() or "Europe/Zurich")
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
@@ -220,7 +221,7 @@ class EnergyForecast(hass.Hass):
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
             f"timezone={self._timezone}, holiday_country={self._holiday_country}, "
-            f"weight_halflife={self._weight_halflife}d, "
+            f"weight_halflife={self._weight_halflife}d, baseline_mode={self._baseline_mode}, "
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
             f"anomaly_sigma_threshold={self._anomaly_sigma_threshold}, "
@@ -662,6 +663,24 @@ class EnergyForecast(hass.Hass):
                 + (" + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "")
             )
 
+        sub_sensors_dict: dict = {}
+        for entity_id in self._sub_energy_sensors:
+            prefix = self._sub_sensor_prefix(entity_id)
+            cache_path = self._sub_sensor_cache_path(entity_id)
+            try:
+                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path, timezone=self._timezone)
+                sub_df = _strip_tz(sub_df, self._timezone)
+                sub_sensors_dict[prefix] = sub_df
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
+
+        if self._baseline_mode and sub_sensors_dict:
+            baseline_df, removed_kwh = _subtract_sub_sensors(baseline_df, sub_sensors_dict)
+            self.log(
+                f"Passive Baseline: removed {removed_kwh:.1f} kWh from controllable "
+                f"sub-sensors ({', '.join(sub_sensors_dict.keys())})."
+            )
+
         start_date = baseline_df["timestamp"].min().date()
         end_date   = baseline_df["timestamp"].max().date()
 
@@ -676,17 +695,6 @@ class EnergyForecast(hass.Hass):
                 level="WARNING",
             )
             weather_df = _empty_weather_df()
-
-        sub_sensors_dict: dict = {}
-        for entity_id in self._sub_energy_sensors:
-            prefix = self._sub_sensor_prefix(entity_id)
-            cache_path = self._sub_sensor_cache_path(entity_id)
-            try:
-                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path, timezone=self._timezone)
-                sub_df = _strip_tz(sub_df, self._timezone)
-                sub_sensors_dict[prefix] = sub_df
-            except (OSError, KeyError, ValueError) as exc:
-                self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
         away_df = ha_data.fetch_boolean_entity_history(
             self, self._away_mode_entity, days=30, timezone=self._timezone
@@ -755,6 +763,10 @@ class EnergyForecast(hass.Hass):
                 sub_sensors_recent[prefix] = sub_df
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
+
+        if self._baseline_mode and sub_sensors_recent:
+            if recent_actuals is not None:
+                recent_actuals, _ = _subtract_sub_sensors(recent_actuals, sub_sensors_recent)
 
         live_temp  = self._read_live_temp()
         now_ts     = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
@@ -852,7 +864,14 @@ class EnergyForecast(hass.Hass):
             except Exception as exc:  # noqa: BLE001
                 self.log(f"SHAP summary failed: {exc}", level="WARNING")
 
-        aggregated = self._aggregate(predictions, full_actuals, live_temp, intervals=intervals)
+        # ── Aggregate and publish ─────────────────────────────────────────────
+        aggregated = self._aggregate(
+            predictions,
+            full_actuals,
+            live_temp,
+            intervals=intervals,
+            sub_sensors_recent=sub_sensors_recent or None,
+        )
         aggregated["shap_top_features"] = shap_data
         aggregated["shap_narrative"]    = _build_shap_narrative(shap_data)
         aggregated["mae_7d"]          = mae_7d
@@ -1301,7 +1320,14 @@ class EnergyForecast(hass.Hass):
 
     # ── Aggregation ───────────────────────────────────────────────────────────
 
-    def _aggregate(self, predictions: Any, full_actuals: Any, live_temp: float | None, intervals: Any = None) -> dict:
+    def _aggregate(
+        self,
+        predictions: Any,
+        full_actuals: Any,
+        live_temp: float | None,
+        intervals: Any = None,
+        sub_sensors_recent: dict[str, Any] | None = None,
+    ) -> dict:
         import numpy as np
         import pandas as pd
 
@@ -1326,10 +1352,21 @@ class EnergyForecast(hass.Hass):
                 for h in range(0, 24, 3)
             }
 
-        # Today: substitute actuals for elapsed hours so the sensor reflects
-        # measured consumption for the past and forecast for the remainder.
+        # For the "today" blended total, use actuals for elapsed hours.
+        # In baseline_mode, actuals must be corrected (EV and sub-sensors removed)
+        # to match the model's baseline predictions.
+        blended_actuals = full_actuals
+        if self._baseline_mode and full_actuals is not None and not full_actuals.empty:
+            # 1. Remove EV sessions
+            blended_actuals, _ = ha_data.split_ev_charging(
+                full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+            )
+            # 2. Remove controllable sub-sensors
+            if sub_sensors_recent:
+                blended_actuals, _ = _subtract_sub_sensors(blended_actuals, sub_sensors_recent)
+
         today_total, blocks_today = _blend_today_totals(
-            p_times, p_vals, full_actuals, today_np, tomorrow_np, now_np
+            p_times, p_vals, blended_actuals, today_np, tomorrow_np, now_np
         )
 
         result = {
@@ -1353,8 +1390,8 @@ class EnergyForecast(hass.Hass):
             def _isum(vals, s, e):
                 return round(float(np.sum(vals[(iv_times >= s) & (iv_times < e)])), 3)
 
-            today_low,  _ = _blend_today_totals(iv_times, iv_low,  full_actuals, today_np, tomorrow_np, now_np)
-            today_high, _ = _blend_today_totals(iv_times, iv_high, full_actuals, today_np, tomorrow_np, now_np)
+            today_low,  _ = _blend_today_totals(iv_times, iv_low,  blended_actuals, today_np, tomorrow_np, now_np)
+            today_high, _ = _blend_today_totals(iv_times, iv_high, blended_actuals, today_np, tomorrow_np, now_np)
 
             result.update({
                 "next_3h_low":   _isum(iv_low,  now_np,      now_np + np.timedelta64(3, "h")),
@@ -1366,9 +1403,7 @@ class EnergyForecast(hass.Hass):
             })
 
         # ── EV kWh from actuals: sum (gross - charger_kw) for charging hours ──
-        # Subtracts the configured charger power to get the household co-load
-        # contribution; the remainder is the estimated EV energy.  Clipped at 0
-        # for hours where gross < charger_kw (partial sessions or EV not home).
+        # Always use original full_actuals for EV reporting, even in baseline_mode.
         if full_actuals is not None and not full_actuals.empty:
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
@@ -1519,6 +1554,41 @@ def _apply_target_correction(
 
     df["gross_kwh"] = (df["gross_kwh"] + delta.values).clip(lower=0.0)
     return df
+
+
+def _subtract_sub_sensors(
+    df: Any,
+    sub_sensors_dict: dict[str, Any] | None,
+    column: str = "gross_kwh",
+) -> tuple[Any, float]:
+    """Subtract all sub-sensor consumption from the target column.
+
+    Returns (df_corrected, total_removed_kwh).
+    """
+    import pandas as pd
+    import numpy as np
+
+    if not sub_sensors_dict:
+        return df.copy(), 0.0
+
+    df = df.copy()
+    ts_index = pd.DatetimeIndex(df["timestamp"])
+    sub_total = pd.Series(np.zeros(len(df), dtype=float), index=ts_index)
+
+    for prefix, sub_df in sub_sensors_dict.items():
+        if sub_df is None or sub_df.empty:
+            continue
+        # Sub-sensors use column "kwh"
+        val = (
+            sub_df.set_index(pd.DatetimeIndex(sub_df["timestamp"]))["kwh"]
+            .reindex(ts_index)
+            .fillna(0.0)
+        )
+        sub_total += val
+
+    removed_kwh = float(sub_total.sum())
+    df[column] = (df[column] - sub_total.values).clip(lower=0.0)
+    return df, removed_kwh
 
 
 def _blend_today_totals(

@@ -38,6 +38,7 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 - [Solar PV + battery](#solar-pv--battery)
 - [Sub-energy sensors](#sub-energy-sensors)
 - [Vacation / Away mode](#vacation--away-mode)
+- [Occupancy / Presence](#occupancy--presence)
 - [MQTT Discovery](#mqtt-discovery-optional)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
@@ -92,6 +93,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Self-healing** — graceful fallbacks at every external dependency (weather API, HA history, ML packages)
 - **MQTT Discovery** (optional) — registers all sensors in the HA entity registry so you can assign them to areas, add labels, and rename them in the UI
 - **Vacation / away mode** — `is_away` binary flag teaches the model your lower holiday consumption so predictions stay accurate while you travel
+- **Occupancy detection** — optional person-count feature improves accuracy during home/away transitions and captures household rhythm shifts
 - **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
 - **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
 - **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
@@ -282,6 +284,7 @@ energy_forecast:
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
 | `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
+| `presence_sensors` | No | `[]` | List of Home Assistant `person` or `device_tracker` entities used for occupancy counting (`people_home` feature). |
 | `model_archive_count` | No | `3` | Number of previous model snapshots to keep in `models/archive/` for rollback. Set to `0` to disable model versioning. Rollback via HA event `energy_forecast_rollback_model` or dashboard. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
@@ -310,7 +313,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attribute `shap_top_features` lists the top driving features and their mean absolute SHAP contributions (`{temp_c: 0.42, lag_24h: 0.31, ...}`). |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features) and `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"). |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
 ### Prediction intervals (calibrated 80% coverage)
@@ -358,6 +361,8 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | `sensor.energy_forecast_mae_7d` | Rolling mean absolute error over the last 7 days. Attribute `n_pairs` shows how many prediction–actual pairs were used. State is `"0.0"` until enough history accumulates. |
 | `sensor.energy_forecast_mae_30d` | Rolling MAE over the last 30 days (`n_pairs` attribute). Reaches full depth after ~30 days. |
 | `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
+| `sensor.energy_forecast_mae_7d_pct` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. |
+| `sensor.energy_forecast_mae_30d_pct` | Rolling relative MAE over the last 30 days (%). |
 
 ### Anomaly detection
 
@@ -423,11 +428,13 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Cyclical encodings | sin/cos of hour, day-of-week, month, day-of-year (`doy_sin`/`doy_cos`) |
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
+| Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
 | Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_24h`, `lag_48h`, `lag_72h`, `lag_168h`, `lag_336h` (daily/weekly) |
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
 | Away / vacation | `is_away` — binary flag; 1 during periods when `away_mode_entity` is "on"; teaches the model lower vacation-period consumption |
+| Occupancy | `people_home` — integer count of people home (from `presence_sensors`) |
 
 When `sub_energy_sensors` is configured, each sub-sensor adds four features: `lag_24h` (same hour yesterday), `lag_168h` (same hour last week, requires ≥ 268 rows of sub-sensor history), `{prefix}_active_24h` (was the appliance active in the past 24 h?), and `{prefix}_runs_7d` (how many on/off cycles in the past 7 days).
 
@@ -588,6 +595,30 @@ Add the optional keys to `apps.yaml`:
 - If `away_return_entity` is also set and contains a valid future datetime within the 48-hour window, the hours from the return time onward are flipped back to `is_away = 0` — so the forecast transitions from vacation-level to normal consumption at the expected return hour.
 
 **Backward compatibility:** Omitting both keys (or leaving them commented out) produces no behaviour change — `is_away` defaults to 0 for all rows and the model behaves identically to prior versions.
+
+---
+
+## Occupancy / Presence
+
+The occupancy feature improves forecast accuracy by counting how many people are currently at home. This allows the model to learn consumption patterns correlated with household presence (e.g. lighting, cooking, or manual HVAC overrides).
+
+### Configuration
+
+Add the optional `presence_sensors` key to `apps.yaml`. It accepts a list of Home Assistant `person` or `device_tracker` entities:
+
+```yaml
+  # Occupancy / Presence (optional).
+  presence_sensors:
+    - person.alice
+    - person.bob
+    - device_tracker.guest_phone
+```
+
+### How it works
+
+- **State counting**: At each hour, the app checks the state of every entity in `presence_sensors`. Any entity in the `"home"` state adds 1 to the `people_home` feature. All other states (including `unavailable` or `unknown`) add 0.
+- **Training**: The app fetches up to 30 days of historical state for these entities to build the `people_home` training column.
+- **Prediction**: For the 48-hour forecast window, the current occupancy count is held constant (broadcast) across all future hours. The model uses this to adjust its baseline prediction.
 
 ---
 

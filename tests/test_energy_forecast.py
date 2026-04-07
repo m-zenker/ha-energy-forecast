@@ -21,6 +21,7 @@ from energy_forecast.energy_forecast import (
     _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
+    _subtract_sub_sensors,
 )
 
 
@@ -356,6 +357,8 @@ class _FakeSelf:
         self._lock = MagicMock()
         self._lock.acquire.return_value = False  # always "busy" → immediate return
         self._timezone = "Europe/Zurich"
+        self._baseline_mode = False
+        self._sub_energy_sensors = []
 
     def log(self, msg, level="INFO"):  # AppDaemon log stub
         pass
@@ -397,6 +400,7 @@ class _FakeValidateSelf:
         self._weight_halflife            = 90.0
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
+        self._baseline_mode              = False
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold    = 3.0
         self._shap_top_n                 = 5
@@ -1656,3 +1660,64 @@ class TestUpdateCbNoLock:
         EnergyForecast._update_cb(fake)
 
         assert calls == [], "_update_sensors must NOT be called when model is None"
+
+
+# ── _subtract_sub_sensors ─────────────────────────────────────────────────────
+
+class TestSubtractSubSensors:
+
+    def test_subtract_single_sensor(self):
+        """Subtraction of one sensor at 1.0 kWh/h from 5.0 kWh/h results in 4.0 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub_sensors = {"heat_pump": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 24.0
+        assert (res["gross_kwh"] == 4.0).all()
+
+    def test_subtract_multiple_sensors(self):
+        """Subtraction of two sensors (1.0 + 0.5) from 5.0 results in 3.5 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub1 = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub2 = pd.DataFrame({"timestamp": ts, "kwh": [0.5] * 24})
+        sub_sensors = {"s1": sub1, "s2": sub2}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 1.5 * 24
+        assert (res["gross_kwh"] == 3.5).all()
+
+    def test_clipping_at_zero(self):
+        """Result must never be negative even if sub-sensors exceed total."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [2.0] * 24})
+        sub_sensors = {"too_high": sub_df}
+
+        res, _ = _subtract_sub_sensors(df, sub_sensors)
+        assert (res["gross_kwh"] == 0.0).all()
+
+    def test_misaligned_timestamps_filled_with_zero(self):
+        """Missing sub-sensor rows (aligned via reindex) are treated as 0.0 kWh (no removal)."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+
+        # Sub-sensor only has data for first 12 hours
+        sub_ts = ts[:12]
+        sub_df = pd.DataFrame({"timestamp": sub_ts, "kwh": [1.0] * 12})
+        sub_sensors = {"partial": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 12.0
+        assert (res.iloc[:12]["gross_kwh"] == 4.0).all()
+        assert (res.iloc[12:]["gross_kwh"] == 5.0).all()
+
+    def test_empty_sub_sensors_returns_copy(self):
+        """Passing None or empty dict returns an unchanged copy of the input."""
+        df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-03-12 00:00", "2026-03-12 01:00"]), "gross_kwh": [5.0, 5.0]})
+        res, removed = _subtract_sub_sensors(df, {})
+        assert removed == 0.0
+        assert (res["gross_kwh"] == 5.0).all()
+        assert res is not df

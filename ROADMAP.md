@@ -1,13 +1,13 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.9.0-alpha on `dev` (deployed 2026-04-02, tagged but awaiting stability validation).
+Current baseline: v0.9.0-alpha (released 2026-04-02). Monitoring sub-sensor maturation until ~April 20.
 
 ---
 
 ## Current Status — Sub-sensor Feature Maturation (Path A: Monitor)
 
-**Decision (2026-04-02):** Wait for natural data maturation of sub-sensor features until ~April 20 rather than accelerating with HVAC state feature (Path B).
+**Date (2026-04-07):** Monitoring sub-sensor stability. MAE showing continued improvement (0.57 → 0.52 kWh/h). Wait for natural data maturation until ~April 20.
 
 **Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — MAE improved from 0.7 to 0.57 kWh/hour (18% improvement), but short-term bouncing pattern (overshooting one hour, undershooting the next) observed. Root cause: lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows); with 14 days of sub-sensor history (~336 rows), these features remain excluded.
 
