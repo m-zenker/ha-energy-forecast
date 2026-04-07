@@ -417,7 +417,7 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
-### 54. Relative MAE sensors (7d / 30d) *(backlog)*
+### 54. Relative MAE sensors (7d / 30d) *(✓ done — v0.9.0, on dev)*
 
 Companion sensors to the existing `sensor.energy_forecast_mae_7d` / `_mae_30d` (#41), expressing
 accuracy as a percentage of mean consumption over the same window rather than in absolute kWh/hour.
@@ -440,7 +440,7 @@ No new data fetching required — purely a derived metric from existing state.
 **Effort:** ~30 min (two extra sensor publishes in `_publish_mae_sensors`, two new MQTT discovery
 registrations). **No model changes.**
 
-### 53. "Why today?" SHAP narrative attribute *(planned — v0.9.0)*
+### 53. "Why today?" SHAP narrative attribute *(✓ done — v0.9.0, on dev)*
 Generate a short human-readable narrative from the top SHAP features, explaining what's
 driving today's forecast. Example: "Today's forecast is shaped primarily by time-of-day
 patterns and a cold 24-hour thermal window (accumulated heating demand is high). Yesterday's

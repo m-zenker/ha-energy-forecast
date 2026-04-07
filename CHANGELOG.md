@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Relative MAE sensors** (`energy_forecast.py`): `mae_7d_pct` and `mae_30d_pct` express rolling MAE
+  as a percentage of mean consumption, providing a normalized accuracy metric independent of
+  consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling)
+  and across households. Implements same persistence logic as absolute MAE sensors.
+- **SHAP narrative attribute** (`shap_analysis.py`): new `explanation` attribute on `sensor.energy_forecast_shap`
+  provides a human-readable "Why today?" summary via SHAP `force_plot` interpretation. Formats
+  feature contributions (base value + top N positive/negative pushes) in a single-line narrative,
+  published as an entity attribute for display in automations/notifications.
+
 ### Fixed
 - **Rolling MAE sensors volatility** (`energy_forecast.py`): `mae_7d` and `mae_30d` sensors now
   remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history`
@@ -15,6 +25,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day
   pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new
   tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- **MQTT NaN handling in relative MAE** (`mqtt_mixin.py`): relative MAE percentages are now safely
+  published even when mean consumption is zero or undefined (e.g., first day of month). Prevents
+  NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0
+  and logs WARNING.
+- **UID slicing fragility** (`mqtt_mixin.py`): topic splitting for sub-entity UID extraction was
+  fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing
+  that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
 
 ---
 
