@@ -543,7 +543,7 @@ Migration reference:
 | 20 | Warn when EV threshold ≥ charger_kw | correctness / UX | 30 min | ✓ done |
 | 21 | Occupancy feature (`people_home`) | **high** | 4 h | ✓ done (on dev) |
 | 22 | EV SoC + charging state feature | high (EV households) | 4 h | deferred |
-| 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done on branch (v0.8.0) |
+| 23 | Solar PV target correction (B1 — grid_import/export + solar + battery) | correctness (solar households) | 2 h | ✓ done (on dev) |
 | 24 | Electricity spot price feature | n/a (fixed tariff) | — | out of scope |
 | 25 | Vacation / away flag | medium | 2 h | ✓ done |
 | 26 | Sub-energy sensors (`sub_energy_sensors`) | medium | 4 h | ✓ done |
