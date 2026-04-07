@@ -847,3 +847,70 @@ class TestFetchPresenceHistory:
         # Only valid transitions: home→not_home
         assert len(result) >= 1
         assert result.iloc[0]["people_home"] == 1
+
+
+# ── fetch_recent_energy — tail read (Fix 4) ───────────────────────────────────
+
+class TestFetchRecentEnergyTailRead:
+    """fetch_recent_energy must read only the last _FETCH_RECENT_TAIL_ROWS rows
+    from a large CSV (memory efficiency), while still returning a correct result.
+    """
+
+    def _make_large_cache(self, path, n_rows: int, base: pd.Timestamp) -> list:
+        """Write n_rows hourly rows to a CSV and return the expected timestamps."""
+        ts = pd.date_range(base, periods=n_rows, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n_rows})
+        df.to_csv(path, index=False)
+        return ts.tolist()
+
+    def test_large_cache_returns_tail_rows(self, mock_app, tmp_path):
+        """With 600 rows in the CSV and no new HA data, the returned DataFrame
+        has at most _FETCH_RECENT_TAIL_ROWS rows (deque tail read)."""
+        from energy_forecast.ha_data import _FETCH_RECENT_TAIL_ROWS
+
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        # Return empty HA data so only the cache contributes
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert len(result) <= _FETCH_RECENT_TAIL_ROWS
+
+    def test_tail_read_preserves_latest_rows(self, mock_app, tmp_path):
+        """The returned rows must be the *last* rows in the CSV, not the first."""
+        from energy_forecast.ha_data import _FETCH_RECENT_TAIL_ROWS
+
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        timestamps = self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        # The last timestamp in the result should match the end of the CSV
+        last_expected = timestamps[-1].normalize() + pd.Timedelta(hours=timestamps[-1].hour)
+        assert result["timestamp"].max() >= timestamps[600 - _FETCH_RECENT_TAIL_ROWS]
+
+    def test_tail_read_merges_new_ha_rows(self, mock_app, tmp_path):
+        """New HA rows are still merged in even when the cache is large."""
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        # HA provides 2 new rows just after the cache window
+        cache_end_ts = base + pd.Timedelta(hours=599)
+        ha_raw = pd.DataFrame({
+            "timestamp": pd.to_datetime([
+                cache_end_ts + pd.Timedelta(hours=1),
+                cache_end_ts + pd.Timedelta(hours=2),
+            ]),
+            "value": [100.0, 101.5],
+        })
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        # At least 1 new kwh row (diff of ha values) must be present
+        tail_ts = result["timestamp"].max()
+        assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)

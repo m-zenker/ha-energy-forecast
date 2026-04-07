@@ -183,6 +183,7 @@ class EnergyForecastModel:
         self._feature_medians_by_how: dict = {}     # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
+        self._country: str                 = "CH"   # ISO 3166-1 alpha-2 country for holidays
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
         self._likely_ev_hours: set[int]    = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)
@@ -211,6 +212,7 @@ class EnergyForecastModel:
         outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
         canton: str | None = None,
+        country: str = "CH",
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
         away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
@@ -261,7 +263,7 @@ class EnergyForecastModel:
         self._likely_ev_hours = likely_ev_hours
 
         # ── Weather / outdoor / calendar features ───────────────────────────
-        df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
+        df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df)
 
@@ -477,6 +479,7 @@ class EnergyForecastModel:
         self.engine                = engine_name
         self._log_transform        = True
         self._canton               = canton
+        self._country              = country
         self._sub_sensor_prefixes  = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
         self._save()
 
@@ -1170,6 +1173,7 @@ def _engineer_features(
     weather_df: pd.DataFrame,           # naive timestamps
     outdoor_df: pd.DataFrame | None,    # naive timestamps
     canton: str | None = None,
+    country: str = "CH",
     likely_ev_hours: set | None = None,
     away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
     presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
@@ -1217,7 +1221,7 @@ def _engineer_features(
         df["likely_ev_hour"] = 0
 
     # ── Public holidays ──────────────────────────────────────────────────────
-    df = _add_holiday_feature(df, canton=canton)
+    df = _add_holiday_feature(df, canton=canton, country=country)
 
     # ── Weather merge ────────────────────────────────────────────────────────
     w = weather_df.copy()
@@ -1313,11 +1317,11 @@ def _engineer_features(
 _BRIDGE_CAP = 3   # days — bridge-day effect beyond this distance is negligible
 
 
-def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.DataFrame:
+def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: str = "CH") -> pd.DataFrame:
     """Add holiday proximity columns using the `holidays` package.
 
     Columns added:
-      is_public_holiday       — 1 on a Swiss federal (or cantonal) holiday, else 0
+      is_public_holiday       — 1 on a public holiday for the configured country, else 0
       days_to_next_holiday    — calendar days until the next holiday, capped at _BRIDGE_CAP
       days_since_last_holiday — calendar days since the last holiday, capped at _BRIDGE_CAP
 
@@ -1327,6 +1331,8 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
 
     Pass canton (e.g. "ZH", "BE") to include cantonal holidays in addition to
     federal ones.  Falls back to federal-only if the canton code is unrecognised.
+    Pass country (ISO 3166-1 alpha-2, e.g. "CH", "GB", "DE") to use the holidays
+    of the user's country.  Defaults to "CH".
 
     Falls back gracefully (is_public_holiday=0, distances=_BRIDGE_CAP) if the
     `holidays` package is not installed.
@@ -1342,14 +1348,15 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
         years = sorted({y + d for y in years_in_data for d in (-1, 0, 1)})
         if canton:
             try:
-                ch_holidays = hd.country_holidays("CH", years=years, subdiv=canton)
+                ch_holidays = hd.country_holidays(country, years=years, subdiv=canton)
             except (NotImplementedError, KeyError):
                 _LOGGER.warning(
-                    "Unknown canton code %r — falling back to federal holidays.", canton
+                    "Unknown canton/subdivision code %r for country %r — falling back to national holidays.",
+                    canton, country,
                 )
-                ch_holidays = hd.country_holidays("CH", years=years)
+                ch_holidays = hd.country_holidays(country, years=years)
         else:
-            ch_holidays = hd.country_holidays("CH", years=years)
+            ch_holidays = hd.country_holidays(country, years=years)
         holiday_dates = sorted(ch_holidays.keys())
 
         dates = df["timestamp"].dt.date

@@ -2042,3 +2042,38 @@ class TestPeopleHomeFeature:
 
         assert "predicted_kwh" in predictions.columns
         assert len(predictions) == 48
+
+
+# ── holiday_country propagation (Fix 2) ──────────────────────────────────────
+
+class TestHolidayCountry:
+    """holiday_country param must be threaded from train() into _add_holiday_feature."""
+
+    def _ts_df(self, dates):
+        return pd.DataFrame({"timestamp": pd.to_datetime(dates)})
+
+    def test_country_gb_uses_uk_holidays(self):
+        """country='GB' must flag UK holidays (e.g. Christmas Day)."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-12-25"]), country="GB")
+        assert result["is_public_holiday"].iloc[0] == 1, "Dec 25 must be a UK holiday"
+
+    def test_country_ch_default_flags_swiss_new_year(self):
+        """Default country='CH' must flag Jan 1 as a public holiday."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-01-01"]))
+        assert result["is_public_holiday"].iloc[0] == 1, "Jan 1 must be a CH holiday"
+
+    def test_country_de_flags_german_holiday(self):
+        """country='DE' must recognise German Unity Day (Oct 3)."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-10-03"]), country="DE")
+        assert result["is_public_holiday"].iloc[0] == 1, "Oct 3 must be a DE holiday"
+
+    def test_invalid_country_falls_back_gracefully(self):
+        """An unrecognised country code must not crash; columns must still be present."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-03-15"]), country="XX")
+        for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
+            assert col in result.columns
+

@@ -51,8 +51,15 @@ energy_forecast:
   # Lower = recent data matters more. Set to 0 to disable weighting.
   weight_halflife_days: 90
 
-  # Optional: two-letter Swiss canton code for cantonal holidays (e.g. ZH, BE, GE).
-  # If omitted, only federal public holidays are used.
+  # Optional: ISO 3166-1 alpha-2 country code for public holidays (default: CH).
+  # Change to match your country (e.g. DE, GB, FR, US). Consumption patterns
+  # around public holidays are country-specific — using the wrong country
+  # degrades forecast accuracy around holiday periods.
+  # holiday_country: CH
+
+  # Optional: two-letter subdivision code for regional holidays (default: none).
+  # For Switzerland, this is the canton (e.g. ZH, BE, GE).
+  # If omitted, only national public holidays are used.
   # holiday_canton: ZH
 
   # Optional: adaptive retraining threshold (default: 2.0).

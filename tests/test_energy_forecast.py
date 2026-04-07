@@ -355,6 +355,7 @@ class _FakeSelf:
         self._ml_model.model = None  # prevents _update_sensors execution
         self._lock = MagicMock()
         self._lock.acquire.return_value = False  # always "busy" → immediate return
+        self._timezone = "Europe/Zurich"
 
     def log(self, msg, level="INFO"):  # AppDaemon log stub
         pass
@@ -391,6 +392,8 @@ class _FakeValidateSelf:
         self._lat                        = 47.0
         self._lon                        = 8.5
         self._plz                        = ""
+        self._timezone                   = "Europe/Zurich"
+        self._holiday_country            = "CH"
         self._weight_halflife            = 90.0
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
@@ -1618,3 +1621,38 @@ class TestRelativeMAEComputation:
         mae_abs = float("nan")
         mae_pct = round(mae_abs / mean_consumption * 100, 2) if mean_consumption > 0 and not math.isnan(mae_abs) else float("nan")
         assert math.isnan(mae_pct)
+
+
+# ── Fix: _update_cb must not skip under lock (concurrency fix) ────────────────
+
+class TestUpdateCbNoLock:
+    """_update_cb must run _update_sensors even when _lock is held (retrain in progress)."""
+
+    def test_update_cb_runs_when_lock_held(self):
+        """With the old code _update_cb skipped if lock was busy; now it must not skip."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = object()  # non-None — past cold start
+        fake._lock.acquire.return_value = False  # simulate lock held by retrain
+
+        # Attach _update_sensors directly to the fake instance
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [1], "_update_sensors must be called regardless of lock state"
+
+    def test_update_cb_skips_when_no_model(self):
+        """_update_cb must return early when no model is trained yet."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = None  # no model yet
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [], "_update_sensors must NOT be called when model is None"

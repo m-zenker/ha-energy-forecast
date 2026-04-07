@@ -126,6 +126,7 @@ def fetch_energy_history(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path = CACHE_PATH,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
@@ -136,16 +137,16 @@ def fetch_energy_history(
         try:
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
-            # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
+            # CSV may contain tz-aware strings — normalise to naive local time
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
             app.log(f"Loaded {len(df_cache)} records from local cache.")
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch fresh data from HA
-    raw_ha = _fetch_history(app, entity_id, days=30)
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
@@ -178,34 +179,46 @@ def fetch_energy_history(
     return combined
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
+_FETCH_RECENT_TAIL_ROWS = 400   # 336 h max lag + buffer; limits memory use in hourly updates
+
+
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
     Fetches only the last 2 days of HA history (vs. 30 days in
     fetch_energy_history), merges into the existing CSV cache, and
-    returns the full cache for lag-feature use.  Keeps _update_cb
-    well within AppDaemon's 10s callback limit.
+    returns the last _FETCH_RECENT_TAIL_ROWS rows for lag-feature use.
+    Keeps _update_cb well within AppDaemon's 10s callback limit.
 
+    Only the tail of the CSV is read into memory (deque-based), reducing
+    memory from O(all rows) to O(_FETCH_RECENT_TAIL_ROWS) per hourly call.
     _retrain() continues to call fetch_energy_history() for a full
     30-day resync once a week.
     """
+    import io
+    import collections
     import pandas as pd
 
-    # 1. Load existing cache — this is the bulk of our history
+    # 1. Load only the tail of the cache — enough rows to cover all lag features.
+    #    deque(fh, maxlen=N) reads the file sequentially but keeps only the last N
+    #    lines in memory, reducing peak memory from O(all rows) to O(N).
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
     if cache_path.exists():
         try:
-            df_cache = pd.read_csv(cache_path)
+            with open(cache_path, "r") as fh:
+                header_line = fh.readline()
+                tail_lines = list(collections.deque(fh, maxlen=_FETCH_RECENT_TAIL_ROWS))
+            df_cache = pd.read_csv(io.StringIO(header_line + "".join(tail_lines)))
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
     #    plus a small overlap buffer for the diff() boundary.
-    raw_ha = _fetch_history(app, entity_id, days=2)
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
@@ -303,6 +316,7 @@ def fetch_sub_sensor_history(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Pull sub-sensor kWh history, merging local CSV cache with fresh HA data.
 
@@ -321,12 +335,12 @@ def fetch_sub_sensor_history(
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
-    raw_ha = _fetch_history(app, entity_id, days=30)
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         app.log(f"No history found for sub-sensor {entity_id} — skipping.", level="WARNING")
@@ -356,6 +370,7 @@ def fetch_recent_sub_sensor(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Lightweight update for sub-sensor hourly refreshes.
 
@@ -375,12 +390,12 @@ def fetch_recent_sub_sensor(
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
-    raw_ha = _fetch_history(app, entity_id, days=2)
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         app.log(f"No recent data for sub-sensor {entity_id}.", level="WARNING")
@@ -410,6 +425,7 @@ def fetch_boolean_entity_history(
     app: "hass.Hass",
     entity_id: str | None,
     days: int = 30,
+    timezone: str = "Europe/Zurich",
 ) -> "pd.DataFrame":
     """Return hourly is_away flags from a boolean entity's state history.
 
@@ -445,7 +461,7 @@ def fetch_boolean_entity_history(
             s = str(state.get("state", "")).lower()
             if s not in ("on", "off"):
                 continue
-            ts = pd.to_datetime(state["last_changed"]).tz_convert("Europe/Zurich")
+            ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
             events.append({"timestamp": ts, "state": s})
         except (ValueError, KeyError, TypeError):
             continue
@@ -463,13 +479,13 @@ def fetch_boolean_entity_history(
     # Hourly grid: span from first to last event
     start = ev_ser.index[0].floor("1h")
     end   = ev_ser.index[-1].floor("1h")
-    hourly = pd.date_range(start, end, freq="1h", tz="Europe/Zurich")
+    hourly = pd.date_range(start, end, freq="1h", tz=timezone)
 
     # Forward-fill state changes onto the grid; hours before first event default to "off"
     combined_idx = ev_ser.index.union(hourly)
     filled = ev_ser.reindex(combined_idx).ffill().reindex(hourly).fillna("off")
 
-    # Convert to naive Europe/Zurich (strip tz, local time already correct)
+    # Convert to naive local time (strip tz, local time already correct)
     timestamps_naive = hourly.tz_localize(None)
 
     return pd.DataFrame({
@@ -482,6 +498,7 @@ def fetch_presence_history(
     app: "hass.Hass",
     entity_ids: list[str] | None,
     days: int = 30,
+    timezone: str = "Europe/Zurich",
 ) -> "pd.DataFrame":
     """Return hourly occupancy count from person entity state history.
 
@@ -528,7 +545,7 @@ def fetch_presence_history(
                 s = str(state.get("state", "")).lower()
                 if s not in ("home", "not_home"):
                     continue
-                ts = pd.to_datetime(state["last_changed"]).tz_convert("Europe/Zurich")
+                ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
                 events.append({"timestamp": ts, "state": s})
             except (ValueError, KeyError, TypeError):
                 continue
@@ -546,7 +563,7 @@ def fetch_presence_history(
         # Hourly grid
         start = ev_ser.index[0].floor("1h")
         end = ev_ser.index[-1].floor("1h")
-        hourly = pd.date_range(start, end, freq="1h", tz="Europe/Zurich")
+        hourly = pd.date_range(start, end, freq="1h", tz=timezone)
 
         # Forward-fill state changes; hours before first event default to "not_home"
         combined_idx = ev_ser.index.union(hourly)
@@ -586,7 +603,7 @@ def fetch_presence_history(
     })
 
 
-def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
+def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:
@@ -606,7 +623,7 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     for state in states:
         try:
             val = float(state["state"])
-            ts  = pd.to_datetime(state["last_updated"]).tz_convert("Europe/Zurich")
+            ts  = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
             rows.append({"timestamp": ts, "value": val})
         except (ValueError, KeyError, TypeError):
             continue

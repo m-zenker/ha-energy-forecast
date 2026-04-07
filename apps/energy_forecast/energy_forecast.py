@@ -90,7 +90,9 @@ class EnergyForecast(hass.Hass):
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float       = float(self.args.get("ev_charger_kw", 9.0))
         self._cache_path: Path           = Path(self.args.get("cache_path", str(CACHE_PATH)))
+        self._timezone: str              = str(self.args.get("timezone") or self.get_timezone() or "Europe/Zurich")
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
+        self._holiday_country: str       = str(self.args.get("holiday_country", "CH")).upper()
         self._adaptive_retrain_threshold: float = float(
             self.args.get("adaptive_retrain_threshold", 2.0)
         )
@@ -217,6 +219,7 @@ class EnergyForecast(hass.Hass):
                 raise ValueError("mqtt_discovery_prefix must be a non-empty string when mqtt_discovery is True")
         self.log(
             f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
+            f"timezone={self._timezone}, holiday_country={self._holiday_country}, "
             f"weight_halflife={self._weight_halflife}d, "
             f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
             f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
@@ -587,27 +590,25 @@ class EnergyForecast(hass.Hass):
     def _update_cb(self, event_name=None, data=None, kwargs=None) -> None:
         if self._ml_model.model is None:
             return
-        if not self._lock.acquire(blocking=False):
-            self.log("Sensor update skipped — another operation is running.", level="DEBUG")
-            return
+        # No lock: prediction reads self._ml_model.model via atomic Python attribute
+        # access (GIL). _retrain_cb replaces it atomically at the end of train().
+        # Concurrent predict + retrain is safe — worst case uses the last-good model.
         try:
             self._update_sensors()
         except Exception as exc:  # noqa: BLE001
             self.log(f"Sensor update failed: {exc}", level="ERROR")
-        finally:
-            self._lock.release()
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
         self.log("Starting model retraining…")
-        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path)
+        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             self.log(f"Insufficient history ({len(energy_df)} h). Skipping.", level="WARNING")
             return
 
-        energy_df = _strip_tz(energy_df)
+        energy_df = _strip_tz(energy_df, self._timezone)
 
         # ── Subtract EV charging from gross import ────────────────────────────
         baseline_df, ev_df = ha_data.split_ev_charging(
@@ -634,8 +635,8 @@ class EnergyForecast(hass.Hass):
             if sensor:
                 cache = self._cache_path.parent / cache_name
                 try:
-                    cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache)
-                    correction_dfs[cache_name] = _strip_tz(cdf)
+                    cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache, timezone=self._timezone)
+                    correction_dfs[cache_name] = _strip_tz(cdf, self._timezone)
                 except (OSError, KeyError, ValueError) as exc:
                     self.log(
                         f"Target correction fetch failed ({cache_name}): {exc}",
@@ -665,8 +666,8 @@ class EnergyForecast(hass.Hass):
         end_date   = baseline_df["timestamp"].max().date()
 
         try:
-            weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date)
-            weather_df = _strip_tz(weather_df)
+            weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date, timezone=self._timezone)
+            weather_df = _strip_tz(weather_df, self._timezone)
         except (OSError, KeyError, ValueError) as exc:
             self.log(
                 f"Historical weather fetch failed: {exc} — "
@@ -681,23 +682,23 @@ class EnergyForecast(hass.Hass):
             prefix = self._sub_sensor_prefix(entity_id)
             cache_path = self._sub_sensor_cache_path(entity_id)
             try:
-                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path)
-                sub_df = _strip_tz(sub_df)
+                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path, timezone=self._timezone)
+                sub_df = _strip_tz(sub_df, self._timezone)
                 sub_sensors_dict[prefix] = sub_df
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
         away_df = ha_data.fetch_boolean_entity_history(
-            self, self._away_mode_entity, days=30
+            self, self._away_mode_entity, days=30, timezone=self._timezone
         )
         if not away_df.empty:
-            away_df = _strip_tz(away_df)
+            away_df = _strip_tz(away_df, self._timezone)
 
         presence_df = ha_data.fetch_presence_history(
-            self, self._presence_sensors or None, days=30
+            self, self._presence_sensors or None, days=30, timezone=self._timezone
         )
         if not presence_df.empty:
-            presence_df = _strip_tz(presence_df)
+            presence_df = _strip_tz(presence_df, self._timezone)
 
         self._ml_model.train(
             baseline_df,
@@ -705,6 +706,7 @@ class EnergyForecast(hass.Hass):
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
+            country=self._holiday_country,
             ev_df=ev_df,
             sub_sensors_dict=sub_sensors_dict or None,
             away_df=away_df if not away_df.empty else None,
@@ -723,15 +725,16 @@ class EnergyForecast(hass.Hass):
             self._lon,
             self.args.get("srg_client_id"),
             self.args.get("srg_client_secret"),
+            timezone=self._timezone,
         )
-        forecast_df = _strip_tz(forecast_df)
+        forecast_df = _strip_tz(forecast_df, self._timezone)
 
         # ── Fetch recent actuals ──────────────────────────────────────────────
         # Uses the lightweight fetch (last 2 days only) to stay well within
         # AppDaemon's 10s callback limit. Full 30-day resync happens in _retrain().
         try:
-            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor, cache_path=self._cache_path)
-            full_actuals = _strip_tz(full_actuals)
+            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
+            full_actuals = _strip_tz(full_actuals, self._timezone)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
             recent_actuals, _ = ha_data.split_ev_charging(
@@ -747,14 +750,14 @@ class EnergyForecast(hass.Hass):
             prefix = self._sub_sensor_prefix(entity_id)
             cache_path = self._sub_sensor_cache_path(entity_id)
             try:
-                sub_df = ha_data.fetch_recent_sub_sensor(self, entity_id, cache_path)
-                sub_df = _strip_tz(sub_df)
+                sub_df = ha_data.fetch_recent_sub_sensor(self, entity_id, cache_path, timezone=self._timezone)
+                sub_df = _strip_tz(sub_df, self._timezone)
                 sub_sensors_recent[prefix] = sub_df
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
 
         live_temp  = self._read_live_temp()
-        now_ts     = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+        now_ts     = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         away_series = self._build_away_prediction_series(now_ts)
         people_home_series = self._build_people_home_prediction_series(now_ts)
 
@@ -906,7 +909,7 @@ class EnergyForecast(hass.Hass):
                     return_dt = pd.Timestamp(raw_return)
                     # Strip tz if present, normalise to naive Europe/Zurich
                     if return_dt.tzinfo is not None:
-                        return_dt = return_dt.tz_convert("Europe/Zurich").tz_localize(None)
+                        return_dt = return_dt.tz_convert(self._timezone).tz_localize(None)
             except (ValueError, TypeError) as exc:
                 self.log(
                     f"Could not parse away_return_entity state as datetime: {exc}",
@@ -953,10 +956,10 @@ class EnergyForecast(hass.Hass):
         cv_mae = self._ml_model.last_cv_mae
         if cv_mae is None:
             return
-        # Use Europe/Zurich local time (tz-naive) consistent with pipeline timestamps.
+        # Use configured local time (tz-naive) consistent with pipeline timestamps.
         # datetime.now() would use system time, which is UTC in Docker/HA and
         # causes the cooldown to fire up to ±2h early/late and wrong during DST.
-        _now = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+        _now = pd.Timestamp.now(self._timezone).tz_localize(None)
         hours_since = (_now - self._last_adaptive_retrain).total_seconds() / 3600
         if hours_since < 24:
             return
@@ -970,7 +973,7 @@ class EnergyForecast(hass.Hass):
                 f"(over {n_pairs} matched hours)",
                 level="WARNING",
             )
-            self._last_adaptive_retrain = pd.Timestamp.now("Europe/Zurich").tz_localize(None)
+            self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
             self._retrain()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
@@ -1302,7 +1305,7 @@ class EnergyForecast(hass.Hass):
         import numpy as np
         import pandas as pd
 
-        now_dt      = pd.Timestamp.now(tz="Europe/Zurich").replace(tzinfo=None)
+        now_dt      = pd.Timestamp.now(tz=self._timezone).replace(tzinfo=None)
         now_np      = np.datetime64(now_dt.floor("h"))
         today_np    = np.datetime64(now_dt.normalize())
         tomorrow_np = today_np + np.timedelta64(1, "D")
@@ -1447,13 +1450,13 @@ class EnergyForecast(hass.Hass):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _strip_tz(df: Any) -> Any:
-    """Convert timestamp column to naive Europe/Zurich local time."""
+def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
+    """Convert timestamp column to naive local time in the given timezone."""
     import pandas as pd
     if "timestamp" in df.columns:
         ts = pd.to_datetime(df["timestamp"])
         if ts.dt.tz is not None:
-            ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+            ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
         df = df.copy()
         df["timestamp"] = ts
     return df
