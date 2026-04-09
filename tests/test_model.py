@@ -33,6 +33,7 @@ from energy_forecast.model import (
     _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
+    _learn_appliance_signatures,
     EnergyForecastModel,
     LAG_HOURS,
 )
@@ -2132,3 +2133,126 @@ class TestHolidayCountry:
         for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
             assert col in result.columns
 
+
+
+# ── Stage 3: Appliance Signature Discovery ────────────────────────────────────
+
+def _make_cycle_df(
+    cycle_kwh: list[float],
+    n_cycles: int,
+    period_hours: int = 12,
+    start: str = "2024-01-01",
+) -> pd.DataFrame:
+    """Synthetic sub-sensor: n_cycles cycles of len(cycle_kwh) each.
+
+    Between cycles there is silence (zeros) so that total length =
+    n_cycles * period_hours.  The cycle occupies the first len(cycle_kwh)
+    hours of each period.
+    """
+    window_hours = len(cycle_kwh)
+    total_hours = n_cycles * period_hours
+    ts = pd.date_range(start, periods=total_hours, freq="1h")
+    kwh = [0.0] * total_hours
+    for i in range(n_cycles):
+        base = i * period_hours
+        for j, v in enumerate(cycle_kwh):
+            kwh[base + j] = v
+    return pd.DataFrame({"timestamp": ts, "kwh": kwh})
+
+
+class TestApplianceSignatures:
+    """Tests for _learn_appliance_signatures()."""
+
+    PROFILE = [1.0, 2.0, 1.5, 0.5]  # 4-hour cycle shape
+
+    def test_basic_two_cycles(self):
+        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=2)
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        s = sigs["hp"]
+        assert s["n_cycles"] == 2
+        assert s["total_kwh"] == pytest.approx(sum(self.PROFILE))
+        assert s["hourly_profile"] == pytest.approx(self.PROFILE)
+        assert s["peak_hour"] == 1  # index of 2.0 in PROFILE
+
+    def test_below_min_cycles_skipped(self):
+        """Only 1 cycle → empty dict (insufficient evidence)."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=1, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        assert sigs == {}
+
+    def test_no_sub_sensors_none(self):
+        """None input → empty dict, no crash."""
+        assert _learn_appliance_signatures(None) == {}
+
+    def test_no_sub_sensors_empty_dict(self):
+        """Empty dict input → empty dict."""
+        assert _learn_appliance_signatures({}) == {}
+
+    def test_partial_window_skipped(self):
+        """Cycle starting within last window_hours rows is discarded (truncated window)."""
+        # 3 full cycles + 1 partial (only 2 hours at end)
+        df_full = _make_cycle_df(self.PROFILE, n_cycles=3, period_hours=8)
+        # Append 2 hours of an extra cycle start at the very end
+        extra = pd.DataFrame({
+            "timestamp": pd.date_range(df_full["timestamp"].iloc[-1] + pd.Timedelta("1h"), periods=2, freq="1h"),
+            "kwh": [1.0, 1.0],
+        })
+        df = pd.concat([df_full, extra], ignore_index=True)
+        sigs = _learn_appliance_signatures({"dw": df}, window_hours=4, min_cycles=2)
+        assert "dw" in sigs
+        # The partial window must not inflate n_cycles
+        assert sigs["dw"]["n_cycles"] == 3
+
+    def test_multiple_prefixes(self):
+        """Two prefixes → independent signatures both returned."""
+        df1 = _make_cycle_df([1.0, 2.0, 0.5, 0.5], n_cycles=3, period_hours=12)
+        df2 = _make_cycle_df([0.5, 0.5, 1.0, 2.0], n_cycles=3, period_hours=12)
+        sigs = _learn_appliance_signatures({"hp": df1, "dw": df2})
+        assert set(sigs.keys()) == {"hp", "dw"}
+        assert sigs["hp"]["peak_hour"] == 1
+        assert sigs["dw"]["peak_hour"] == 3
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """Save → delete in-memory → load → same dict."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model._appliance_signatures = _learn_appliance_signatures({"hp": df})
+        original = dict(model._appliance_signatures)
+        model._save_signatures()
+        # Reset and reload
+        model._appliance_signatures = {}
+        model._load_signatures()
+        assert model._appliance_signatures == original
+
+    def test_train_populates_signatures(self, tmp_path):
+        """After train(), _appliance_signatures is populated and saved to disk."""
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(42)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 3.0, n)})
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        # Build a sub-sensor with enough cycles to learn a signature
+        sub_hp = _make_cycle_df(self.PROFILE, n_cycles=20, period_hours=24, start="2024-01-01")
+        sub_hp = sub_hp[sub_hp["timestamp"] < ts[-1]].reset_index(drop=True)
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model.train(
+            energy_df=energy_df,
+            weather_df=weather_df,
+            outdoor_df=None,
+            sub_sensors_dict={"sub_hp": sub_hp},
+        )
+        assert isinstance(model._appliance_signatures, dict)
+        assert "sub_hp" in model._appliance_signatures
+        assert (tmp_path / "appliance_signatures.json").exists()

@@ -195,6 +195,8 @@ class EnergyForecastModel:
         self._model_q90 = None
         self._model_q10_path = model_dir / "energy_model_q10.pkl"
         self._model_q90_path = model_dir / "energy_model_q90.pkl"
+        self._signatures_path = model_dir / "appliance_signatures.json"
+        self._appliance_signatures: dict = {}  # {prefix: {total_kwh, hourly_profile, peak_hour, n_cycles}}
         # CQR interval correction scalar (log-space additive offset)
         self._interval_correction: float = 0.0
         self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
@@ -263,6 +265,17 @@ class EnergyForecastModel:
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
+
+        # ── Appliance signature learning (Stage 3) ──────────────────────────
+        self._appliance_signatures = _learn_appliance_signatures(sub_sensors_dict)
+        self._save_signatures()
+        for prefix, sig in self._appliance_signatures.items():
+            _LOGGER.info(
+                "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
+                prefix, sig["n_cycles"], sig["total_kwh"], sig["peak_hour"],
+            )
+        if not self._appliance_signatures and sub_sensors_dict:
+            _LOGGER.info("Appliance signatures: no signatures learned (insufficient cycles in history)")
 
         # ── EV session probability: which hour_of_week slots charge regularly ─
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
@@ -891,6 +904,22 @@ class EnergyForecastModel:
         except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
             _LOGGER.warning("Could not load interval correction: %s", exc)
 
+    def _save_signatures(self) -> None:
+        try:
+            with open(self._signatures_path, "w") as fh:
+                json.dump(self._appliance_signatures, fh)
+        except OSError as exc:
+            _LOGGER.warning("Could not save appliance signatures: %s", exc)
+
+    def _load_signatures(self) -> None:
+        if not self._signatures_path.exists():
+            return
+        try:
+            with open(self._signatures_path) as fh:
+                self._appliance_signatures = json.load(fh)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _LOGGER.warning("Could not load appliance signatures: %s", exc)
+
     def _load(self) -> None:
         if self._model_path.exists():
             if not _verify_hash(self._model_path):
@@ -930,6 +959,7 @@ class EnergyForecastModel:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
         self._load_quantile_models()
+        self._load_signatures()
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
@@ -1107,6 +1137,65 @@ def _add_sub_sensor_lags_training(
         df[f"{prefix}_runs_7d"] = runs.values
 
     return df
+
+
+def _learn_appliance_signatures(
+    sub_sensors: dict | None,
+    window_hours: int = 4,
+    min_cycles: int = 2,
+) -> dict:
+    """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
+
+    For each prefix, detect run cycles (0→>0 transitions), extract a
+    ``window_hours``-wide kWh profile for every cycle, and average them.
+    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
+    detected cycles are omitted.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if not sub_sensors:
+        return {}
+
+    result: dict = {}
+    for prefix, sub_df in sub_sensors.items():
+        if sub_df is None or sub_df.empty:
+            continue
+
+        # Align to hourly index (same as lag helper)
+        kwh_series = (
+            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
+            .sort_index()
+            .resample("h")
+            .sum()
+            .astype(float)
+        )
+        filled = kwh_series.fillna(0)
+
+        # Detect cycle starts: previous hour was 0, current hour > 0
+        is_start = (filled > 0) & (filled.shift(1).fillna(0) == 0)
+        start_positions = [i for i, v in enumerate(is_start) if v]
+
+        windows: list[list[float]] = []
+        for pos in start_positions:
+            window = filled.iloc[pos : pos + window_hours]
+            if len(window) < window_hours:
+                continue  # truncated at end of history — skip
+            windows.append(window.tolist())
+
+        if len(windows) < min_cycles:
+            continue
+
+        arr = np.array(windows)  # shape: (n_cycles, window_hours)
+        hourly_profile = np.mean(arr, axis=0).tolist()
+        result[prefix] = {
+            "total_kwh": float(sum(hourly_profile)),
+            "hourly_profile": hourly_profile,
+            "peak_hour": int(np.argmax(hourly_profile)),
+            "n_cycles": len(windows),
+        }
+
+    return result
 
 
 def _add_sub_sensor_lags_prediction(
