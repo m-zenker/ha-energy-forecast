@@ -9,7 +9,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `apps/energy_forecast/model.py` — **Stage 4: Scenario Modeling & What-If API**: new `_composite_forecast()` pure function overlays learned appliance hourly run profiles onto a baseline 48h forecast given a schedule dict `{prefix: "HH:MM" | "off" | None}`. New `predict_scenario()` method on `EnergyForecastModel` wraps `predict()` + composite overlay, returning `[timestamp, predicted_kwh, delta_kwh]`. Enables the Energy Manager to ask "what is the expected import if dishwasher runs at 14:00?" and receive a delta-annotated composite forecast instantly.
+- `apps/energy_forecast/energy_forecast.py` — **Scenario service**: AppDaemon service `energy_forecast/get_scenario` registered in `initialize()`. Callback `_get_scenario_cb()` validates cached inputs, calls `predict_scenario()`, fires `energy_forecast_scenario_result` event with full 48h records. `publish=True` additionally writes `sensor.energy_forecast_scenario_today`, `_tomorrow`, `_delta_today`, and 8 block sensors via `_publish_scenario_forecast()`. Input cache (`_cached_forecast_df`, `_cached_live_temp`, etc.) populated each `_update_sensors()` cycle for zero-latency scenario re-use.
 - `apps/energy_forecast/model.py` — **Stage 3: Automated Load Signature Discovery**: new `_learn_appliance_signatures()` scans sub-sensor histories for run cycles (0→>0 kWh transitions) and computes an average hourly energy profile per appliance prefix. Signatures persisted to `models/appliance_signatures.json`, reloaded on startup, and ready for Stage 4 scenario modeling. Per-prefix log: `Appliance signature | <prefix> | cycles=N | total=X.XX kWh | peak_hour=H`. 8 new unit + integration tests in `TestApplianceSignatures`.
+
+### Tests
+- 352 passing (13 new for Stage 4: `TestCompositeForecast` × 10 and `TestGetScenarioCb` × 3)
 
 ---
 
