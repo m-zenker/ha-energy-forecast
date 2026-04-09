@@ -141,6 +141,16 @@ class EnergyForecast(hass.Hass):
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
+        # Stage 4: cached inputs for scenario/what-if API
+        self._cached_forecast_df: Any    = None
+        self._cached_live_temp: Any      = None
+        self._cached_recent_actuals: Any = None
+        self._cached_sub_sensors: Any    = None
+        self._cached_away_series: Any    = None
+        self._cached_people_home: Any    = None
+        self._cached_climate_recent: Any = None
+        self._cached_dhw_recent: Any     = None
+
         # MQTT Discovery (opt-in)
         self._mqtt_discovery: bool       = bool(self.args.get("mqtt_discovery", False))
         self._mqtt_namespace: str        = str(self.args.get("mqtt_namespace", "mqtt"))
@@ -160,6 +170,7 @@ class EnergyForecast(hass.Hass):
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
         self.listen_event(self._rollback_model_cb, "energy_forecast_rollback_model")
+        self.register_service("energy_forecast/get_scenario", self._get_scenario_cb)
 
         self._check_setup()
         self._publish_unavailable()
@@ -607,6 +618,101 @@ class EnergyForecast(hass.Hass):
         finally:
             self._lock.release()
 
+    def _get_scenario_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service callback: energy_forecast/get_scenario.
+
+        Accepts kwargs:
+          schedule (dict[str, str]): {prefix: "HH:MM" | "off" | None}
+          publish  (bool):           if True, publish scenario sensors to HA
+        Fires event "energy_forecast_scenario_result" with the forecast payload.
+        """
+        try:
+            if self._cached_forecast_df is None:
+                self.log("get_scenario called before first forecast cycle", level="WARNING")
+                return
+
+            schedule = kwargs.get("schedule", {})
+            if not isinstance(schedule, dict):
+                self.log(f"get_scenario: 'schedule' must be a dict, got {type(schedule).__name__}", level="WARNING")
+                return
+
+            result_df = self._ml_model.predict_scenario(
+                self._cached_forecast_df,
+                self._cached_live_temp,
+                schedule,
+                recent_actuals=self._cached_recent_actuals,
+                sub_sensors_recent=self._cached_sub_sensors,
+                away_series=self._cached_away_series,
+                people_home_series=self._cached_people_home,
+                climate_recent=self._cached_climate_recent,
+                dhw_recent=self._cached_dhw_recent,
+            )
+
+            if kwargs.get("publish", False):
+                self._publish_scenario_forecast(result_df)
+
+            self.fire_event(
+                "energy_forecast_scenario_result",
+                forecast=result_df.to_dict("records"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"get_scenario failed: {exc}", level="ERROR")
+
+    def _publish_scenario_forecast(self, result_df: "Any") -> None:
+        """Publish scenario forecast sensors to HA (called when publish=True)."""
+        import math as _math
+        import pandas as pd
+        import numpy as np
+
+        now_dt      = pd.Timestamp.now(tz=self._timezone).replace(tzinfo=None)
+        today_np    = np.datetime64(now_dt.normalize())
+        tomorrow_np = today_np + np.timedelta64(1, "D")
+        after_np    = tomorrow_np + np.timedelta64(1, "D")
+
+        p_times = pd.to_datetime(result_df["timestamp"]).values.astype("datetime64[ns]")
+        p_vals  = result_df["predicted_kwh"].values.astype(float)
+        d_vals  = result_df["delta_kwh"].values.astype(float)
+
+        def _sum(arr, s, e):
+            return round(float(np.sum(arr[(p_times >= s) & (p_times < e)])), 3)
+
+        def _safe_set_scenario(entity_id: str, value: Any, friendly_name: str) -> None:
+            try:
+                val = float(value)
+                if _math.isnan(val) or _math.isinf(val):
+                    val = 0.0
+            except (TypeError, ValueError):
+                val = 0.0
+            self.set_state(
+                entity_id,
+                state=str(round(val, 3)),
+                attributes={
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": friendly_name,
+                    "unique_id": entity_id.split(".", 1)[-1],
+                    "attribution": ATTRIBUTION,
+                },
+                replace=True,
+            )
+
+        scenario_today    = _sum(p_vals, today_np, tomorrow_np)
+        scenario_tomorrow = _sum(p_vals, tomorrow_np, after_np)
+        delta_today       = _sum(d_vals, today_np, tomorrow_np)
+
+        _safe_set_scenario("sensor.energy_forecast_scenario_today",    scenario_today,    "Energy Forecast Scenario Today")
+        _safe_set_scenario("sensor.energy_forecast_scenario_tomorrow",  scenario_tomorrow, "Energy Forecast Scenario Tomorrow")
+        _safe_set_scenario("sensor.energy_forecast_scenario_delta_today", delta_today,     "Energy Forecast Scenario Delta Today")
+
+        for h in range(0, 24, 3):
+            slot      = f"{h:02d}_{h + 3:02d}"
+            slot_start = today_np + np.timedelta64(h, "h")
+            slot_end   = today_np + np.timedelta64(h + 3, "h")
+            _safe_set_scenario(
+                f"sensor.energy_forecast_scenario_today_{slot}",
+                _sum(p_vals, slot_start, slot_end),
+                f"Energy Forecast Scenario Today {h:02d}:{h + 3:02d}",
+            )
+
     def _update_cb(self, event_name=None, data=None, kwargs=None) -> None:
         if self._ml_model.model is None:
             return
@@ -839,6 +945,16 @@ class EnergyForecast(hass.Hass):
                     dhw_recent = _strip_tz(dhw_recent, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"DHW {self._dhw_buffer_sensor} recent fetch failed: {exc}", level="WARNING")
+
+        # Cache inputs for scenario/what-if API (Stage 4)
+        self._cached_forecast_df    = forecast_df
+        self._cached_live_temp      = live_temp
+        self._cached_recent_actuals = recent_actuals
+        self._cached_sub_sensors    = sub_sensors_recent or None
+        self._cached_away_series    = away_series
+        self._cached_people_home    = people_home_series
+        self._cached_climate_recent = climate_recent or None
+        self._cached_dhw_recent     = dhw_recent if not dhw_recent.empty else None
 
         predictions = self._ml_model.predict(
             forecast_df, live_temp, recent_actuals,

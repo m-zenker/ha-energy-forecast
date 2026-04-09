@@ -692,6 +692,39 @@ class EnergyForecastModel:
         low, high = np.minimum(low, high), np.maximum(low, high)
         return pd.DataFrame({"timestamp": future_hours, "low_kwh": low, "high_kwh": high})
 
+    def predict_scenario(
+        self,
+        forecast_df: "pd.DataFrame",
+        live_temp: "float | None",
+        schedule: "dict[str, str | None]",
+        recent_actuals: "pd.DataFrame | None" = None,
+        sub_sensors_recent: "dict | None" = None,
+        away_series: "pd.Series | None" = None,
+        people_home_series: "pd.Series | None" = None,
+        climate_recent: "dict[str, pd.DataFrame] | None" = None,
+        dhw_recent: "pd.DataFrame | None" = None,
+    ) -> "pd.DataFrame":
+        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
+
+        Runs the baseline predict() then overlays the appliance profiles from
+        *schedule* using the learned appliance signatures.
+
+        Raises:
+            RuntimeError: if the model has not been trained yet.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not yet trained.")
+
+        baseline_df = self.predict(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent,
+            away_series=away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+        )
+        return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
+
     def shap_summary(
         self,
         forecast_df: "pd.DataFrame",
@@ -1195,6 +1228,75 @@ def _learn_appliance_signatures(
             "n_cycles": len(windows),
         }
 
+    return result
+
+
+def _composite_forecast(
+    baseline_df: "pd.DataFrame",
+    schedule: "dict[str, str | None]",
+    signatures: dict,
+) -> "pd.DataFrame":
+    """Overlay appliance run profiles onto a baseline forecast.
+
+    Args:
+        baseline_df: DataFrame with columns [timestamp, predicted_kwh] — 48 rows, naive tz.
+        schedule:    {prefix: "HH:MM" | "off" | None} — desired appliance start times.
+        signatures:  appliance signatures dict from _learn_appliance_signatures().
+
+    Returns:
+        DataFrame with columns [timestamp, predicted_kwh, delta_kwh].
+    """
+    import pandas as pd
+    import numpy as np
+
+    result = baseline_df.copy()
+    result["delta_kwh"] = 0.0
+
+    if not schedule or not signatures:
+        return result
+
+    forecast_start = pd.Timestamp(result["timestamp"].iloc[0])
+
+    for prefix, time_str in schedule.items():
+        if time_str is None or time_str == "off":
+            continue
+        if prefix not in signatures:
+            _LOGGER.warning("_composite_forecast: no signature for prefix '%s' — skipping", prefix)
+            continue
+
+        try:
+            hour, minute = (int(x) for x in str(time_str).split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"out of range: {hour}:{minute}")
+        except (ValueError, AttributeError):
+            _LOGGER.warning("_composite_forecast: invalid time_str '%s' for prefix '%s'", time_str, prefix)
+            continue
+
+        # Build candidate timestamps for today and tomorrow relative to forecast_start
+        today_ts = forecast_start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        tomorrow_ts = today_ts + pd.Timedelta(days=1)
+
+        # Pick the earliest one >= forecast_start
+        if today_ts >= forecast_start:
+            target_ts = today_ts
+        else:
+            target_ts = tomorrow_ts
+
+        offset_h = round((target_ts - forecast_start).total_seconds() / 3600)
+
+        if offset_h >= 48 or offset_h < 0:
+            continue
+
+        profile: list = signatures[prefix]["hourly_profile"]
+        # Clip profile to available window
+        profile = profile[: 48 - offset_h]
+        if not profile:
+            continue
+
+        n = len(profile)
+        result.loc[result.index[offset_h : offset_h + n], "delta_kwh"] += profile
+
+    result["predicted_kwh"] = np.maximum(0.0, result["predicted_kwh"].values + result["delta_kwh"].values)
     return result
 
 

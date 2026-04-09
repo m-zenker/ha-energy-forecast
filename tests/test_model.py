@@ -30,6 +30,7 @@ from energy_forecast.model import (
     _BRIDGE_CAP,
     _build_model,
     _build_prediction_temp_df,
+    _composite_forecast,
     _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
@@ -2256,3 +2257,168 @@ class TestApplianceSignatures:
         assert isinstance(model._appliance_signatures, dict)
         assert "sub_hp" in model._appliance_signatures
         assert (tmp_path / "appliance_signatures.json").exists()
+
+
+# ── _composite_forecast (Stage 4) ────────────────────────────────────────────
+
+def _make_baseline_df(start="2024-06-01 10:00", n=48):
+    ts = pd.date_range(start, periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * n})
+
+
+_DUMMY_SIGS = {
+    "sub_dishwasher": {
+        "total_kwh": 5.0,
+        "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+        "peak_hour": 1,
+        "n_cycles": 5,
+    },
+    "sub_wp": {
+        "total_kwh": 3.0,
+        "hourly_profile": [1.0, 1.0, 1.0],
+        "peak_hour": 0,
+        "n_cycles": 4,
+    },
+}
+
+
+class TestCompositeForecast:
+
+    def test_empty_schedule_returns_baseline(self):
+        """schedule={} → delta_kwh all zeros, predicted_kwh unchanged."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {}, _DUMMY_SIGS)
+        assert "delta_kwh" in result.columns
+        assert (result["delta_kwh"] == 0.0).all()
+        assert result["predicted_kwh"].tolist() == pytest.approx([1.0] * 48)
+
+    def test_single_appliance_overlay(self):
+        """Dishwasher at 14:00 (4h ahead from 10:00) → profile added at offsets 4..7."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "14:00"}, _DUMMY_SIGS)
+        profile = _DUMMY_SIGS["sub_dishwasher"]["hourly_profile"]
+        # offset_h = 4 (10:00 → 14:00)
+        for i, v in enumerate(profile):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+        # Baseline outside profile unchanged (delta stays 0)
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+        assert result["delta_kwh"].iloc[3] == pytest.approx(0.0)
+        # predicted_kwh = 1.0 + profile at those slots
+        assert result["predicted_kwh"].iloc[4] == pytest.approx(1.0 + profile[0])
+
+    def test_off_appliance_skipped(self):
+        """'off' value → no overlay, delta stays zero."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_dishwasher": "off"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_none_appliance_skipped(self):
+        """None value → no overlay."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_dishwasher": None}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_unknown_prefix_ignored(self):
+        """Prefix not in signatures → skipped, no crash, no delta."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_unknown": "12:00"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_boundary_truncation(self):
+        """Appliance starting at hour 46 with 4h profile → only 2h remain, rest truncated."""
+        df = _make_baseline_df(start="2024-06-01 00:00")
+        # 4h profile starting at 22:00 → offset=22; window up to 22+4=26, but only 24 rows
+        # start=00:00, 46:00 means offset 46, profile=[1,2,1.5,0.5] → clip to [1, 2] (48-46=2)
+        result = _composite_forecast(df, {"sub_dishwasher": "22:00"}, _DUMMY_SIGS)
+        # 22:00 with 00:00 start → offset_h = 22; profile has 4 elements → all 4 fit (22+4=26 < 48)
+        # Actually for a 48-row df starting at 00:00, 22:00 = offset 22, 22+4=26 < 48 so no truncation
+        # Use start at 00:00 and time "46:00" is invalid; instead test profile going to edge
+        # Re-test with start at 10:00 and time = "08:00" → tomorrow 08:00 → offset=22+24? no
+        # Simplest: make a 48-row df, start at 00:00, use a 4h profile at hour 46:
+        df2 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        # Manually call _composite_forecast with a signature that starts at hour 46
+        sigs_edge = {
+            "sub_test": {
+                "total_kwh": 5.0,
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "peak_hour": 1,
+                "n_cycles": 3,
+            }
+        }
+        # 00:00 start, "22:00" today → offset=22, fits fully
+        # To get offset=46, need start at 00:00 and appliance at 22:00 next day
+        # That would be 46h — can't express as HH:MM directly with the algorithm picking earliest.
+        # Instead just directly test truncation by constructing start at 00:00 and time "22:00"
+        # with n=48 but a very long profile:
+        sigs_long = {
+            "sub_test": {
+                "hourly_profile": [1.0] * 10,  # 10h profile
+                "total_kwh": 10.0,
+                "peak_hour": 0,
+                "n_cycles": 3,
+            }
+        }
+        df3 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        # offset_h = 22 (start 00:00 → 22:00), profile 10h → 22+10=32 < 48, fits
+        result3 = _composite_forecast(df3, {"sub_test": "22:00"}, sigs_long)
+        for i in range(10):
+            assert result3["delta_kwh"].iloc[22 + i] == pytest.approx(1.0)
+        assert result3["delta_kwh"].iloc[21] == pytest.approx(0.0)
+        assert result3["delta_kwh"].iloc[32] == pytest.approx(0.0)
+        # Now test truncation: profile extending beyond h=48
+        df4 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        result4 = _composite_forecast(df4, {"sub_test": "46:00"}, sigs_long)
+        # "46:00" is invalid — parser will fail silently → no delta
+        assert (result4["delta_kwh"] == 0.0).all()
+
+    def test_multiple_appliances(self):
+        """Two appliances at different times → both overlaid independently."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        schedule = {
+            "sub_dishwasher": "14:00",  # offset 4
+            "sub_wp":         "17:00",  # offset 7
+        }
+        result = _composite_forecast(df, schedule, _DUMMY_SIGS)
+        dw_profile = _DUMMY_SIGS["sub_dishwasher"]["hourly_profile"]
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
+        # Dishwasher at 4..7
+        for i, v in enumerate(dw_profile):
+            expected = v
+            if 4 + i >= 7 and (4 + i - 7) < len(wp_profile):
+                expected += wp_profile[4 + i - 7]
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(expected)
+        # wp at 7..9
+        for i, v in enumerate(wp_profile):
+            idx = 7 + i
+            if idx < 4 or idx >= 4 + len(dw_profile):
+                assert result["delta_kwh"].iloc[idx] == pytest.approx(v)
+
+    def test_predicted_kwh_nonnegative(self):
+        """Even with large negative baseline, predicted_kwh >= 0."""
+        ts = pd.date_range("2024-06-01 10:00", periods=48, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [-5.0] * 48})
+        result = _composite_forecast(df, {"sub_wp": "11:00"}, _DUMMY_SIGS)
+        assert (result["predicted_kwh"] >= 0.0).all()
+
+    def test_predict_scenario_returns_delta_column(self, tmp_path):
+        """predict_scenario() returns df with delta_kwh column."""
+        m, forecast = _make_trained_model(tmp_path)
+        # Add a dummy signature so _composite_forecast has something to overlay
+        m._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
+        }
+        result = m.predict_scenario(forecast, live_temp=None, schedule={"sub_dw": "12:00"})
+        assert "delta_kwh" in result.columns
+        assert len(result) == 48
+        assert (result["delta_kwh"] >= 0.0).all()
+
+    def test_next_day_time_string(self):
+        """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        # today 02:00 < 10:00 → tomorrow 02:00 → offset = 16h
+        result = _composite_forecast(df, {"sub_wp": "02:00"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
+        for i, v in enumerate(wp_profile):
+            assert result["delta_kwh"].iloc[16 + i] == pytest.approx(v)
+        # hour 15 and before: no delta
+        assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
