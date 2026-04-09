@@ -27,6 +27,7 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 
 - [Quick Start](#quick-start)
 - [Features](#features)
+- [Scenario / What-If API](#scenario--what-if-api)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -97,6 +98,45 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
 - **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
 - **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
+- **Scenario / What-If API** — ask "what would my consumption look like if I run the dishwasher at 22:00?" without changing the live forecast; results fire an event and optionally publish dedicated HA sensors
+
+---
+
+## Scenario / What-If API
+
+Call the `energy_forecast/get_scenario` AppDaemon service to overlay appliance run schedules onto the current 48-hour baseline forecast.
+
+**Service call (YAML):**
+```yaml
+service: appdaemon/energy_forecast_get_scenario
+data:
+  schedule:
+    sub_dishwasher: "22:30"
+    sub_washing_machine: "off"   # "off" or null to skip
+  publish: true                  # optional: write result to HA sensors
+```
+
+**Event payload** (`energy_forecast_scenario_result`):
+```json
+{
+  "forecast": [
+    {"timestamp": "2024-06-01T00:00:00", "predicted_kwh": 0.42, "delta_kwh": 0.0},
+    {"timestamp": "2024-06-01T01:00:00", "predicted_kwh": 0.38, "delta_kwh": 0.0},
+    "..."
+  ]
+}
+```
+
+**Published sensors** (when `publish: true`):
+
+| Entity ID | Description |
+|-----------|-------------|
+| `sensor.energy_forecast_scenario_today` | Total scenario consumption today (kWh) |
+| `sensor.energy_forecast_scenario_tomorrow` | Total scenario consumption tomorrow (kWh) |
+| `sensor.energy_forecast_scenario_delta_today` | Appliance-induced delta vs baseline today (kWh) |
+| `sensor.energy_forecast_scenario_today_00_03` … `_21_24` | 8 × 3-hour block sensors for today (kWh) |
+
+All sensors carry `unit_of_measurement: kWh`. Invalid or unknown schedule entries are silently skipped.
 
 ---
 

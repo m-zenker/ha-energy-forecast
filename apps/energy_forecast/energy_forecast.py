@@ -658,8 +658,19 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             self.log(f"get_scenario failed: {exc}", level="ERROR")
 
-    def _publish_scenario_forecast(self, result_df: "Any") -> None:
-        """Publish scenario forecast sensors to HA (called when publish=True)."""
+    def _publish_scenario_forecast(self, result_df: "pd.DataFrame") -> None:
+        """Publish scenario forecast sensors to HA (called when publish=True).
+
+        Writes the following HA sensor entities (all in kWh):
+          - sensor.energy_forecast_scenario_today       — total today
+          - sensor.energy_forecast_scenario_tomorrow    — total tomorrow
+          - sensor.energy_forecast_scenario_delta_today — appliance-induced delta vs baseline (today)
+          - sensor.energy_forecast_scenario_today_HH_HH — 8 three-hour block sensors for today
+            (00_03, 03_06, 06_09, 09_12, 12_15, 15_18, 18_21, 21_24)
+
+        All sensors carry ``unit_of_measurement: kWh`` and ``attribution`` attributes.
+        Values are rounded to 3 decimal places; NaN/Inf are coerced to 0.
+        """
         import math as _math
         import pandas as pd
         import numpy as np

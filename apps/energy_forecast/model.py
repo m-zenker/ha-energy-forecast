@@ -37,7 +37,7 @@ import json
 import logging
 import pickle
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -795,7 +795,7 @@ class EnergyForecastModel:
         if not self._model_path.exists():
             return  # nothing to archive on first save
         try:
-            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             snap_dir = self._archive_dir / stamp
             snap_dir.mkdir(parents=True, exist_ok=True)
             _artifacts = [
@@ -1012,15 +1012,16 @@ def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int
 
     df = energy_df.sort_values("timestamp").reset_index(drop=True).copy()
 
+    new_cols: dict = {}
     for lag in active_lags:
-        df[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
+        new_cols[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
 
     shifted = df["gross_kwh"].shift(1)
-    df["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
-    df["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
-    df["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
+    new_cols["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
+    new_cols["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
+    new_cols["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
 
-    return df
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.DataFrame | None) -> pd.DataFrame:
@@ -1133,6 +1134,7 @@ def _add_sub_sensor_lags_training(
 
     n_rows = len(df)
     ts_idx = pd.to_datetime(df["timestamp"])
+    new_cols: dict = {}
 
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
@@ -1152,23 +1154,25 @@ def _add_sub_sensor_lags_training(
                 "will be filled with training medians.",
                 prefix, nan_count, len(kwh_series),
             )
-        df[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
+        new_cols[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
-            df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
+            new_cols[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
 
         # active_24h: was the appliance active any time in the past 24h?
         # Use shift(1) so the current-row value is excluded (lag semantics).
         filled = kwh_series.fillna(0)
         shifted_kwh = filled.shift(1)
         active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
-        df[f"{prefix}_active_24h"] = active.values
+        new_cols[f"{prefix}_active_24h"] = active.values
 
         # runs_7d: how many times did the appliance start (0→>0 transition) in
         # the past 168h?  shift(1) applied before rolling to exclude current row.
         is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
         runs = is_start.shift(1).rolling(168, min_periods=1).sum()
-        df[f"{prefix}_runs_7d"] = runs.values
+        new_cols[f"{prefix}_runs_7d"] = runs.values
 
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
 
 
@@ -1241,10 +1245,17 @@ def _composite_forecast(
     Args:
         baseline_df: DataFrame with columns [timestamp, predicted_kwh] — 48 rows, naive tz.
         schedule:    {prefix: "HH:MM" | "off" | None} — desired appliance start times.
+                     Example: {"dishwasher": "22:30", "washing_machine": "off"}.
+                     Invalid or out-of-range time strings (e.g. "25:00", "abc") are
+                     logged as warnings and skipped; ``delta_kwh`` stays 0 for that
+                     prefix.
         signatures:  appliance signatures dict from _learn_appliance_signatures().
 
     Returns:
         DataFrame with columns [timestamp, predicted_kwh, delta_kwh].
+        ``delta_kwh`` is the signed kWh difference vs. the baseline introduced by
+        the scheduled appliances; it is 0 when schedule is empty or a prefix has no
+        matching signature.
     """
     import pandas as pd
     import numpy as np

@@ -2422,3 +2422,21 @@ class TestCompositeForecast:
             assert result["delta_kwh"].iloc[16 + i] == pytest.approx(v)
         # hour 15 and before: no delta
         assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
+
+    def test_malformed_time_string_skipped(self):
+        """Unparseable time string → warning logged (implicitly), delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:99"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_non_string_time_skipped(self):
+        """Non-string schedule value (int) → treated as invalid, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": 1400}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_out_of_range_hour_skipped(self):
+        """Hour > 23 → ValueError raised internally, skipped, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
