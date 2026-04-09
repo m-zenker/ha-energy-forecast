@@ -9,6 +9,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `apps/energy_forecast/model.py` — **Stage 3: Automated Load Signature Discovery**: new `_learn_appliance_signatures()` scans sub-sensor histories for run cycles (0→>0 kWh transitions) and computes an average hourly energy profile per appliance prefix. Signatures persisted to `models/appliance_signatures.json`, reloaded on startup, and ready for Stage 4 scenario modeling. Per-prefix log: `Appliance signature | <prefix> | cycles=N | total=X.XX kWh | peak_hour=H`. 8 new unit + integration tests in `TestApplianceSignatures`.
+
+---
+
+## [0.10.0-alpha] — 2026-04-09
+
+### Added
+- `apps/energy_forecast/model.py` — **Stage 2 modeling**: intent-driven thermal and DHW features now part of default feature set. Adds `intent_thermal_active`, `intent_thermal_temp_c`, `intent_dhw_active`, `intent_dhw_target_c`, `baseline_mode`, and `occupancy_present` to the feature pipeline. Enables the model to learn the relationship between heating/DHW intent and consumption, supporting predictive scheduling and occupancy-aware forecasting. Stage 2 model is production-ready; regression tests confirm backward compatibility and accuracy parity.
+- `apps/energy_forecast/model.py` — **Baseline mode support**: new `baseline_mode` binary feature flags time windows when the system should revert to conservative baseline behavior (e.g., during extended away periods or when solar/battery subsystems are offline). Allows the forecast to adapt to fallback scenarios without retraining.
+- `apps/energy_forecast/model.py` — **Occupancy presence sensor**: new `occupancy_present` binary feature reflects real-time presence detection from HA occupancy sensors. When integrated with baseline mode, enables the model to distinguish between occupied and unoccupied consumption profiles, improving forecast accuracy during vacations or irregular schedules.
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — **Relative MAE sensors volatility** (`mae_7d_pct`, `mae_30d_pct`): relative MAE sensors now remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history` dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- `apps/energy_forecast/mqtt_mixin.py` — **MQTT NaN handling in relative MAE**: relative MAE percentages are now safely published even when mean consumption is zero or undefined (e.g., first day of month). Prevents NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0 and logs WARNING.
+- `apps/energy_forecast/mqtt_mixin.py` — **UID slicing fragility**: topic splitting for sub-entity UID extraction was fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
+
+---
+
+## [0.9.1-alpha] — 2026-04-07
+
+### Added
 - **Relative MAE sensors** (`energy_forecast.py`): `mae_7d_pct` and `mae_30d_pct` express rolling MAE
   as a percentage of mean consumption, providing a normalized accuracy metric independent of
   consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling)
