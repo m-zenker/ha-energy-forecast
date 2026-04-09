@@ -220,9 +220,11 @@ class TestAggregate:
 
     def _run(self, today, now, predictions, actuals=None, intervals=None):
         from energy_forecast.energy_forecast import EnergyForecast
-        return EnergyForecast._aggregate(
-            _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
-        )
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = now
+            return EnergyForecast._aggregate(
+                _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
+            )
 
     def test_next_1h_sums_only_one_future_hour(self):
         """next_1h must equal exactly 1 × per-hour prediction."""
@@ -328,7 +330,10 @@ class TestEvKwhSensorCalc:
         app._ev_threshold  = ev_threshold
         app._ev_charger_kw = ev_charger_kw
 
-        return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
+        with patch("pandas.Timestamp.now") as mock_now:
+            # mock_now must be timezone-aware because _aggregate calls .tz_convert
+            mock_now.return_value = today.tz_localize("Europe/Zurich")
+            return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
 
     def test_ev_today_uses_charger_kw_not_threshold(self):
         """ev_today must equal gross − charger_kw, not gross − threshold."""

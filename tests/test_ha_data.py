@@ -19,10 +19,29 @@ import pandas as pd
 import pytest
 
 from energy_forecast import ha_data
-from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames
+from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames, _merge_frames
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def make_climate_ha_raw(timestamps_utc: list[str], current_temps: list[float], setpoints: list[float]) -> pd.DataFrame:
+    """Build a climate-style raw HA history DataFrame with attributes."""
+    rows = []
+    for ts, ct, sp in zip(timestamps_utc, current_temps, setpoints):
+        rows.append({
+            "timestamp": pd.to_datetime(ts, utc=True).tz_convert("Europe/Zurich"),
+            "current_temperature": ct,
+            "temperature": sp
+        })
+    return pd.DataFrame(rows)
+
+
+def make_generic_ha_raw(timestamps_utc: list[str], values: list[float]) -> pd.DataFrame:
+    """Build a generic absolute sensor raw HA history DataFrame."""
+    return pd.DataFrame({
+        "timestamp": pd.to_datetime(timestamps_utc, utc=True).tz_convert("Europe/Zurich"),
+        "value": values
+    })
 
 def make_energy_df(timestamps: list[str], kwh_values: list[float]) -> pd.DataFrame:
     """Build a naive-timestamp energy DataFrame (as stored in the CSV cache)."""
@@ -55,6 +74,55 @@ def mock_app() -> MagicMock:
     app = MagicMock()
     app.log = MagicMock()
     return app
+
+
+# ── Stage 2: Climate & Generic ───────────────────────────────────────────────
+
+class TestClimateAndGenericHistory:
+
+    def test_merge_frames_generic(self):
+        """_merge_frames works correctly with any value column."""
+        ts = "2024-01-01 10:00"
+        winner = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [22.0]})
+        loser  = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [21.0]})
+        result = _merge_frames(winner, loser, "val")
+        assert result.iloc[0]["val"] == 22.0
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_climate_history_basic(self, mock_fetch, mock_app, tmp_path):
+        """fetch_climate_history correctly extracts and resamples attributes."""
+        # 10:00 UTC -> 11:00 CET
+        ha_raw = make_climate_ha_raw(
+            ["2024-01-01 10:00", "2024-01-01 10:30"],
+            [20.0, 20.5], [21.0, 21.0]
+        )
+        mock_fetch.return_value = ha_raw
+        cache_file = tmp_path / "climate_test.csv"
+
+        df = ha_data.fetch_climate_history(mock_app, "climate.living_room", cache_file)
+
+        assert not df.empty
+        assert "current_temp" in df.columns
+        assert "setpoint" in df.columns
+        # Should be resampled to 11:00 local (last state in the 10:xx UTC window)
+        assert df.iloc[0]["timestamp"] == pd.to_datetime("2024-01-01 11:00")
+        assert df.iloc[0]["current_temp"] == 20.5
+        assert df.iloc[0]["setpoint"] == 21.0
+        assert cache_file.exists()
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_generic_sensor_history(self, mock_fetch, mock_app, tmp_path):
+        """fetch_generic_sensor_history handles absolute values correctly."""
+        ha_raw = make_generic_ha_raw(["2024-01-01 10:00", "2024-01-01 10:30"], [55.0, 54.5])
+        mock_fetch.return_value = ha_raw
+        cache_file = tmp_path / "sensor_test.csv"
+
+        df = ha_data.fetch_generic_sensor_history(mock_app, "sensor.dhw_temp", cache_file, column_name="buffer_temp")
+
+        assert not df.empty
+        assert "buffer_temp" in df.columns
+        assert df.iloc[0]["buffer_temp"] == 54.5
+        assert cache_file.exists()
 
 
 # ── _merge_energy_frames ─────────────────────────────────────────────────────

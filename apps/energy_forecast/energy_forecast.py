@@ -126,6 +126,15 @@ class EnergyForecast(hass.Hass):
         self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Model versioning: number of archived model snapshots to retain
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
+
+        # Stage 2: Intent-Driven Thermal & DHW Modeling
+        # climate_entities: list of HA climate entities (e.g. climate.living_room)
+        # dhw_buffer_sensor: entity ID for DHW temperature sensor
+        # heating_system_active_entity: binary sensor to verify "heating off" periods for Tau
+        self._climate_entities: list[str] = list(self.args.get("climate_entities") or [])
+        self._dhw_buffer_sensor: str | None = self.args.get("dhw_buffer_sensor") or None
+        self._heating_active_entity: str | None = self.args.get("heating_system_active_entity") or None
+
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float]    = {}
@@ -292,6 +301,16 @@ class EnergyForecast(hass.Hass):
         """Return the CSV cache path for a sub-energy sensor."""
         sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
         return self._cache_path.parent / f"sub_{sanitized}.csv"
+
+    def _climate_cache_path(self, entity_id: str) -> Path:
+        """Return the CSV cache path for a climate entity (setpoints/temp)."""
+        sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
+        return self._cache_path.parent / f"climate_{sanitized}.csv"
+
+    def _generic_sensor_cache_path(self, entity_id: str, prefix: str = "sensor") -> Path:
+        """Return the CSV cache path for a generic absolute sensor."""
+        sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
+        return self._cache_path.parent / f"{prefix}_{sanitized}.csv"
 
     # ── MQTT Discovery ────────────────────────────────────────────────────────
 
@@ -708,6 +727,29 @@ class EnergyForecast(hass.Hass):
         if not presence_df.empty:
             presence_df = _strip_tz(presence_df, self._timezone)
 
+        # ── Stage 2: Climate & DHW History ──────────────────────────────────
+        climate_dfs: dict[str, Any] = {}
+        for entity_id in self._climate_entities:
+            c_path = self._climate_cache_path(entity_id)
+            try:
+                c_df = ha_data.fetch_climate_history(self, entity_id, c_path, timezone=self._timezone)
+                if not c_df.empty:
+                    climate_dfs[entity_id] = _strip_tz(c_df, self._timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"Climate {entity_id} history fetch failed: {exc}", level="WARNING")
+
+        dhw_df = pd.DataFrame()
+        if self._dhw_buffer_sensor:
+            dhw_path = self._generic_sensor_cache_path(self._dhw_buffer_sensor, prefix="dhw")
+            try:
+                dhw_df = ha_data.fetch_generic_sensor_history(
+                    self, self._dhw_buffer_sensor, dhw_path, column_name="buffer_temp", timezone=self._timezone
+                )
+                if not dhw_df.empty:
+                    dhw_df = _strip_tz(dhw_df, self._timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"DHW {self._dhw_buffer_sensor} history fetch failed: {exc}", level="WARNING")
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -719,6 +761,8 @@ class EnergyForecast(hass.Hass):
             sub_sensors_dict=sub_sensors_dict or None,
             away_df=away_df if not away_df.empty else None,
             presence_df=presence_df if not presence_df.empty else None,
+            climate_dfs=climate_dfs or None,
+            dhw_df=dhw_df if not dhw_df.empty else None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -773,11 +817,36 @@ class EnergyForecast(hass.Hass):
         away_series = self._build_away_prediction_series(now_ts)
         people_home_series = self._build_people_home_prediction_series(now_ts)
 
+        # ── Stage 2: Climate & DHW Recent Fetch ──────────────────────────────
+        climate_recent: dict[str, Any] = {}
+        for entity_id in self._climate_entities:
+            c_path = self._climate_cache_path(entity_id)
+            try:
+                c_df = ha_data.fetch_recent_climate(self, entity_id, c_path, timezone=self._timezone)
+                if not c_df.empty:
+                    climate_recent[entity_id] = _strip_tz(c_df, self._timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"Climate {entity_id} recent fetch failed: {exc}", level="WARNING")
+
+        dhw_recent = pd.DataFrame()
+        if self._dhw_buffer_sensor:
+            dhw_path = self._generic_sensor_cache_path(self._dhw_buffer_sensor, prefix="dhw")
+            try:
+                dhw_recent = ha_data.fetch_recent_generic_sensor(
+                    self, self._dhw_buffer_sensor, dhw_path, column_name="buffer_temp", timezone=self._timezone
+                )
+                if not dhw_recent.empty:
+                    dhw_recent = _strip_tz(dhw_recent, self._timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(f"DHW {self._dhw_buffer_sensor} recent fetch failed: {exc}", level="WARNING")
+
         predictions = self._ml_model.predict(
             forecast_df, live_temp, recent_actuals,
             sub_sensors_recent=sub_sensors_recent or None,
             away_series=away_series,
             people_home_series=people_home_series,
+            climate_recent=climate_recent or None,
+            dhw_recent=dhw_recent if not dhw_recent.empty else None,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
@@ -786,6 +855,8 @@ class EnergyForecast(hass.Hass):
             sub_sensors_recent=sub_sensors_recent or None,
             away_series=away_series,
             people_home_series=people_home_series,
+            climate_recent=climate_recent or None,
+            dhw_recent=dhw_recent if not dhw_recent.empty else None,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)

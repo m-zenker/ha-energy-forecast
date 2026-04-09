@@ -455,6 +455,61 @@ class TestNewWeatherFeatures:
         assert result["cloud_cover_pct"].isna().all()
         assert result["direct_radiation_wm2"].isna().all()
 
+
+class TestStage2Features:
+
+    def test_thermal_pressure_feature(self):
+        """thermal_pressure is correctly calculated as (setpoint - current)."""
+        ts = pd.date_range("2026-03-12 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        
+        # Room 1: 21.0 - 20.0 = 1.0 delta
+        # Room 2: 22.0 - 18.0 = 4.0 delta
+        # Average thermal_pressure should be 2.5
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp": ts,
+                "current_temp": [20.0, 20.0],
+                "setpoint": [21.0, 21.0]
+            }),
+            "climate.room2": pd.DataFrame({
+                "timestamp": ts,
+                "current_temp": [18.0, 18.0],
+                "setpoint": [22.0, 22.0]
+            })
+        }
+        
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert "thermal_pressure" in result.columns
+        assert (result["thermal_pressure"] == 2.5).all()
+
+    def test_dhw_pressure_feature(self):
+        """dhw_pressure increases non-linearly as buffer_temp drops towards 40C."""
+        ts = pd.date_range("2026-03-12 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        
+        # Hour 0: 55C -> low pressure
+        # Hour 1: 41C -> high pressure
+        dhw_df = pd.DataFrame({
+            "timestamp": ts,
+            "buffer_temp": [55.0, 41.0]
+        })
+        
+        result = _engineer_features(df, w, None, dhw_df=dhw_df)
+        assert "dhw_buffer_temp" in result.columns
+        assert "dhw_pressure" in result.columns
+        assert result.iloc[0]["dhw_buffer_temp"] == 55.0
+        assert result.iloc[1]["dhw_buffer_temp"] == 41.0
+        
+        p0 = result.iloc[0]["dhw_pressure"]
+        p1 = result.iloc[1]["dhw_pressure"]
+        # p0 = 1 / (55-40+1)^2 = 1/16^2 = 1/256
+        # p1 = 1 / (41-40+1)^2 = 1/2^2 = 1/4
+        assert p1 > p0
+        assert p1 == pytest.approx(0.25)
+
     def test_temp_rolling_3d_anchored_by_historical_tail(self):
         """With 72h of history prepended to a 4h forecast, temp_rolling_3d at h=0
         must equal the mean of all 72 historical temps, not just the first value."""

@@ -105,6 +105,10 @@ _FEATURES_BASE = [
     "is_away",
     # Occupancy
     "people_home",
+    # Stage 2: Intent-driven features
+    "thermal_pressure",
+    "dhw_buffer_temp",
+    "dhw_pressure",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -217,6 +221,8 @@ class EnergyForecastModel:
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
         away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
         presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+        climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
+        dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -265,7 +271,8 @@ class EnergyForecastModel:
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
-                                presence_df=presence_df)
+                                presence_df=presence_df, climate_dfs=climate_dfs,
+                                dhw_df=dhw_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -530,6 +537,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -553,7 +562,8 @@ class EnergyForecastModel:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
-                                     likely_ev_hours=self._likely_ev_hours)
+                                     likely_ev_hours=self._likely_ev_hours,
+                                     climate_dfs=climate_recent, dhw_df=dhw_recent)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -609,6 +619,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -618,7 +630,8 @@ class EnergyForecastModel:
             raise RuntimeError("Model not yet trained.")
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
+            climate_recent=climate_recent, dhw_recent=dhw_recent
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -634,6 +647,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -647,7 +662,8 @@ class EnergyForecastModel:
             return None
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
+            climate_recent=climate_recent, dhw_recent=dhw_recent
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1177,6 +1193,8 @@ def _engineer_features(
     likely_ev_hours: set | None = None,
     away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
     presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+    climate_dfs: dict[str, pd.DataFrame] | None = None,
+    dhw_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1311,6 +1329,54 @@ def _engineer_features(
         df["people_home"] = df["people_home"].fillna(0).astype(int)
     else:
         df["people_home"] = 0
+
+    # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
+    if climate_dfs:
+        deltas = []
+        for eid, c_df in climate_dfs.items():
+            if c_df.empty:
+                continue
+            c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
+            c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
+            c[f"{eid}_delta"] = c["setpoint"] - c["current_temp"]
+            deltas.append(c[["timestamp", f"{eid}_delta"]])
+
+        if deltas:
+            # Join all deltas
+            from functools import reduce
+            merged_deltas = reduce(lambda left, right: pd.merge(left, right, on="timestamp", how="outer"), deltas)
+            # Average delta across all rooms as the household "thermal pressure"
+            delta_cols = [c for c in merged_deltas.columns if c != "timestamp"]
+            merged_deltas["thermal_pressure"] = merged_deltas[delta_cols].mean(axis=1)
+
+            df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+            df = df.merge(merged_deltas[["timestamp", "thermal_pressure"]], left_on="_ts_floor", right_on="timestamp",
+                          how="left", suffixes=("", "_tp"))
+            df.drop(columns=["timestamp_tp", "_ts_floor"], errors="ignore", inplace=True)
+            df["thermal_pressure"] = df["thermal_pressure"].fillna(0.0)
+        else:
+            df["thermal_pressure"] = 0.0
+    else:
+        df["thermal_pressure"] = 0.0
+
+    # ── Stage 2: DHW Pressure ───────────────────────────────────────────
+    if dhw_df is not None and not dhw_df.empty:
+        d = dhw_df[["timestamp", "buffer_temp"]].copy()
+        d["timestamp"] = pd.to_datetime(d["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(d, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_dhw"))
+        df.drop(columns=["timestamp_dhw", "_ts_floor"], errors="ignore", inplace=True)
+        # Rename merged column to the feature name
+        if "buffer_temp" in df.columns:
+            df.rename(columns={"buffer_temp": "dhw_buffer_temp"}, inplace=True)
+        
+        df["dhw_buffer_temp"] = df["dhw_buffer_temp"].fillna(50.0) # Assume neutral 50C
+        # non-linear trigger: higher as temp drops towards 40C floor
+        df["dhw_pressure"] = 1.0 / (np.maximum(0.5, df["dhw_buffer_temp"] - 40.0 + 1.0)**2)
+    else:
+        df["dhw_buffer_temp"] = 50.0
+        df["dhw_pressure"] = 0.0
 
     return df
 
