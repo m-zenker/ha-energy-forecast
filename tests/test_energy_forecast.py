@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 from energy_forecast.energy_forecast import (
+    EnergyForecast,
     _apply_target_correction,
     _blend_today_totals,
     _build_shap_narrative,
@@ -1726,3 +1727,71 @@ class TestSubtractSubSensors:
         assert removed == 0.0
         assert (res["gross_kwh"] == 5.0).all()
         assert res is not df
+
+
+# ── EnergyForecast._subtract_only_dict ───────────────────────────────────────
+
+class _FakeSubtractSelf:
+    """Minimal stand-in for EnergyForecast with sub-sensor config."""
+
+    def __init__(self, sub_energy_sensors: list[str], baseline_included_sensors: list[str]):
+        self._sub_energy_sensors = sub_energy_sensors
+        self._baseline_included_sensors = baseline_included_sensors
+
+    def _sub_sensor_prefix(self, entity_id: str) -> str:
+        sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
+        return f"sub_{sanitized}"
+
+
+class TestSubtractOnlyDict:
+
+    def _make_sub_dict(self, *entity_ids: str) -> dict:
+        """Build a sub_dict with dummy DataFrames keyed by prefix."""
+        fake = _FakeSubtractSelf(list(entity_ids), [])
+        return {fake._sub_sensor_prefix(e): object() for e in entity_ids}
+
+    def test_partial_subtraction(self):
+        """One sensor in baseline_included_sensors → its prefix absent from result."""
+        sensors = ["sensor.heat_pump_energy_kwh", "sensor.dishwasher_energy_kwh"]
+        included = ["sensor.heat_pump_energy_kwh"]
+        fake = _FakeSubtractSelf(sensors, included)
+        sub_dict = {fake._sub_sensor_prefix(e): object() for e in sensors}
+
+        result = EnergyForecast._subtract_only_dict(fake, sub_dict)
+
+        assert "sub_heat_pump_energy_kwh" not in result
+        assert "sub_dishwasher_energy_kwh" in result
+        assert len(result) == 1
+
+    def test_all_included_returns_empty(self):
+        """All sensors in baseline_included_sensors → empty dict → no subtraction."""
+        sensors = ["sensor.heat_pump_energy_kwh", "sensor.dhw_energy_kwh"]
+        fake = _FakeSubtractSelf(sensors, sensors)
+        sub_dict = {fake._sub_sensor_prefix(e): object() for e in sensors}
+
+        result = EnergyForecast._subtract_only_dict(fake, sub_dict)
+
+        assert result == {}
+
+    def test_no_baseline_included_returns_full_dict(self):
+        """Omitting baseline_included_sensors → full dict returned (backward-compatible)."""
+        sensors = ["sensor.heat_pump_energy_kwh", "sensor.dishwasher_energy_kwh"]
+        fake = _FakeSubtractSelf(sensors, [])
+        sub_dict = {fake._sub_sensor_prefix(e): object() for e in sensors}
+
+        result = EnergyForecast._subtract_only_dict(fake, sub_dict)
+
+        assert result is sub_dict
+
+    def test_unknown_sensor_in_included_no_crash(self):
+        """A sensor in baseline_included_sensors not present in sub_dict is silently ignored."""
+        sensors = ["sensor.dishwasher_energy_kwh"]
+        included = ["sensor.heat_pump_energy_kwh"]  # not in sub_dict
+        fake = _FakeSubtractSelf(sensors, included)
+        sub_dict = {fake._sub_sensor_prefix(e): object() for e in sensors}
+
+        result = EnergyForecast._subtract_only_dict(fake, sub_dict)
+
+        # heat_pump not in sub_dict — no crash; dishwasher still present
+        assert "sub_dishwasher_energy_kwh" in result
+        assert len(result) == 1
