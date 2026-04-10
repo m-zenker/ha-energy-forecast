@@ -188,6 +188,21 @@ class TestMergeEnergyFrames:
         assert len(result) == 3
         assert list(result["gross_kwh"]) == pytest.approx([10.0, 20.0, 30.0])
 
+    def test_empty_winner_preserves_float_dtype(self):
+        """Regression: pandas 3.x promotes concat(float64, empty_object) to object.
+
+        When raw_ha is empty, df_new = pd.DataFrame(columns=[...]) has object dtype.
+        After concat with the float64 cache, gross_kwh must still be float64, not object.
+        Otherwise downstream lag features become object and LightGBM raises
+        'pandas dtypes must be int, float or bool'.
+        """
+        import numpy as np
+        winner = pd.DataFrame(columns=["timestamp", "gross_kwh"])  # object dtype (empty)
+        loser  = make_energy_df(["2024-01-01 09:00", "2024-01-01 10:00"], [0.5, 0.3])
+        result = _merge_energy_frames(winner, loser)
+        assert result["gross_kwh"].dtype == np.float64
+        assert list(result["gross_kwh"]) == pytest.approx([0.5, 0.3])
+
 
 # ── fetch_energy_history ──────────────────────────────────────────────────────
 

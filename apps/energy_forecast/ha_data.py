@@ -113,13 +113,17 @@ def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: st
     either key column.
     """
     import pandas as pd
-    return (
+    result = (
         pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
         .drop_duplicates(subset=["timestamp"], keep="last")
         .sort_values("timestamp")
         .dropna(subset=["timestamp", value_col])
         .reset_index(drop=True)
     )
+    # pandas 3.x promotes concat(float64_df, empty_object_df) to object dtype.
+    # Coerce the value column back to float64 so downstream lag features stay numeric.
+    result[value_col] = pd.to_numeric(result[value_col], errors="coerce")
+    return result
 
 
 def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
