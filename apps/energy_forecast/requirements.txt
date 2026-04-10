@@ -13,3 +13,4 @@ scikit-learn==1.8.0
 # the app automatically falls back to scikit-learn's GradientBoostingRegressor.
 # Comment it out if you get build errors and don't have a C compiler available.
 lightgbm>=4.0.0
+holidays>=0.46

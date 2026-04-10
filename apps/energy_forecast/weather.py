@@ -36,7 +36,7 @@ def _parse_sunshine_min(sunshine_seconds: list) -> list:
     return [min(60.0, v) for v in result]
 
 
-def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date: date) -> pd.DataFrame:
+def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date: date, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Fetch hourly historical weather from the Open-Meteo Archive API.
 
     Returns a DataFrame with columns:
@@ -44,13 +44,15 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
         precipitation_mm, sunshine_min, wind_kmh,
         cloud_cover_pct, direct_radiation_wm2
     """
+    import urllib.parse
+    tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}"
         f"&start_date={start_date.isoformat()}&end_date={end_date.isoformat()}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
         ",cloud_cover,direct_radiation"
-        "&timezone=Europe%2FZurich"
+        f"&timezone={tz_encoded}"
     )
     res = requests.get(url, timeout=30)
     res.raise_for_status()
@@ -71,7 +73,7 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
     })
 
 
-def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None) -> pd.DataFrame:
+def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback.
 
     When SRG credentials are provided and the fetch succeeds, Open-Meteo is
@@ -80,7 +82,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
     values for temp_c, precipitation_mm, sunshine_min, wind_kmh are preserved.
     """
     if not client_id or not client_secret:
-        return fetch_open_meteo(lat, lon)
+        return fetch_open_meteo(lat, lon, timezone=timezone)
 
     try:
         # 1. Get OAuth Token (cached for 55 minutes to avoid rate-limiting).
@@ -97,7 +99,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
                     "SRG-SSR auth failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
                     auth_res.status_code, auth_res.text,
                 )
-                return fetch_open_meteo(lat, lon)
+                return fetch_open_meteo(lat, lon, timezone=timezone)
         token = _srg_token
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
@@ -117,7 +119,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
 
             if not geo_id:
                 _LOGGER.warning("SRG-SSR geolocation lookup returned no results — falling back to Open-Meteo.")
-                return fetch_open_meteo(lat, lon)
+                return fetch_open_meteo(lat, lon, timezone=timezone)
             _srg_geo_id[loc_key] = geo_id
         geo_id = _srg_geo_id[loc_key]
 
@@ -135,7 +137,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
                 "SRG-SSR forecast parse failed — HTTP %s, page: %r — falling back to Open-Meteo.",
                 res.status_code, title_str,
             )
-            return fetch_open_meteo(lat, lon)
+            return fetch_open_meteo(lat, lon, timezone=timezone)
 
         records = []
         for hour in data.get("hours", []):
@@ -150,15 +152,15 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         srg_df = pd.DataFrame(records)
 
         # 3. Supplement with Open-Meteo: cloud/radiation + 3-day historical tail
-        om_df = fetch_open_meteo(lat, lon)
-        return _supplement_from_open_meteo(srg_df, om_df)
+        om_df = fetch_open_meteo(lat, lon, timezone=timezone)
+        return _supplement_from_open_meteo(srg_df, om_df, timezone=timezone)
 
     except (requests.RequestException, KeyError, ValueError) as exc:
         _LOGGER.warning("SRG-SSR forecast failed (%s) — falling back to Open-Meteo.", exc)
-        return fetch_open_meteo(lat, lon)
+        return fetch_open_meteo(lat, lon, timezone=timezone)
 
 
-def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd.DataFrame:
+def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Merge Open-Meteo data into an SRG forecast DataFrame.
 
     Combines two sources into one DataFrame:
@@ -181,7 +183,7 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
         # utc=True normalises them before converting to local time.
         _ts = pd.to_datetime(srg_df["timestamp"], utc=True)
     if _ts.dt.tz is not None:
-        _ts = _ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+        _ts = _ts.dt.tz_convert(timezone).dt.tz_localize(None)
     srg_df["timestamp"] = _ts
     om_df  = om_df.copy()
     om_df["timestamp"]  = pd.to_datetime(om_df["timestamp"])
@@ -213,19 +215,21 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame) -> pd
     return combined.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_open_meteo(lat: float, lon: float) -> pd.DataFrame:
+def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Forecast (+ 3-day historical tail) using the free Open-Meteo API.
 
     past_days=3 adds ~72 h of measured history before the forecast window.
     This anchors the temp_rolling_3d feature in _engineer_features so the
     3-day rolling mean is based on real observations, not forecast values.
     """
+    import urllib.parse
+    tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
         ",cloud_cover,direct_radiation"
         "&past_days=3"
-        "&timezone=Europe%2FZurich"
+        f"&timezone={tz_encoded}"
     )
     try:
         res = requests.get(url, timeout=10)

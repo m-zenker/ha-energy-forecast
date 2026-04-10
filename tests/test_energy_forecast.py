@@ -21,6 +21,7 @@ from energy_forecast.energy_forecast import (
     _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
+    _subtract_sub_sensors,
 )
 
 
@@ -219,9 +220,11 @@ class TestAggregate:
 
     def _run(self, today, now, predictions, actuals=None, intervals=None):
         from energy_forecast.energy_forecast import EnergyForecast
-        return EnergyForecast._aggregate(
-            _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
-        )
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = now
+            return EnergyForecast._aggregate(
+                _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
+            )
 
     def test_next_1h_sums_only_one_future_hour(self):
         """next_1h must equal exactly 1 × per-hour prediction."""
@@ -327,7 +330,10 @@ class TestEvKwhSensorCalc:
         app._ev_threshold  = ev_threshold
         app._ev_charger_kw = ev_charger_kw
 
-        return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
+        with patch("pandas.Timestamp.now") as mock_now:
+            # mock_now must be timezone-aware because _aggregate calls .tz_convert
+            mock_now.return_value = today.tz_localize("Europe/Zurich")
+            return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
 
     def test_ev_today_uses_charger_kw_not_threshold(self):
         """ev_today must equal gross − charger_kw, not gross − threshold."""
@@ -355,6 +361,9 @@ class _FakeSelf:
         self._ml_model.model = None  # prevents _update_sensors execution
         self._lock = MagicMock()
         self._lock.acquire.return_value = False  # always "busy" → immediate return
+        self._timezone = "Europe/Zurich"
+        self._baseline_mode = False
+        self._sub_energy_sensors = []
 
     def log(self, msg, level="INFO"):  # AppDaemon log stub
         pass
@@ -391,9 +400,12 @@ class _FakeValidateSelf:
         self._lat                        = 47.0
         self._lon                        = 8.5
         self._plz                        = ""
+        self._timezone                   = "Europe/Zurich"
+        self._holiday_country            = "CH"
         self._weight_halflife            = 90.0
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
+        self._baseline_mode              = False
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold    = 3.0
         self._shap_top_n                 = 5
@@ -1618,3 +1630,99 @@ class TestRelativeMAEComputation:
         mae_abs = float("nan")
         mae_pct = round(mae_abs / mean_consumption * 100, 2) if mean_consumption > 0 and not math.isnan(mae_abs) else float("nan")
         assert math.isnan(mae_pct)
+
+
+# ── Fix: _update_cb must not skip under lock (concurrency fix) ────────────────
+
+class TestUpdateCbNoLock:
+    """_update_cb must run _update_sensors even when _lock is held (retrain in progress)."""
+
+    def test_update_cb_runs_when_lock_held(self):
+        """With the old code _update_cb skipped if lock was busy; now it must not skip."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = object()  # non-None — past cold start
+        fake._lock.acquire.return_value = False  # simulate lock held by retrain
+
+        # Attach _update_sensors directly to the fake instance
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [1], "_update_sensors must be called regardless of lock state"
+
+    def test_update_cb_skips_when_no_model(self):
+        """_update_cb must return early when no model is trained yet."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = None  # no model yet
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [], "_update_sensors must NOT be called when model is None"
+
+
+# ── _subtract_sub_sensors ─────────────────────────────────────────────────────
+
+class TestSubtractSubSensors:
+
+    def test_subtract_single_sensor(self):
+        """Subtraction of one sensor at 1.0 kWh/h from 5.0 kWh/h results in 4.0 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub_sensors = {"heat_pump": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 24.0
+        assert (res["gross_kwh"] == 4.0).all()
+
+    def test_subtract_multiple_sensors(self):
+        """Subtraction of two sensors (1.0 + 0.5) from 5.0 results in 3.5 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub1 = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub2 = pd.DataFrame({"timestamp": ts, "kwh": [0.5] * 24})
+        sub_sensors = {"s1": sub1, "s2": sub2}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 1.5 * 24
+        assert (res["gross_kwh"] == 3.5).all()
+
+    def test_clipping_at_zero(self):
+        """Result must never be negative even if sub-sensors exceed total."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [2.0] * 24})
+        sub_sensors = {"too_high": sub_df}
+
+        res, _ = _subtract_sub_sensors(df, sub_sensors)
+        assert (res["gross_kwh"] == 0.0).all()
+
+    def test_misaligned_timestamps_filled_with_zero(self):
+        """Missing sub-sensor rows (aligned via reindex) are treated as 0.0 kWh (no removal)."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+
+        # Sub-sensor only has data for first 12 hours
+        sub_ts = ts[:12]
+        sub_df = pd.DataFrame({"timestamp": sub_ts, "kwh": [1.0] * 12})
+        sub_sensors = {"partial": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 12.0
+        assert (res.iloc[:12]["gross_kwh"] == 4.0).all()
+        assert (res.iloc[12:]["gross_kwh"] == 5.0).all()
+
+    def test_empty_sub_sensors_returns_copy(self):
+        """Passing None or empty dict returns an unchanged copy of the input."""
+        df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-03-12 00:00", "2026-03-12 01:00"]), "gross_kwh": [5.0, 5.0]})
+        res, removed = _subtract_sub_sensors(df, {})
+        assert removed == 0.0
+        assert (res["gross_kwh"] == 5.0).all()
+        assert res is not df

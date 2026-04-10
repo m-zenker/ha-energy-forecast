@@ -6,32 +6,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.10.0] — 2026-04-10
 
 ### Added
-- **Relative MAE sensors** (`energy_forecast.py`): `mae_7d_pct` and `mae_30d_pct` express rolling MAE
-  as a percentage of mean consumption, providing a normalized accuracy metric independent of
-  consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling)
-  and across households. Implements same persistence logic as absolute MAE sensors.
-- **SHAP narrative attribute** (`shap_analysis.py`): new `explanation` attribute on `sensor.energy_forecast_shap`
-  provides a human-readable "Why today?" summary via SHAP `force_plot` interpretation. Formats
-  feature contributions (base value + top N positive/negative pushes) in a single-line narrative,
-  published as an entity attribute for display in automations/notifications.
+- `apps/energy_forecast/energy_forecast.py` — **Stage 1: Passive House Baseline mode**: new `baseline_mode` config flag (default `false`). When enabled, the model trains on and predicts only the household baseline by subtracting all controllable `sub_energy_sensors` from the total consumption target before training, and mirrors that subtraction at prediction time. Keeps appliance noise out of the baseline model so `predict_scenario()` deltas are meaningful. Also wires `presence_sensors` config into the hourly update and retrain cycle (model feature `people_home` was added in v0.9.0; Stage 1 connects the config key end-to-end).
+- `apps/energy_forecast/ha_data.py` + `model.py` — **Stage 2: Intent-Driven Thermal & DHW Modeling**: new `fetch_climate_history()` reads setpoint and current temperature from any HA `climate` entities listed in `climate_entities`; new `fetch_generic_sensor_history()` reads a DHW buffer temperature sensor. `model.py` derives two new features: `thermal_pressure` (mean of setpoint − current-temp across all configured climate entities; 0 when none configured) and `dhw_pressure` (heat-loss urgency score `1 / (max(0.5, buffer_temp − 40) + 1)²`; 0 when not configured). Both features are added to `_FEATURES_BASE` and the NaN-fill loop. Config keys: `climate_entities` (list), `dhw_buffer_sensor`, `heating_system_active_entity`.
+- `apps/energy_forecast/model.py` — **Stage 3: Automated Load Signature Discovery**: new `_learn_appliance_signatures()` scans sub-sensor histories for run cycles (0→>0 kWh transitions) and computes an average hourly energy profile per appliance prefix. Signatures persisted to `models/appliance_signatures.json`, reloaded on startup, and ready for Stage 4 scenario modeling. Per-prefix log: `Appliance signature | <prefix> | cycles=N | total=X.XX kWh | peak_hour=H`. 8 new unit + integration tests in `TestApplianceSignatures`.
+- `apps/energy_forecast/model.py` — **Stage 4: Scenario Modeling & What-If API**: new `_composite_forecast()` pure function overlays learned appliance hourly run profiles onto a baseline 48h forecast given a schedule dict `{prefix: "HH:MM" | "off" | None}`. New `predict_scenario()` method on `EnergyForecastModel` wraps `predict()` + composite overlay, returning `[timestamp, predicted_kwh, delta_kwh]`. Enables the Energy Manager to ask "what is the expected import if dishwasher runs at 14:00?" and receive a delta-annotated composite forecast instantly.
+- `apps/energy_forecast/energy_forecast.py` — **Scenario service**: AppDaemon service `energy_forecast/get_scenario` registered in `initialize()`. Callback `_get_scenario_cb()` validates cached inputs, calls `predict_scenario()`, fires `energy_forecast_scenario_result` event with full 48h records. `publish=True` additionally writes `sensor.energy_forecast_scenario_today`, `_tomorrow`, `_delta_today`, and 8 block sensors via `_publish_scenario_forecast()`. Input cache (`_cached_forecast_df`, `_cached_live_temp`, etc.) populated each `_update_sensors()` cycle for zero-latency scenario re-use.
 
 ### Fixed
-- **Rolling MAE sensors volatility** (`energy_forecast.py`): `mae_7d` and `mae_30d` sensors now
-  remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history`
-  dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented
-  JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day
-  pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new
-  tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
-- **MQTT NaN handling in relative MAE** (`mqtt_mixin.py`): relative MAE percentages are now safely
-  published even when mean consumption is zero or undefined (e.g., first day of month). Prevents
-  NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0
-  and logs WARNING.
-- **UID slicing fragility** (`mqtt_mixin.py`): topic splitting for sub-entity UID extraction was
-  fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing
-  that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
+- `apps/energy_forecast/requirements.txt` — added `holidays>=0.46` explicitly; absence caused a silent holiday-feature fallback and `sensor.energy_forecast_setup_status` showing `missing_packages` on fresh installs.
+- `apps/energy_forecast/model.py` / `energy_forecast.py` — replaced deprecated `datetime.utcnow()` calls with `datetime.now(timezone.utc)` throughout.
+- `apps/energy_forecast/model.py` — eliminated pandas `PerformanceWarning` in `_add_lag_and_rolling_training()` and `_add_sub_sensor_lags_training()` by accumulating new columns in a dict and calling `pd.concat` once instead of assigning per-column in a loop.
+- `apps/energy_forecast/model.py` — **DS-1**: appliance signatures now store `std_profile` (per-hour standard deviation across all observed cycles alongside `hourly_profile`); logs a `WARNING` when the coefficient of variation exceeds 0.5, flagging high-variability appliances (e.g. oven) where a fixed mean profile is unreliable.
+- `apps/energy_forecast/model.py` — **DS-2**: scenario time-slot offset now uses `int()` floor instead of `round()`, ensuring deterministic slot assignment (e.g. "00:30" always maps to offset 0, not randomly 0 or 1 depending on floating-point rounding).
+- `apps/energy_forecast/ha_data.py` / `model.py` — **SE-3**: replaced three broad `except Exception` clauses with narrower types: `OSError`/`ValueError` in `validate_energy_cache`, `KeyError`/`TypeError` in `_add_holiday_feature`, and specific LightGBM exception types in the early-stopping fallback paths.
+
+### Tests
+- 377 passing (25 new since Stage 3: 8 for Stage 3 `TestApplianceSignatures`, 13 for Stage 4 `TestCompositeForecast` × 10 + `TestGetScenarioCb` × 3, plus T3b/T4/T5 regression tests and `TestConcurrency` from DS-1/DS-2/SE-3 review fixes)
+
+---
+
+## [0.10.0-alpha] — 2026-04-09
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — **Timezone generalisation + holiday country**: `timezone` apps.yaml key is now fully wired up (was silently ignored); all 18 hardcoded `"Europe/Zurich"` strings replaced with `self._timezone`. New `holiday_country` config key (ISO 3166-1 alpha-2, default `CH`) propagated through `train()` → `_engineer_features()` → `_add_holiday_feature()`, replacing three hardcoded `"CH"` references.
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — **Concurrency**: `_update_cb` no longer acquires the training lock; hourly sensor updates always run against the last-good model during a background retrain, eliminating the ~60-second sensor-silent window that previously occurred when retraining and an update raced.
+- `apps/energy_forecast/ha_data.py` — **CSV tail read**: `fetch_recent_energy()` now uses `deque(maxlen=400)` to read the last 400 rows, reducing memory from O(all rows) to O(400) per hourly call.
+- `apps/energy_forecast/energy_forecast.py` — **Relative MAE sensors volatility** (`mae_7d_pct`, `mae_30d_pct`): relative MAE sensors now remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history` dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- `apps/energy_forecast/mqtt_mixin.py` — **MQTT NaN handling in relative MAE**: relative MAE percentages are now safely published even when mean consumption is zero or undefined (e.g., first day of month). Prevents NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0 and logs WARNING.
+- `apps/energy_forecast/mqtt_mixin.py` — **UID slicing fragility**: topic splitting for sub-entity UID extraction was fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
+
+---
+
+## [0.9.1-alpha] — 2026-04-07
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — relative MAE sensors (`mae_7d_pct`, `mae_30d_pct`) express rolling MAE as a percentage of mean consumption, providing a normalized accuracy metric independent of consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling) and across households. Implements same persistence logic as absolute MAE sensors.
+- `apps/energy_forecast/shap_analysis.py` — SHAP narrative attribute (`explanation`) on `sensor.energy_forecast_shap` provides a human-readable "Why today?" summary via SHAP `force_plot` interpretation. Formats feature contributions (base value + top N positive/negative pushes) in a single-line narrative, published as an entity attribute for display in automations/notifications.
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — rolling MAE sensors (`mae_7d`, `mae_30d`) now remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history` dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- `apps/energy_forecast/mqtt_mixin.py` — relative MAE percentages are now safely published even when mean consumption is zero or undefined (e.g., first day of month). Prevents NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0 and logs WARNING.
+- `apps/energy_forecast/mqtt_mixin.py` — topic splitting for sub-entity UID extraction was fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
 
 ---
 

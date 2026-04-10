@@ -51,8 +51,15 @@ energy_forecast:
   # Lower = recent data matters more. Set to 0 to disable weighting.
   weight_halflife_days: 90
 
-  # Optional: two-letter Swiss canton code for cantonal holidays (e.g. ZH, BE, GE).
-  # If omitted, only federal public holidays are used.
+  # Optional: ISO 3166-1 alpha-2 country code for public holidays (default: CH).
+  # Change to match your country (e.g. DE, GB, FR, US). Consumption patterns
+  # around public holidays are country-specific — using the wrong country
+  # degrades forecast accuracy around holiday periods.
+  # holiday_country: CH
+
+  # Optional: two-letter subdivision code for regional holidays (default: none).
+  # For Switzerland, this is the canton (e.g. ZH, BE, GE).
+  # If omitted, only national public holidays are used.
   # holiday_canton: ZH
 
   # Optional: adaptive retraining threshold (default: 2.0).
@@ -76,6 +83,11 @@ energy_forecast:
   # To roll back, fire HA event 'energy_forecast_rollback_model' via
   # Developer Tools → Events. Set to 0 to disable archiving.
   # model_archive_count: 3
+
+  # Optional: Passive House Baseline mode (default: false).
+  # When enabled, the model trains on and predicts only the household baseline,
+  # subtracting all controllable sub_energy_sensors from the total.
+  # baseline_mode: true
 
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
@@ -132,6 +144,21 @@ energy_forecast:
   # presence_sensors:
   #   - person.alice
   #   - person.bob
+
+  # ── Stage 2: Intent-Driven Thermal & DHW Modeling (Optional) ───────────
+  # climate_entities: List of HA climate entities (e.g. climate.living_room).
+  #                   Used to calculate "Thermal Pressure" (Setpoint - Current Temp).
+  # climate_entities:
+  #   - climate.living_room
+  #   - climate.bedroom
+
+  # dhw_buffer_sensor: Entity ID for your DHW (Domestic Hot Water) buffer temperature.
+  #                    Used to predict water heating cycles based on heat loss.
+  # dhw_buffer_sensor: sensor.dhw_buffer_temperature
+
+  # heating_system_active_entity: Binary sensor or input_boolean that is "on"
+  #                               only when the heating system is permitted to run.
+  # heating_system_active_entity: binary_sensor.heating_season
 
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).

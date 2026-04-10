@@ -37,7 +37,7 @@ import json
 import logging
 import pickle
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -105,6 +105,10 @@ _FEATURES_BASE = [
     "is_away",
     # Occupancy
     "people_home",
+    # Stage 2: Intent-driven features
+    "thermal_pressure",
+    "dhw_buffer_temp",
+    "dhw_pressure",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
@@ -183,6 +187,7 @@ class EnergyForecastModel:
         self._feature_medians_by_how: dict = {}     # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool          = False  # log1p target; False = backward compat
         self._canton: str | None           = None   # cantonal holiday subdivision
+        self._country: str                 = "CH"   # ISO 3166-1 alpha-2 country for holidays
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
         self._likely_ev_hours: set[int]    = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)
@@ -190,6 +195,8 @@ class EnergyForecastModel:
         self._model_q90 = None
         self._model_q10_path = model_dir / "energy_model_q10.pkl"
         self._model_q90_path = model_dir / "energy_model_q90.pkl"
+        self._signatures_path = model_dir / "appliance_signatures.json"
+        self._appliance_signatures: dict = {}  # {prefix: {total_kwh, hourly_profile, peak_hour, n_cycles}}
         # CQR interval correction scalar (log-space additive offset)
         self._interval_correction: float = 0.0
         self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
@@ -211,10 +218,13 @@ class EnergyForecastModel:
         outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
         canton: str | None = None,
+        country: str = "CH",
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
         away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
         presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+        climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
+        dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -256,14 +266,26 @@ class EnergyForecastModel:
         df = _add_lag_and_rolling_training(energy_df, active_lags)
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
 
+        # ── Appliance signature learning (Stage 3) ──────────────────────────
+        self._appliance_signatures = _learn_appliance_signatures(sub_sensors_dict)
+        self._save_signatures()
+        for prefix, sig in self._appliance_signatures.items():
+            _LOGGER.info(
+                "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
+                prefix, sig["n_cycles"], sig["total_kwh"], sig["peak_hour"],
+            )
+        if not self._appliance_signatures and sub_sensors_dict:
+            _LOGGER.info("Appliance signatures: no signatures learned (insufficient cycles in history)")
+
         # ── EV session probability: which hour_of_week slots charge regularly ─
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
         self._likely_ev_hours = likely_ev_hours
 
         # ── Weather / outdoor / calendar features ───────────────────────────
-        df = _engineer_features(df, weather_df, outdoor_df, canton=canton,
+        df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
-                                presence_df=presence_df)
+                                presence_df=presence_df, climate_dfs=climate_dfs,
+                                dhw_df=dhw_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -378,7 +400,7 @@ class EnergyForecastModel:
                                     ],
                                     **fit_kwargs,
                                 )
-                            except Exception:  # noqa: BLE001
+                            except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                             sweep_maes[nl] = float(
                                 mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx])))
@@ -402,7 +424,7 @@ class EnergyForecastModel:
                                 **fit_kwargs,
                             )
                             best_n_est = getattr(m, "best_iteration_", best_n_est)
-                        except Exception:  # noqa: BLE001
+                        except (ValueError, RuntimeError):
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         fold_maes.append(sweep_maes[best_num_leaves])
                     else:
@@ -419,7 +441,7 @@ class EnergyForecastModel:
                                     **fit_kwargs,
                                 )
                                 best_n_est = getattr(m, "best_iteration_", best_n_est)
-                            except Exception as _es_exc:  # noqa: BLE001
+                            except (ValueError, RuntimeError) as _es_exc:
                                 _LOGGER.debug(
                                     "Early stopping failed for fold: %s — using fixed estimators",
                                     _es_exc,
@@ -477,6 +499,7 @@ class EnergyForecastModel:
         self.engine                = engine_name
         self._log_transform        = True
         self._canton               = canton
+        self._country              = country
         self._sub_sensor_prefixes  = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
         self._save()
 
@@ -527,6 +550,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -550,7 +575,8 @@ class EnergyForecastModel:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
-                                     likely_ev_hours=self._likely_ev_hours)
+                                     likely_ev_hours=self._likely_ev_hours,
+                                     climate_dfs=climate_recent, dhw_df=dhw_recent)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -606,6 +632,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -615,7 +643,8 @@ class EnergyForecastModel:
             raise RuntimeError("Model not yet trained.")
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
+            climate_recent=climate_recent, dhw_recent=dhw_recent
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -631,6 +660,8 @@ class EnergyForecastModel:
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -644,7 +675,8 @@ class EnergyForecastModel:
             return None
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
+            climate_recent=climate_recent, dhw_recent=dhw_recent
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -659,6 +691,39 @@ class EnergyForecastModel:
         # Enforce ordering in case of quantile crossing
         low, high = np.minimum(low, high), np.maximum(low, high)
         return pd.DataFrame({"timestamp": future_hours, "low_kwh": low, "high_kwh": high})
+
+    def predict_scenario(
+        self,
+        forecast_df: "pd.DataFrame",
+        live_temp: "float | None",
+        schedule: "dict[str, str | None]",
+        recent_actuals: "pd.DataFrame | None" = None,
+        sub_sensors_recent: "dict | None" = None,
+        away_series: "pd.Series | None" = None,
+        people_home_series: "pd.Series | None" = None,
+        climate_recent: "dict[str, pd.DataFrame] | None" = None,
+        dhw_recent: "pd.DataFrame | None" = None,
+    ) -> "pd.DataFrame":
+        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
+
+        Runs the baseline predict() then overlays the appliance profiles from
+        *schedule* using the learned appliance signatures.
+
+        Raises:
+            RuntimeError: if the model has not been trained yet.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not yet trained.")
+
+        baseline_df = self.predict(
+            forecast_df, live_temp, recent_actuals,
+            sub_sensors_recent=sub_sensors_recent,
+            away_series=away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+        )
+        return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 
     def shap_summary(
         self,
@@ -730,7 +795,7 @@ class EnergyForecastModel:
         if not self._model_path.exists():
             return  # nothing to archive on first save
         try:
-            stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             snap_dir = self._archive_dir / stamp
             snap_dir.mkdir(parents=True, exist_ok=True)
             _artifacts = [
@@ -872,6 +937,22 @@ class EnergyForecastModel:
         except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
             _LOGGER.warning("Could not load interval correction: %s", exc)
 
+    def _save_signatures(self) -> None:
+        try:
+            with open(self._signatures_path, "w") as fh:
+                json.dump(self._appliance_signatures, fh)
+        except OSError as exc:
+            _LOGGER.warning("Could not save appliance signatures: %s", exc)
+
+    def _load_signatures(self) -> None:
+        if not self._signatures_path.exists():
+            return
+        try:
+            with open(self._signatures_path) as fh:
+                self._appliance_signatures = json.load(fh)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _LOGGER.warning("Could not load appliance signatures: %s", exc)
+
     def _load(self) -> None:
         if self._model_path.exists():
             if not _verify_hash(self._model_path):
@@ -911,6 +992,7 @@ class EnergyForecastModel:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
         self._load_quantile_models()
+        self._load_signatures()
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
@@ -930,15 +1012,16 @@ def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int
 
     df = energy_df.sort_values("timestamp").reset_index(drop=True).copy()
 
+    new_cols: dict = {}
     for lag in active_lags:
-        df[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
+        new_cols[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
 
     shifted = df["gross_kwh"].shift(1)
-    df["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
-    df["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
-    df["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
+    new_cols["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
+    new_cols["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
+    new_cols["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
 
-    return df
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.DataFrame | None) -> pd.DataFrame:
@@ -1051,6 +1134,7 @@ def _add_sub_sensor_lags_training(
 
     n_rows = len(df)
     ts_idx = pd.to_datetime(df["timestamp"])
+    new_cols: dict = {}
 
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
@@ -1070,24 +1154,180 @@ def _add_sub_sensor_lags_training(
                 "will be filled with training medians.",
                 prefix, nan_count, len(kwh_series),
             )
-        df[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
+        new_cols[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
-            df[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
+            new_cols[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
 
         # active_24h: was the appliance active any time in the past 24h?
         # Use shift(1) so the current-row value is excluded (lag semantics).
         filled = kwh_series.fillna(0)
         shifted_kwh = filled.shift(1)
         active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
-        df[f"{prefix}_active_24h"] = active.values
+        new_cols[f"{prefix}_active_24h"] = active.values
 
         # runs_7d: how many times did the appliance start (0→>0 transition) in
         # the past 168h?  shift(1) applied before rolling to exclude current row.
         is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
         runs = is_start.shift(1).rolling(168, min_periods=1).sum()
-        df[f"{prefix}_runs_7d"] = runs.values
+        new_cols[f"{prefix}_runs_7d"] = runs.values
 
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
+
+
+def _learn_appliance_signatures(
+    sub_sensors: dict | None,
+    window_hours: int = 4,
+    min_cycles: int = 2,
+) -> dict:
+    """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
+
+    For each prefix, detect run cycles (0→>0 transitions), extract a
+    ``window_hours``-wide kWh profile for every cycle, and average them.
+    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
+    detected cycles are omitted.
+
+    Each signature includes ``std_profile`` (per-hour standard deviation across
+    cycles) and logs a WARNING if the coefficient of variation exceeds 0.3,
+    indicating that scenario predictions for that appliance may be inaccurate.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if not sub_sensors:
+        return {}
+
+    result: dict = {}
+    for prefix, sub_df in sub_sensors.items():
+        if sub_df is None or sub_df.empty:
+            continue
+
+        # Align to hourly index (same as lag helper)
+        kwh_series = (
+            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
+            .sort_index()
+            .resample("h")
+            .sum()
+            .astype(float)
+        )
+        filled = kwh_series.fillna(0)
+
+        # Detect cycle starts: previous hour was 0, current hour > 0
+        is_start = (filled > 0) & (filled.shift(1).fillna(0) == 0)
+        start_positions = [i for i, v in enumerate(is_start) if v]
+
+        windows: list[list[float]] = []
+        for pos in start_positions:
+            window = filled.iloc[pos : pos + window_hours]
+            if len(window) < window_hours:
+                continue  # truncated at end of history — skip
+            windows.append(window.tolist())
+
+        if len(windows) < min_cycles:
+            continue
+
+        arr = np.array(windows)  # shape: (n_cycles, window_hours)
+        hourly_profile = np.mean(arr, axis=0).tolist()
+        std_profile = np.std(arr, axis=0).tolist()
+
+        mean_arr = np.mean(arr, axis=0)
+        std_arr = np.std(arr, axis=0)
+        nonzero_mask = mean_arr > 0
+        if nonzero_mask.any():
+            cov_max = float((std_arr[nonzero_mask] / mean_arr[nonzero_mask]).max())
+            if cov_max > 0.3:
+                _LOGGER.warning(
+                    "Appliance '%s' signature has high variability (CoV=%.2f) across %d cycles"
+                    " — scenario predictions may be inaccurate.",
+                    prefix, cov_max, len(windows),
+                )
+
+        result[prefix] = {
+            "total_kwh": float(sum(hourly_profile)),
+            "hourly_profile": hourly_profile,
+            "std_profile": std_profile,
+            "peak_hour": int(np.argmax(hourly_profile)),
+            "n_cycles": len(windows),
+        }
+
+    return result
+
+
+def _composite_forecast(
+    baseline_df: "pd.DataFrame",
+    schedule: "dict[str, str | None]",
+    signatures: dict,
+) -> "pd.DataFrame":
+    """Overlay appliance run profiles onto a baseline forecast.
+
+    Args:
+        baseline_df: DataFrame with columns [timestamp, predicted_kwh] — 48 rows, naive tz.
+        schedule:    {prefix: "HH:MM" | "off" | None} — desired appliance start times.
+                     Example: {"dishwasher": "22:30", "washing_machine": "off"}.
+                     Invalid or out-of-range time strings (e.g. "25:00", "abc") are
+                     logged as warnings and skipped; ``delta_kwh`` stays 0 for that
+                     prefix.
+        signatures:  appliance signatures dict from _learn_appliance_signatures().
+
+    Returns:
+        DataFrame with columns [timestamp, predicted_kwh, delta_kwh].
+        ``delta_kwh`` is the signed kWh difference vs. the baseline introduced by
+        the scheduled appliances; it is 0 when schedule is empty or a prefix has no
+        matching signature.
+    """
+    import pandas as pd
+    import numpy as np
+
+    result = baseline_df.copy()
+    result["delta_kwh"] = 0.0
+
+    if not schedule or not signatures:
+        return result
+
+    forecast_start = pd.Timestamp(result["timestamp"].iloc[0])
+
+    for prefix, time_str in schedule.items():
+        if time_str is None or time_str == "off":
+            continue
+        if prefix not in signatures:
+            _LOGGER.warning("_composite_forecast: no signature for prefix '%s' — skipping", prefix)
+            continue
+
+        try:
+            hour, minute = (int(x) for x in str(time_str).split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"out of range: {hour}:{minute}")
+        except (ValueError, AttributeError):
+            _LOGGER.warning("_composite_forecast: invalid time_str '%s' for prefix '%s'", time_str, prefix)
+            continue
+
+        # Build candidate timestamps for today and tomorrow relative to forecast_start
+        today_ts = forecast_start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        tomorrow_ts = today_ts + pd.Timedelta(days=1)
+
+        # Pick the earliest one >= forecast_start
+        if today_ts >= forecast_start:
+            target_ts = today_ts
+        else:
+            target_ts = tomorrow_ts
+
+        offset_h = int((target_ts - forecast_start).total_seconds() / 3600)  # floor: "14:30" → offset 0, not 1
+
+        if offset_h >= 48 or offset_h < 0:
+            continue
+
+        profile: list = signatures[prefix]["hourly_profile"]
+        # Clip profile to available window
+        profile = profile[: 48 - offset_h]
+        if not profile:
+            continue
+
+        n = len(profile)
+        result.loc[result.index[offset_h : offset_h + n], "delta_kwh"] += profile
+
+    result["predicted_kwh"] = np.maximum(0.0, result["predicted_kwh"].values + result["delta_kwh"].values)
+    return result
 
 
 def _add_sub_sensor_lags_prediction(
@@ -1170,9 +1410,12 @@ def _engineer_features(
     weather_df: pd.DataFrame,           # naive timestamps
     outdoor_df: pd.DataFrame | None,    # naive timestamps
     canton: str | None = None,
+    country: str = "CH",
     likely_ev_hours: set | None = None,
     away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
     presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+    climate_dfs: dict[str, pd.DataFrame] | None = None,
+    dhw_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1217,7 +1460,7 @@ def _engineer_features(
         df["likely_ev_hour"] = 0
 
     # ── Public holidays ──────────────────────────────────────────────────────
-    df = _add_holiday_feature(df, canton=canton)
+    df = _add_holiday_feature(df, canton=canton, country=country)
 
     # ── Weather merge ────────────────────────────────────────────────────────
     w = weather_df.copy()
@@ -1308,16 +1551,64 @@ def _engineer_features(
     else:
         df["people_home"] = 0
 
+    # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
+    if climate_dfs:
+        deltas = []
+        for eid, c_df in climate_dfs.items():
+            if c_df.empty:
+                continue
+            c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
+            c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
+            c[f"{eid}_delta"] = c["setpoint"] - c["current_temp"]
+            deltas.append(c[["timestamp", f"{eid}_delta"]])
+
+        if deltas:
+            # Join all deltas
+            from functools import reduce
+            merged_deltas = reduce(lambda left, right: pd.merge(left, right, on="timestamp", how="outer"), deltas)
+            # Average delta across all rooms as the household "thermal pressure"
+            delta_cols = [c for c in merged_deltas.columns if c != "timestamp"]
+            merged_deltas["thermal_pressure"] = merged_deltas[delta_cols].mean(axis=1)
+
+            df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+            df = df.merge(merged_deltas[["timestamp", "thermal_pressure"]], left_on="_ts_floor", right_on="timestamp",
+                          how="left", suffixes=("", "_tp"))
+            df.drop(columns=["timestamp_tp", "_ts_floor"], errors="ignore", inplace=True)
+            df["thermal_pressure"] = df["thermal_pressure"].fillna(0.0)
+        else:
+            df["thermal_pressure"] = 0.0
+    else:
+        df["thermal_pressure"] = 0.0
+
+    # ── Stage 2: DHW Pressure ───────────────────────────────────────────
+    if dhw_df is not None and not dhw_df.empty:
+        d = dhw_df[["timestamp", "buffer_temp"]].copy()
+        d["timestamp"] = pd.to_datetime(d["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(d, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_dhw"))
+        df.drop(columns=["timestamp_dhw", "_ts_floor"], errors="ignore", inplace=True)
+        # Rename merged column to the feature name
+        if "buffer_temp" in df.columns:
+            df.rename(columns={"buffer_temp": "dhw_buffer_temp"}, inplace=True)
+        
+        df["dhw_buffer_temp"] = df["dhw_buffer_temp"].fillna(50.0) # Assume neutral 50C
+        # non-linear trigger: higher as temp drops towards 40C floor
+        df["dhw_pressure"] = 1.0 / (np.maximum(0.5, df["dhw_buffer_temp"] - 40.0 + 1.0)**2)
+    else:
+        df["dhw_buffer_temp"] = 50.0
+        df["dhw_pressure"] = 0.0
+
     return df
 
 _BRIDGE_CAP = 3   # days — bridge-day effect beyond this distance is negligible
 
 
-def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.DataFrame:
+def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: str = "CH") -> pd.DataFrame:
     """Add holiday proximity columns using the `holidays` package.
 
     Columns added:
-      is_public_holiday       — 1 on a Swiss federal (or cantonal) holiday, else 0
+      is_public_holiday       — 1 on a public holiday for the configured country, else 0
       days_to_next_holiday    — calendar days until the next holiday, capped at _BRIDGE_CAP
       days_since_last_holiday — calendar days since the last holiday, capped at _BRIDGE_CAP
 
@@ -1327,6 +1618,8 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
 
     Pass canton (e.g. "ZH", "BE") to include cantonal holidays in addition to
     federal ones.  Falls back to federal-only if the canton code is unrecognised.
+    Pass country (ISO 3166-1 alpha-2, e.g. "CH", "GB", "DE") to use the holidays
+    of the user's country.  Defaults to "CH".
 
     Falls back gracefully (is_public_holiday=0, distances=_BRIDGE_CAP) if the
     `holidays` package is not installed.
@@ -1342,14 +1635,15 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
         years = sorted({y + d for y in years_in_data for d in (-1, 0, 1)})
         if canton:
             try:
-                ch_holidays = hd.country_holidays("CH", years=years, subdiv=canton)
+                ch_holidays = hd.country_holidays(country, years=years, subdiv=canton)
             except (NotImplementedError, KeyError):
                 _LOGGER.warning(
-                    "Unknown canton code %r — falling back to federal holidays.", canton
+                    "Unknown canton/subdivision code %r for country %r — falling back to national holidays.",
+                    canton, country,
                 )
-                ch_holidays = hd.country_holidays("CH", years=years)
+                ch_holidays = hd.country_holidays(country, years=years)
         else:
-            ch_holidays = hd.country_holidays("CH", years=years)
+            ch_holidays = hd.country_holidays(country, years=years)
         holiday_dates = sorted(ch_holidays.keys())
 
         dates = df["timestamp"].dt.date
@@ -1387,7 +1681,7 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None) -> pd.Data
         df["is_public_holiday"]       = 0
         df["days_to_next_holiday"]    = _BRIDGE_CAP
         df["days_since_last_holiday"] = _BRIDGE_CAP
-    except Exception as exc:  # noqa: BLE001
+    except (KeyError, ValueError, TypeError, AttributeError, NotImplementedError) as exc:
         _LOGGER.warning("Holiday feature failed: %s — defaulting to 0 / %d", exc, _BRIDGE_CAP)
         df["is_public_holiday"]       = 0
         df["days_to_next_holiday"]    = _BRIDGE_CAP
