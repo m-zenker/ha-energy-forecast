@@ -6,11 +6,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.10.1-alpha-2] — 2026-04-10
+## [0.10.1] — 2026-04-10
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — new `baseline_included_sensors` config key (list of HA sensor entity IDs). When `baseline_mode: true` is set, only sub-sensors NOT in `baseline_included_sensors` are subtracted from the training target; sensors listed there (e.g., heating and DHW) remain in the baseline model target. Previously all `sub_energy_sensors` were subtracted. This allows the model to learn heating/DHW consumption as a baseline pattern (leveraging thermal/weather/occupancy features) while still removing schedulable appliances for clean scenario modeling.
 
 ### Fixed
-- `apps/energy_forecast/model.py` — coerce feature matrix to `float64` via `.astype(float)` before fitting, preventing dtype incompatibility errors when `int32` or pandas extension types appear in the feature columns (e.g., after a `merge` or categorical fill). Fixes silent LightGBM/sklearn type rejection that caused retrain failures.
+- `apps/energy_forecast/ha_data.py` — `_merge_frames()` now explicitly coerces the value column back to `float64` after `pd.concat()`. In pandas 3.0.2, `pd.concat([float64_df, empty_object_df])` promotes the result to `object` dtype even when the empty DataFrame contributes no rows. This caused all lag feature columns to become object dtype, which LightGBM rejected with "pandas dtypes must be int, float or bool". Fix: `result[value_col] = pd.to_numeric(result[value_col], errors="coerce")` applied after concat in `_merge_frames`.
+- `apps/energy_forecast/model.py` — coerce feature matrix to `float64` via `.astype(float)` before fitting, providing a belt-and-suspenders guard against dtype incompatibility errors when `int32` or pandas extension types appear in the feature columns.
 - `apps/energy_forecast/energy_forecast.py` — retrain exception handler now logs the full traceback (`traceback.format_exc()`) alongside the error message, making dtype and other unexpected retrain failures diagnosable from HA logs without needing a debugger.
+
+### Tests
+- 382 passing (5 new since v0.10.0: `TestBaselineIncludedSensors` covering selective inclusion logic, and `test_empty_winner_preserves_float_dtype` in `TestMergeEnergyFrames` for the pandas 3.x dtype regression)
 
 ---
 
