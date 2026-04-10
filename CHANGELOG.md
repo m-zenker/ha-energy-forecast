@@ -6,6 +6,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.1-alpha-2] — 2026-04-10
+
+### Fixed
+- `apps/energy_forecast/model.py` — coerce feature matrix to `float64` via `.astype(float)` before fitting, preventing dtype incompatibility errors when `int32` or pandas extension types appear in the feature columns (e.g., after a `merge` or categorical fill). Fixes silent LightGBM/sklearn type rejection that caused retrain failures.
+- `apps/energy_forecast/energy_forecast.py` — retrain exception handler now logs the full traceback (`traceback.format_exc()`) alongside the error message, making dtype and other unexpected retrain failures diagnosable from HA logs without needing a debugger.
+
+---
+
 ## [0.10.0] — 2026-04-10
 
 ### Added
