@@ -723,3 +723,127 @@ class TestValidateCacheIntegration:
         ):
             ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
         mock_validate.assert_called_once()
+
+
+# ── fetch_presence_history ──────────────────────────────────────────────────────
+
+class TestFetchPresenceHistory:
+    """Tests for fetch_presence_history (occupancy feature #21)."""
+
+    def test_returns_empty_when_no_sensors(self, mock_app):
+        """Empty entity list returns empty DataFrame."""
+        result = ha_data.fetch_presence_history(mock_app, None, days=30)
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_returns_empty_when_empty_list(self, mock_app):
+        """Empty list returns empty DataFrame."""
+        result = ha_data.fetch_presence_history(mock_app, [], days=30)
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_single_person_home_counts_correctly(self, mock_app):
+        """Single person entity in home state produces count=1."""
+        # HA history raw response: person.alice in "home" state
+        # 10:00–11:00 local: home (state="home")
+        # 11:00–12:00 local: not_home (state="not_home")
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},  # 10:00 local
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},  # 11:00 local
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 2
+        assert result.iloc[0]["people_home"] == 1  # home during hour 0
+        assert result.iloc[1]["people_home"] == 0  # not_home during hour 1
+
+    def test_two_persons_sum_correctly(self, mock_app):
+        """Two person entities count independently and sum."""
+        raw_alice = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+        raw_bob = {
+            "person.bob": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+
+        def side_effect_fn(*args, **kwargs):
+            entity = kwargs.get("entity_id")
+            if entity == "person.alice":
+                return raw_alice
+            elif entity == "person.bob":
+                return raw_bob
+            return {}
+
+        mock_app.get_history.side_effect = side_effect_fn
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice", "person.bob"], days=30)
+
+        assert len(result) == 2
+        assert result.iloc[0]["people_home"] == 2  # both home at 10:00
+        assert result.iloc[1]["people_home"] == 1  # only bob home at 11:00
+
+    def test_person_not_home_is_zero(self, mock_app):
+        """Person always in not_home state produces all zeros."""
+        raw_response = {
+            "person.alice": [
+                {"state": "not_home", "last_changed": "2024-01-01T09:00:00+01:00"},
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 1
+        assert result.iloc[0]["people_home"] == 0
+
+    def test_returns_empty_on_fetch_error(self, mock_app):
+        """Exception during get_history returns empty DataFrame."""
+        mock_app.get_history.side_effect = Exception("API error")
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_timestamps_are_naive_europe_zurich(self, mock_app):
+        """Returned timestamps are naive (no timezone) in Europe/Zurich local time."""
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},  # 09:00 local (UTC+1)
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 1
+        ts = result.iloc[0]["timestamp"]
+        assert ts.tzinfo is None  # naive
+        assert ts.hour == 9  # 09:00 local time (UTC+1)
+
+    def test_ignores_invalid_state_values(self, mock_app):
+        """States other than home/not_home are skipped."""
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "unavailable", "last_changed": "2024-01-01T09:30:00+01:00"},  # skipped
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        # Only valid transitions: home→not_home
+        assert len(result) >= 1
+        assert result.iloc[0]["people_home"] == 1

@@ -8,7 +8,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-(No unreleased changes yet.)
+### Added
+- **Relative MAE sensors** (`energy_forecast.py`): `mae_7d_pct` and `mae_30d_pct` express rolling MAE
+  as a percentage of mean consumption, providing a normalized accuracy metric independent of
+  consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling)
+  and across households. Implements same persistence logic as absolute MAE sensors.
+- **SHAP narrative attribute** (`shap_analysis.py`): new `explanation` attribute on `sensor.energy_forecast_shap`
+  provides a human-readable "Why today?" summary via SHAP `force_plot` interpretation. Formats
+  feature contributions (base value + top N positive/negative pushes) in a single-line narrative,
+  published as an entity attribute for display in automations/notifications.
+
+### Fixed
+- **Rolling MAE sensors volatility** (`energy_forecast.py`): `mae_7d` and `mae_30d` sensors now
+  remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history`
+  dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented
+  JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day
+  pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new
+  tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
+- **MQTT NaN handling in relative MAE** (`mqtt_mixin.py`): relative MAE percentages are now safely
+  published even when mean consumption is zero or undefined (e.g., first day of month). Prevents
+  NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0
+  and logs WARNING.
+- **UID slicing fragility** (`mqtt_mixin.py`): topic splitting for sub-entity UID extraction was
+  fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing
+  that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
+
+---
+
+## [0.9.0-alpha] — 2026-04-02
+
+### Added
+- **Thermal modeling features** (`model.py`): eight new engineered features improve heating season
+  accuracy by capturing thermal inertia, outdoor temperature trends, and lagged temperature effects:
+  `temp_ewma_24h`, `temp_ewma_72h` (exponential weighted moving averages),
+  `heating_deg_sum_24h`, `heating_deg_sum_168h` (heating degree sums below 15°C base),
+  `temp_delta_1h`, `temp_delta_24h` (short/medium-term deltas),
+  `temp_lag_24h`, `temp_lag_168h` (multi-day temperature lags). Documented in #49–#52.
+- **Occupancy sensor** (`model.py`): new optional `people_home` feature counts number of people
+  present using Home Assistant `person` or `device_tracker` entities (configurable via
+  `presence_sensors` in `apps.yaml`). Enables occupancy-correlated consumption patterns (lighting,
+  HVAC, cooking). Documented in #21.
+
+### Tests
+- 307 tests passing (7 new tests covering thermal features, occupancy sensor, and feature
+  engineering edge cases).
+
+### Known Issues
+- **SolarEdge entity lookup warnings** (out of scope): entity ID resolution errors for SolarEdge
+  sensors originate from `ha-energy-manager` config and do not affect forecast operation.
+- **SRG-SSR API 429 error** (observation): one rate-limit error logged during testing despite
+  geolocation caching (v0.8.1). Cache verification and monitoring ongoing.
 
 ---
 

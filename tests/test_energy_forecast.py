@@ -18,6 +18,7 @@ import pytest
 from energy_forecast.energy_forecast import (
     _apply_target_correction,
     _blend_today_totals,
+    _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
 )
@@ -1295,3 +1296,325 @@ class TestTargetCorrection:
         _ = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
                                      battery_charge_df=None, battery_discharge_df=None)
         assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
+
+
+# ── Prediction history persistence ────────────────────────────────────────────
+
+class TestPredHistoryPersistence:
+    """Tests for _load_pred_history and _save_pred_history methods."""
+
+    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+        """Save a known dict, load it back, verify keys and values match."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # Mock PRED_HISTORY_PATH to use tmp_path
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Prepare test data
+        now = pd.Timestamp.now().normalize()
+        pred_data = {
+            now - pd.Timedelta(days=1): 1.5,
+            now - pd.Timedelta(days=5): 2.0,
+        }
+        actuals_data = {
+            now - pd.Timedelta(days=2): 1.4,
+            now - pd.Timedelta(days=3): 2.1,
+        }
+
+        # Manually save
+        import json
+        data = {
+            "pred": {ts.isoformat(): kwh for ts, kwh in pred_data.items()},
+            "actuals": {ts.isoformat(): kwh for ts, kwh in actuals_data.items()},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load back
+        EnergyForecast._load_pred_history(app)
+
+        # Verify
+        assert len(app._pred_history) == 2
+        assert len(app._actuals_history) == 2
+        assert app._pred_history[now - pd.Timedelta(days=1)] == 1.5
+        assert app._actuals_history[now - pd.Timedelta(days=2)] == 1.4
+
+    def test_load_applies_30d_pruning(self, tmp_path, monkeypatch):
+        """Save an entry >30 days old, verify it's discarded on load."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Create data with one old entry (35 days ago) and one recent (5 days ago)
+        now = pd.Timestamp.now().normalize()
+        old_ts = now - pd.Timedelta(days=35)
+        recent_ts = now - pd.Timedelta(days=5)
+
+        import json
+        data = {
+            "pred": {
+                old_ts.isoformat(): 1.0,
+                recent_ts.isoformat(): 2.0,
+            },
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # Only the recent entry should be loaded
+        assert len(app._pred_history) == 1
+        assert recent_ts in app._pred_history
+        assert app._pred_history[recent_ts] == 2.0
+        assert old_ts not in app._pred_history
+
+    def test_load_keep_first_on_conflict(self, tmp_path, monkeypatch):
+        """If in-memory already has a key, loaded value must not overwrite it."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        ts_key = now - pd.Timedelta(days=5)
+
+        # Pre-populate in-memory dict
+        app._pred_history = {ts_key: 1.0}
+        app._actuals_history = {}
+
+        # Write file with different value for the same key
+        import json
+        data = {
+            "pred": {ts_key.isoformat(): 99.0},  # Should be ignored
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # In-memory value should be preserved (keep-first)
+        assert app._pred_history[ts_key] == 1.0
+
+    def test_load_missing_file_is_silent(self, tmp_path, monkeypatch):
+        """No file present → no exception, dicts remain empty."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # File doesn't exist
+        assert not mock_path.exists()
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        app.log.assert_not_called()
+
+    def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch):
+        """Invalid JSON → no exception, dicts remain empty, warning logged."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Write invalid JSON
+        mock_path.write_text("{invalid json}")
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to load" in app.log.call_args[0][0]
+
+    def test_save_creates_file_atomically(self, tmp_path, monkeypatch):
+        """Verify that .tmp file is used (save is atomic)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        app._pred_history = {now - pd.Timedelta(days=1): 1.5}
+        app._actuals_history = {now - pd.Timedelta(days=2): 2.0}
+
+        # Save
+        EnergyForecast._save_pred_history(app)
+
+        # Verify file was created
+        assert mock_path.exists()
+        # Verify .tmp file was cleaned up
+        assert not mock_path.with_suffix(".json.tmp").exists()
+
+        # Verify content
+        import json
+        with open(mock_path) as f:
+            data = json.load(f)
+        assert len(data["pred"]) == 1
+        assert len(data["actuals"]) == 1
+
+    def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch):
+        """Save failure (OSError) is logged, doesn't raise."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Mock open to raise OSError
+        mock_open = MagicMock()
+        mock_open.side_effect = OSError("Disk full")
+        monkeypatch.setattr("builtins.open", mock_open)
+
+        # Should not raise
+        EnergyForecast._save_pred_history(app)
+
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to save" in app.log.call_args[0][0]
+
+
+# ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
+
+class TestBuildShapNarrative:
+
+    def test_empty_dict_returns_empty_string(self):
+        """Empty shap_features dict returns empty string."""
+        result = _build_shap_narrative({})
+        assert result == ""
+
+    def test_none_returns_empty_string(self):
+        """None input returns empty string."""
+        # The function checks if not shap_features, so None is falsy
+        result = _build_shap_narrative(None)  # type: ignore
+        assert result == ""
+
+    def test_single_feature(self):
+        """Single feature narrative includes label and value."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "+0.14" in result
+        assert "Mainly driven by:" in result
+
+    def test_multiple_features(self):
+        """Multiple features all appear in narrative."""
+        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h": 0.07}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "current outdoor temperature" in result
+        assert "yesterday's same-hour consumption" in result
+        assert "+0.14" in result
+        assert "+0.09" in result
+        assert "+0.07" in result
+
+    def test_unknown_feature_uses_feature_name(self):
+        """Unknown feature name falls back to raw feature name."""
+        shap_features = {"unknown_feature_xyz": 0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "unknown_feature_xyz" in result
+        assert "+0.05" in result
+
+    def test_negative_shap_value_formatted_correctly(self):
+        """Negative SHAP values use proper +/- sign."""
+        shap_features = {"temp_c": -0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "-0.05" in result
+
+    def test_narrative_ends_with_period(self):
+        """Narrative string ends with a period."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert result.endswith(".")
+
+    def test_sine_and_cosine_labels_differentiated(self):
+        """Sine and cosine features have distinct labels in narrative."""
+        shap_features = {"hour_sin": 0.14, "hour_cos": 0.09}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "time-of-day (cosine)" in result
+        # Verify both appear in the narrative
+        assert result.count("time-of-day") == 2
+
+
+# ── Relative MAE (#54) ───────────────────────────────────────────────────────────
+
+class TestRelativeMAEComputation:
+    """Integration tests for relative MAE computation in _update_sensors."""
+
+    def test_relative_mae_7d_computed_correctly(self):
+        """Verify relative MAE (%) is correctly computed from absolute MAE and actuals mean."""
+        # Populate histories: 10 hours of 10 kWh each, MAE should be 5% of mean
+        now = pd.Timestamp.now().normalize()
+        pred_history = {}
+        actuals_history = {}
+        for i in range(10):
+            ts = (now - pd.Timedelta(hours=i)).isoformat()
+            pred_history[ts] = 10.5  # +0.5 error
+            actuals_history[ts] = 10.0
+
+        # Compute relative MAE as _update_sensors does
+        mae_7d = 0.5  # known absolute MAE
+        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        actuals_7d = [v for ts, v in actuals_history.items() if pd.Timestamp(ts) >= cutoff_7d]
+        mean_7d = float(np.mean(actuals_7d)) if actuals_7d else float("nan")
+        mae_7d_pct = round(mae_7d / mean_7d * 100, 2) if mean_7d > 0 and not math.isnan(mae_7d) else float("nan")
+
+        # Expected: 0.5 / 10.0 * 100 = 5.0%
+        assert mae_7d_pct == 5.0
+
+    def test_relative_mae_nan_when_no_actuals(self):
+        """Relative MAE is NaN when actuals_history is empty."""
+        actuals_empty = []
+        mean_empty = float(np.mean(actuals_empty)) if actuals_empty else float("nan")
+        assert math.isnan(mean_empty)
+
+        mae_abs = 0.5
+        mae_pct = round(mae_abs / mean_empty * 100, 2) if mean_empty > 0 and not math.isnan(mae_abs) else float("nan")
+        assert math.isnan(mae_pct)
+
+    def test_relative_mae_nan_propagates_from_absolute_mae(self):
+        """Relative MAE is NaN when absolute MAE is NaN (cold start)."""
+        mean_consumption = 10.0
+        mae_abs = float("nan")
+        mae_pct = round(mae_abs / mean_consumption * 100, 2) if mean_consumption > 0 and not math.isnan(mae_abs) else float("nan")
+        assert math.isnan(mae_pct)

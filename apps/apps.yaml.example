@@ -126,6 +126,13 @@ energy_forecast:
   # Requires away_mode_entity to be configured.
   # away_return_entity: input_datetime.vacation_return
 
+  # Optional: list of HA person entities for occupancy feature.
+  # Counts how many are in the "home" state at each hour to improve forecast accuracy.
+  # Example: person.alice, person.bob
+  # presence_sensors:
+  #   - person.alice
+  #   - person.bob
+
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).
   # Requires AppDaemon MQTT plugin in appdaemon.yaml + a running MQTT broker.
