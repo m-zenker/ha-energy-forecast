@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.10.0] — 2026-04-10
 
 ### Added
 - `apps/energy_forecast/energy_forecast.py` — **Stage 1: Passive House Baseline mode**: new `baseline_mode` config flag (default `false`). When enabled, the model trains on and predicts only the household baseline by subtracting all controllable `sub_energy_sensors` from the total consumption target before training, and mirrors that subtraction at prediction time. Keeps appliance noise out of the baseline model so `predict_scenario()` deltas are meaningful. Also wires `presence_sensors` config into the hourly update and retrain cycle (model feature `people_home` was added in v0.9.0; Stage 1 connects the config key end-to-end).
