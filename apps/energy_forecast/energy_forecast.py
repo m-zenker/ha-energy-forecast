@@ -615,7 +615,8 @@ class EnergyForecast(hass.Hass):
             if self._ml_model.model is not None:
                 self._update_sensors()
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Retraining failed: {exc}", level="ERROR")
+            import traceback
+            self.log(f"Retraining failed: {exc}\n{traceback.format_exc()}", level="ERROR")
         finally:
             self._lock.release()
 
