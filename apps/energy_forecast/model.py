@@ -400,7 +400,7 @@ class EnergyForecastModel:
                                     ],
                                     **fit_kwargs,
                                 )
-                            except Exception:  # noqa: BLE001
+                            except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                             sweep_maes[nl] = float(
                                 mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx])))
@@ -424,7 +424,7 @@ class EnergyForecastModel:
                                 **fit_kwargs,
                             )
                             best_n_est = getattr(m, "best_iteration_", best_n_est)
-                        except Exception:  # noqa: BLE001
+                        except (ValueError, RuntimeError):
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         fold_maes.append(sweep_maes[best_num_leaves])
                     else:
@@ -441,7 +441,7 @@ class EnergyForecastModel:
                                     **fit_kwargs,
                                 )
                                 best_n_est = getattr(m, "best_iteration_", best_n_est)
-                            except Exception as _es_exc:  # noqa: BLE001
+                            except (ValueError, RuntimeError) as _es_exc:
                                 _LOGGER.debug(
                                     "Early stopping failed for fold: %s — using fixed estimators",
                                     _es_exc,
@@ -1187,6 +1187,10 @@ def _learn_appliance_signatures(
     ``window_hours``-wide kWh profile for every cycle, and average them.
     Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
     detected cycles are omitted.
+
+    Each signature includes ``std_profile`` (per-hour standard deviation across
+    cycles) and logs a WARNING if the coefficient of variation exceeds 0.3,
+    indicating that scenario predictions for that appliance may be inaccurate.
     """
     import numpy as np
     import pandas as pd
@@ -1225,9 +1229,24 @@ def _learn_appliance_signatures(
 
         arr = np.array(windows)  # shape: (n_cycles, window_hours)
         hourly_profile = np.mean(arr, axis=0).tolist()
+        std_profile = np.std(arr, axis=0).tolist()
+
+        mean_arr = np.mean(arr, axis=0)
+        std_arr = np.std(arr, axis=0)
+        nonzero_mask = mean_arr > 0
+        if nonzero_mask.any():
+            cov_max = float((std_arr[nonzero_mask] / mean_arr[nonzero_mask]).max())
+            if cov_max > 0.3:
+                _LOGGER.warning(
+                    "Appliance '%s' signature has high variability (CoV=%.2f) across %d cycles"
+                    " — scenario predictions may be inaccurate.",
+                    prefix, cov_max, len(windows),
+                )
+
         result[prefix] = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
+            "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),
         }
@@ -1293,7 +1312,7 @@ def _composite_forecast(
         else:
             target_ts = tomorrow_ts
 
-        offset_h = round((target_ts - forecast_start).total_seconds() / 3600)
+        offset_h = int((target_ts - forecast_start).total_seconds() / 3600)  # floor: "14:30" → offset 0, not 1
 
         if offset_h >= 48 or offset_h < 0:
             continue
@@ -1662,7 +1681,7 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
         df["is_public_holiday"]       = 0
         df["days_to_next_holiday"]    = _BRIDGE_CAP
         df["days_since_last_holiday"] = _BRIDGE_CAP
-    except Exception as exc:  # noqa: BLE001
+    except (KeyError, ValueError, TypeError, AttributeError, NotImplementedError) as exc:
         _LOGGER.warning("Holiday feature failed: %s — defaulting to 0 / %d", exc, _BRIDGE_CAP)
         df["is_public_holiday"]       = 0
         df["days_to_next_holiday"]    = _BRIDGE_CAP

@@ -101,7 +101,7 @@ def validate_energy_cache(df: "pd.DataFrame", logger: logging.Logger) -> None:
                     "(e.g. %.4f). Spike filter may have missed these.",
                     n_bad_vals, MAX_HOURLY_KWH, example_val,
                 )
-    except Exception as exc:  # noqa: BLE001
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.error("validate_energy_cache raised unexpectedly: %s", exc)
 
 

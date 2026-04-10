@@ -2167,7 +2167,7 @@ class TestApplianceSignatures:
     PROFILE = [1.0, 2.0, 1.5, 0.5]  # 4-hour cycle shape
 
     def test_basic_two_cycles(self):
-        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles."""
+        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
         df = _make_cycle_df(self.PROFILE, n_cycles=2)
         sigs = _learn_appliance_signatures({"hp": df})
         assert "hp" in sigs
@@ -2176,6 +2176,10 @@ class TestApplianceSignatures:
         assert s["total_kwh"] == pytest.approx(sum(self.PROFILE))
         assert s["hourly_profile"] == pytest.approx(self.PROFILE)
         assert s["peak_hour"] == 1  # index of 2.0 in PROFILE
+        # std_profile present and all-zeros (identical cycles)
+        assert "std_profile" in s
+        assert len(s["std_profile"]) == 4
+        assert s["std_profile"] == pytest.approx([0.0, 0.0, 0.0, 0.0])
 
     def test_below_min_cycles_skipped(self):
         """Only 1 cycle → empty dict (insufficient evidence)."""
@@ -2214,6 +2218,17 @@ class TestApplianceSignatures:
         assert set(sigs.keys()) == {"hp", "dw"}
         assert sigs["hp"]["peak_hour"] == 1
         assert sigs["dw"]["peak_hour"] == 3
+
+    def test_high_variability_logs_warning(self, caplog):
+        """Two very different cycles (CoV > 0.3) → WARNING logged."""
+        import logging
+        # Cycle 1: high consumption; cycle 2: low consumption → CoV ≈ 0.9
+        ts = pd.date_range("2026-01-01", periods=10, freq="1h")
+        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1]
+        df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        assert any("high variability" in r.message for r in caplog.records)
 
     def test_save_load_roundtrip(self, tmp_path):
         """Save → delete in-memory → load → same dict."""
@@ -2257,6 +2272,50 @@ class TestApplianceSignatures:
         assert isinstance(model._appliance_signatures, dict)
         assert "sub_hp" in model._appliance_signatures
         assert (tmp_path / "appliance_signatures.json").exists()
+
+    def test_cold_start_load_preserves_std_profile(self, tmp_path):
+        """Signatures saved by train() are fully restored in a fresh model instance.
+
+        Simulates an AppDaemon restart: model1 trains and saves, model2 is a
+        cold instance that loads from disk.  Verifies std_profile survives the
+        JSON round-trip and the loaded dict is identical to the saved one.
+        """
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(0)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 3.0, n),
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        sub_hp = _make_cycle_df(self.PROFILE, n_cycles=20, period_hours=24, start="2024-01-01")
+        sub_hp = sub_hp[sub_hp["timestamp"] < ts[-1]].reset_index(drop=True)
+
+        model1 = EnergyForecastModel(model_dir=tmp_path)
+        model1.train(
+            energy_df=energy_df,
+            weather_df=weather_df,
+            outdoor_df=None,
+            sub_sensors_dict={"sub_hp": sub_hp},
+        )
+        saved = dict(model1._appliance_signatures)
+
+        # Fresh instance — simulates restart
+        model2 = EnergyForecastModel(model_dir=tmp_path)
+        model2._load_signatures()
+
+        assert model2._appliance_signatures == saved
+        assert "std_profile" in model2._appliance_signatures["sub_hp"]
+        assert len(model2._appliance_signatures["sub_hp"]["std_profile"]) == 4
 
 
 # ── _composite_forecast (Stage 4) ────────────────────────────────────────────
@@ -2423,6 +2482,22 @@ class TestCompositeForecast:
         # hour 15 and before: no delta
         assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
 
+    def test_half_hour_time_floors_to_start_hour(self):
+        """'15:30' with forecast_start 14:00 → offset 1 (floor), not 2 (round).
+
+        round(1.5) == 2 under Python banker's rounding, so this would schedule
+        the appliance one hour late without the int() floor fix.
+        """
+        df = _make_baseline_df(start="2024-06-01 14:00")
+        result = _composite_forecast(df, {"sub_wp": "15:30"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]  # len=3
+        # offset_h must be 1 (floor(1.5)), not 2 (round(1.5))
+        assert result["delta_kwh"].iloc[1] == pytest.approx(wp_profile[0])
+        assert result["delta_kwh"].iloc[2] == pytest.approx(wp_profile[1])
+        assert result["delta_kwh"].iloc[3] == pytest.approx(wp_profile[2])
+        # hour 0 must be untouched
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
     def test_malformed_time_string_skipped(self):
         """Unparseable time string → warning logged (implicitly), delta_kwh all zero."""
         df = _make_baseline_df(start="2024-06-01 10:00")
@@ -2440,3 +2515,65 @@ class TestCompositeForecast:
         df = _make_baseline_df(start="2024-06-01 10:00")
         result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
         assert (result["delta_kwh"] == 0.0).all()
+
+
+# ── Concurrency (SE-2) ───────────────────────────────────────────────────────
+
+class TestConcurrency:
+    """Validates the GIL-safe lockless prediction invariant.
+
+    _update_cb reads self._ml_model.model without holding _lock, relying on
+    CPython's GIL making object-reference replacement atomic.  These tests
+    exercise the model layer directly to confirm predict() is safe to call
+    while train() runs concurrently.
+    """
+
+    def test_predict_during_retrain_does_not_raise(self, tmp_path):
+        """predict() called while train() runs in a background thread must not raise."""
+        import threading
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(1)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 3.0, n),
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        future_weather = weather_df.copy()
+        future_weather["timestamp"] = ts + pd.Timedelta(hours=n)
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        # Prime the model so predict() has something to work with
+        model.train(energy_df=energy_df, weather_df=weather_df, outdoor_df=None)
+
+        train_exc: list = []
+
+        def _retrain():
+            try:
+                model.train(energy_df=energy_df, weather_df=weather_df, outdoor_df=None)
+            except Exception as exc:  # noqa: BLE001
+                train_exc.append(exc)
+
+        t = threading.Thread(target=_retrain)
+        t.start()
+        # predict() must not raise regardless of where train() is in its lifecycle
+        result = model.predict(
+            forecast_df=future_weather,
+            live_temp=None,
+            recent_actuals=energy_df.tail(400),
+        )
+        t.join()
+
+        assert train_exc == [], f"train() raised in background thread: {train_exc}"
+        assert result is not None
+        assert len(result) == 48
+        assert "predicted_kwh" in result.columns
