@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.9.0--alpha-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-325%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.10.0--alpha-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-377%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -40,6 +40,8 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 - [Sub-energy sensors](#sub-energy-sensors)
 - [Vacation / Away mode](#vacation--away-mode)
 - [Occupancy / Presence](#occupancy--presence)
+- [Baseline / Passive mode](#baseline--passive-mode)
+- [Thermal & DHW modeling](#thermal--dhw-modeling)
 - [MQTT Discovery](#mqtt-discovery-optional)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
@@ -98,6 +100,8 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
 - **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
 - **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
+- **Passive / Baseline mode** — optional `baseline_mode` flag strips controllable sub-sensor loads from the training target, giving the model a cleaner household baseline signal and making scenario deltas more meaningful
+- **Thermal & DHW intent modeling** — optional climate entity setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
 - **Scenario / What-If API** — ask "what would my consumption look like if I run the dishwasher at 22:00?" without changing the live forecast; results fire an event and optionally publish dedicated HA sensors
 
 ---
@@ -317,9 +321,14 @@ energy_forecast:
 | `battery_charge_sensor` | No | — | Entity ID of a cumulative battery charge kWh meter (`total_increasing`). Subtracts battery charging from the training target. |
 | `battery_discharge_sensor` | No | — | Entity ID of a cumulative battery discharge kWh meter (`total_increasing`). Adds battery discharge back to the training target. |
 | `cache_path` | No | Next to `energy_forecast.py` | Override path for the energy history CSV file |
+| `holiday_country` | No | `CH` | ISO 3166-1 alpha-2 country code for public holidays (e.g. `DE`, `GB`, `FR`, `US`). Change to match your country — using the wrong country degrades accuracy around holiday periods. |
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `baseline_mode` | No | `false` | When `true`, subtracts all `sub_energy_sensors` from the training target so the model learns the household baseline without controllable-appliance noise. Mirrors the same subtraction at prediction time. See [Baseline / Passive mode](#baseline--passive-mode). |
+| `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (mean setpoint − current temp). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
+| `dhw_buffer_sensor` | No | — | Entity ID of a DHW buffer temperature sensor (°C). Used to derive `dhw_pressure`. See [Thermal & DHW modeling](#thermal--dhw-modeling). |
+| `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run. Used to isolate passive-decay periods for thermal calibration. |
 | `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
@@ -469,6 +478,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
+| Thermal & DHW intent | `thermal_pressure` (mean HVAC setpoint − current temp across `climate_entities`; 0 when not configured), `dhw_pressure` (buffer heat-loss urgency score; 0 when not configured) |
 | Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_24h`, `lag_48h`, `lag_72h`, `lag_168h`, `lag_336h` (daily/weekly) |
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
@@ -659,6 +669,69 @@ Add the optional `presence_sensors` key to `apps.yaml`. It accepts a list of Hom
 - **State counting**: At each hour, the app checks the state of every entity in `presence_sensors`. Any entity in the `"home"` state adds 1 to the `people_home` feature. All other states (including `unavailable` or `unknown`) add 0.
 - **Training**: The app fetches up to 30 days of historical state for these entities to build the `people_home` training column.
 - **Prediction**: For the 48-hour forecast window, the current occupancy count is held constant (broadcast) across all future hours. The model uses this to adjust its baseline prediction.
+
+---
+
+## Baseline / Passive mode
+
+When `baseline_mode: true` is set, the model trains on and predicts only the *household baseline* — total consumption minus all `sub_energy_sensors`. This removes the stochastic noise of controllable appliances (dishwasher, washing machine, etc.) from the training signal, which typically lowers baseline MAE and makes `predict_scenario()` deltas more interpretable (the delta is the *net addition* of a scheduled run, not a difference against a noisy aggregate).
+
+### Configuration
+
+```yaml
+  baseline_mode: true      # subtract sub_energy_sensors from target
+  sub_energy_sensors:
+    - sensor.dishwasher_energy_kwh
+    - sensor.washing_machine_energy_kwh
+```
+
+`sub_energy_sensors` must be configured for `baseline_mode` to have any effect. Without sub-sensors the flag is a no-op.
+
+### How it works
+
+- **Training**: each training row's target (`gross_kwh`) has the same-hour sum of all `sub_energy_sensors` subtracted before fitting.
+- **Prediction**: the baseline forecast is returned as-is; `predict_scenario()` then *adds* the learned appliance run profile for each scheduled appliance on top.
+- **MAE reporting**: `sensor.energy_forecast_model_mae` reflects baseline MAE (lower than gross MAE). Scenario sensors reflect the composite (baseline + appliances) forecast.
+
+**Backward compatibility:** Omitting `baseline_mode` (or setting it to `false`) produces no behaviour change.
+
+---
+
+## Thermal & DHW modeling
+
+Stage 2 adds two intent-driven features that allow the model to anticipate HVAC and domestic hot water heating cycles *before* they start, rather than relying on lagged consumption alone.
+
+| Feature | Source | Description |
+|---------|--------|-------------|
+| `thermal_pressure` | `climate_entities` | Mean of (setpoint − current temperature) across all configured climate entities. High values indicate the heating system will run soon. 0 when no entities configured. |
+| `dhw_pressure` | `dhw_buffer_sensor` | Heat-loss urgency: `1 / (max(0.5, buffer_temp − 40) + 1)²`. Rises steeply as the DHW buffer cools toward the reheat threshold (~40 °C). 0 when not configured. |
+
+Both features are zero-safe — omitting the config keys leaves them at 0 for all rows, producing no behaviour change.
+
+### Configuration
+
+```yaml
+  # Stage 2: Thermal & DHW intent (all optional)
+  climate_entities:
+    - climate.living_room
+    - climate.bedroom
+  dhw_buffer_sensor: sensor.dhw_buffer_temperature
+  heating_system_active_entity: binary_sensor.heating_season  # optional
+```
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `climate_entities` | No | List of HA `climate` entity IDs. Each entity contributes its `(setpoint − current_temp)` delta to `thermal_pressure`. |
+| `dhw_buffer_sensor` | No | Entity ID of a temperature sensor measuring the DHW buffer (°C). |
+| `heating_system_active_entity` | No | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-decay periods for future thermal calibration steps. |
+
+### How it works
+
+- `ha_data.py` fetches climate and DHW history via `fetch_climate_history()` / `fetch_generic_sensor_history()` at each retrain and caches it alongside the main energy CSV.
+- `model.py` merges these time series into the training dataframe and computes `thermal_pressure` and `dhw_pressure` per row before fitting.
+- At prediction time the same logic applies to the 48-hour forecast window, using current sensor states.
+
+**Backward compatibility:** All three config keys are optional. Omitting them leaves both features at 0 and the model behaves identically to prior versions.
 
 ---
 
