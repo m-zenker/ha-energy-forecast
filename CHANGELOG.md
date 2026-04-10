@@ -8,7 +8,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] — 2026-04-10
+
 ### Added
+- **Thermal modeling features** (`model.py`): eight new engineered features improve heating season
+  accuracy by capturing thermal inertia, outdoor temperature trends, and lagged temperature effects:
+  `temp_ewma_24h`, `temp_ewma_72h` (exponential weighted moving averages),
+  `heating_deg_sum_24h`, `heating_deg_sum_168h` (heating degree sums below 15°C base),
+  `temp_delta_1h`, `temp_delta_24h` (short/medium-term deltas),
+  `temp_lag_24h`, `temp_lag_168h` (multi-day temperature lags). Documented in #49–#52.
+- **Occupancy sensor** (`model.py`): new optional `people_home` feature counts number of people
+  present using Home Assistant `person` or `device_tracker` entities (configurable via
+  `presence_sensors` in `apps.yaml`). Enables occupancy-correlated consumption patterns (lighting,
+  HVAC, cooking). Documented in #21.
 - **Relative MAE sensors** (`energy_forecast.py`): `mae_7d_pct` and `mae_30d_pct` express rolling MAE
   as a percentage of mean consumption, providing a normalized accuracy metric independent of
   consumption scale. Useful for comparing forecast accuracy across seasons (heating/cooling)
@@ -33,31 +47,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing
   that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
 
----
-
-## [0.9.0-alpha] — 2026-04-02
-
-### Added
-- **Thermal modeling features** (`model.py`): eight new engineered features improve heating season
-  accuracy by capturing thermal inertia, outdoor temperature trends, and lagged temperature effects:
-  `temp_ewma_24h`, `temp_ewma_72h` (exponential weighted moving averages),
-  `heating_deg_sum_24h`, `heating_deg_sum_168h` (heating degree sums below 15°C base),
-  `temp_delta_1h`, `temp_delta_24h` (short/medium-term deltas),
-  `temp_lag_24h`, `temp_lag_168h` (multi-day temperature lags). Documented in #49–#52.
-- **Occupancy sensor** (`model.py`): new optional `people_home` feature counts number of people
-  present using Home Assistant `person` or `device_tracker` entities (configurable via
-  `presence_sensors` in `apps.yaml`). Enables occupancy-correlated consumption patterns (lighting,
-  HVAC, cooking). Documented in #21.
-
 ### Tests
-- 307 tests passing (7 new tests covering thermal features, occupancy sensor, and feature
-  engineering edge cases).
-
-### Known Issues
-- **SolarEdge entity lookup warnings** (out of scope): entity ID resolution errors for SolarEdge
-  sensors originate from `ha-energy-manager` config and do not affect forecast operation.
-- **SRG-SSR API 429 error** (observation): one rate-limit error logged during testing despite
-  geolocation caching (v0.8.1). Cache verification and monitoring ongoing.
+- 325 tests passing.
 
 ---
 
