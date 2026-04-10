@@ -101,12 +101,12 @@ def validate_energy_cache(df: "pd.DataFrame", logger: logging.Logger) -> None:
                     "(e.g. %.4f). Spike filter may have missed these.",
                     n_bad_vals, MAX_HOURLY_KWH, example_val,
                 )
-    except Exception as exc:  # noqa: BLE001
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.error("validate_energy_cache raised unexpectedly: %s", exc)
 
 
-def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
-    """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps.
+def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """Merge two DataFrames; df_winner's value wins on duplicate timestamps.
 
     Concatenates loser first so that keep="last" in drop_duplicates() always
     selects the winner's row.  Sorts by timestamp and drops rows with NaN in
@@ -117,15 +117,21 @@ def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.
         pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
         .drop_duplicates(subset=["timestamp"], keep="last")
         .sort_values("timestamp")
-        .dropna(subset=["timestamp", "gross_kwh"])
+        .dropna(subset=["timestamp", value_col])
         .reset_index(drop=True)
     )
+
+
+def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
+    """Merge two energy DataFrames; df_winner's value wins on duplicate timestamps."""
+    return _merge_frames(df_winner, df_loser, "gross_kwh")
 
 
 def fetch_energy_history(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path = CACHE_PATH,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
@@ -136,16 +142,16 @@ def fetch_energy_history(
         try:
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
-            # CSV may contain tz-aware strings — normalise to naive Europe/Zurich
+            # CSV may contain tz-aware strings — normalise to naive local time
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
             app.log(f"Loaded {len(df_cache)} records from local cache.")
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch fresh data from HA
-    raw_ha = _fetch_history(app, entity_id, days=30)
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
@@ -178,34 +184,46 @@ def fetch_energy_history(
     return combined
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH) -> pd.DataFrame:
+_FETCH_RECENT_TAIL_ROWS = 400   # 336 h max lag + buffer; limits memory use in hourly updates
+
+
+def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH, timezone: str = "Europe/Zurich") -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
     Fetches only the last 2 days of HA history (vs. 30 days in
     fetch_energy_history), merges into the existing CSV cache, and
-    returns the full cache for lag-feature use.  Keeps _update_cb
-    well within AppDaemon's 10s callback limit.
+    returns the last _FETCH_RECENT_TAIL_ROWS rows for lag-feature use.
+    Keeps _update_cb well within AppDaemon's 10s callback limit.
 
+    Only the tail of the CSV is read into memory (deque-based), reducing
+    memory from O(all rows) to O(_FETCH_RECENT_TAIL_ROWS) per hourly call.
     _retrain() continues to call fetch_energy_history() for a full
     30-day resync once a week.
     """
+    import io
+    import collections
     import pandas as pd
 
-    # 1. Load existing cache — this is the bulk of our history
+    # 1. Load only the tail of the cache — enough rows to cover all lag features.
+    #    deque(fh, maxlen=N) reads the file sequentially but keeps only the last N
+    #    lines in memory, reducing peak memory from O(all rows) to O(N).
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
     if cache_path.exists():
         try:
-            df_cache = pd.read_csv(cache_path)
+            with open(cache_path, "r") as fh:
+                header_line = fh.readline()
+                tail_lines = list(collections.deque(fh, maxlen=_FETCH_RECENT_TAIL_ROWS))
+            df_cache = pd.read_csv(io.StringIO(header_line + "".join(tail_lines)))
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load cache: {e}", level="WARNING")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
     #    plus a small overlap buffer for the diff() boundary.
-    raw_ha = _fetch_history(app, entity_id, days=2)
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
@@ -277,32 +295,15 @@ def split_ev_charging(
 
 
 def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame") -> "pd.DataFrame":
-    """Merge two sub-sensor DataFrames (column 'kwh'); fresh HA data wins on conflicts.
-
-    Thin wrapper around _merge_energy_frames: temporarily renames 'kwh' to
-    'gross_kwh' so the shared helper can be used, then renames back.  This
-    avoids duplicating the concat/drop_duplicates/sort logic and keeps both
-    sub-sensor fetch paths in lockstep with the main energy merge semantics.
-
-    Unlike fetch_sub_sensor_history (which raises ValueError when both sources
-    are empty), sub-sensor functions return an empty DataFrame silently — callers
-    should handle both cases.
-    """
-    import pandas as pd
-
-    rename_to   = {"kwh": "gross_kwh"}
-    rename_back = {"gross_kwh": "kwh"}
-    combined = _merge_energy_frames(
-        df_winner=df_winner.rename(columns=rename_to),
-        df_loser=df_loser.rename(columns=rename_to),
-    )
-    return combined.rename(columns=rename_back)
+    """Merge two sub-sensor DataFrames (column 'kwh'); fresh HA data wins on conflicts."""
+    return _merge_frames(df_winner, df_loser, "kwh")
 
 
 def fetch_sub_sensor_history(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Pull sub-sensor kWh history, merging local CSV cache with fresh HA data.
 
@@ -321,12 +322,12 @@ def fetch_sub_sensor_history(
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
-    raw_ha = _fetch_history(app, entity_id, days=30)
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         app.log(f"No history found for sub-sensor {entity_id} — skipping.", level="WARNING")
@@ -356,6 +357,7 @@ def fetch_recent_sub_sensor(
     app: "hass.Hass",
     entity_id: str,
     cache_path: Path,
+    timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Lightweight update for sub-sensor hourly refreshes.
 
@@ -375,12 +377,12 @@ def fetch_recent_sub_sensor(
             df_cache = pd.read_csv(cache_path)
             ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
             if ts.dt.tz is not None:
-                ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
             app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
 
-    raw_ha = _fetch_history(app, entity_id, days=2)
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
         app.log(f"No recent data for sub-sensor {entity_id}.", level="WARNING")
@@ -406,10 +408,216 @@ def fetch_recent_sub_sensor(
     return combined
 
 
+def fetch_generic_sensor_history(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+    column_name: str = "value",
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Pull generic sensor history (absolute values), merging local CSV cache with fresh HA data."""
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", column_name])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No history found for sensor {entity_id} — skipping.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", column_name])
+
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill().reset_index()
+        hourly.columns = ["timestamp", column_name]
+        if hourly["timestamp"].dt.tz is not None:
+            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+        df_new = hourly.copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", column_name])
+
+    combined = _merge_frames(df_winner=df_new, df_loser=df_cache, value_col=column_name)
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
+def fetch_recent_generic_sensor(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+    column_name: str = "value",
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Lightweight update for generic absolute sensor hourly refreshes."""
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", column_name])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No recent data for sensor {entity_id}.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", column_name])
+
+    if not raw_ha.empty:
+        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill().reset_index()
+        hourly.columns = ["timestamp", column_name]
+        if hourly["timestamp"].dt.tz is not None:
+            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+        df_new = hourly.copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", column_name])
+
+    combined = _merge_frames(df_winner=df_new, df_loser=df_cache, value_col=column_name)
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
+def fetch_climate_history(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Pull climate current_temperature and setpoint history, merging local cache with fresh HA data."""
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone, include_attributes=True)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No history found for climate {entity_id} — skipping.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+
+    if not raw_ha.empty:
+        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
+        # For climate, we need to extract and resample both 'current_temperature' and 'temperature'
+        # attributes from the raw attribute rows.
+        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
+        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
+        ha_df = ha_df.sort_values("timestamp")
+
+        # Resample to hourly grid
+        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
+        if hourly["timestamp"].dt.tz is not None:
+            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+        df_new = hourly.copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+
+    # Multi-column merge
+    combined = (
+        pd.concat([df_cache, df_new])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
+def fetch_recent_climate(
+    app: "hass.Hass",
+    entity_id: str,
+    cache_path: Path,
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Lightweight update for climate hourly refreshes."""
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone, include_attributes=True)
+
+    if raw_ha.empty and df_cache.empty:
+        app.log(f"No recent data for climate {entity_id}.", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+
+    if not raw_ha.empty:
+        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
+        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
+        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
+        ha_df = ha_df.sort_values("timestamp")
+        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
+        if hourly["timestamp"].dt.tz is not None:
+            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+        df_new = hourly.copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
+
+    combined = (
+        pd.concat([df_cache, df_new])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .dropna(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+
+    return combined
+
+
 def fetch_boolean_entity_history(
     app: "hass.Hass",
     entity_id: str | None,
     days: int = 30,
+    timezone: str = "Europe/Zurich",
 ) -> "pd.DataFrame":
     """Return hourly is_away flags from a boolean entity's state history.
 
@@ -445,7 +653,7 @@ def fetch_boolean_entity_history(
             s = str(state.get("state", "")).lower()
             if s not in ("on", "off"):
                 continue
-            ts = pd.to_datetime(state["last_changed"]).tz_convert("Europe/Zurich")
+            ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
             events.append({"timestamp": ts, "state": s})
         except (ValueError, KeyError, TypeError):
             continue
@@ -463,13 +671,13 @@ def fetch_boolean_entity_history(
     # Hourly grid: span from first to last event
     start = ev_ser.index[0].floor("1h")
     end   = ev_ser.index[-1].floor("1h")
-    hourly = pd.date_range(start, end, freq="1h", tz="Europe/Zurich")
+    hourly = pd.date_range(start, end, freq="1h", tz=timezone)
 
     # Forward-fill state changes onto the grid; hours before first event default to "off"
     combined_idx = ev_ser.index.union(hourly)
     filled = ev_ser.reindex(combined_idx).ffill().reindex(hourly).fillna("off")
 
-    # Convert to naive Europe/Zurich (strip tz, local time already correct)
+    # Convert to naive local time (strip tz, local time already correct)
     timestamps_naive = hourly.tz_localize(None)
 
     return pd.DataFrame({
@@ -478,7 +686,116 @@ def fetch_boolean_entity_history(
     })
 
 
-def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
+def fetch_presence_history(
+    app: "hass.Hass",
+    entity_ids: list[str] | None,
+    days: int = 30,
+    timezone: str = "Europe/Zurich",
+) -> "pd.DataFrame":
+    """Return hourly occupancy count from person entity state history.
+
+    Fetches up to *days* of history for each entity in *entity_ids* (e.g. person.alice),
+    counts how many are in the "home" state per hour, and returns a DataFrame with
+    one row per hour. Person entities use state "home" or "not_home" (not "on"/"off").
+
+    Args:
+        app: AppDaemon app instance
+        entity_ids: List of HA person entity IDs, or None
+        days: Number of days to fetch
+
+    Returns:
+        pd.DataFrame with columns {"timestamp" (naive Europe/Zurich), "people_home" (int count)}.
+        Returns an empty DataFrame (no rows) when entity_ids is None/empty or all fetches fail.
+    """
+    import pandas as pd
+
+    if not entity_ids:
+        return pd.DataFrame(columns=["timestamp", "people_home"])
+
+    all_per_entity = {}  # entity_id -> DataFrame of hourly 0/1 for that person
+
+    for entity_id in entity_ids:
+        try:
+            raw = app.get_history(entity_id=entity_id, days=days)
+        except Exception as exc:  # noqa: BLE001
+            app.log(
+                f"get_history failed for presence entity {entity_id}: {exc}",
+                level="WARNING",
+            )
+            continue
+
+        if isinstance(raw, dict):
+            states = raw.get(entity_id, [])
+        elif isinstance(raw, list) and raw:
+            states = raw[0] if isinstance(raw[0], list) else raw
+        else:
+            states = []
+
+        events = []
+        for state in states:
+            try:
+                s = str(state.get("state", "")).lower()
+                if s not in ("home", "not_home"):
+                    continue
+                ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
+                events.append({"timestamp": ts, "state": s})
+            except (ValueError, KeyError, TypeError):
+                continue
+
+        if not events:
+            app.log(
+                f"No usable history for presence entity {entity_id}.",
+                level="WARNING",
+            )
+            continue
+
+        events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True)
+        ev_ser = events_df.set_index("timestamp")["state"]
+
+        # Hourly grid
+        start = ev_ser.index[0].floor("1h")
+        end = ev_ser.index[-1].floor("1h")
+        hourly = pd.date_range(start, end, freq="1h", tz=timezone)
+
+        # Forward-fill state changes; hours before first event default to "not_home"
+        combined_idx = ev_ser.index.union(hourly)
+        filled = ev_ser.reindex(combined_idx).ffill().reindex(hourly).fillna("not_home")
+
+        all_per_entity[entity_id] = (filled == "home").astype(int)
+
+    if not all_per_entity:
+        app.log(
+            f"No usable presence history from {entity_ids} — people_home will be 0.",
+            level="WARNING",
+        )
+        return pd.DataFrame(columns=["timestamp", "people_home"])
+
+    # Union all timestamps from all entities using reduce
+    from functools import reduce
+    all_ts = reduce(
+        lambda idx1, idx2: idx1.union(idx2),
+        [s.index for s in all_per_entity.values()],
+        pd.DatetimeIndex([]),
+    )
+    all_ts = pd.DatetimeIndex(all_ts.sort_values())
+
+    # Reindex each series to full union, fill gaps with 0 (not_home)
+    stacked = pd.concat(
+        [all_per_entity[e].reindex(all_ts, fill_value=0) for e in all_per_entity],
+        axis=1,
+    )
+
+    # Sum across entities and convert to naive Europe/Zurich
+    people_count = stacked.sum(axis=1)
+    timestamps_naive = all_ts.tz_localize(None)
+
+    return pd.DataFrame({
+        "timestamp": timestamps_naive,
+        "people_home": people_count.astype(int).values,
+    })
+
+
+def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:
@@ -497,9 +814,16 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int) -> pd.DataFrame:
     rows = []
     for state in states:
         try:
-            val = float(state["state"])
-            ts  = pd.to_datetime(state["last_updated"]).tz_convert("Europe/Zurich")
-            rows.append({"timestamp": ts, "value": val})
+            ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
+            if include_attributes:
+                # Extract all attributes for specialized callers (e.g. climate)
+                attrs = state.get("attributes", {})
+                row = {"timestamp": ts}
+                row.update(attrs)
+                rows.append(row)
+            else:
+                val = float(state["state"])
+                rows.append({"timestamp": ts, "value": val})
         except (ValueError, KeyError, TypeError):
             continue
 

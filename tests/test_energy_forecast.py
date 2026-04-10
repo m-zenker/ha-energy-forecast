@@ -18,8 +18,10 @@ import pytest
 from energy_forecast.energy_forecast import (
     _apply_target_correction,
     _blend_today_totals,
+    _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
+    _subtract_sub_sensors,
 )
 
 
@@ -218,9 +220,11 @@ class TestAggregate:
 
     def _run(self, today, now, predictions, actuals=None, intervals=None):
         from energy_forecast.energy_forecast import EnergyForecast
-        return EnergyForecast._aggregate(
-            _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
-        )
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = now
+            return EnergyForecast._aggregate(
+                _fake_self_for_aggregate(), predictions, actuals, live_temp=None, intervals=intervals
+            )
 
     def test_next_1h_sums_only_one_future_hour(self):
         """next_1h must equal exactly 1 × per-hour prediction."""
@@ -326,7 +330,10 @@ class TestEvKwhSensorCalc:
         app._ev_threshold  = ev_threshold
         app._ev_charger_kw = ev_charger_kw
 
-        return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
+        with patch("pandas.Timestamp.now") as mock_now:
+            # mock_now must be timezone-aware because _aggregate calls .tz_convert
+            mock_now.return_value = today.tz_localize("Europe/Zurich")
+            return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
 
     def test_ev_today_uses_charger_kw_not_threshold(self):
         """ev_today must equal gross − charger_kw, not gross − threshold."""
@@ -354,6 +361,9 @@ class _FakeSelf:
         self._ml_model.model = None  # prevents _update_sensors execution
         self._lock = MagicMock()
         self._lock.acquire.return_value = False  # always "busy" → immediate return
+        self._timezone = "Europe/Zurich"
+        self._baseline_mode = False
+        self._sub_energy_sensors = []
 
     def log(self, msg, level="INFO"):  # AppDaemon log stub
         pass
@@ -390,9 +400,12 @@ class _FakeValidateSelf:
         self._lat                        = 47.0
         self._lon                        = 8.5
         self._plz                        = ""
+        self._timezone                   = "Europe/Zurich"
+        self._holiday_country            = "CH"
         self._weight_halflife            = 90.0
         self._ev_threshold               = ev_threshold
         self._ev_charger_kw              = ev_charger_kw
+        self._baseline_mode              = False
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold    = 3.0
         self._shap_top_n                 = 5
@@ -1295,3 +1308,421 @@ class TestTargetCorrection:
         _ = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
                                      battery_charge_df=None, battery_discharge_df=None)
         assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
+
+
+# ── Prediction history persistence ────────────────────────────────────────────
+
+class TestPredHistoryPersistence:
+    """Tests for _load_pred_history and _save_pred_history methods."""
+
+    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+        """Save a known dict, load it back, verify keys and values match."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # Mock PRED_HISTORY_PATH to use tmp_path
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Prepare test data
+        now = pd.Timestamp.now().normalize()
+        pred_data = {
+            now - pd.Timedelta(days=1): 1.5,
+            now - pd.Timedelta(days=5): 2.0,
+        }
+        actuals_data = {
+            now - pd.Timedelta(days=2): 1.4,
+            now - pd.Timedelta(days=3): 2.1,
+        }
+
+        # Manually save
+        import json
+        data = {
+            "pred": {ts.isoformat(): kwh for ts, kwh in pred_data.items()},
+            "actuals": {ts.isoformat(): kwh for ts, kwh in actuals_data.items()},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load back
+        EnergyForecast._load_pred_history(app)
+
+        # Verify
+        assert len(app._pred_history) == 2
+        assert len(app._actuals_history) == 2
+        assert app._pred_history[now - pd.Timedelta(days=1)] == 1.5
+        assert app._actuals_history[now - pd.Timedelta(days=2)] == 1.4
+
+    def test_load_applies_30d_pruning(self, tmp_path, monkeypatch):
+        """Save an entry >30 days old, verify it's discarded on load."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Create data with one old entry (35 days ago) and one recent (5 days ago)
+        now = pd.Timestamp.now().normalize()
+        old_ts = now - pd.Timedelta(days=35)
+        recent_ts = now - pd.Timedelta(days=5)
+
+        import json
+        data = {
+            "pred": {
+                old_ts.isoformat(): 1.0,
+                recent_ts.isoformat(): 2.0,
+            },
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # Only the recent entry should be loaded
+        assert len(app._pred_history) == 1
+        assert recent_ts in app._pred_history
+        assert app._pred_history[recent_ts] == 2.0
+        assert old_ts not in app._pred_history
+
+    def test_load_keep_first_on_conflict(self, tmp_path, monkeypatch):
+        """If in-memory already has a key, loaded value must not overwrite it."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        ts_key = now - pd.Timedelta(days=5)
+
+        # Pre-populate in-memory dict
+        app._pred_history = {ts_key: 1.0}
+        app._actuals_history = {}
+
+        # Write file with different value for the same key
+        import json
+        data = {
+            "pred": {ts_key.isoformat(): 99.0},  # Should be ignored
+            "actuals": {},
+        }
+        mock_path.write_text(json.dumps(data))
+
+        # Load
+        EnergyForecast._load_pred_history(app)
+
+        # In-memory value should be preserved (keep-first)
+        assert app._pred_history[ts_key] == 1.0
+
+    def test_load_missing_file_is_silent(self, tmp_path, monkeypatch):
+        """No file present → no exception, dicts remain empty."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # File doesn't exist
+        assert not mock_path.exists()
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        app.log.assert_not_called()
+
+    def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch):
+        """Invalid JSON → no exception, dicts remain empty, warning logged."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Write invalid JSON
+        mock_path.write_text("{invalid json}")
+
+        # Should not raise
+        EnergyForecast._load_pred_history(app)
+
+        # Dicts remain empty
+        assert app._pred_history == {}
+        assert app._actuals_history == {}
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to load" in app.log.call_args[0][0]
+
+    def test_save_creates_file_atomically(self, tmp_path, monkeypatch):
+        """Verify that .tmp file is used (save is atomic)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+
+        now = pd.Timestamp.now().normalize()
+        app._pred_history = {now - pd.Timedelta(days=1): 1.5}
+        app._actuals_history = {now - pd.Timedelta(days=2): 2.0}
+
+        # Save
+        EnergyForecast._save_pred_history(app)
+
+        # Verify file was created
+        assert mock_path.exists()
+        # Verify .tmp file was cleaned up
+        assert not mock_path.with_suffix(".json.tmp").exists()
+
+        # Verify content
+        import json
+        with open(mock_path) as f:
+            data = json.load(f)
+        assert len(data["pred"]) == 1
+        assert len(data["actuals"]) == 1
+
+    def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch):
+        """Save failure (OSError) is logged, doesn't raise."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+
+        app = MagicMock(spec=EnergyForecast)
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+
+        # Mock open to raise OSError
+        mock_open = MagicMock()
+        mock_open.side_effect = OSError("Disk full")
+        monkeypatch.setattr("builtins.open", mock_open)
+
+        # Should not raise
+        EnergyForecast._save_pred_history(app)
+
+        # Warning should be logged
+        app.log.assert_called_once()
+        assert "Failed to save" in app.log.call_args[0][0]
+
+
+# ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
+
+class TestBuildShapNarrative:
+
+    def test_empty_dict_returns_empty_string(self):
+        """Empty shap_features dict returns empty string."""
+        result = _build_shap_narrative({})
+        assert result == ""
+
+    def test_none_returns_empty_string(self):
+        """None input returns empty string."""
+        # The function checks if not shap_features, so None is falsy
+        result = _build_shap_narrative(None)  # type: ignore
+        assert result == ""
+
+    def test_single_feature(self):
+        """Single feature narrative includes label and value."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "+0.14" in result
+        assert "Mainly driven by:" in result
+
+    def test_multiple_features(self):
+        """Multiple features all appear in narrative."""
+        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h": 0.07}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "current outdoor temperature" in result
+        assert "yesterday's same-hour consumption" in result
+        assert "+0.14" in result
+        assert "+0.09" in result
+        assert "+0.07" in result
+
+    def test_unknown_feature_uses_feature_name(self):
+        """Unknown feature name falls back to raw feature name."""
+        shap_features = {"unknown_feature_xyz": 0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "unknown_feature_xyz" in result
+        assert "+0.05" in result
+
+    def test_negative_shap_value_formatted_correctly(self):
+        """Negative SHAP values use proper +/- sign."""
+        shap_features = {"temp_c": -0.05}
+        result = _build_shap_narrative(shap_features)
+        assert "-0.05" in result
+
+    def test_narrative_ends_with_period(self):
+        """Narrative string ends with a period."""
+        shap_features = {"hour_sin": 0.14}
+        result = _build_shap_narrative(shap_features)
+        assert result.endswith(".")
+
+    def test_sine_and_cosine_labels_differentiated(self):
+        """Sine and cosine features have distinct labels in narrative."""
+        shap_features = {"hour_sin": 0.14, "hour_cos": 0.09}
+        result = _build_shap_narrative(shap_features)
+        assert "time-of-day (sine)" in result
+        assert "time-of-day (cosine)" in result
+        # Verify both appear in the narrative
+        assert result.count("time-of-day") == 2
+
+
+# ── Relative MAE (#54) ───────────────────────────────────────────────────────────
+
+class TestRelativeMAEComputation:
+    """Integration tests for relative MAE computation in _update_sensors."""
+
+    def test_relative_mae_7d_computed_correctly(self):
+        """Verify relative MAE (%) is correctly computed from absolute MAE and actuals mean."""
+        # Populate histories: 10 hours of 10 kWh each, MAE should be 5% of mean
+        now = pd.Timestamp.now().normalize()
+        pred_history = {}
+        actuals_history = {}
+        for i in range(10):
+            ts = (now - pd.Timedelta(hours=i)).isoformat()
+            pred_history[ts] = 10.5  # +0.5 error
+            actuals_history[ts] = 10.0
+
+        # Compute relative MAE as _update_sensors does
+        mae_7d = 0.5  # known absolute MAE
+        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        actuals_7d = [v for ts, v in actuals_history.items() if pd.Timestamp(ts) >= cutoff_7d]
+        mean_7d = float(np.mean(actuals_7d)) if actuals_7d else float("nan")
+        mae_7d_pct = round(mae_7d / mean_7d * 100, 2) if mean_7d > 0 and not math.isnan(mae_7d) else float("nan")
+
+        # Expected: 0.5 / 10.0 * 100 = 5.0%
+        assert mae_7d_pct == 5.0
+
+    def test_relative_mae_nan_when_no_actuals(self):
+        """Relative MAE is NaN when actuals_history is empty."""
+        actuals_empty = []
+        mean_empty = float(np.mean(actuals_empty)) if actuals_empty else float("nan")
+        assert math.isnan(mean_empty)
+
+        mae_abs = 0.5
+        mae_pct = round(mae_abs / mean_empty * 100, 2) if mean_empty > 0 and not math.isnan(mae_abs) else float("nan")
+        assert math.isnan(mae_pct)
+
+    def test_relative_mae_nan_propagates_from_absolute_mae(self):
+        """Relative MAE is NaN when absolute MAE is NaN (cold start)."""
+        mean_consumption = 10.0
+        mae_abs = float("nan")
+        mae_pct = round(mae_abs / mean_consumption * 100, 2) if mean_consumption > 0 and not math.isnan(mae_abs) else float("nan")
+        assert math.isnan(mae_pct)
+
+
+# ── Fix: _update_cb must not skip under lock (concurrency fix) ────────────────
+
+class TestUpdateCbNoLock:
+    """_update_cb must run _update_sensors even when _lock is held (retrain in progress)."""
+
+    def test_update_cb_runs_when_lock_held(self):
+        """With the old code _update_cb skipped if lock was busy; now it must not skip."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = object()  # non-None — past cold start
+        fake._lock.acquire.return_value = False  # simulate lock held by retrain
+
+        # Attach _update_sensors directly to the fake instance
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [1], "_update_sensors must be called regardless of lock state"
+
+    def test_update_cb_skips_when_no_model(self):
+        """_update_cb must return early when no model is trained yet."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        calls = []
+        fake = _FakeSelf()
+        fake._ml_model.model = None  # no model yet
+        fake._update_sensors = lambda: calls.append(1)
+
+        EnergyForecast._update_cb(fake)
+
+        assert calls == [], "_update_sensors must NOT be called when model is None"
+
+
+# ── _subtract_sub_sensors ─────────────────────────────────────────────────────
+
+class TestSubtractSubSensors:
+
+    def test_subtract_single_sensor(self):
+        """Subtraction of one sensor at 1.0 kWh/h from 5.0 kWh/h results in 4.0 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub_sensors = {"heat_pump": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 24.0
+        assert (res["gross_kwh"] == 4.0).all()
+
+    def test_subtract_multiple_sensors(self):
+        """Subtraction of two sensors (1.0 + 0.5) from 5.0 results in 3.5 kWh/h."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+        sub1 = pd.DataFrame({"timestamp": ts, "kwh": [1.0] * 24})
+        sub2 = pd.DataFrame({"timestamp": ts, "kwh": [0.5] * 24})
+        sub_sensors = {"s1": sub1, "s2": sub2}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 1.5 * 24
+        assert (res["gross_kwh"] == 3.5).all()
+
+    def test_clipping_at_zero(self):
+        """Result must never be negative even if sub-sensors exceed total."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 24})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [2.0] * 24})
+        sub_sensors = {"too_high": sub_df}
+
+        res, _ = _subtract_sub_sensors(df, sub_sensors)
+        assert (res["gross_kwh"] == 0.0).all()
+
+    def test_misaligned_timestamps_filled_with_zero(self):
+        """Missing sub-sensor rows (aligned via reindex) are treated as 0.0 kWh (no removal)."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [5.0] * 24})
+
+        # Sub-sensor only has data for first 12 hours
+        sub_ts = ts[:12]
+        sub_df = pd.DataFrame({"timestamp": sub_ts, "kwh": [1.0] * 12})
+        sub_sensors = {"partial": sub_df}
+
+        res, removed = _subtract_sub_sensors(df, sub_sensors)
+        assert removed == 12.0
+        assert (res.iloc[:12]["gross_kwh"] == 4.0).all()
+        assert (res.iloc[12:]["gross_kwh"] == 5.0).all()
+
+    def test_empty_sub_sensors_returns_copy(self):
+        """Passing None or empty dict returns an unchanged copy of the input."""
+        df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-03-12 00:00", "2026-03-12 01:00"]), "gross_kwh": [5.0, 5.0]})
+        res, removed = _subtract_sub_sensors(df, {})
+        assert removed == 0.0
+        assert (res["gross_kwh"] == 5.0).all()
+        assert res is not df

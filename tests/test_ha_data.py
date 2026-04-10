@@ -19,10 +19,29 @@ import pandas as pd
 import pytest
 
 from energy_forecast import ha_data
-from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames
+from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames, _merge_frames
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def make_climate_ha_raw(timestamps_utc: list[str], current_temps: list[float], setpoints: list[float]) -> pd.DataFrame:
+    """Build a climate-style raw HA history DataFrame with attributes."""
+    rows = []
+    for ts, ct, sp in zip(timestamps_utc, current_temps, setpoints):
+        rows.append({
+            "timestamp": pd.to_datetime(ts, utc=True).tz_convert("Europe/Zurich"),
+            "current_temperature": ct,
+            "temperature": sp
+        })
+    return pd.DataFrame(rows)
+
+
+def make_generic_ha_raw(timestamps_utc: list[str], values: list[float]) -> pd.DataFrame:
+    """Build a generic absolute sensor raw HA history DataFrame."""
+    return pd.DataFrame({
+        "timestamp": pd.to_datetime(timestamps_utc, utc=True).tz_convert("Europe/Zurich"),
+        "value": values
+    })
 
 def make_energy_df(timestamps: list[str], kwh_values: list[float]) -> pd.DataFrame:
     """Build a naive-timestamp energy DataFrame (as stored in the CSV cache)."""
@@ -55,6 +74,55 @@ def mock_app() -> MagicMock:
     app = MagicMock()
     app.log = MagicMock()
     return app
+
+
+# ── Stage 2: Climate & Generic ───────────────────────────────────────────────
+
+class TestClimateAndGenericHistory:
+
+    def test_merge_frames_generic(self):
+        """_merge_frames works correctly with any value column."""
+        ts = "2024-01-01 10:00"
+        winner = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [22.0]})
+        loser  = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [21.0]})
+        result = _merge_frames(winner, loser, "val")
+        assert result.iloc[0]["val"] == 22.0
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_climate_history_basic(self, mock_fetch, mock_app, tmp_path):
+        """fetch_climate_history correctly extracts and resamples attributes."""
+        # 10:00 UTC -> 11:00 CET
+        ha_raw = make_climate_ha_raw(
+            ["2024-01-01 10:00", "2024-01-01 10:30"],
+            [20.0, 20.5], [21.0, 21.0]
+        )
+        mock_fetch.return_value = ha_raw
+        cache_file = tmp_path / "climate_test.csv"
+
+        df = ha_data.fetch_climate_history(mock_app, "climate.living_room", cache_file)
+
+        assert not df.empty
+        assert "current_temp" in df.columns
+        assert "setpoint" in df.columns
+        # Should be resampled to 11:00 local (last state in the 10:xx UTC window)
+        assert df.iloc[0]["timestamp"] == pd.to_datetime("2024-01-01 11:00")
+        assert df.iloc[0]["current_temp"] == 20.5
+        assert df.iloc[0]["setpoint"] == 21.0
+        assert cache_file.exists()
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_generic_sensor_history(self, mock_fetch, mock_app, tmp_path):
+        """fetch_generic_sensor_history handles absolute values correctly."""
+        ha_raw = make_generic_ha_raw(["2024-01-01 10:00", "2024-01-01 10:30"], [55.0, 54.5])
+        mock_fetch.return_value = ha_raw
+        cache_file = tmp_path / "sensor_test.csv"
+
+        df = ha_data.fetch_generic_sensor_history(mock_app, "sensor.dhw_temp", cache_file, column_name="buffer_temp")
+
+        assert not df.empty
+        assert "buffer_temp" in df.columns
+        assert df.iloc[0]["buffer_temp"] == 54.5
+        assert cache_file.exists()
 
 
 # ── _merge_energy_frames ─────────────────────────────────────────────────────
@@ -723,3 +791,194 @@ class TestValidateCacheIntegration:
         ):
             ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
         mock_validate.assert_called_once()
+
+
+# ── fetch_presence_history ──────────────────────────────────────────────────────
+
+class TestFetchPresenceHistory:
+    """Tests for fetch_presence_history (occupancy feature #21)."""
+
+    def test_returns_empty_when_no_sensors(self, mock_app):
+        """Empty entity list returns empty DataFrame."""
+        result = ha_data.fetch_presence_history(mock_app, None, days=30)
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_returns_empty_when_empty_list(self, mock_app):
+        """Empty list returns empty DataFrame."""
+        result = ha_data.fetch_presence_history(mock_app, [], days=30)
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_single_person_home_counts_correctly(self, mock_app):
+        """Single person entity in home state produces count=1."""
+        # HA history raw response: person.alice in "home" state
+        # 10:00–11:00 local: home (state="home")
+        # 11:00–12:00 local: not_home (state="not_home")
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},  # 10:00 local
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},  # 11:00 local
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 2
+        assert result.iloc[0]["people_home"] == 1  # home during hour 0
+        assert result.iloc[1]["people_home"] == 0  # not_home during hour 1
+
+    def test_two_persons_sum_correctly(self, mock_app):
+        """Two person entities count independently and sum."""
+        raw_alice = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+        raw_bob = {
+            "person.bob": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+
+        def side_effect_fn(*args, **kwargs):
+            entity = kwargs.get("entity_id")
+            if entity == "person.alice":
+                return raw_alice
+            elif entity == "person.bob":
+                return raw_bob
+            return {}
+
+        mock_app.get_history.side_effect = side_effect_fn
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice", "person.bob"], days=30)
+
+        assert len(result) == 2
+        assert result.iloc[0]["people_home"] == 2  # both home at 10:00
+        assert result.iloc[1]["people_home"] == 1  # only bob home at 11:00
+
+    def test_person_not_home_is_zero(self, mock_app):
+        """Person always in not_home state produces all zeros."""
+        raw_response = {
+            "person.alice": [
+                {"state": "not_home", "last_changed": "2024-01-01T09:00:00+01:00"},
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 1
+        assert result.iloc[0]["people_home"] == 0
+
+    def test_returns_empty_on_fetch_error(self, mock_app):
+        """Exception during get_history returns empty DataFrame."""
+        mock_app.get_history.side_effect = Exception("API error")
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 0
+        assert list(result.columns) == ["timestamp", "people_home"]
+
+    def test_timestamps_are_naive_europe_zurich(self, mock_app):
+        """Returned timestamps are naive (no timezone) in Europe/Zurich local time."""
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},  # 09:00 local (UTC+1)
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        assert len(result) == 1
+        ts = result.iloc[0]["timestamp"]
+        assert ts.tzinfo is None  # naive
+        assert ts.hour == 9  # 09:00 local time (UTC+1)
+
+    def test_ignores_invalid_state_values(self, mock_app):
+        """States other than home/not_home are skipped."""
+        raw_response = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "unavailable", "last_changed": "2024-01-01T09:30:00+01:00"},  # skipped
+                {"state": "not_home", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        }
+        mock_app.get_history.return_value = raw_response
+
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+
+        # Only valid transitions: home→not_home
+        assert len(result) >= 1
+        assert result.iloc[0]["people_home"] == 1
+
+
+# ── fetch_recent_energy — tail read (Fix 4) ───────────────────────────────────
+
+class TestFetchRecentEnergyTailRead:
+    """fetch_recent_energy must read only the last _FETCH_RECENT_TAIL_ROWS rows
+    from a large CSV (memory efficiency), while still returning a correct result.
+    """
+
+    def _make_large_cache(self, path, n_rows: int, base: pd.Timestamp) -> list:
+        """Write n_rows hourly rows to a CSV and return the expected timestamps."""
+        ts = pd.date_range(base, periods=n_rows, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n_rows})
+        df.to_csv(path, index=False)
+        return ts.tolist()
+
+    def test_large_cache_returns_tail_rows(self, mock_app, tmp_path):
+        """With 600 rows in the CSV and no new HA data, the returned DataFrame
+        has at most _FETCH_RECENT_TAIL_ROWS rows (deque tail read)."""
+        from energy_forecast.ha_data import _FETCH_RECENT_TAIL_ROWS
+
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        # Return empty HA data so only the cache contributes
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert len(result) <= _FETCH_RECENT_TAIL_ROWS
+
+    def test_tail_read_preserves_latest_rows(self, mock_app, tmp_path):
+        """The returned rows must be the *last* rows in the CSV, not the first."""
+        from energy_forecast.ha_data import _FETCH_RECENT_TAIL_ROWS
+
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        timestamps = self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        # The last timestamp in the result should match the end of the CSV
+        last_expected = timestamps[-1].normalize() + pd.Timedelta(hours=timestamps[-1].hour)
+        assert result["timestamp"].max() >= timestamps[600 - _FETCH_RECENT_TAIL_ROWS]
+
+    def test_tail_read_merges_new_ha_rows(self, mock_app, tmp_path):
+        """New HA rows are still merged in even when the cache is large."""
+        cache_path = tmp_path / "energy_history.csv"
+        base = pd.Timestamp("2024-01-01 00:00")
+        self._make_large_cache(cache_path, n_rows=600, base=base)
+
+        # HA provides 2 new rows just after the cache window
+        cache_end_ts = base + pd.Timedelta(hours=599)
+        ha_raw = pd.DataFrame({
+            "timestamp": pd.to_datetime([
+                cache_end_ts + pd.Timedelta(hours=1),
+                cache_end_ts + pd.Timedelta(hours=2),
+            ]),
+            "value": [100.0, 101.5],
+        })
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        # At least 1 new kwh row (diff of ha values) must be present
+        tail_ts = result["timestamp"].max()
+        assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)

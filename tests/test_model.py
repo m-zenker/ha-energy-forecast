@@ -30,9 +30,11 @@ from energy_forecast.model import (
     _BRIDGE_CAP,
     _build_model,
     _build_prediction_temp_df,
+    _composite_forecast,
     _compute_likely_ev_hours,
     _FEATURES_BASE,
     _engineer_features,
+    _learn_appliance_signatures,
     EnergyForecastModel,
     LAG_HOURS,
 )
@@ -455,6 +457,61 @@ class TestNewWeatherFeatures:
         assert result["cloud_cover_pct"].isna().all()
         assert result["direct_radiation_wm2"].isna().all()
 
+
+class TestStage2Features:
+
+    def test_thermal_pressure_feature(self):
+        """thermal_pressure is correctly calculated as (setpoint - current)."""
+        ts = pd.date_range("2026-03-12 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        
+        # Room 1: 21.0 - 20.0 = 1.0 delta
+        # Room 2: 22.0 - 18.0 = 4.0 delta
+        # Average thermal_pressure should be 2.5
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp": ts,
+                "current_temp": [20.0, 20.0],
+                "setpoint": [21.0, 21.0]
+            }),
+            "climate.room2": pd.DataFrame({
+                "timestamp": ts,
+                "current_temp": [18.0, 18.0],
+                "setpoint": [22.0, 22.0]
+            })
+        }
+        
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert "thermal_pressure" in result.columns
+        assert (result["thermal_pressure"] == 2.5).all()
+
+    def test_dhw_pressure_feature(self):
+        """dhw_pressure increases non-linearly as buffer_temp drops towards 40C."""
+        ts = pd.date_range("2026-03-12 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        
+        # Hour 0: 55C -> low pressure
+        # Hour 1: 41C -> high pressure
+        dhw_df = pd.DataFrame({
+            "timestamp": ts,
+            "buffer_temp": [55.0, 41.0]
+        })
+        
+        result = _engineer_features(df, w, None, dhw_df=dhw_df)
+        assert "dhw_buffer_temp" in result.columns
+        assert "dhw_pressure" in result.columns
+        assert result.iloc[0]["dhw_buffer_temp"] == 55.0
+        assert result.iloc[1]["dhw_buffer_temp"] == 41.0
+        
+        p0 = result.iloc[0]["dhw_pressure"]
+        p1 = result.iloc[1]["dhw_pressure"]
+        # p0 = 1 / (55-40+1)^2 = 1/16^2 = 1/256
+        # p1 = 1 / (41-40+1)^2 = 1/2^2 = 1/4
+        assert p1 > p0
+        assert p1 == pytest.approx(0.25)
+
     def test_temp_rolling_3d_anchored_by_historical_tail(self):
         """With 72h of history prepended to a 4h forecast, temp_rolling_3d at h=0
         must equal the mean of all 72 historical temps, not just the first value."""
@@ -477,6 +534,218 @@ class TestNewWeatherFeatures:
         # Without the historical tail (min_periods=1), it would just be 10.0.
         expected = (71 * 2.0 + 1 * 10.0) / 72
         assert abs(float(result["temp_rolling_3d"].iloc[0]) - expected) < 1e-6
+
+
+# ── Thermal modelling features (#49–#52) ──────────────────────────────────────
+
+class TestEWMATemperature:
+    """#49 EWMA temperature features — RC-circuit thermal mass model."""
+
+    def test_temp_ewma_features_in_features_base(self):
+        assert "temp_ewma_24h" in _FEATURES_BASE
+        assert "temp_ewma_72h" in _FEATURES_BASE
+
+    def test_ewma_24h_decays_exponentially(self):
+        """With constant temp = 5.0, ewm(halflife=24) should stabilise near 5.0."""
+        ts = pd.date_range("2026-03-12 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=5.0)
+        result = _engineer_features(df, w, None)
+        # After 200 hours, EWMA should be very close to 5.0
+        assert abs(float(result["temp_ewma_24h"].iloc[-1]) - 5.0) < 0.01
+
+    def test_ewma_72h_slower_than_24h(self):
+        """72h EWMA should respond slower to temp changes than 24h EWMA."""
+        ts = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
+        w_constant = _make_weather_df(ts, temp=5.0)
+        # Override to step-change at t=24: 5.0 → 15.0
+        w_step = w_constant.copy()
+        w_step.loc[w_step["timestamp"] >= pd.Timestamp("2026-03-13 00:00"), "temp_c"] = 15.0
+        df = _make_bare_df(ts)
+        result = _engineer_features(df, w_step, None)
+        # At hour 48, both should have moved toward 15.0 but 72h should be further back
+        ewma_24_at_48 = float(result["temp_ewma_24h"].iloc[-1])
+        ewma_72_at_48 = float(result["temp_ewma_72h"].iloc[-1])
+        assert ewma_24_at_48 > ewma_72_at_48  # 24h reacts faster
+
+    def test_ewma_nan_fill_works(self):
+        """When weather is missing, EWMA columns should be NaN then filled by median."""
+        ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w = pd.DataFrame({
+            "timestamp":        pd.to_datetime(ts),
+            "temp_c":           [5.0] * 24,
+            "precipitation_mm": [0.0] * 24,
+            "sunshine_min":     [30.0] * 24,
+            "wind_kmh":         [10.0] * 24,
+        })
+        result = _engineer_features(df, w, None)
+        # EWMA columns should exist (created as NaN then filled)
+        assert "temp_ewma_24h" in result.columns
+        assert "temp_ewma_72h" in result.columns
+        # After median fill, no NaN should remain
+        assert not result["temp_ewma_24h"].isna().any()
+        assert not result["temp_ewma_72h"].isna().any()
+
+
+class TestRollingDegreeHourSums:
+    """#50 Accumulated heating/cooling degree-hour sums."""
+
+    def test_heating_deg_sum_features_in_features_base(self):
+        assert "heating_deg_sum_24h" in _FEATURES_BASE
+        assert "heating_deg_sum_168h" in _FEATURES_BASE
+
+    def test_heating_deg_sum_24h_below_18(self):
+        """With constant temp=10°C (below 18°C threshold), sum over 24h should be 24*8=192."""
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=10.0)
+        result = _engineer_features(df, w, None)
+        # At hour 24: rolling sum of (18-10)=8 over 24 hours = 192
+        expected_24h = 24 * (18 - 10)
+        # Allow small tolerance for float precision
+        assert abs(float(result["heating_deg_sum_24h"].iloc[24]) - expected_24h) < 0.1
+
+    def test_heating_deg_sum_zero_when_temp_above_18(self):
+        """With constant temp=25°C (above 18°C threshold), heating_deg_sum should be 0."""
+        ts = pd.date_range("2026-06-15 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=25.0)
+        result = _engineer_features(df, w, None)
+        assert (result["heating_deg_sum_24h"] == 0.0).all()
+
+    def test_heating_deg_sum_168h_accumulates(self):
+        """168h sum (7 days) should be larger than 24h sum for the same conditions."""
+        ts = pd.date_range("2026-01-15 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=5.0)  # (18-5) = 13 degree-hours per hour
+        result = _engineer_features(df, w, None)
+        # At hour 168, should have 168 * 13
+        sum_168 = float(result["heating_deg_sum_168h"].iloc[168])
+        expected = 168 * 13
+        assert abs(sum_168 - expected) < 0.1
+
+
+class TestTemperatureDelta:
+    """#51 Temperature rate of change (delta 1h and 24h)."""
+
+    def test_temp_delta_features_in_features_base(self):
+        assert "temp_delta_1h" in _FEATURES_BASE
+        assert "temp_delta_24h" in _FEATURES_BASE
+
+    def test_temp_delta_1h_tracks_change(self):
+        """Rising temp sequence: 0, 1, 2, 3, ... should have delta=1 after first row."""
+        ts = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
+        df = _make_bare_df(ts)
+        # Temperature increases by 0.5°C per hour
+        temps = [float(i) * 0.5 for i in range(48)]
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               temps,
+            "precipitation_mm":     [0.0] * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+        result = _engineer_features(df, w, None)
+        # delta[1:] should be ~0.5 (small tolerance for float errors)
+        assert abs(float(result["temp_delta_1h"].iloc[5]) - 0.5) < 0.01
+
+    def test_temp_delta_24h_detects_daily_pattern(self):
+        """With 24-hour period shift, temp_delta_24h should show day-over-day change."""
+        ts = pd.date_range("2026-03-12 00:00", periods=72, freq="1h")
+        df = _make_bare_df(ts)
+        # Day 1: 5°C, Day 2: 10°C, Day 3: 5°C again
+        temps = [5.0] * 24 + [10.0] * 24 + [5.0] * 24
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               temps,
+            "precipitation_mm":     [0.0] * 72,
+            "sunshine_min":         [30.0] * 72,
+            "wind_kmh":             [10.0] * 72,
+            "cloud_cover_pct":      [50.0] * 72,
+            "direct_radiation_wm2": [100.0] * 72,
+        })
+        result = _engineer_features(df, w, None)
+        # At hour 24: 10 - 5 = +5 (warmer than day before)
+        assert abs(float(result["temp_delta_24h"].iloc[24]) - 5.0) < 0.01
+        # At hour 48: 5 - 10 = -5 (colder than day before)
+        assert abs(float(result["temp_delta_24h"].iloc[48]) - (-5.0)) < 0.01
+
+
+class TestTemperatureLagFeatures:
+    """#52 Temperature lag features (24h and 168h)."""
+
+    def test_temp_lag_features_in_features_base(self):
+        assert "temp_lag_24h" in _FEATURES_BASE
+        assert "temp_lag_168h" in _FEATURES_BASE
+
+    def test_temp_lag_24h_value_matches(self):
+        """temp_lag_24h[h] should equal temp_c[h-24]."""
+        ts = pd.date_range("2026-03-12 00:00", periods=96, freq="1h")
+        df = _make_bare_df(ts)
+        temps = list(range(96))  # 0, 1, 2, ..., 95
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts),
+            "temp_c":               [float(t) for t in temps],
+            "precipitation_mm":     [0.0] * 96,
+            "sunshine_min":         [30.0] * 96,
+            "wind_kmh":             [10.0] * 96,
+            "cloud_cover_pct":      [50.0] * 96,
+            "direct_radiation_wm2": [100.0] * 96,
+        })
+        result = _engineer_features(df, w, None)
+        # At index 24, lag_24h should be 0.0
+        assert abs(float(result["temp_lag_24h"].iloc[24]) - 0.0) < 1e-9
+        # At index 50, lag_24h should be 26.0
+        assert abs(float(result["temp_lag_24h"].iloc[50]) - 26.0) < 1e-9
+
+    def test_temp_lag_168h_nan_for_first_week(self):
+        """First 168 hours should initially be NaN for temp_lag_168h (no history),
+        but filled by median during NaN-fill step in _engineer_features."""
+        ts = pd.date_range("2026-03-12 00:00", periods=200, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=10.0)
+        result = _engineer_features(df, w, None)
+        # After NaN-fill with median, no NaN should remain in temp_lag_168h
+        assert not result["temp_lag_168h"].isna().any()
+        # Hour 168+ should have correct values (shifted by exactly 168 hours)
+        # At hour 168: lag should equal temp_c from hour 0 (which is 10.0)
+        assert abs(float(result["temp_lag_168h"].iloc[168]) - 10.0) < 1e-9
+
+
+class TestThermalFeaturesIntegration:
+    """Integration test: all 8 thermal features activate during training."""
+
+    def test_all_thermal_features_in_trained_model(self, tmp_path):
+        """After training with sufficient rows, all 8 thermal features should be in m.feature_cols."""
+        rng = np.random.default_rng(1)
+        ts = pd.date_range("2024-01-01", periods=400, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=400),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=400),
+            "precipitation_mm":     [0.0] * 400,
+            "sunshine_min":         [30.0] * 400,
+            "wind_kmh":             [10.0] * 400,
+            "cloud_cover_pct":      [50.0] * 400,
+            "direct_radiation_wm2": [100.0] * 400,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # All 8 thermal features should be present
+        thermal_features = [
+            "temp_ewma_24h", "temp_ewma_72h",
+            "heating_deg_sum_24h", "heating_deg_sum_168h",
+            "temp_delta_1h", "temp_delta_24h",
+            "temp_lag_24h", "temp_lag_168h",
+        ]
+        for feat in thermal_features:
+            assert feat in m.feature_cols, f"{feat} not found in feature_cols"
 
 
 # ── Log-transform (#7) ────────────────────────────────────────────────────────
@@ -1665,3 +1934,646 @@ class TestModelVersioning:
         with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
             m.rollback_model()
         assert any(archive_name in r.message for r in caplog.records)
+
+
+# ── Occupancy feature (people_home) — #21 ──────────────────────────────────────
+
+class TestPeopleHomeFeature:
+    """Tests for occupancy feature: people_home integer count (#21)."""
+
+    def test_people_home_in_features_base(self):
+        """people_home is listed in _FEATURES_BASE."""
+        assert "people_home" in _FEATURES_BASE
+
+    def test_people_home_zero_without_presence_df(self, tmp_path):
+        """When presence_df is None, people_home defaults to 0."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=None)
+
+        # Get feature columns
+        assert "people_home" in m.feature_cols
+
+    def test_people_home_column_present_with_presence_df(self, tmp_path):
+        """When presence_df is provided, people_home column is populated."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": rng.integers(0, 3, size=200),  # 0, 1, or 2 people
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        assert "people_home" in m.feature_cols
+
+    def test_people_home_values_match_presence_df(self):
+        """people_home values from presence_df are correctly merged into features."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values[:100],  # Partial overlap
+            "people_home": [2, 1, 0, 1] * 25,  # 4-hour cycle repeated
+        })
+
+        # Call _engineer_features directly to inspect merge behavior
+        df = _engineer_features(energy, weather, None, presence_df=presence)
+
+        assert "people_home" in df.columns
+        assert df["people_home"].dtype == int
+
+    def test_people_home_in_feature_cols_after_train(self, tmp_path):
+        """people_home is included in feature_cols list after training."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": [1] * len(energy),
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        assert "people_home" in m.feature_cols
+
+    def test_predict_with_people_home_series(self, tmp_path):
+        """Prediction with people_home_series injects values into prediction."""
+        rng = np.random.default_rng(0)
+        ts  = pd.date_range("2024-01-01", periods=200, freq="1h")
+        energy = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 5.0, size=200),
+        })
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(-5, 25, size=200),
+            "precipitation_mm":     [0.0]   * 200,
+            "sunshine_min":         [30.0]  * 200,
+            "wind_kmh":             [10.0]  * 200,
+            "cloud_cover_pct":      [50.0]  * 200,
+            "direct_radiation_wm2": [100.0] * 200,
+        })
+        presence = pd.DataFrame({
+            "timestamp": energy["timestamp"].values,
+            "people_home": [1] * len(energy),
+        })
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, presence_df=presence)
+
+        # Build forecast for next 48 hours
+        now = energy["timestamp"].max()
+        forecast = pd.DataFrame({
+            "timestamp": pd.date_range(now + pd.Timedelta(hours=1), periods=48, freq="1h"),
+            "temp_c": [15.0] * 48,
+            "precipitation_mm": [0.0] * 48,
+            "sunshine_min": [30.0] * 48,
+            "wind_kmh": [10.0] * 48,
+            "cloud_cover_pct": [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+
+        # Create a 48-element Series with occupancy values
+        people_home_series = pd.Series(
+            data=[2] * 48,
+            index=forecast["timestamp"].values,
+        )
+
+        predictions = m.predict(
+            forecast,
+            live_temp=15.0,
+            recent_actuals=None,
+            people_home_series=people_home_series,
+        )
+
+        assert "predicted_kwh" in predictions.columns
+        assert len(predictions) == 48
+
+
+# ── holiday_country propagation (Fix 2) ──────────────────────────────────────
+
+class TestHolidayCountry:
+    """holiday_country param must be threaded from train() into _add_holiday_feature."""
+
+    def _ts_df(self, dates):
+        return pd.DataFrame({"timestamp": pd.to_datetime(dates)})
+
+    def test_country_gb_uses_uk_holidays(self):
+        """country='GB' must flag UK holidays (e.g. Christmas Day)."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-12-25"]), country="GB")
+        assert result["is_public_holiday"].iloc[0] == 1, "Dec 25 must be a UK holiday"
+
+    def test_country_ch_default_flags_swiss_new_year(self):
+        """Default country='CH' must flag Jan 1 as a public holiday."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-01-01"]))
+        assert result["is_public_holiday"].iloc[0] == 1, "Jan 1 must be a CH holiday"
+
+    def test_country_de_flags_german_holiday(self):
+        """country='DE' must recognise German Unity Day (Oct 3)."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-10-03"]), country="DE")
+        assert result["is_public_holiday"].iloc[0] == 1, "Oct 3 must be a DE holiday"
+
+    def test_invalid_country_falls_back_gracefully(self):
+        """An unrecognised country code must not crash; columns must still be present."""
+        pytest.importorskip("holidays")
+        result = _add_holiday_feature(self._ts_df(["2026-03-15"]), country="XX")
+        for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
+            assert col in result.columns
+
+
+
+# ── Stage 3: Appliance Signature Discovery ────────────────────────────────────
+
+def _make_cycle_df(
+    cycle_kwh: list[float],
+    n_cycles: int,
+    period_hours: int = 12,
+    start: str = "2024-01-01",
+) -> pd.DataFrame:
+    """Synthetic sub-sensor: n_cycles cycles of len(cycle_kwh) each.
+
+    Between cycles there is silence (zeros) so that total length =
+    n_cycles * period_hours.  The cycle occupies the first len(cycle_kwh)
+    hours of each period.
+    """
+    window_hours = len(cycle_kwh)
+    total_hours = n_cycles * period_hours
+    ts = pd.date_range(start, periods=total_hours, freq="1h")
+    kwh = [0.0] * total_hours
+    for i in range(n_cycles):
+        base = i * period_hours
+        for j, v in enumerate(cycle_kwh):
+            kwh[base + j] = v
+    return pd.DataFrame({"timestamp": ts, "kwh": kwh})
+
+
+class TestApplianceSignatures:
+    """Tests for _learn_appliance_signatures()."""
+
+    PROFILE = [1.0, 2.0, 1.5, 0.5]  # 4-hour cycle shape
+
+    def test_basic_two_cycles(self):
+        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=2)
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        s = sigs["hp"]
+        assert s["n_cycles"] == 2
+        assert s["total_kwh"] == pytest.approx(sum(self.PROFILE))
+        assert s["hourly_profile"] == pytest.approx(self.PROFILE)
+        assert s["peak_hour"] == 1  # index of 2.0 in PROFILE
+        # std_profile present and all-zeros (identical cycles)
+        assert "std_profile" in s
+        assert len(s["std_profile"]) == 4
+        assert s["std_profile"] == pytest.approx([0.0, 0.0, 0.0, 0.0])
+
+    def test_below_min_cycles_skipped(self):
+        """Only 1 cycle → empty dict (insufficient evidence)."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=1, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        assert sigs == {}
+
+    def test_no_sub_sensors_none(self):
+        """None input → empty dict, no crash."""
+        assert _learn_appliance_signatures(None) == {}
+
+    def test_no_sub_sensors_empty_dict(self):
+        """Empty dict input → empty dict."""
+        assert _learn_appliance_signatures({}) == {}
+
+    def test_partial_window_skipped(self):
+        """Cycle starting within last window_hours rows is discarded (truncated window)."""
+        # 3 full cycles + 1 partial (only 2 hours at end)
+        df_full = _make_cycle_df(self.PROFILE, n_cycles=3, period_hours=8)
+        # Append 2 hours of an extra cycle start at the very end
+        extra = pd.DataFrame({
+            "timestamp": pd.date_range(df_full["timestamp"].iloc[-1] + pd.Timedelta("1h"), periods=2, freq="1h"),
+            "kwh": [1.0, 1.0],
+        })
+        df = pd.concat([df_full, extra], ignore_index=True)
+        sigs = _learn_appliance_signatures({"dw": df}, window_hours=4, min_cycles=2)
+        assert "dw" in sigs
+        # The partial window must not inflate n_cycles
+        assert sigs["dw"]["n_cycles"] == 3
+
+    def test_multiple_prefixes(self):
+        """Two prefixes → independent signatures both returned."""
+        df1 = _make_cycle_df([1.0, 2.0, 0.5, 0.5], n_cycles=3, period_hours=12)
+        df2 = _make_cycle_df([0.5, 0.5, 1.0, 2.0], n_cycles=3, period_hours=12)
+        sigs = _learn_appliance_signatures({"hp": df1, "dw": df2})
+        assert set(sigs.keys()) == {"hp", "dw"}
+        assert sigs["hp"]["peak_hour"] == 1
+        assert sigs["dw"]["peak_hour"] == 3
+
+    def test_high_variability_logs_warning(self, caplog):
+        """Two very different cycles (CoV > 0.3) → WARNING logged."""
+        import logging
+        # Cycle 1: high consumption; cycle 2: low consumption → CoV ≈ 0.9
+        ts = pd.date_range("2026-01-01", periods=10, freq="1h")
+        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1]
+        df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        assert any("high variability" in r.message for r in caplog.records)
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """Save → delete in-memory → load → same dict."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model._appliance_signatures = _learn_appliance_signatures({"hp": df})
+        original = dict(model._appliance_signatures)
+        model._save_signatures()
+        # Reset and reload
+        model._appliance_signatures = {}
+        model._load_signatures()
+        assert model._appliance_signatures == original
+
+    def test_train_populates_signatures(self, tmp_path):
+        """After train(), _appliance_signatures is populated and saved to disk."""
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(42)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 3.0, n)})
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        # Build a sub-sensor with enough cycles to learn a signature
+        sub_hp = _make_cycle_df(self.PROFILE, n_cycles=20, period_hours=24, start="2024-01-01")
+        sub_hp = sub_hp[sub_hp["timestamp"] < ts[-1]].reset_index(drop=True)
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model.train(
+            energy_df=energy_df,
+            weather_df=weather_df,
+            outdoor_df=None,
+            sub_sensors_dict={"sub_hp": sub_hp},
+        )
+        assert isinstance(model._appliance_signatures, dict)
+        assert "sub_hp" in model._appliance_signatures
+        assert (tmp_path / "appliance_signatures.json").exists()
+
+    def test_cold_start_load_preserves_std_profile(self, tmp_path):
+        """Signatures saved by train() are fully restored in a fresh model instance.
+
+        Simulates an AppDaemon restart: model1 trains and saves, model2 is a
+        cold instance that loads from disk.  Verifies std_profile survives the
+        JSON round-trip and the loaded dict is identical to the saved one.
+        """
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(0)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 3.0, n),
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        sub_hp = _make_cycle_df(self.PROFILE, n_cycles=20, period_hours=24, start="2024-01-01")
+        sub_hp = sub_hp[sub_hp["timestamp"] < ts[-1]].reset_index(drop=True)
+
+        model1 = EnergyForecastModel(model_dir=tmp_path)
+        model1.train(
+            energy_df=energy_df,
+            weather_df=weather_df,
+            outdoor_df=None,
+            sub_sensors_dict={"sub_hp": sub_hp},
+        )
+        saved = dict(model1._appliance_signatures)
+
+        # Fresh instance — simulates restart
+        model2 = EnergyForecastModel(model_dir=tmp_path)
+        model2._load_signatures()
+
+        assert model2._appliance_signatures == saved
+        assert "std_profile" in model2._appliance_signatures["sub_hp"]
+        assert len(model2._appliance_signatures["sub_hp"]["std_profile"]) == 4
+
+
+# ── _composite_forecast (Stage 4) ────────────────────────────────────────────
+
+def _make_baseline_df(start="2024-06-01 10:00", n=48):
+    ts = pd.date_range(start, periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * n})
+
+
+_DUMMY_SIGS = {
+    "sub_dishwasher": {
+        "total_kwh": 5.0,
+        "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+        "peak_hour": 1,
+        "n_cycles": 5,
+    },
+    "sub_wp": {
+        "total_kwh": 3.0,
+        "hourly_profile": [1.0, 1.0, 1.0],
+        "peak_hour": 0,
+        "n_cycles": 4,
+    },
+}
+
+
+class TestCompositeForecast:
+
+    def test_empty_schedule_returns_baseline(self):
+        """schedule={} → delta_kwh all zeros, predicted_kwh unchanged."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {}, _DUMMY_SIGS)
+        assert "delta_kwh" in result.columns
+        assert (result["delta_kwh"] == 0.0).all()
+        assert result["predicted_kwh"].tolist() == pytest.approx([1.0] * 48)
+
+    def test_single_appliance_overlay(self):
+        """Dishwasher at 14:00 (4h ahead from 10:00) → profile added at offsets 4..7."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "14:00"}, _DUMMY_SIGS)
+        profile = _DUMMY_SIGS["sub_dishwasher"]["hourly_profile"]
+        # offset_h = 4 (10:00 → 14:00)
+        for i, v in enumerate(profile):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+        # Baseline outside profile unchanged (delta stays 0)
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+        assert result["delta_kwh"].iloc[3] == pytest.approx(0.0)
+        # predicted_kwh = 1.0 + profile at those slots
+        assert result["predicted_kwh"].iloc[4] == pytest.approx(1.0 + profile[0])
+
+    def test_off_appliance_skipped(self):
+        """'off' value → no overlay, delta stays zero."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_dishwasher": "off"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_none_appliance_skipped(self):
+        """None value → no overlay."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_dishwasher": None}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_unknown_prefix_ignored(self):
+        """Prefix not in signatures → skipped, no crash, no delta."""
+        df = _make_baseline_df()
+        result = _composite_forecast(df, {"sub_unknown": "12:00"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_boundary_truncation(self):
+        """Appliance starting at hour 46 with 4h profile → only 2h remain, rest truncated."""
+        df = _make_baseline_df(start="2024-06-01 00:00")
+        # 4h profile starting at 22:00 → offset=22; window up to 22+4=26, but only 24 rows
+        # start=00:00, 46:00 means offset 46, profile=[1,2,1.5,0.5] → clip to [1, 2] (48-46=2)
+        result = _composite_forecast(df, {"sub_dishwasher": "22:00"}, _DUMMY_SIGS)
+        # 22:00 with 00:00 start → offset_h = 22; profile has 4 elements → all 4 fit (22+4=26 < 48)
+        # Actually for a 48-row df starting at 00:00, 22:00 = offset 22, 22+4=26 < 48 so no truncation
+        # Use start at 00:00 and time "46:00" is invalid; instead test profile going to edge
+        # Re-test with start at 10:00 and time = "08:00" → tomorrow 08:00 → offset=22+24? no
+        # Simplest: make a 48-row df, start at 00:00, use a 4h profile at hour 46:
+        df2 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        # Manually call _composite_forecast with a signature that starts at hour 46
+        sigs_edge = {
+            "sub_test": {
+                "total_kwh": 5.0,
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "peak_hour": 1,
+                "n_cycles": 3,
+            }
+        }
+        # 00:00 start, "22:00" today → offset=22, fits fully
+        # To get offset=46, need start at 00:00 and appliance at 22:00 next day
+        # That would be 46h — can't express as HH:MM directly with the algorithm picking earliest.
+        # Instead just directly test truncation by constructing start at 00:00 and time "22:00"
+        # with n=48 but a very long profile:
+        sigs_long = {
+            "sub_test": {
+                "hourly_profile": [1.0] * 10,  # 10h profile
+                "total_kwh": 10.0,
+                "peak_hour": 0,
+                "n_cycles": 3,
+            }
+        }
+        df3 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        # offset_h = 22 (start 00:00 → 22:00), profile 10h → 22+10=32 < 48, fits
+        result3 = _composite_forecast(df3, {"sub_test": "22:00"}, sigs_long)
+        for i in range(10):
+            assert result3["delta_kwh"].iloc[22 + i] == pytest.approx(1.0)
+        assert result3["delta_kwh"].iloc[21] == pytest.approx(0.0)
+        assert result3["delta_kwh"].iloc[32] == pytest.approx(0.0)
+        # Now test truncation: profile extending beyond h=48
+        df4 = _make_baseline_df(start="2024-06-01 00:00", n=48)
+        result4 = _composite_forecast(df4, {"sub_test": "46:00"}, sigs_long)
+        # "46:00" is invalid — parser will fail silently → no delta
+        assert (result4["delta_kwh"] == 0.0).all()
+
+    def test_multiple_appliances(self):
+        """Two appliances at different times → both overlaid independently."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        schedule = {
+            "sub_dishwasher": "14:00",  # offset 4
+            "sub_wp":         "17:00",  # offset 7
+        }
+        result = _composite_forecast(df, schedule, _DUMMY_SIGS)
+        dw_profile = _DUMMY_SIGS["sub_dishwasher"]["hourly_profile"]
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
+        # Dishwasher at 4..7
+        for i, v in enumerate(dw_profile):
+            expected = v
+            if 4 + i >= 7 and (4 + i - 7) < len(wp_profile):
+                expected += wp_profile[4 + i - 7]
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(expected)
+        # wp at 7..9
+        for i, v in enumerate(wp_profile):
+            idx = 7 + i
+            if idx < 4 or idx >= 4 + len(dw_profile):
+                assert result["delta_kwh"].iloc[idx] == pytest.approx(v)
+
+    def test_predicted_kwh_nonnegative(self):
+        """Even with large negative baseline, predicted_kwh >= 0."""
+        ts = pd.date_range("2024-06-01 10:00", periods=48, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [-5.0] * 48})
+        result = _composite_forecast(df, {"sub_wp": "11:00"}, _DUMMY_SIGS)
+        assert (result["predicted_kwh"] >= 0.0).all()
+
+    def test_predict_scenario_returns_delta_column(self, tmp_path):
+        """predict_scenario() returns df with delta_kwh column."""
+        m, forecast = _make_trained_model(tmp_path)
+        # Add a dummy signature so _composite_forecast has something to overlay
+        m._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
+        }
+        result = m.predict_scenario(forecast, live_temp=None, schedule={"sub_dw": "12:00"})
+        assert "delta_kwh" in result.columns
+        assert len(result) == 48
+        assert (result["delta_kwh"] >= 0.0).all()
+
+    def test_next_day_time_string(self):
+        """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        # today 02:00 < 10:00 → tomorrow 02:00 → offset = 16h
+        result = _composite_forecast(df, {"sub_wp": "02:00"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
+        for i, v in enumerate(wp_profile):
+            assert result["delta_kwh"].iloc[16 + i] == pytest.approx(v)
+        # hour 15 and before: no delta
+        assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
+
+    def test_half_hour_time_floors_to_start_hour(self):
+        """'15:30' with forecast_start 14:00 → offset 1 (floor), not 2 (round).
+
+        round(1.5) == 2 under Python banker's rounding, so this would schedule
+        the appliance one hour late without the int() floor fix.
+        """
+        df = _make_baseline_df(start="2024-06-01 14:00")
+        result = _composite_forecast(df, {"sub_wp": "15:30"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]  # len=3
+        # offset_h must be 1 (floor(1.5)), not 2 (round(1.5))
+        assert result["delta_kwh"].iloc[1] == pytest.approx(wp_profile[0])
+        assert result["delta_kwh"].iloc[2] == pytest.approx(wp_profile[1])
+        assert result["delta_kwh"].iloc[3] == pytest.approx(wp_profile[2])
+        # hour 0 must be untouched
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
+    def test_malformed_time_string_skipped(self):
+        """Unparseable time string → warning logged (implicitly), delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:99"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_non_string_time_skipped(self):
+        """Non-string schedule value (int) → treated as invalid, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": 1400}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_out_of_range_hour_skipped(self):
+        """Hour > 23 → ValueError raised internally, skipped, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+
+# ── Concurrency (SE-2) ───────────────────────────────────────────────────────
+
+class TestConcurrency:
+    """Validates the GIL-safe lockless prediction invariant.
+
+    _update_cb reads self._ml_model.model without holding _lock, relying on
+    CPython's GIL making object-reference replacement atomic.  These tests
+    exercise the model layer directly to confirm predict() is safe to call
+    while train() runs concurrently.
+    """
+
+    def test_predict_during_retrain_does_not_raise(self, tmp_path):
+        """predict() called while train() runs in a background thread must not raise."""
+        import threading
+        pytest.importorskip("sklearn")
+        rng = np.random.default_rng(1)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": rng.uniform(0.5, 3.0, n),
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               rng.uniform(5, 25, n),
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [30.0]  * n,
+            "wind_kmh":             [10.0]  * n,
+            "cloud_cover_pct":      [50.0]  * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        future_weather = weather_df.copy()
+        future_weather["timestamp"] = ts + pd.Timedelta(hours=n)
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        # Prime the model so predict() has something to work with
+        model.train(energy_df=energy_df, weather_df=weather_df, outdoor_df=None)
+
+        train_exc: list = []
+
+        def _retrain():
+            try:
+                model.train(energy_df=energy_df, weather_df=weather_df, outdoor_df=None)
+            except Exception as exc:  # noqa: BLE001
+                train_exc.append(exc)
+
+        t = threading.Thread(target=_retrain)
+        t.start()
+        # predict() must not raise regardless of where train() is in its lifecycle
+        result = model.predict(
+            forecast_df=future_weather,
+            live_temp=None,
+            recent_actuals=energy_df.tail(400),
+        )
+        t.join()
+
+        assert train_exc == [], f"train() raised in background thread: {train_exc}"
+        assert result is not None
+        assert len(result) == 48
+        assert "predicted_kwh" in result.columns
