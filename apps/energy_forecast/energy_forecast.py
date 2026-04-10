@@ -100,6 +100,9 @@ class EnergyForecast(hass.Hass):
         # Optional sub-sensors: cumulative kWh meters (heat pump, dishwasher, etc.)
         # whose consumption is tracked as lag features to improve forecast accuracy.
         self._sub_energy_sensors: list[str] = list(self.args.get("sub_energy_sensors") or [])
+        self._baseline_included_sensors: list[str] = list(
+            self.args.get("baseline_included_sensors") or []
+        )
         # Optional away / vacation mode entities:
         # away_mode_entity    — input_boolean whose "on" state marks a vacation period
         # away_return_entity  — input_datetime holding the expected return (for prediction only)
@@ -312,6 +315,18 @@ class EnergyForecast(hass.Hass):
         """Return the CSV cache path for a sub-energy sensor."""
         sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
         return self._cache_path.parent / f"sub_{sanitized}.csv"
+
+    def _subtract_only_dict(self, sub_dict: dict) -> dict:
+        """Return sub_dict filtered to sensors not in baseline_included_sensors.
+
+        Sensors listed in baseline_included_sensors stay in the training target
+        (the main model predicts them via thermal/weather features). Only the
+        remaining sensors are subtracted from the baseline.
+        """
+        if not self._baseline_included_sensors:
+            return sub_dict
+        included = {self._sub_sensor_prefix(e) for e in self._baseline_included_sensors}
+        return {k: v for k, v in sub_dict.items() if k not in included}
 
     def _climate_cache_path(self, entity_id: str) -> Path:
         """Return the CSV cache path for a climate entity (setpoints/temp)."""
@@ -812,10 +827,14 @@ class EnergyForecast(hass.Hass):
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
         if self._baseline_mode and sub_sensors_dict:
-            baseline_df, removed_kwh = _subtract_sub_sensors(baseline_df, sub_sensors_dict)
+            subtract_dict = self._subtract_only_dict(sub_sensors_dict)
+            baseline_df, removed_kwh = _subtract_sub_sensors(baseline_df, subtract_dict)
+            included_prefixes = {self._sub_sensor_prefix(e) for e in self._baseline_included_sensors}
             self.log(
-                f"Passive Baseline: removed {removed_kwh:.1f} kWh from controllable "
-                f"sub-sensors ({', '.join(sub_sensors_dict.keys())})."
+                f"Passive Baseline: removed {removed_kwh:.1f} kWh from "
+                f"({', '.join(subtract_dict.keys()) or 'none'})"
+                + (f"; keeping {', '.join(sorted(included_prefixes))} in baseline" if included_prefixes else "")
+                + "."
             )
 
         start_date = baseline_df["timestamp"].min().date()
@@ -928,7 +947,7 @@ class EnergyForecast(hass.Hass):
 
         if self._baseline_mode and sub_sensors_recent:
             if recent_actuals is not None:
-                recent_actuals, _ = _subtract_sub_sensors(recent_actuals, sub_sensors_recent)
+                recent_actuals, _ = _subtract_sub_sensors(recent_actuals, self._subtract_only_dict(sub_sensors_recent))
 
         live_temp  = self._read_live_temp()
         now_ts     = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
@@ -1562,7 +1581,7 @@ class EnergyForecast(hass.Hass):
             )
             # 2. Remove controllable sub-sensors
             if sub_sensors_recent:
-                blended_actuals, _ = _subtract_sub_sensors(blended_actuals, sub_sensors_recent)
+                blended_actuals, _ = _subtract_sub_sensors(blended_actuals, self._subtract_only_dict(sub_sensors_recent))
 
         today_total, blocks_today = _blend_today_totals(
             p_times, p_vals, blended_actuals, today_np, tomorrow_np, now_np
