@@ -738,6 +738,7 @@ class EnergyForecast(hass.Hass):
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
+        import pandas as pd
         self.log("Starting model retraining…")
         energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
 
