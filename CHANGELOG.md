@@ -10,6 +10,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-4] — 2026-04-11
+
+### Added
+- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: each signature now includes quality metadata: `cov` (coefficient of variation of cycle total_kwh), `reliability` (`"high"` / `"medium"` / `"low"` based on CoV thresholds), `n_cycles` is now also stored per cluster. Duration clusters (`short`, `long`) each carry `cov` and `reliability` independently, so mixed-program appliances (e.g., quick-wash vs. cotton) report accurate reliability per mode.
+- `apps/energy_forecast/model.py` — CoV-based clustering: cycles are split into CoV groups and a Jenks-like median-split heuristic assigns `"high"` (CoV < 0.25), `"medium"` (0.25–0.5), or `"low"` (> 0.5) reliability labels, enabling downstream consumers (scenario API, dashboards) to suppress or weight signatures by confidence.
+
+### Tests
+- 406 passing (5 new tests: `TestApplianceSignaturesMetadata` covering CoV computation, reliability labelling thresholds, per-cluster metadata, and JSON serialization round-trip).
+
+---
+
 ## [0.10.2-alpha-3] — 2026-04-11
 
 ### Added
