@@ -6,6 +6,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-2] — 2026-04-11
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `_fetch_history()` now maps `"on"` → `1.0` and `"off"` → `0.0` before attempting `float()`. Previously, `input_boolean` entities (e.g. `heating_system_active_entity: input_boolean.heizung_wintermodus`) caused `float("on")` to raise `ValueError` which was silently swallowed, returning an empty DataFrame and logging "No history found" despite HA having the data. τ calibration was therefore never receiving any `heating_active_df`. Two regression tests added.
+- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` now calls `fetch_recent_generic_sensor()` for `heating_system_active_entity` each prediction cycle, mirroring the DHW pattern. Previously the CSV cache was only written during training; HA's short history window (~10 days) meant the cache would drift stale between weekly retrains.
+- `apps/energy_forecast/model.py` — `_calibrate_tau()`: passive-cooling windows are now trimmed at the first hour where T_indoor ≤ T_outdoor (instead of rejecting the whole block). In spring, a single warm afternoon hour where outdoor temp briefly reaches indoor temp was discarding otherwise-valid multi-hour cooling curves.
+- `apps/energy_forecast/model.py` — `_calibrate_tau()`: windows are additionally trimmed at the first hour where ΔT stops declining (instead of rejecting on slope ≥ 0). Solar gain during off-periods pushes indoor temps up mid-block; the initial decay portion remains physically valid for the OLS fit.
+
+### Tests
+- 389 passing (2 new: `test_fetch_history_boolean_states`, `test_fetch_history_numeric_states_unchanged`)
+
+---
+
 ## [0.10.2-alpha-1] — 2026-04-11
 
 ### Added
