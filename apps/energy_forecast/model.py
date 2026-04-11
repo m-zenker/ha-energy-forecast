@@ -1034,9 +1034,17 @@ class EnergyForecastModel:
                 continue
             delta = delta[:valid_until]
 
+            # Trim at first hour where delta stops declining (e.g. solar gain)
+            # rather than rejecting — the initial decay portion is still valid.
+            if len(delta) > 1 and np.any(np.diff(delta) >= 0):
+                rising_at = int(np.argmax(np.diff(delta) >= 0)) + 1
+                if rising_at < 2:
+                    continue
+                delta = delta[:rising_at]
+
             t = np.arange(len(delta), dtype=float)
             slope, _ = np.polyfit(t, np.log(delta), 1)
-            if slope >= 0:  # temperature rising, not decaying — skip
+            if slope >= 0:  # safety net for noisy data
                 continue
 
             tau = -1.0 / slope
