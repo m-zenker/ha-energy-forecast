@@ -202,6 +202,8 @@ class EnergyForecastModel:
         self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
         # Sub-energy sensor prefixes used in last training run
         self._sub_sensor_prefixes: list[str] = []
+        # Building thermal time constant (hours) — calibrated from passive-cooling windows
+        self._tau_hours: float | None = None
 
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
@@ -225,6 +227,7 @@ class EnergyForecastModel:
         presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
         dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
+        heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -269,6 +272,16 @@ class EnergyForecastModel:
         # ── Appliance signature learning (Stage 3) ──────────────────────────
         self._appliance_signatures = _learn_appliance_signatures(sub_sensors_dict)
         self._save_signatures()
+
+        # ── Thermal time constant calibration (#55) ──────────────────────────
+        if climate_dfs and heating_active_df is not None and not heating_active_df.empty:
+            self._tau_hours = self._calibrate_tau(climate_dfs, heating_active_df, weather_df)
+        else:
+            if not climate_dfs:
+                _LOGGER.debug("τ calibration skipped: no climate_entities configured.")
+            elif heating_active_df is None or heating_active_df.empty:
+                _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
+
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
@@ -285,7 +298,7 @@ class EnergyForecastModel:
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
-                                dhw_df=dhw_df)
+                                dhw_df=dhw_df, tau_hours=self._tau_hours)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -576,7 +589,8 @@ class EnergyForecastModel:
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
-                                     climate_dfs=climate_recent, dhw_df=dhw_recent)
+                                     climate_dfs=climate_recent, dhw_df=dhw_recent,
+                                     tau_hours=self._tau_hours)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -862,6 +876,7 @@ class EnergyForecastModel:
             "canton":                    self._canton,
             "likely_ev_hours":           self._likely_ev_hours,
             "sub_sensor_prefixes":       self._sub_sensor_prefixes,
+            "tau_hours":                 self._tau_hours,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -953,6 +968,91 @@ class EnergyForecastModel:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _LOGGER.warning("Could not load appliance signatures: %s", exc)
 
+    def _calibrate_tau(
+        self,
+        climate_dfs: "dict[str, pd.DataFrame]",
+        heating_active_df: "pd.DataFrame",  # cols: timestamp, heating_active (0/1)
+        weather_df: "pd.DataFrame",          # cols: timestamp, temp_c
+    ) -> "float | None":
+        """Estimate building thermal time constant τ (hours) from passive-cooling windows.
+
+        Fits log-linear OLS on `ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ` for each
+        window where the heating system was confirmed off for ≥ 2 consecutive hours.
+        Returns median τ across valid windows, or None if fewer than 3 windows qualify.
+        """
+        import pandas as pd
+        import numpy as np
+
+        # Average indoor temperature across all climate entities
+        indoor_parts = []
+        for eid, c_df in climate_dfs.items():
+            if c_df.empty:
+                continue
+            c = c_df[["timestamp", "current_temp"]].copy()
+            c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
+            indoor_parts.append(c.set_index("timestamp")["current_temp"])
+
+        if not indoor_parts:
+            return None
+
+        T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
+
+        # Outdoor temperature from weather_df
+        outdoor = weather_df[["timestamp", "temp_c"]].copy()
+        outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
+        T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
+
+        # Heating active status (treat any value > 0.5 as "on")
+        active = heating_active_df[["timestamp", "heating_active"]].copy()
+        active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
+        active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
+
+        combined = pd.DataFrame({
+            "T_indoor":       T_indoor_series,
+            "T_outdoor":      T_outdoor_series,
+            "heating_active": active_series,
+        }).dropna().sort_index()
+
+        if combined.empty:
+            return None
+
+        # Label contiguous off-blocks
+        combined["off"] = (combined["heating_active"] == 0).astype(int)
+        combined["block"] = (combined["off"].diff().ne(0)).cumsum()
+
+        tau_estimates: list[float] = []
+        for _, group in combined[combined["off"] == 1].groupby("block"):
+            if len(group) < 2:
+                continue
+            group = group.iloc[:12]  # cap at 12h to avoid ambient drift
+
+            delta = group["T_indoor"].values - group["T_outdoor"].values
+            if np.any(delta <= 0):  # indoor ≤ outdoor → not passive cooling
+                continue
+
+            t = np.arange(len(delta), dtype=float)
+            slope, _ = np.polyfit(t, np.log(delta), 1)
+            if slope >= 0:  # temperature rising, not decaying — skip
+                continue
+
+            tau = -1.0 / slope
+            if 0.5 <= tau <= 200:  # physics sanity guard
+                tau_estimates.append(tau)
+
+        if len(tau_estimates) < 3:
+            _LOGGER.info(
+                "τ calibration: only %d valid passive-cooling windows found (need ≥3) — skipping.",
+                len(tau_estimates),
+            )
+            return None
+
+        tau_median = float(np.median(tau_estimates))
+        _LOGGER.info(
+            "Building τ estimated at %.1f h from %d passive-cooling windows.",
+            tau_median, len(tau_estimates),
+        )
+        return tau_median
+
     def _load(self) -> None:
         if self._model_path.exists():
             if not _verify_hash(self._model_path):
@@ -988,6 +1088,7 @@ class EnergyForecastModel:
                     self._canton               = meta.get("canton",                None)
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
                     self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
+                    self._tau_hours            = meta.get("tau_hours",             None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -1416,6 +1517,7 @@ def _engineer_features(
     presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
     climate_dfs: dict[str, pd.DataFrame] | None = None,
     dhw_df: pd.DataFrame | None = None,
+    tau_hours: float | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1566,9 +1668,12 @@ def _engineer_features(
             # Join all deltas
             from functools import reduce
             merged_deltas = reduce(lambda left, right: pd.merge(left, right, on="timestamp", how="outer"), deltas)
-            # Average delta across all rooms as the household "thermal pressure"
+            # Average delta across all rooms as the household "thermal pressure".
+            # When τ is known, scale by 1/τ to express urgency in °C/h rather than
+            # a static °C delta — a fast-cooling building (low τ) gets higher urgency.
             delta_cols = [c for c in merged_deltas.columns if c != "timestamp"]
-            merged_deltas["thermal_pressure"] = merged_deltas[delta_cols].mean(axis=1)
+            raw_delta = merged_deltas[delta_cols].mean(axis=1)
+            merged_deltas["thermal_pressure"] = raw_delta / tau_hours if tau_hours else raw_delta
 
             df["_ts_floor"] = df["timestamp"].dt.floor("1h")
             df = df.merge(merged_deltas[["timestamp", "thermal_pressure"]], left_on="_ts_floor", right_on="timestamp",
