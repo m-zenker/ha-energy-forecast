@@ -24,6 +24,9 @@ PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
 # Occupancy Detection
 PRESENCE_STATE_HOME = "home"
 
+# Appliance Signature Learning
+APPLIANCE_MAX_WINDOW_HOURS = 12  # Hard cap for adaptive cycle detection
+
 # Sensor Blending Logic
 # How many hours to trust the local outdoor sensor before
 # transitioning fully to the weather forecast.
