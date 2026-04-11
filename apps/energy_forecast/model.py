@@ -1027,29 +1027,34 @@ class EnergyForecastModel:
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
-            # Trim at first hour where indoor ≤ outdoor (e.g. warm spring afternoon)
-            # rather than rejecting the whole block — the initial decay is still valid.
-            valid_until = int(np.argmax(delta <= 0)) if np.any(delta <= 0) else len(delta)
-            if valid_until < 2:
-                continue
-            delta = delta[:valid_until]
 
-            # Trim at first hour where delta stops declining (e.g. solar gain)
-            # rather than rejecting — the initial decay portion is still valid.
-            if len(delta) > 1 and np.any(np.diff(delta) >= 0):
-                rising_at = int(np.argmax(np.diff(delta) >= 0)) + 1
-                if rising_at < 2:
+            # Scan ALL maximal contiguous sub-sequences where indoor is both
+            # warmer than outdoor (delta > 0) and cooling (diff < 0).
+            # Prefix-only trimming missed evening cooling windows when heating
+            # turns off in the morning — solar gain invalidates the early hours
+            # but the valuable signal is in the tail (no sun, outdoor temp sinking).
+            valid = delta > 0
+            declining = np.concatenate([[False], np.diff(delta) < 0])
+            mask = valid & declining
+
+            if not np.any(mask):
+                continue
+
+            edges = np.diff(mask.astype(int), prepend=0, append=0)
+            starts = np.where(edges == 1)[0]
+            ends   = np.where(edges == -1)[0]
+
+            for s, e in zip(starts, ends):
+                if e - s < 2:
                     continue
-                delta = delta[:rising_at]
-
-            t = np.arange(len(delta), dtype=float)
-            slope, _ = np.polyfit(t, np.log(delta), 1)
-            if slope >= 0:  # safety net for noisy data
-                continue
-
-            tau = -1.0 / slope
-            if 0.5 <= tau <= 200:  # physics sanity guard
-                tau_estimates.append(tau)
+                d = delta[s:e]
+                t = np.arange(len(d), dtype=float)
+                slope, _ = np.polyfit(t, np.log(d), 1)
+                if slope >= 0:  # safety net for noisy data
+                    continue
+                tau = -1.0 / slope
+                if 0.5 <= tau <= 200:  # physics sanity guard
+                    tau_estimates.append(tau)
 
         if len(tau_estimates) < 3:
             _LOGGER.info(

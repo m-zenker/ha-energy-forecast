@@ -2674,6 +2674,54 @@ class TestCalibrateTau:
         })
         assert model._calibrate_tau(climate_dfs, heating_df, weather_df) is None
 
+    def test_evening_cooling_window_used(self, tmp_path):
+        """Cooling in the tail of an off-block (after solar gain) still yields a τ.
+
+        Scenario: heating off for 12 h.  First 4 h: solar gain → indoor temp rises
+        (invalid prefix).  Hours 4-11: genuine passive cooling → valid sub-sequence
+        in the tail.  Old prefix-trim code would have discarded the entire block;
+        new sub-sequence scan should find and use the evening portion.
+        """
+        TRUE_TAU = 5.0
+        period = 12   # 4 h solar gain + 7 h cooling + 1 h heating-on gap
+        n_blocks = 4
+        n = period * n_blocks + 5
+        ts = pd.date_range("2024-01-10", periods=n, freq="1h")
+        T_out = 5.0
+
+        T_indoor = np.full(n, 20.0)
+        heating_active = np.ones(n, dtype=float)
+
+        # Build 4 off-blocks, each with solar-gain prefix + evening cooling tail
+        for block in range(n_blocks):
+            base = block * period
+            # Hours 0-3: solar gain — indoor rises from 20 → 23 °C
+            for j in range(4):
+                T_indoor[base + j] = 20.0 + j * 0.75
+                heating_active[base + j] = 0.0
+            # Hours 4-10: passive cooling from 23 °C with TRUE_TAU
+            for j in range(7):
+                T_indoor[base + 4 + j] = T_out + (23.0 - T_out) * np.exp(-j / TRUE_TAU)
+                heating_active[base + 4 + j] = 0.0
+
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp": ts, "current_temp": T_indoor, "setpoint": T_indoor + 1.0,
+        })}
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": heating_active})
+        weather_df = pd.DataFrame({
+            "timestamp": ts, "temp_c": [T_out] * n,
+            "precipitation_mm": [0.0] * n, "sunshine_min": [0.0] * n,
+            "wind_kmh": [0.0] * n, "cloud_cover_pct": [100.0] * n,
+            "direct_radiation_wm2": [0.0] * n,
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, "evening cooling sub-sequence should yield a τ estimate"
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
     def test_thermal_pressure_scaled(self, tmp_path):
         """_engineer_features applies 1/τ scaling when tau_hours is set."""
         n = 10
