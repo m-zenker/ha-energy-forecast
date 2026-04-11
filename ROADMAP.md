@@ -182,6 +182,37 @@ prediction projection + tests).
 temperature pressure. Night setback signal explains the 21:00–06:00 consumption reduction without
 relying on time-of-day features alone.
 
+### 55. Verified Passive Decay — building thermal time constant (τ) *(backlog)*
+
+**Origin:** Stage 2, task [2.4] from `temp/STAGED_ROADMAP_V1.md` — planned but not implemented.
+
+**Idea:** Observe the indoor temperature drop rate during verified heating-off periods (gated by
+`heating_system_active_entity`) to calibrate the building's thermal time constant τ (hours). A low
+τ means the house cools fast → the heat pump turns on sooner after a setpoint raise → predictable
+consumption spike.
+
+**Current gap:** `heating_system_active_entity` is read from config and stored in
+`self._heating_active_entity` (`energy_forecast.py:139`) but is never used. The `thermal_pressure`
+feature is a raw `setpoint − current_temp` delta with no τ weighting.
+
+**Implementation sketch:**
+- During each retrain, scan the climate + `heating_system_active_entity` history for windows where
+  heating was confirmed off for ≥ 2 h.
+- Fit an exponential decay `T_indoor(t) = T_outdoor + (T0 − T_outdoor) · e^(−t/τ)` on those
+  windows (scipy `curve_fit` or a simple log-linear OLS).
+- Store τ in `meta.pkl` alongside NaN medians.
+- Weight `thermal_pressure` by `1/τ` (or derive `hours_to_equilibrium = τ · ln(ΔT/threshold)`)
+  to give the model a physically meaningful "urgency" signal instead of a raw degree delta.
+
+**Dependencies:** `heating_system_active_entity` config key already wired up (`energy_forecast.py:139`).
+Climate history fetch already implemented (`fetch_climate_history` in `ha_data.py`).
+
+**Effort:** Medium (~4 h). Requires careful handling of summer/transition periods where heating is
+off for weeks (τ estimation becomes noisy without an outdoor temp anchor).
+
+**Impact:** Medium. Sharpens `thermal_pressure` accuracy, especially on buildings with fast thermal
+decay. Pairs with #15 (HVAC state).
+
 ---
 
 ## Distribution
