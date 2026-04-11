@@ -37,6 +37,7 @@ import json
 import logging
 import pickle
 import shutil
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from .const import (
+    APPLIANCE_MAX_WINDOW_HOURS,
     HOLDOUT_FRACTION,
     MAX_HOURLY_KWH,
     MIN_CV_ROWS,
@@ -1296,19 +1298,27 @@ def _add_sub_sensor_lags_training(
 
 def _learn_appliance_signatures(
     sub_sensors: dict | None,
-    window_hours: int = 4,
     min_cycles: int = 2,
 ) -> dict:
     """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
 
-    For each prefix, detect run cycles (0→>0 transitions), extract a
-    ``window_hours``-wide kWh profile for every cycle, and average them.
-    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
-    detected cycles are omitted.
+    Improvements over the original fixed-window approach:
 
-    Each signature includes ``std_profile`` (per-hour standard deviation across
-    cycles) and logs a WARNING if the coefficient of variation exceeds 0.3,
-    indicating that scenario predictions for that appliance may be inaccurate.
+    * **Adaptive window** — cycle end is detected when consumption drops back to
+      the idle level rather than using a hard 4-hour cutoff. A cap of
+      ``APPLIANCE_MAX_WINDOW_HOURS`` prevents runaway windows.
+    * **Demand-surge detection** — appliances that never drop to zero (e.g. heat
+      pumps in heating season) use the 25th-percentile consumption as the idle
+      baseline; starts are detected as upward crossings of that threshold.
+    * **Outlier cycle rejection** — cycles whose total kWh exceeds
+      ``median + 2 × σ`` are discarded before averaging (requires ≥ 4 cycles).
+    * **Duration clustering** — if detected cycles naturally split into short
+      and long programs (median duration ≥ 2 h), separate cluster profiles are
+      stored under ``"clusters"``.  The top-level ``hourly_profile`` is always
+      present for backward compatibility with ``_composite_forecast()``.
+
+    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
+    valid cycles are omitted.
     """
     import numpy as np
     import pandas as pd
@@ -1316,12 +1326,34 @@ def _learn_appliance_signatures(
     if not sub_sensors:
         return {}
 
+    def _avg_profile(
+        wins: list[list[float]],
+    ) -> tuple[list[float], list[float]]:
+        """Pad variable-length windows to the same length and average column-wise."""
+        max_len = max(len(w) for w in wins)
+        padded = [w + [0.0] * (max_len - len(w)) for w in wins]
+        arr = np.array(padded)
+        return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
+
+    def _cov_warning(prefix: str, label: str, profile: list[float], std: list[float]) -> None:
+        mean_arr = np.array(profile)
+        std_arr = np.array(std)
+        nonzero = mean_arr > 0
+        if nonzero.any():
+            cov_max = float((std_arr[nonzero] / mean_arr[nonzero]).max())
+            if cov_max > 0.3:
+                _LOGGER.warning(
+                    "Appliance '%s' (%s) signature has high variability (CoV=%.2f)"
+                    " — scenario predictions may be inaccurate.",
+                    prefix, label, cov_max,
+                )
+
     result: dict = {}
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
             continue
 
-        # Align to hourly index (same as lag helper)
+        # ── Align to hourly index ──────────────────────────────────────────────
         kwh_series = (
             sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
             .sort_index()
@@ -1329,45 +1361,100 @@ def _learn_appliance_signatures(
             .sum()
             .astype(float)
         )
-        filled = kwh_series.fillna(0)
+        filled = kwh_series.fillna(0.0)
+        n = len(filled)
 
-        # Detect cycle starts: previous hour was 0, current hour > 0
-        is_start = (filled > 0) & (filled.shift(1).fillna(0) == 0)
+        # ── Idle threshold (adaptive) ──────────────────────────────────────────
+        # Appliances that never truly idle (e.g. HP heating in winter) have
+        # <5 % zero-hours; use the bottom-quartile level as the "off" baseline.
+        zero_frac = float((filled == 0).mean())
+        if zero_frac >= 0.05:
+            idle_thresh = 0.0
+        else:
+            idle_thresh = float(filled.quantile(0.25))
+
+        # ── Cycle start detection ──────────────────────────────────────────────
+        prev = filled.shift(1).fillna(idle_thresh)
+        is_start = (filled > idle_thresh) & (prev <= idle_thresh)
         start_positions = [i for i, v in enumerate(is_start) if v]
 
+        # ── Extract variable-length windows ────────────────────────────────────
         windows: list[list[float]] = []
         for pos in start_positions:
-            window = filled.iloc[pos : pos + window_hours]
-            if len(window) < window_hours:
-                continue  # truncated at end of history — skip
-            windows.append(window.tolist())
+            end = pos + 1
+            while (
+                end < n
+                and end - pos < APPLIANCE_MAX_WINDOW_HOURS
+                and filled.iloc[end] > idle_thresh
+            ):
+                end += 1
+            # Skip if the cycle was still running when history ended (truncated).
+            # A cycle that hit the MAX_WINDOW cap is kept — it's complete enough.
+            if end >= n and filled.iloc[end - 1] > idle_thresh:
+                continue
+            windows.append(filled.iloc[pos:end].tolist())
 
         if len(windows) < min_cycles:
             continue
 
-        arr = np.array(windows)  # shape: (n_cycles, window_hours)
-        hourly_profile = np.mean(arr, axis=0).tolist()
-        std_profile = np.std(arr, axis=0).tolist()
-
-        mean_arr = np.mean(arr, axis=0)
-        std_arr = np.std(arr, axis=0)
-        nonzero_mask = mean_arr > 0
-        if nonzero_mask.any():
-            cov_max = float((std_arr[nonzero_mask] / mean_arr[nonzero_mask]).max())
-            if cov_max > 0.3:
-                _LOGGER.warning(
-                    "Appliance '%s' signature has high variability (CoV=%.2f) across %d cycles"
-                    " — scenario predictions may be inaccurate.",
-                    prefix, cov_max, len(windows),
+        # ── Outlier cycle rejection (requires ≥ 4 cycles) ─────────────────────
+        totals = np.array([sum(w) for w in windows])
+        n_rejected = 0
+        if len(totals) >= 4:
+            median_t = float(np.median(totals))
+            std_t = float(np.std(totals))
+            keep_mask = totals <= median_t + 2.0 * std_t
+            n_rejected = int((~keep_mask).sum())
+            if n_rejected:
+                windows = [w for w, keep in zip(windows, keep_mask) if keep]
+                _LOGGER.debug(
+                    "Appliance '%s': rejected %d outlier cycle(s) (total kWh > median + 2σ)",
+                    prefix, n_rejected,
                 )
 
-        result[prefix] = {
+        if len(windows) < min_cycles:
+            continue
+
+        # ── Duration clustering ────────────────────────────────────────────────
+        durations = [len(w) for w in windows]
+        median_dur = statistics.median(durations)
+        clusters: dict = {}
+        if median_dur >= 2:
+            short_wins = [w for w, d in zip(windows, durations) if d <= median_dur]
+            long_wins = [w for w, d in zip(windows, durations) if d > median_dur]
+            for label, wins in [("short", short_wins), ("long", long_wins)]:
+                if not wins:
+                    continue
+                prof, std = _avg_profile(wins)
+                clusters[label] = {
+                    "n_cycles": len(wins),
+                    "median_duration_h": int(statistics.median(len(w) for w in wins)),
+                    "hourly_profile": prof,
+                    "std_profile": std,
+                    "total_kwh": float(sum(prof)),
+                }
+                _cov_warning(prefix, label, prof, std)
+
+        # ── Combined profile (backward-compatible top-level keys) ──────────────
+        hourly_profile, std_profile = _avg_profile(windows)
+
+        # CoV warning only if clustering did not split (or only one cluster exists)
+        if len(clusters) <= 1:
+            _cov_warning(prefix, "combined", hourly_profile, std_profile)
+
+        sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
             "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),
+            "n_rejected": n_rejected,
+            "idle_threshold": idle_thresh,
         }
+        if clusters:
+            sig["clusters"] = clusters
+
+        result[prefix] = sig
 
     return result
 

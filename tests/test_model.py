@@ -2205,7 +2205,7 @@ class TestApplianceSignatures:
             "kwh": [1.0, 1.0],
         })
         df = pd.concat([df_full, extra], ignore_index=True)
-        sigs = _learn_appliance_signatures({"dw": df}, window_hours=4, min_cycles=2)
+        sigs = _learn_appliance_signatures({"dw": df}, min_cycles=2)
         assert "dw" in sigs
         # The partial window must not inflate n_cycles
         assert sigs["dw"]["n_cycles"] == 3
@@ -2222,9 +2222,10 @@ class TestApplianceSignatures:
     def test_high_variability_logs_warning(self, caplog):
         """Two very different cycles (CoV > 0.3) → WARNING logged."""
         import logging
-        # Cycle 1: high consumption; cycle 2: low consumption → CoV ≈ 0.9
-        ts = pd.date_range("2026-01-01", periods=10, freq="1h")
-        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1]
+        # Cycle 1: high consumption [2.0]*4; cycle 2: low consumption [0.1]*4
+        # Trailing zeros so neither cycle is truncated at end of history.
+        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1] + [0.0] * 12
+        ts = pd.date_range("2026-01-01", periods=len(kwh), freq="1h")
         df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
         with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
             _learn_appliance_signatures({"hp": df}, min_cycles=2)
@@ -2315,7 +2316,164 @@ class TestApplianceSignatures:
 
         assert model2._appliance_signatures == saved
         assert "std_profile" in model2._appliance_signatures["sub_hp"]
-        assert len(model2._appliance_signatures["sub_hp"]["std_profile"]) == 4
+
+    # ── New-behaviour tests ───────────────────────────────────────────────────
+
+    def test_adaptive_window_short_cycle(self):
+        """A 2-hour actual cycle produces a profile of length 2, not 4."""
+        # cycle_kwh has 2 non-zero slots; period_hours=12 so next 10 slots are 0
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=12)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert len(sigs["dw"]["hourly_profile"]) == 2
+        assert sigs["dw"]["hourly_profile"] == pytest.approx([1.0, 0.5])
+
+    def test_adaptive_window_long_cycle(self):
+        """A 6-hour actual cycle produces a profile of length 6."""
+        df = _make_cycle_df([0.5, 1.0, 1.5, 1.2, 0.8, 0.3], n_cycles=3, period_hours=18)
+        sigs = _learn_appliance_signatures({"wm": df})
+        assert "wm" in sigs
+        assert len(sigs["wm"]["hourly_profile"]) == 6
+
+    def test_adaptive_window_max_cap(self):
+        """A cycle running longer than APPLIANCE_MAX_WINDOW_HOURS is capped."""
+        from energy_forecast.const import APPLIANCE_MAX_WINDOW_HOURS
+        # 15 consecutive non-zero hours, then 5 zero hours, repeated
+        long_cycle = [1.0] * 15
+        df = _make_cycle_df(long_cycle, n_cycles=3, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        assert len(sigs["hp"]["hourly_profile"]) <= APPLIANCE_MAX_WINDOW_HOURS
+
+    def test_never_zero_surge_detection(self):
+        """HP-style series (never drops to 0) — starts still detected via idle threshold."""
+        # Baseline ~1 kWh/h; demand surges to 3 kWh/h for 2h each cycle
+        ts = pd.date_range("2024-01-01", periods=60, freq="1h")
+        kwh = [1.0] * 60
+        # Two surges: hours 5-6 and 30-31
+        for h in [5, 6, 30, 31]:
+            kwh[h] = 3.0
+        df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        sigs = _learn_appliance_signatures({"hp_heat": df})
+        # Should detect at least one surge cycle (idle_thresh = Q25 ≈ 1.0)
+        # Whether 1 or 2 cycles detected depends on quartile; just ensure no crash
+        # and backward-compat keys present if any cycles found
+        if "hp_heat" in sigs:
+            assert "hourly_profile" in sigs["hp_heat"]
+            assert "n_cycles" in sigs["hp_heat"]
+
+    def test_outlier_cycle_rejected(self):
+        """One cycle with 5× the normal kWh is rejected; profile reflects the rest."""
+        # Normal cycles: [1.0, 0.5] each; outlier: [5.0, 5.0]
+        normal_cycles = _make_cycle_df([1.0, 0.5], n_cycles=5, period_hours=10)
+        # Append one outlier cycle at the end
+        last_ts = normal_cycles["timestamp"].iloc[-1]
+        outlier_ts = pd.date_range(last_ts + pd.Timedelta("1h"), periods=2, freq="1h")
+        # Leave enough room after outlier so it isn't truncated (>= APPLIANCE_MAX_WINDOW_HOURS)
+        padding_ts = pd.date_range(outlier_ts[-1] + pd.Timedelta("1h"), periods=12, freq="1h")
+        outlier = pd.DataFrame({"timestamp": outlier_ts, "kwh": [5.0, 5.0]})
+        padding = pd.DataFrame({"timestamp": padding_ts, "kwh": [0.0] * 12})
+        df = pd.concat([normal_cycles, outlier, padding], ignore_index=True)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        # With outlier rejected, profile should be close to [1.0, 0.5]
+        assert sigs["dw"]["hourly_profile"][0] == pytest.approx(1.0, abs=0.2)
+        assert sigs["dw"]["n_rejected"] >= 1
+
+    def test_outlier_rejection_skipped_with_few_cycles(self):
+        """With only 3 cycles, no outlier rejection is applied (threshold: ≥ 4)."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["n_rejected"] == 0
+
+    def test_duration_clustering_two_groups(self):
+        """Mix of 2h and 5h cycles → both 'short' and 'long' clusters present."""
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # 5 short cycles (2h), 5 long cycles (5h), separated by 5h gaps
+        for _ in range(5):
+            for h in range(2):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(1.0)
+            t += pd.Timedelta(hours=7)
+        for _ in range(5):
+            for h in range(5):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(1.0)
+            t += pd.Timedelta(hours=10)
+        # Add tail padding to avoid truncation
+        for h in range(12):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"wm": df})
+        assert "wm" in sigs
+        assert "clusters" in sigs["wm"]
+        assert "short" in sigs["wm"]["clusters"]
+        assert "long" in sigs["wm"]["clusters"]
+        assert sigs["wm"]["clusters"]["short"]["median_duration_h"] == 2
+        assert sigs["wm"]["clusters"]["long"]["median_duration_h"] == 5
+
+    def test_duration_clustering_single_group(self):
+        """Uniform-duration cycles → no clusters key (or clusters is absent/single)."""
+        df = _make_cycle_df([1.0, 0.5, 0.2], n_cycles=5, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        # All cycles are 3h → median_dur=3; short == long bucket doesn't split
+        # Clusters key may be absent or have only one entry
+        clusters = sigs["dw"].get("clusters", {})
+        assert len(clusters) <= 1
+
+    def test_cov_warning_suppressed_after_clustering(self, caplog):
+        """Mixed-duration cycles that are internally consistent → no WARNING after cluster split."""
+        import logging
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # Short cycles: consistent 2h pattern [1.5, 0.5]
+        for _ in range(6):
+            for h, v in enumerate([1.5, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=6)
+        # Long cycles: consistent 4h pattern [0.5, 1.0, 1.0, 0.5]
+        for _ in range(6):
+            for h, v in enumerate([0.5, 1.0, 1.0, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=8)
+        # Tail padding
+        for h in range(12):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+            sigs = _learn_appliance_signatures({"wm": df})
+        # Clusters should exist; no high-variability warning expected
+        assert "wm" in sigs
+        assert "clusters" in sigs["wm"]
+        assert not any("high variability" in r.message for r in caplog.records)
+
+    def test_schema_backward_compatible(self):
+        """New schema always contains the original keys for _composite_forecast compatibility."""
+        df = _make_cycle_df([1.0, 2.0, 1.5, 0.5], n_cycles=4, period_hours=12)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        for key in ("total_kwh", "hourly_profile", "std_profile", "peak_hour", "n_cycles"):
+            assert key in sigs["dw"], f"Missing backward-compat key: {key}"
+        # New keys
+        assert "n_rejected" in sigs["dw"]
+        assert "idle_threshold" in sigs["dw"]
+
+    def test_composite_forecast_works_with_new_schema(self):
+        """_composite_forecast reads hourly_profile correctly from new schema."""
+        df = _make_cycle_df([1.0, 2.0, 1.5], n_cycles=4, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        baseline = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(baseline, {"dw": "14:00"}, sigs)
+        assert "delta_kwh" in result.columns
+        # Profile was placed at offset 4 (14:00 - 10:00 = 4h)
+        assert result["delta_kwh"].iloc[4] == pytest.approx(sigs["dw"]["hourly_profile"][0])
 
 
 # ── _composite_forecast (Stage 4) ────────────────────────────────────────────

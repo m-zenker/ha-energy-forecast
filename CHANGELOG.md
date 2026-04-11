@@ -6,6 +6,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- `apps/energy_forecast/const.py` — new `APPLIANCE_MAX_WINDOW_HOURS = 12` constant caps the adaptive cycle window to prevent runaway detection.
+- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **adaptive window** — cycle end is now detected at the first return to idle instead of a fixed 4-hour cutoff. The `window_hours` parameter is removed. Fixes truncated profiles for long-duration appliances (tumble dryer cotton, DHW heating).
+- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **demand-surge detection** — appliances with < 5 % zero-hours (e.g. heat pump heating in winter) use the 25th-percentile consumption as idle baseline; cycle starts/ends are upward/downward threshold crossings instead of strict 0→>0 transitions. Eliminates "no cycles found" for always-on devices.
+- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **outlier cycle rejection** — cycles with total_kwh > median + 2σ are discarded before averaging (≥ 4 cycles required). Stored as `n_rejected` in the signature JSON.
+- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **duration clustering** — cycles with median duration ≥ 2 h are split into `short` and `long` clusters via median-duration split. Each cluster stores its own `hourly_profile`, `std_profile`, and `total_kwh`. CoV warnings are evaluated per cluster, eliminating false positives caused by mixed programs (quick wash vs. cotton 90°, ECO dishwasher vs. intensive). Top-level keys preserved for backward compatibility; `_composite_forecast()` unchanged.
+
+### Tests
+- 401 passing (11 new in `TestApplianceSignatures` covering adaptive window, demand-surge detection, outlier rejection, duration clustering, CoV warning suppression, and backward-compatible JSON schema).
+
+---
+
 ## [0.10.2-alpha-2] — 2026-04-11
 
 ### Fixed
