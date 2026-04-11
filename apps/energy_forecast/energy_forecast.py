@@ -998,6 +998,21 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"DHW {self._dhw_buffer_sensor} recent fetch failed: {exc}", level="WARNING")
 
+        if self._heating_active_entity:
+            ha_path = self._generic_sensor_cache_path(
+                self._heating_active_entity, prefix="heating_active"
+            )
+            try:
+                ha_data.fetch_recent_generic_sensor(
+                    self, self._heating_active_entity, ha_path,
+                    column_name="heating_active", timezone=self._timezone,
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(
+                    f"Heating active {self._heating_active_entity} recent fetch failed: {exc}",
+                    level="WARNING",
+                )
+
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df    = forecast_df
         self._cached_live_temp      = live_temp
