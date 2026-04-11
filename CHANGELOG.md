@@ -6,6 +6,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-1] — 2026-04-11
+
+### Added
+- `apps/energy_forecast/model.py` — **#55 Verified Passive Decay (τ calibration)**: new `_calibrate_tau()` method fits log-linear OLS on passive-cooling windows (contiguous periods where the heating system is confirmed off) to estimate the building thermal time constant τ (hours). Result is the median τ across all qualifying windows (minimum 3). τ is used to scale `thermal_pressure` by `1/τ`, expressing heating urgency in °C/h rather than a static °C delta — more physically meaningful and transfer-learned between climates. τ persisted in `meta.pkl` so it survives AppDaemon restarts without re-fitting.
+- `apps/energy_forecast/energy_forecast.py` — fetches `heating_system_active_entity` history (30 days, binary 0/1) and passes it to `train()` as `heating_active_df` for τ calibration. Fully backward-compatible: if `heating_system_active_entity` is not configured, calibration is skipped and `thermal_pressure` remains unchanged.
+
+### Tests
+- 387 passing (5 new since v0.10.1: `TestCalibrateTau` covering the OLS fit, sanity bounds, minimum-window guard, non-positive-delta skip, and rising-temperature skip)
+
+---
+
 ## [0.10.1] — 2026-04-10
 
 ### Added
