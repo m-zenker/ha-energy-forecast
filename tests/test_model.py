@@ -2577,3 +2577,158 @@ class TestConcurrency:
         assert result is not None
         assert len(result) == 48
         assert "predicted_kwh" in result.columns
+
+
+# ── τ (thermal time constant) calibration ─────────────────────────────────────
+
+def _make_tau_fixtures(tau: float, n_windows: int = 5, window_len: int = 8):
+    """Build synthetic climate_dfs, heating_active_df, weather_df for τ tests.
+
+    Each cooling window spans `window_len` hours with indoor temperature decaying
+    from T0=22°C toward T_outdoor=5°C with the given τ.  Heating-on gaps of 3 h
+    separate windows.
+    """
+    rng = np.random.default_rng(42)
+    T0, T_out = 22.0, 5.0
+    period = window_len + 3  # window + heating-on gap
+    total_hours = n_windows * period + 5
+    timestamps = pd.date_range("2024-01-01", periods=total_hours, freq="1h")
+
+    T_indoor = np.full(total_hours, T0)
+    heating_active = np.ones(total_hours, dtype=float)
+
+    for i in range(n_windows):
+        start = i * period
+        for j in range(window_len):
+            idx = start + j
+            if idx >= total_hours:
+                break
+            T_indoor[idx] = T_out + (T0 - T_out) * np.exp(-j / tau)
+            heating_active[idx] = 0  # heating off
+
+    # Tiny noise so OLS isn't perfectly noiseless (more realistic)
+    T_indoor += rng.normal(0, 0.05, size=total_hours)
+    T_indoor = np.clip(T_indoor, T_out + 0.1, None)
+
+    climate_df = pd.DataFrame({
+        "timestamp":    timestamps,
+        "current_temp": T_indoor,
+        "setpoint":     T_indoor + 1.0,  # setpoint doesn't matter for τ estimation
+    })
+    heating_df = pd.DataFrame({
+        "timestamp":      timestamps,
+        "heating_active": heating_active,
+    })
+    weather_df = pd.DataFrame({
+        "timestamp":            timestamps,
+        "temp_c":               [T_out] * total_hours,
+        "precipitation_mm":     [0.0]   * total_hours,
+        "sunshine_min":         [0.0]   * total_hours,
+        "wind_kmh":             [0.0]   * total_hours,
+        "cloud_cover_pct":      [100.0] * total_hours,
+        "direct_radiation_wm2": [0.0]   * total_hours,
+    })
+    return {"climate.test": climate_df}, heating_df, weather_df
+
+
+class TestCalibrateTau:
+    def test_known_tau(self, tmp_path):
+        """τ estimated from synthetic data matches the true value within 10%."""
+        TRUE_TAU = 4.0
+        model = EnergyForecastModel(model_dir=tmp_path)
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(TRUE_TAU)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.10, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
+    def test_insufficient_windows(self, tmp_path):
+        """Fewer than 3 valid windows → returns None."""
+        model = EnergyForecastModel(model_dir=tmp_path)
+        # Only 2 windows
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(4.0, n_windows=2)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def test_heating_always_on(self, tmp_path):
+        """No off-window → returns None."""
+        model = EnergyForecastModel(model_dir=tmp_path)
+        n = 100
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [20.0] * n,
+            "setpoint":     [21.0] * n,
+        })}
+        heating_df = pd.DataFrame({
+            "timestamp":      ts,
+            "heating_active": [1.0] * n,  # always on
+        })
+        weather_df = pd.DataFrame({
+            "timestamp": ts,
+            "temp_c":    [5.0] * n,
+            "precipitation_mm": [0.0] * n, "sunshine_min": [0.0] * n,
+            "wind_kmh": [0.0] * n, "cloud_cover_pct": [0.0] * n,
+            "direct_radiation_wm2": [0.0] * n,
+        })
+        assert model._calibrate_tau(climate_dfs, heating_df, weather_df) is None
+
+    def test_thermal_pressure_scaled(self, tmp_path):
+        """_engineer_features applies 1/τ scaling when tau_hours is set."""
+        n = 10
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0]   * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [0.0]   * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+        climate_df = pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0] * n,
+            "setpoint":     [20.0] * n,   # raw delta = 2.0 °C
+        })
+        TAU = 2.0
+        result = _engineer_features(
+            df, weather, None,
+            climate_dfs={"climate.room": climate_df},
+            tau_hours=TAU,
+        )
+        # thermal_pressure should be 2.0 / 2.0 = 1.0 °C/h
+        assert "thermal_pressure" in result.columns
+        non_zero = result["thermal_pressure"].dropna()
+        assert len(non_zero) > 0
+        np.testing.assert_allclose(non_zero.values, 1.0, atol=1e-6)
+
+    def test_thermal_pressure_no_tau(self, tmp_path):
+        """Without τ, thermal_pressure equals the raw setpoint−current_temp delta."""
+        n = 10
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0]   * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [0.0]   * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+        climate_df = pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0] * n,
+            "setpoint":     [21.0] * n,  # raw delta = 3.0 °C
+        })
+        result = _engineer_features(
+            df, weather, None,
+            climate_dfs={"climate.room": climate_df},
+            tau_hours=None,  # no τ — backward-compat path
+        )
+        non_zero = result["thermal_pressure"].dropna()
+        assert len(non_zero) > 0
+        np.testing.assert_allclose(non_zero.values, 3.0, atol=1e-6)

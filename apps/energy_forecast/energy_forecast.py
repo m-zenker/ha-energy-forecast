@@ -888,6 +888,25 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"DHW {self._dhw_buffer_sensor} history fetch failed: {exc}", level="WARNING")
 
+        # ── Stage 2 / #55: Heating active sensor (τ calibration) ─────────────
+        heating_active_df = pd.DataFrame()
+        if self._heating_active_entity:
+            ha_path = self._generic_sensor_cache_path(
+                self._heating_active_entity, prefix="heating_active"
+            )
+            try:
+                heating_active_df = ha_data.fetch_generic_sensor_history(
+                    self, self._heating_active_entity, ha_path,
+                    column_name="heating_active", timezone=self._timezone,
+                )
+                if not heating_active_df.empty:
+                    heating_active_df = _strip_tz(heating_active_df, self._timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(
+                    f"Heating active {self._heating_active_entity} fetch failed: {exc}",
+                    level="WARNING",
+                )
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -901,6 +920,7 @@ class EnergyForecast(hass.Hass):
             presence_df=presence_df if not presence_df.empty else None,
             climate_dfs=climate_dfs or None,
             dhw_df=dhw_df if not dhw_df.empty else None,
+            heating_active_df=heating_active_df if not heating_active_df.empty else None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
