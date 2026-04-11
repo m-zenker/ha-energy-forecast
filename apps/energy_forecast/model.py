@@ -1027,8 +1027,12 @@ class EnergyForecastModel:
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
-            if np.any(delta <= 0):  # indoor ≤ outdoor → not passive cooling
+            # Trim at first hour where indoor ≤ outdoor (e.g. warm spring afternoon)
+            # rather than rejecting the whole block — the initial decay is still valid.
+            valid_until = int(np.argmax(delta <= 0)) if np.any(delta <= 0) else len(delta)
+            if valid_until < 2:
                 continue
+            delta = delta[:valid_until]
 
             t = np.arange(len(delta), dtype=float)
             slope, _ = np.polyfit(t, np.log(delta), 1)
