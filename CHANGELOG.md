@@ -13,9 +13,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` now calls `fetch_recent_generic_sensor()` for `heating_system_active_entity` each prediction cycle, mirroring the DHW pattern. Previously the CSV cache was only written during training; HA's short history window (~10 days) meant the cache would drift stale between weekly retrains.
 - `apps/energy_forecast/model.py` — `_calibrate_tau()`: passive-cooling windows are now trimmed at the first hour where T_indoor ≤ T_outdoor (instead of rejecting the whole block). In spring, a single warm afternoon hour where outdoor temp briefly reaches indoor temp was discarding otherwise-valid multi-hour cooling curves.
 - `apps/energy_forecast/model.py` — `_calibrate_tau()`: windows are additionally trimmed at the first hour where ΔT stops declining (instead of rejecting on slope ≥ 0). Solar gain during off-periods pushes indoor temps up mid-block; the initial decay portion remains physically valid for the OLS fit.
+- `apps/energy_forecast/model.py` — `_calibrate_tau()`: replaced prefix-trim approach with a full sub-sequence scan. Each off-block is now scanned for all maximal contiguous intervals where `delta > 0` AND `diff(delta) < 0` simultaneously; each qualifying run of ≥ 2 hours is evaluated independently. This captures evening cooling windows (the most valuable signal when heating turns off in the morning and solar gain dominates the early hours) that the prefix-trim approach discarded entirely.
 
 ### Tests
-- 389 passing (2 new: `test_fetch_history_boolean_states`, `test_fetch_history_numeric_states_unchanged`)
+- 390 passing (3 new: `test_fetch_history_boolean_states`, `test_fetch_history_numeric_states_unchanged`, `test_evening_cooling_window_used`)
 
 ---
 
