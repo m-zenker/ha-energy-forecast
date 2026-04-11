@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.10.2-alpha-3] — 2026-04-11
+
 ### Added
 - `apps/energy_forecast/const.py` — new `APPLIANCE_MAX_WINDOW_HOURS = 12` constant caps the adaptive cycle window to prevent runaway detection.
 - `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **adaptive window** — cycle end is now detected at the first return to idle instead of a fixed 4-hour cutoff. The `window_hours` parameter is removed. Fixes truncated profiles for long-duration appliances (tumble dryer cotton, DHW heating).
