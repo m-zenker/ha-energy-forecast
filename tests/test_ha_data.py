@@ -19,7 +19,7 @@ import pandas as pd
 import pytest
 
 from energy_forecast import ha_data
-from energy_forecast.ha_data import _check_dst_duplicates, _merge_energy_frames, _merge_frames
+from energy_forecast.ha_data import _check_dst_duplicates, _fetch_history, _merge_energy_frames, _merge_frames
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -123,6 +123,35 @@ class TestClimateAndGenericHistory:
         assert "buffer_temp" in df.columns
         assert df.iloc[0]["buffer_temp"] == 54.5
         assert cache_file.exists()
+
+    def test_fetch_history_boolean_states(self, mock_app):
+        """_fetch_history maps 'on'→1.0 and 'off'→0.0 for input_boolean entities."""
+        states = [
+            {"last_updated": "2024-01-01T10:00:00+01:00", "state": "on"},
+            {"last_updated": "2024-01-01T11:00:00+01:00", "state": "off"},
+            {"last_updated": "2024-01-01T12:00:00+01:00", "state": "unavailable"},
+        ]
+        mock_app.get_history.return_value = [states]
+
+        df = _fetch_history(mock_app, "input_boolean.heizung_wintermodus", days=30)
+
+        assert len(df) == 2, "unavailable state must be skipped"
+        assert df.iloc[0]["value"] == pytest.approx(1.0)
+        assert df.iloc[1]["value"] == pytest.approx(0.0)
+
+    def test_fetch_history_numeric_states_unchanged(self, mock_app):
+        """_fetch_history still parses numeric states correctly."""
+        states = [
+            {"last_updated": "2024-01-01T10:00:00+01:00", "state": "55.3"},
+            {"last_updated": "2024-01-01T11:00:00+01:00", "state": "54.1"},
+        ]
+        mock_app.get_history.return_value = [states]
+
+        df = _fetch_history(mock_app, "sensor.dhw_temp", days=30)
+
+        assert len(df) == 2
+        assert df.iloc[0]["value"] == pytest.approx(55.3)
+        assert df.iloc[1]["value"] == pytest.approx(54.1)
 
 
 # ── _merge_energy_frames ─────────────────────────────────────────────────────

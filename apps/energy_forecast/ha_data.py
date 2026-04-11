@@ -826,7 +826,13 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = 
                 row.update(attrs)
                 rows.append(row)
             else:
-                val = float(state["state"])
+                raw_state = state["state"]
+                if raw_state.lower() == "on":
+                    val = 1.0
+                elif raw_state.lower() == "off":
+                    val = 0.0
+                else:
+                    val = float(raw_state)
                 rows.append({"timestamp": ts, "value": val})
         except (ValueError, KeyError, TypeError):
             continue
