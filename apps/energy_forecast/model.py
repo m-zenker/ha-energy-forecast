@@ -966,7 +966,15 @@ class EnergyForecastModel:
             return
         try:
             with open(self._signatures_path) as fh:
-                self._appliance_signatures = json.load(fh)
+                raw = json.load(fh)
+            # JSON serialises dict keys as strings; convert hour_of_day_distribution
+            # keys back to int so the in-memory representation is consistent.
+            for sig in raw.values():
+                if "hour_of_day_distribution" in sig:
+                    sig["hour_of_day_distribution"] = {
+                        int(k): v for k, v in sig["hour_of_day_distribution"].items()
+                    }
+            self._appliance_signatures = raw
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _LOGGER.warning("Could not load appliance signatures: %s", exc)
 
@@ -1298,7 +1306,7 @@ def _add_sub_sensor_lags_training(
 
 def _learn_appliance_signatures(
     sub_sensors: dict | None,
-    min_cycles: int = 2,
+    min_cycles: int = 3,
 ) -> dict:
     """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
 
@@ -1380,6 +1388,7 @@ def _learn_appliance_signatures(
 
         # ── Extract variable-length windows ────────────────────────────────────
         windows: list[list[float]] = []
+        valid_starts: list[int] = []  # parallel to windows; tracks start index in filled
         for pos in start_positions:
             end = pos + 1
             while (
@@ -1393,6 +1402,7 @@ def _learn_appliance_signatures(
             if end >= n and filled.iloc[end - 1] > idle_thresh:
                 continue
             windows.append(filled.iloc[pos:end].tolist())
+            valid_starts.append(pos)
 
         if len(windows) < min_cycles:
             continue
@@ -1407,6 +1417,7 @@ def _learn_appliance_signatures(
             n_rejected = int((~keep_mask).sum())
             if n_rejected:
                 windows = [w for w, keep in zip(windows, keep_mask) if keep]
+                valid_starts = [s for s, keep in zip(valid_starts, keep_mask) if keep]
                 _LOGGER.debug(
                     "Appliance '%s': rejected %d outlier cycle(s) (total kWh > median + 2σ)",
                     prefix, n_rejected,
@@ -1416,10 +1427,16 @@ def _learn_appliance_signatures(
             continue
 
         # ── Duration clustering ────────────────────────────────────────────────
+        # Trigger on high energy CoV (> 0.5) in addition to long median duration,
+        # so bimodal consumers like heat-pump heating (many 1h pulses + occasional
+        # multi-hour runs) are also split into short/long clusters.
         durations = [len(w) for w in windows]
         median_dur = statistics.median(durations)
+        cycle_totals = np.array([sum(w) for w in windows])
+        mean_total = float(np.mean(cycle_totals))
+        energy_cov = float(np.std(cycle_totals) / mean_total) if mean_total > 0 else 0.0
         clusters: dict = {}
-        if median_dur >= 2:
+        if median_dur >= 2 or energy_cov > 0.5:
             short_wins = [w for w, d in zip(windows, durations) if d <= median_dur]
             long_wins = [w for w, d in zip(windows, durations) if d > median_dur]
             for label, wins in [("short", short_wins), ("long", long_wins)]:
@@ -1442,6 +1459,21 @@ def _learn_appliance_signatures(
         if len(clusters) <= 1:
             _cov_warning(prefix, "combined", hourly_profile, std_profile)
 
+        # ── Hour-of-day distribution ───────────────────────────────────────────
+        from collections import Counter as _Counter
+        hour_dist = _Counter(int(kwh_series.index[pos].hour) for pos in valid_starts)
+
+        # ── Signature quality metadata ─────────────────────────────────────────
+        n_data_days = int(
+            (kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400
+        )
+        last_cycle_ts = str(kwh_series.index[valid_starts[-1]]) if valid_starts else ""
+        quality = (
+            "good" if len(windows) >= 15
+            else "fair" if len(windows) >= 5
+            else "poor"
+        )
+
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
@@ -1450,6 +1482,10 @@ def _learn_appliance_signatures(
             "n_cycles": len(windows),
             "n_rejected": n_rejected,
             "idle_threshold": idle_thresh,
+            "quality": quality,
+            "n_data_days": n_data_days,
+            "last_cycle_ts": last_cycle_ts,
+            "hour_of_day_distribution": dict(sorted(hour_dist.items())),
         }
         if clusters:
             sig["clusters"] = clusters

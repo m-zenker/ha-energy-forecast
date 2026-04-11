@@ -2167,12 +2167,12 @@ class TestApplianceSignatures:
     PROFILE = [1.0, 2.0, 1.5, 0.5]  # 4-hour cycle shape
 
     def test_basic_two_cycles(self):
-        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
-        df = _make_cycle_df(self.PROFILE, n_cycles=2)
+        """Three identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
         sigs = _learn_appliance_signatures({"hp": df})
         assert "hp" in sigs
         s = sigs["hp"]
-        assert s["n_cycles"] == 2
+        assert s["n_cycles"] == 3
         assert s["total_kwh"] == pytest.approx(sum(self.PROFILE))
         assert s["hourly_profile"] == pytest.approx(self.PROFILE)
         assert s["peak_hour"] == 1  # index of 2.0 in PROFILE
@@ -2182,9 +2182,9 @@ class TestApplianceSignatures:
         assert s["std_profile"] == pytest.approx([0.0, 0.0, 0.0, 0.0])
 
     def test_below_min_cycles_skipped(self):
-        """Only 1 cycle → empty dict (insufficient evidence)."""
-        df = _make_cycle_df(self.PROFILE, n_cycles=1, period_hours=20)
-        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        """Fewer cycles than min_cycles → empty dict (insufficient evidence)."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=2, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=3)
         assert sigs == {}
 
     def test_no_sub_sensors_none(self):
@@ -2205,7 +2205,7 @@ class TestApplianceSignatures:
             "kwh": [1.0, 1.0],
         })
         df = pd.concat([df_full, extra], ignore_index=True)
-        sigs = _learn_appliance_signatures({"dw": df}, min_cycles=2)
+        sigs = _learn_appliance_signatures({"dw": df})
         assert "dw" in sigs
         # The partial window must not inflate n_cycles
         assert sigs["dw"]["n_cycles"] == 3
@@ -2455,15 +2455,99 @@ class TestApplianceSignatures:
         assert not any("high variability" in r.message for r in caplog.records)
 
     def test_schema_backward_compatible(self):
-        """New schema always contains the original keys for _composite_forecast compatibility."""
+        """New schema always contains all expected keys."""
         df = _make_cycle_df([1.0, 2.0, 1.5, 0.5], n_cycles=4, period_hours=12)
         sigs = _learn_appliance_signatures({"dw": df})
         assert "dw" in sigs
         for key in ("total_kwh", "hourly_profile", "std_profile", "peak_hour", "n_cycles"):
             assert key in sigs["dw"], f"Missing backward-compat key: {key}"
-        # New keys
+        # Existing metadata keys
         assert "n_rejected" in sigs["dw"]
         assert "idle_threshold" in sigs["dw"]
+        # New metadata keys (A + B)
+        assert "quality" in sigs["dw"]
+        assert sigs["dw"]["quality"] in ("good", "fair", "poor")
+        assert "n_data_days" in sigs["dw"]
+        assert isinstance(sigs["dw"]["n_data_days"], int)
+        assert "last_cycle_ts" in sigs["dw"]
+        assert isinstance(sigs["dw"]["last_cycle_ts"], str)
+        assert "hour_of_day_distribution" in sigs["dw"]
+        assert isinstance(sigs["dw"]["hour_of_day_distribution"], dict)
+
+    def test_quality_poor_few_cycles(self):
+        """3 cycles → quality='poor'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "poor"
+
+    def test_quality_fair_medium_cycles(self):
+        """5–14 cycles → quality='fair'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=7, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "fair"
+
+    def test_quality_good_many_cycles(self):
+        """15+ cycles → quality='good'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=15, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "good"
+
+    def test_hour_of_day_distribution_present(self):
+        """hour_of_day_distribution is a dict mapping hours (int) to counts (int)."""
+        # All cycles start at 08:00 UTC
+        ts = pd.date_range("2024-01-01 08:00", periods=0, freq="1h")
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01 08:00")
+        for _ in range(5):
+            for h, v in enumerate([1.0, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=12)
+        for h in range(6):  # tail padding
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        dist = sigs["dw"]["hour_of_day_distribution"]
+        assert isinstance(dist, dict)
+        assert all(isinstance(k, int) for k in dist.keys())
+        assert all(isinstance(v, int) for v in dist.values())
+        assert sum(dist.values()) == sigs["dw"]["n_cycles"]
+
+    def test_cov_based_clustering_high_energy_spread(self):
+        """High energy CoV (> 0.5) triggers clustering even when median_dur == 1h.
+
+        Uses only 3 cycles (< 4) so outlier rejection is skipped, letting us
+        isolate the CoV-based trigger: 2 light 1h cycles and 1 heavy 2h cycle.
+        """
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # 2 light 1h cycles (0.3 kWh)
+        for _ in range(2):
+            ts_list.append(t)
+            kwh_list.append(0.3)
+            t += pd.Timedelta(hours=5)
+        # 1 heavy 2h cycle (4.0 kWh total)
+        for v in [2.0, 2.0]:
+            ts_list.append(t)
+            kwh_list.append(v)
+            t += pd.Timedelta(hours=1)
+        t += pd.Timedelta(hours=5)  # idle gap
+        # Tail padding to avoid truncation
+        for h in range(6):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        # median_dur == 1 so the duration condition alone would not trigger;
+        # energy CoV >> 0.5 → clustering must fire via the CoV path.
+        assert "clusters" in sigs["hp"], "Expected clusters when energy CoV > 0.5"
+        assert len(sigs["hp"]["clusters"]) == 2
 
     def test_composite_forecast_works_with_new_schema(self):
         """_composite_forecast reads hourly_profile correctly from new schema."""
