@@ -10,6 +10,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-6] — 2026-04-12
+
+### Changed
+- `apps/energy_forecast/ha_data.py` — sub-sensor CSVs (`sub_<id>.csv`) now include a `program` column: the program label active at each hourly timestamp, resolved via last-value-carry-forward (`pd.merge_asof`). Hours before the first program event get an empty string. Backward-compatible: existing CSVs without the column are loaded and extended transparently.
+- `apps/energy_forecast/ha_data.py` — new `_resolve_programs_for_series()` helper encapsulates the last-value-carry-forward logic; `fetch_sub_sensor_history()` and `fetch_recent_sub_sensor()` accept a new optional `program_entity_id` param that triggers program label resolution and persistence.
+- `apps/energy_forecast/ha_data.py` — `_merge_sub_sensor_frames()` extended to preserve non-empty program labels from the cache when the fresh window doesn't cover older rows (winner's label wins; loser's label fills gaps; column only added when at least one frame has it).
+- `apps/energy_forecast/energy_forecast.py` — `_retrain()` now derives `program_histories` from the persisted CSV `program` column instead of a separate 30-day `fetch_program_sensor_history()` call. Program attribution accumulates indefinitely rather than being capped to the last 30 days.
+- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` threads `program_entity_id` into `fetch_recent_sub_sensor()` so every hourly write also captures the current program state.
+
+### Tests
+- 436 passing (11 new: `TestResolveProgramsForSeries` × 5 covering LVFC correctness, empty input, index preservation; `TestFetchSubSensorHistoryWithProgram` × 6 covering column written to CSV, label resolution, backward compat, cached-label preservation, recent fetch).
+
+---
+
 ## [0.10.2-alpha-5] — 2026-04-12
 
 ### Added
