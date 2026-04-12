@@ -99,7 +99,24 @@ class EnergyForecast(hass.Hass):
         )
         # Optional sub-sensors: cumulative kWh meters (heat pump, dishwasher, etc.)
         # whose consumption is tracked as lag features to improve forecast accuracy.
-        self._sub_energy_sensors: list[str] = list(self.args.get("sub_energy_sensors") or [])
+        # Each item may be a plain entity_id string or a dict with "entity_id" and
+        # optionally "program_sensor" for per-program energy profile learning.
+        _raw_sub = list(self.args.get("sub_energy_sensors") or [])
+        self._sub_energy_sensors: list[str] = []
+        self._program_sensors: dict[str, str] = {}  # energy_entity → program_entity
+        for _item in _raw_sub:
+            if isinstance(_item, str):
+                self._sub_energy_sensors.append(_item)
+            elif isinstance(_item, dict) and "entity_id" in _item:
+                _eid = str(_item["entity_id"])
+                self._sub_energy_sensors.append(_eid)
+                if "program_sensor" in _item:
+                    self._program_sensors[_eid] = str(_item["program_sensor"])
+            else:
+                self.log(
+                    f"sub_energy_sensors: unrecognized item {_item!r} — skipping",
+                    level="WARNING",
+                )
         self._baseline_included_sensors: list[str] = list(
             self.args.get("baseline_included_sensors") or []
         )
@@ -827,6 +844,23 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
 
+        program_histories: dict = {}
+        for entity_id in self._sub_energy_sensors:
+            if entity_id not in self._program_sensors:
+                continue
+            prefix = self._sub_sensor_prefix(entity_id)
+            try:
+                prog_df = ha_data.fetch_program_sensor_history(
+                    self, self._program_sensors[entity_id], days=30, timezone=self._timezone
+                )
+                if not prog_df.empty:
+                    program_histories[prefix] = prog_df
+            except (OSError, KeyError, ValueError) as exc:
+                self.log(
+                    f"Program sensor {self._program_sensors[entity_id]} fetch failed: {exc}",
+                    level="WARNING",
+                )
+
         if self._baseline_mode and sub_sensors_dict:
             subtract_dict = self._subtract_only_dict(sub_sensors_dict)
             baseline_df, removed_kwh = _subtract_sub_sensors(baseline_df, subtract_dict)
@@ -921,6 +955,7 @@ class EnergyForecast(hass.Hass):
             climate_dfs=climate_dfs or None,
             dhw_df=dhw_df if not dhw_df.empty else None,
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
+            program_histories=program_histories or None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 

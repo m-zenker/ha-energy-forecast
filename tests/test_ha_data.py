@@ -1026,3 +1026,83 @@ class TestFetchRecentEnergyTailRead:
         # At least 1 new kwh row (diff of ha values) must be present
         tail_ts = result["timestamp"].max()
         assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)
+
+
+# ── fetch_program_sensor_history ─────────────────────────────────────────────
+
+class TestFetchProgramSensorHistory:
+    """Tests for fetch_program_sensor_history (program-type sensor support)."""
+
+    def _make_raw(self, states: list[dict]) -> dict:
+        return {"sensor.dw_program": states}
+
+    def test_returns_string_states(self, mock_app):
+        """Normal states are returned with correct columns and values."""
+        raw = self._make_raw([
+            {"state": "eco",    "last_changed": "2024-01-01T10:00:00+01:00"},
+            {"state": "normal", "last_changed": "2024-01-01T12:00:00+01:00"},
+        ])
+        mock_app.get_history.return_value = raw
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert list(result.columns) == ["timestamp", "program"]
+        assert len(result) == 2
+        assert result.iloc[0]["program"] == "eco"
+        assert result.iloc[1]["program"] == "normal"
+
+    def test_drops_unavailable_and_unknown(self, mock_app):
+        """'unavailable', 'unknown', and '' are excluded from the result."""
+        raw = self._make_raw([
+            {"state": "unavailable", "last_changed": "2024-01-01T08:00:00+01:00"},
+            {"state": "unknown",     "last_changed": "2024-01-01T09:00:00+01:00"},
+            {"state": "",            "last_changed": "2024-01-01T09:30:00+01:00"},
+            {"state": "eco",         "last_changed": "2024-01-01T10:00:00+01:00"},
+        ])
+        mock_app.get_history.return_value = raw
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert len(result) == 1
+        assert result.iloc[0]["program"] == "eco"
+
+    def test_lowercases_states(self, mock_app):
+        """State values are lowercased — 'ECO', 'Eco' → 'eco'."""
+        raw = self._make_raw([
+            {"state": "ECO",    "last_changed": "2024-01-01T10:00:00+01:00"},
+            {"state": "Normal", "last_changed": "2024-01-01T12:00:00+01:00"},
+        ])
+        mock_app.get_history.return_value = raw
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert result.iloc[0]["program"] == "eco"
+        assert result.iloc[1]["program"] == "normal"
+
+    def test_returns_empty_on_get_history_failure(self, mock_app):
+        """Exception from get_history → empty DataFrame, no exception propagated."""
+        mock_app.get_history.side_effect = RuntimeError("HA unavailable")
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert result.empty
+        assert list(result.columns) == ["timestamp", "program"]
+
+    def test_returns_empty_on_empty_history(self, mock_app):
+        """Empty state list → empty DataFrame."""
+        mock_app.get_history.return_value = {"sensor.dw_program": []}
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert result.empty
+        assert list(result.columns) == ["timestamp", "program"]
+
+    def test_timestamps_are_naive(self, mock_app):
+        """Returned timestamps must be naive (no tzinfo)."""
+        raw = self._make_raw([
+            {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
+        ])
+        mock_app.get_history.return_value = raw
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert result.iloc[0]["timestamp"].tzinfo is None
+
+    def test_sorted_by_timestamp(self, mock_app):
+        """Result is sorted ascending by timestamp regardless of input order."""
+        raw = self._make_raw([
+            {"state": "intensive", "last_changed": "2024-01-01T14:00:00+01:00"},
+            {"state": "eco",       "last_changed": "2024-01-01T10:00:00+01:00"},
+        ])
+        mock_app.get_history.return_value = raw
+        result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
+        assert result.iloc[0]["program"] == "eco"
+        assert result.iloc[1]["program"] == "intensive"

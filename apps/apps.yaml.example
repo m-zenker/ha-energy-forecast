@@ -104,6 +104,10 @@ energy_forecast:
   # sub_energy_sensors:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
+  # Each item may also be a dict with an optional program_sensor to learn
+  # per-program energy profiles (≥ 2 cycles per program required):
+  #   - entity_id: sensor.dishwasher_energy_kwh
+  #     program_sensor: sensor.dishwasher_selected_program
 
   # Optional: EV charging detection.
   # Hours where gross consumption exceeds ev_charging_threshold_kwh are treated

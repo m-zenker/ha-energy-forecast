@@ -2758,6 +2758,264 @@ class TestCompositeForecast:
         result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
         assert (result["delta_kwh"] == 0.0).all()
 
+    # ── Program-type schedule (dict form) ────────────────────────────────────
+
+    def test_program_schedule_uses_program_profile(self):
+        """Dict schedule with known program uses per-program hourly_profile."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": eco_profile,
+                        "std_profile": [0.0, 0.0, 0.0],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(eco_profile):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
+    def test_program_fallback_when_program_unknown(self):
+        """Unknown program label → falls back to combined hourly_profile."""
+        combined = [1.0, 2.0, 1.5, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": [0.5, 1.0, 0.5],
+                        "std_profile": [],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+
+    def test_program_fallback_when_no_programs_key(self):
+        """Sig without 'programs' key → falls back to hourly_profile, no error."""
+        combined = [1.0, 2.0]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "12:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[2 + i] == pytest.approx(v)
+
+    def test_legacy_string_schedule_unchanged(self):
+        """Plain 'HH:MM' string alongside sigs with programs → identical to pre-feature result."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {"eco": {"hourly_profile": eco_profile, "std_profile": [], "total_kwh": 2.0, "n_cycles": 3}},
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result_str = _composite_forecast(df, {"sub_dw": "14:00"}, sigs)
+        # Must use the combined profile, not eco
+        assert result_str["delta_kwh"].iloc[4] == pytest.approx(1.0)
+        assert result_str["delta_kwh"].iloc[5] == pytest.approx(2.0)
+
+    def test_program_off_start_skipped(self):
+        """Dict schedule with start='off' → no delta."""
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0],
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+                "programs": {"eco": {"hourly_profile": [0.5, 0.5], "std_profile": [], "total_kwh": 1.0, "n_cycles": 2}},
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "off", "program": "eco"}}, sigs)
+        assert (result["delta_kwh"] == 0.0).all()
+
+
+# ── Program signatures in _learn_appliance_signatures ────────────────────────
+
+def _make_prog_df(
+    cycle_starts: list[str],
+    programs: list[str],
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Build a synthetic program sensor DataFrame aligned to given cycle starts."""
+    rows = []
+    for ts_str, prog in zip(cycle_starts, programs):
+        ts = pd.Timestamp(ts_str)
+        rows.append({"timestamp": ts, "program": prog})
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+class TestApplianceSignaturesPrograms:
+    """Tests for program_histories support in _learn_appliance_signatures()."""
+
+    PROFILE = [1.0, 2.0, 1.5, 0.5]
+
+    def test_programs_absent_without_program_history(self):
+        """No program_histories → 'programs' key absent from signature."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "programs" not in sigs.get("dw", {})
+
+    def test_programs_learned_with_sufficient_cycles(self):
+        """≥ 2 cycles for a program → profile stored under sig['programs']."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        # Assign "eco" to all 4 cycle starts (every 12 hours from 2024-01-01 00:00)
+        cycle_starts = [
+            pd.Timestamp("2024-01-01 00:00"),
+            pd.Timestamp("2024-01-01 12:00"),
+            pd.Timestamp("2024-01-02 00:00"),
+            pd.Timestamp("2024-01-02 12:00"),
+        ]
+        prog_df = _make_prog_df(
+            [str(ts) for ts in cycle_starts],
+            ["eco"] * 4,
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        assert "dw" in sigs
+        assert "programs" in sigs["dw"]
+        assert "eco" in sigs["dw"]["programs"]
+        eco = sigs["dw"]["programs"]["eco"]
+        assert eco["n_cycles"] == 4
+        assert eco["total_kwh"] == pytest.approx(sum(self.PROFILE))
+
+    def test_programs_skipped_below_min_cycles_per_program(self):
+        """1 cycle for 'normal' → absent; 3 for 'eco' → present."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        cycle_starts = [
+            "2024-01-01 00:00",
+            "2024-01-01 12:00",
+            "2024-01-02 00:00",
+            "2024-01-02 12:00",
+        ]
+        programs = ["eco", "eco", "eco", "normal"]
+        prog_df = _make_prog_df(cycle_starts, programs)
+        sigs = _learn_appliance_signatures(
+            {"dw": df},
+            program_histories={"dw": prog_df},
+            min_cycles_per_program=2,
+        )
+        assert "programs" in sigs["dw"]
+        assert "eco" in sigs["dw"]["programs"]
+        assert "normal" not in sigs["dw"]["programs"]
+
+    def test_programs_and_clusters_coexist(self):
+        """Both 'clusters' and 'programs' can appear in the same signature."""
+        # Use a profile that triggers clustering: mix short (1h) and long (4h) cycles
+        short = [2.0]
+        long_ = [1.0, 2.0, 1.5, 0.5]
+        n_each = 4
+        period = 12
+        rows = []
+        ts = pd.Timestamp("2024-01-01 00:00")
+        cycle_starts = []
+        for i in range(n_each):
+            cycle_starts.append(str(ts))
+            for v in short:
+                rows.append({"timestamp": ts, "kwh": v})
+                ts += pd.Timedelta(hours=1)
+            for _ in range(period - len(short)):
+                rows.append({"timestamp": ts, "kwh": 0.0})
+                ts += pd.Timedelta(hours=1)
+        for i in range(n_each):
+            cycle_starts.append(str(ts))
+            for v in long_:
+                rows.append({"timestamp": ts, "kwh": v})
+                ts += pd.Timedelta(hours=1)
+            for _ in range(period - len(long_)):
+                rows.append({"timestamp": ts, "kwh": 0.0})
+                ts += pd.Timedelta(hours=1)
+
+        df = pd.DataFrame(rows)
+        # All short cycles: "quick", all long cycles: "eco"
+        programs = ["quick"] * n_each + ["eco"] * n_each
+        prog_df = _make_prog_df(cycle_starts, programs)
+        sigs = _learn_appliance_signatures({"app": df}, program_histories={"app": prog_df})
+        sig = sigs.get("app", {})
+        # clusters present (mix of short/long durations)
+        assert "clusters" in sig
+        # programs present (≥ 2 for each label)
+        assert "programs" in sig
+        assert "quick" in sig["programs"]
+        assert "eco" in sig["programs"]
+
+    def test_programs_cycle_predating_history_excluded(self):
+        """Cycles before prog_df start are not counted in programs but counted in n_cycles."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        # Only provide program history from cycle 3 onward (skip first two)
+        prog_df = _make_prog_df(
+            ["2024-01-02 00:00", "2024-01-02 12:00"],
+            ["eco", "eco"],
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        sig = sigs["dw"]
+        # Combined n_cycles covers all 4
+        assert sig["n_cycles"] == 4
+        # But only 2 cycles have program info → eco has 2
+        assert "programs" in sig
+        assert sig["programs"]["eco"]["n_cycles"] == 2
+
+    def test_programs_normalizes_to_lowercase(self):
+        """Program labels are already lowercased by fetch_program_sensor_history;
+        test that _learn_appliance_signatures groups by exact label (case-sensitive).
+        'eco' and 'eco' group together; 'ECO' would be a different key."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        cycle_starts = [
+            "2024-01-01 00:00",
+            "2024-01-01 12:00",
+            "2024-01-02 00:00",
+            "2024-01-02 12:00",
+        ]
+        # Simulate already-lowercased input (as produced by fetch_program_sensor_history)
+        prog_df = _make_prog_df(cycle_starts, ["eco", "eco", "eco", "eco"])
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        assert "eco" in sigs["dw"]["programs"]
+        assert "ECO" not in sigs["dw"]["programs"]
+
+    def test_programs_save_load_roundtrip(self, tmp_path):
+        """sig['programs'] survives JSON round-trip (string keys, no int-key issue)."""
+        import json
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        prog_df = _make_prog_df(
+            ["2024-01-01 00:00", "2024-01-01 12:00", "2024-01-02 00:00", "2024-01-02 12:00"],
+            ["eco"] * 4,
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        sig_path = tmp_path / "appliance_signatures.json"
+        sig_path.write_text(json.dumps(sigs))
+        loaded = json.loads(sig_path.read_text())
+        assert "programs" in loaded["dw"]
+        assert "eco" in loaded["dw"]["programs"]
+        assert loaded["dw"]["programs"]["eco"]["n_cycles"] == 4
+
 
 # ── Concurrency (SE-2) ───────────────────────────────────────────────────────
 

@@ -799,6 +799,53 @@ def fetch_presence_history(
     })
 
 
+def fetch_program_sensor_history(
+    app: "hass.Hass",
+    entity_id: str,
+    days: int = 30,
+    timezone: str = "Europe/Zurich",
+) -> "pd.DataFrame":
+    """Return state-change history for a string program sensor.
+
+    Columns: timestamp (naive, local tz), program (str, lowercased).
+    States "unavailable"/"unknown"/"" are dropped.
+    Returns empty DataFrame on failure — not cached to CSV.
+    """
+    import pandas as pd
+
+    try:
+        raw = app.get_history(entity_id=entity_id, days=days)
+    except Exception as exc:  # noqa: BLE001
+        app.log(f"get_history failed for program sensor {entity_id}: {exc}", level="WARNING")
+        return pd.DataFrame(columns=["timestamp", "program"])
+
+    if isinstance(raw, dict):
+        states = raw.get(entity_id, [])
+    elif isinstance(raw, list) and raw:
+        states = raw[0] if isinstance(raw[0], list) else raw
+    else:
+        states = []
+
+    rows = []
+    for state in states:
+        try:
+            s = str(state.get("state", "")).strip().lower()
+            if s in ("unavailable", "unknown", ""):
+                continue
+            ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            rows.append({"timestamp": ts, "program": s})
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    return (
+        pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        if rows
+        else pd.DataFrame(columns=["timestamp", "program"])
+    )
+
+
 def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
