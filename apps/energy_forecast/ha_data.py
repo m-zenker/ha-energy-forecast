@@ -299,8 +299,63 @@ def split_ev_charging(
 
 
 def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame") -> "pd.DataFrame":
-    """Merge two sub-sensor DataFrames (column 'kwh'); fresh HA data wins on conflicts."""
-    return _merge_frames(df_winner, df_loser, "kwh")
+    """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
+
+    Fresh HA data wins on kwh conflicts.  For the 'program' column the rule is
+    "keep existing non-empty label if the winner has none" — program history is
+    only fetched for the recent window so older cached labels must be preserved.
+    """
+    import pandas as pd
+
+    combined = _merge_frames(df_winner, df_loser, "kwh")
+
+    # Preserve program labels: if the winner had an empty/NaN program for a row
+    # that the loser already labelled, restore the loser's label.
+    if "program" in df_winner.columns or "program" in df_loser.columns:
+        # Re-merge only the program column from both sides.
+        # Build a loser index: timestamp → program (non-empty only)
+        loser_prog = df_loser.copy() if "program" in df_loser.columns else pd.DataFrame(columns=["timestamp", "program"])
+        loser_prog = loser_prog[loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        loser_prog = loser_prog.set_index("timestamp")["program"]
+
+        winner_prog = df_winner.copy() if "program" in df_winner.columns else pd.DataFrame(columns=["timestamp", "program"])
+        winner_prog = winner_prog[winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        winner_prog = winner_prog.set_index("timestamp")["program"]
+
+        # Winner takes precedence; loser fills gaps
+        merged_prog = winner_prog.combine_first(loser_prog)
+        combined["program"] = combined["timestamp"].map(merged_prog).fillna("")
+
+    return combined
+
+
+def _resolve_programs_for_series(
+    timestamps: "pd.Series",
+    prog_df: "pd.DataFrame",
+) -> "pd.Series":
+    """Assign a program label to each hourly timestamp using last-value-carry-forward.
+
+    Args:
+        timestamps: Series of naive hourly timestamps (the energy CSV rows).
+        prog_df:    DataFrame with columns ``timestamp`` (naive) and ``program``
+                    (str), representing program state-change events.
+
+    Returns:
+        Series of str (same length / index as *timestamps*).  Rows with no
+        preceding program event get an empty string.
+    """
+    import pandas as pd
+
+    if prog_df.empty:
+        return pd.Series("", index=timestamps.index)
+
+    left = pd.DataFrame({"timestamp": timestamps}).sort_values("timestamp")
+    right = prog_df[["timestamp", "program"]].sort_values("timestamp")
+
+    merged = pd.merge_asof(left, right, on="timestamp", direction="backward")
+    result = merged["program"].fillna("").astype(str)
+    result.index = timestamps.index
+    return result
 
 
 def fetch_sub_sensor_history(
@@ -308,6 +363,7 @@ def fetch_sub_sensor_history(
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
+    program_entity_id: str | None = None,
 ) -> pd.DataFrame:
     """Pull sub-sensor kWh history, merging local CSV cache with fresh HA data.
 
@@ -317,6 +373,12 @@ def fetch_sub_sensor_history(
       appliance being off and must appear as 0 so lag features return 0 (not NaN)
       during idle hours.
     - Suitable for any cumulative kWh meter (heat pump, dishwasher, etc.)
+
+    When *program_entity_id* is provided the returned DataFrame (and the written
+    CSV) will contain a ``program`` column: the program label active at each
+    hourly timestamp, resolved via last-value-carry-forward from the program
+    sensor's state-change history.  Existing non-empty labels in the cache are
+    preserved even when the fresh window does not cover them.
     """
     import pandas as pd
 
@@ -347,6 +409,10 @@ def fetch_sub_sensor_history(
     else:
         df_new = pd.DataFrame(columns=["timestamp", "kwh"])
 
+    if program_entity_id:
+        prog_df = fetch_program_sensor_history(app, program_entity_id, days=30, timezone=timezone)
+        df_new["program"] = _resolve_programs_for_series(df_new["timestamp"], prog_df)
+
     combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
@@ -362,6 +428,7 @@ def fetch_recent_sub_sensor(
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
+    program_entity_id: str | None = None,
 ) -> pd.DataFrame:
     """Lightweight update for sub-sensor hourly refreshes.
 
@@ -372,6 +439,10 @@ def fetch_recent_sub_sensor(
     Unlike fetch_energy_history (raises ValueError when both sources empty),
     this function returns an empty DataFrame silently so a missing sub-sensor
     does not abort the hourly update for the main sensor.
+
+    When *program_entity_id* is provided the new rows written to the CSV will
+    include a ``program`` label resolved from the last 2 days of program sensor
+    history.  Existing cached labels for older rows are preserved.
     """
     import pandas as pd
 
@@ -401,6 +472,10 @@ def fetch_recent_sub_sensor(
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
         df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+
+    if program_entity_id:
+        prog_df = fetch_program_sensor_history(app, program_entity_id, days=2, timezone=timezone)
+        df_new["program"] = _resolve_programs_for_series(df_new["timestamp"], prog_df)
 
     combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 

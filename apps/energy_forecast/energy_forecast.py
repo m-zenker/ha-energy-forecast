@@ -834,32 +834,28 @@ class EnergyForecast(hass.Hass):
             )
 
         sub_sensors_dict: dict = {}
+        program_histories: dict = {}
         for entity_id in self._sub_energy_sensors:
             prefix = self._sub_sensor_prefix(entity_id)
             cache_path = self._sub_sensor_cache_path(entity_id)
+            program_entity_id = self._program_sensors.get(entity_id)
             try:
-                sub_df = ha_data.fetch_sub_sensor_history(self, entity_id, cache_path, timezone=self._timezone)
+                sub_df = ha_data.fetch_sub_sensor_history(
+                    self, entity_id, cache_path,
+                    timezone=self._timezone,
+                    program_entity_id=program_entity_id,
+                )
                 sub_df = _strip_tz(sub_df, self._timezone)
                 sub_sensors_dict[prefix] = sub_df
+                # Build program_histories from the persisted CSV program column
+                if "program" in sub_df.columns:
+                    prog_df = sub_df[
+                        sub_df["program"].notna() & (sub_df["program"].astype(str) != "")
+                    ][["timestamp", "program"]].copy()
+                    if not prog_df.empty:
+                        program_histories[prefix] = prog_df
             except (OSError, KeyError, ValueError) as exc:
                 self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
-
-        program_histories: dict = {}
-        for entity_id in self._sub_energy_sensors:
-            if entity_id not in self._program_sensors:
-                continue
-            prefix = self._sub_sensor_prefix(entity_id)
-            try:
-                prog_df = ha_data.fetch_program_sensor_history(
-                    self, self._program_sensors[entity_id], days=30, timezone=self._timezone
-                )
-                if not prog_df.empty:
-                    program_histories[prefix] = prog_df
-            except (OSError, KeyError, ValueError) as exc:
-                self.log(
-                    f"Program sensor {self._program_sensors[entity_id]} fetch failed: {exc}",
-                    level="WARNING",
-                )
 
         if self._baseline_mode and sub_sensors_dict:
             subtract_dict = self._subtract_only_dict(sub_sensors_dict)
@@ -994,8 +990,13 @@ class EnergyForecast(hass.Hass):
         for entity_id in self._sub_energy_sensors:
             prefix = self._sub_sensor_prefix(entity_id)
             cache_path = self._sub_sensor_cache_path(entity_id)
+            program_entity_id = self._program_sensors.get(entity_id)
             try:
-                sub_df = ha_data.fetch_recent_sub_sensor(self, entity_id, cache_path, timezone=self._timezone)
+                sub_df = ha_data.fetch_recent_sub_sensor(
+                    self, entity_id, cache_path,
+                    timezone=self._timezone,
+                    program_entity_id=program_entity_id,
+                )
                 sub_df = _strip_tz(sub_df, self._timezone)
                 sub_sensors_recent[prefix] = sub_df
             except (OSError, KeyError, ValueError) as exc:
