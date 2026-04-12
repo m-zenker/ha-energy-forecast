@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-7] — 2026-04-12
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `_resolve_programs_for_series()`: program sensor events that fire slightly *after* the hour boundary (e.g. user starts machine at 12:05, hourly row stamped 12:00) were previously mislabelled with the preceding idle state (`"no_program"`). A 1-hour forward-lookup pass now substitutes the real program label when backward LVFC gives `""` or `"no_program"` and a non-idle program event exists within the next hour. The forward pass is skipped when backward already carries a real label, so the tail of a running cycle is never overwritten by the next cycle's program. (4 new tests.)
+
+---
+
 ## [0.10.2-alpha-6] — 2026-04-12
 
 ### Changed
