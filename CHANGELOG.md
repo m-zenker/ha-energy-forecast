@@ -10,6 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-5] — 2026-04-12
+
+### Added
+- `apps/energy_forecast/model.py` — **Program-type sensor support**: `_learn_appliance_signatures()` now accepts a `program_histories` dict mapping timestamps to program labels; cycles are grouped per program and per-program hourly profiles stored under `sig["programs"][<label>]` (with `hourly_profile`, `std_profile`, `total_kwh`, `n_cycles`). Requires ≥ 2 cycles per program to avoid overfitting single runs. Backward-compatible: without program states, behavior is identical to alpha-4.
+- `apps/energy_forecast/model.py` — `_composite_forecast()` scenario API accepts dict-form schedule entries `{"start": "HH:MM", "program": "<label>"}`. When a program label is provided the matching per-program profile is used; falls back gracefully to the combined signature when unknown or not specified.
+- `apps/energy_forecast/energy_forecast.py` — `train()` fetches program-type sensor history for all sub-sensors that have `program_type_sensor` configured and passes it to `_learn_appliance_signatures()`.
+- `apps/energy_forecast/ha_data.py` — new `fetch_program_type_history()` retrieves categorical state history for program-type sensors (e.g. `sensor.washing_machine_program`) over the training window, returning a DataFrame of timestamp → program label for cycle labelling.
+
+### Tests
+- 425 passing (19 new covering per-program signature learning, minimum-cycle filtering, per-program scenario profile selection, graceful fallback to aggregate signature, and config schema validation for the new `program_type_sensor` key).
+
+---
+
 ## [0.10.2-alpha-4] — 2026-04-11
 
 ### Added
