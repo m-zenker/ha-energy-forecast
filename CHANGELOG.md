@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-8] — 2026-04-12
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `_resolve_programs_for_series()`: increased forward-lookup tolerance from 1 h to 2 h. The 1 h window was insufficient when the program sensor fires just into the following hour (e.g. cycle starts at 21:00, sensor fires at 22:05 → 65-minute gap). The forward fallback still only activates when backward LVFC gives `""` or `"no_program"`, so labels for running cycles are unaffected.
+
+---
+
 ## [0.10.2-alpha-7] — 2026-04-12
 
 ### Fixed
