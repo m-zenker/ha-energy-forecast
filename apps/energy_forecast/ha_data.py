@@ -343,17 +343,42 @@ def _resolve_programs_for_series(
     Returns:
         Series of str (same length / index as *timestamps*).  Rows with no
         preceding program event get an empty string.
+
+    The primary strategy is backward LVFC: each row gets the last program state
+    at or before its timestamp.  A forward-lookup fallback (tolerance: 1 h) is
+    applied when the backward result is empty or the idle sentinel
+    ``"no_program"``: this handles the common case where a user starts the
+    machine at (say) 12:05, the hourly row is stamped 12:00, and the backward
+    lookup still sees the previous ``"no_program"`` state — the forward pass
+    finds the real ``"eco"`` event at 12:05 and substitutes it.  The forward
+    pass is *not* applied when backward already has a real program label, so
+    the tail of a running cycle is never overwritten by the next cycle's program.
     """
     import pandas as pd
 
     if prog_df.empty:
         return pd.Series("", index=timestamps.index)
 
-    left = pd.DataFrame({"timestamp": timestamps}).sort_values("timestamp")
+    left = pd.DataFrame({"timestamp": timestamps}).sort_values("timestamp").reset_index(drop=True)
     right = prog_df[["timestamp", "program"]].sort_values("timestamp")
 
-    merged = pd.merge_asof(left, right, on="timestamp", direction="backward")
-    result = merged["program"].fillna("").astype(str)
+    # Primary: backward LVFC
+    merged_back = pd.merge_asof(left, right, on="timestamp", direction="backward")
+    prog_back = merged_back["program"].fillna("").astype(str)
+
+    # Fallback: forward lookup within 1 h (catches late-firing program sensors)
+    merged_fwd = pd.merge_asof(
+        left, right, on="timestamp", direction="forward",
+        tolerance=pd.Timedelta("1h"),
+    )
+    prog_fwd = merged_fwd["program"].fillna("").astype(str)
+
+    # Substitute forward result only when backward gives "no signal"
+    idle = prog_back.isin(["", "no_program"])
+    has_real_fwd = ~prog_fwd.isin(["", "no_program"])
+    result = prog_back.copy()
+    result[idle & has_real_fwd] = prog_fwd[idle & has_real_fwd]
+
     result.index = timestamps.index
     return result
 

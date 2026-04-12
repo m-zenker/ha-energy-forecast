@@ -1164,6 +1164,66 @@ class TestResolveProgramsForSeries:
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert list(result.index) == [5, 7]
 
+    # -- forward-lookup fallback tests -----------------------------------------
+
+    def test_late_firing_sensor_gets_correct_label(self):
+        """Program event 15 min after hour boundary is attributed to that hour.
+
+        Reproduces: user starts machine at 12:05 → program sensor fires 'eco'
+        at 12:05 → hour row stamped 12:00 backward-sees 'no_program' → should
+        be corrected to 'eco' by the forward fallback.
+        """
+        prog_df = self._make_prog_df([
+            ("2024-01-01 11:30", "no_program"),  # previous cycle ended
+            ("2024-01-01 12:05", "eco"),          # new cycle selected at 12:05
+            ("2024-01-01 16:30", "no_program"),   # cycle finished
+        ])
+        timestamps = pd.Series(pd.to_datetime([
+            "2024-01-01 11:00",
+            "2024-01-01 12:00",   # ← should get "eco", not "no_program"
+            "2024-01-01 13:00",
+            "2024-01-01 14:00",
+            "2024-01-01 17:00",
+        ]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        # 11:00 precedes the first event (11:30) → no backward match → ""
+        assert result.tolist() == ["", "eco", "eco", "eco", "no_program"]
+
+    def test_forward_fallback_does_not_override_running_cycle(self):
+        """A real backward label is never replaced by a forward match.
+
+        If eco is still running at 13:00 and 'intensive' starts at 13:50,
+        the 13:00 row must keep 'eco', not be overwritten by 'intensive'.
+        """
+        prog_df = self._make_prog_df([
+            ("2024-01-01 12:00", "eco"),
+            ("2024-01-01 13:50", "intensive"),
+        ])
+        timestamps = pd.Series(pd.to_datetime([
+            "2024-01-01 13:00",   # ← 'eco' still running; 'intensive' within 1 h forward
+            "2024-01-01 14:00",
+        ]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["eco", "intensive"]
+
+    def test_forward_fallback_not_triggered_beyond_one_hour(self):
+        """Program event more than 1 h ahead does not affect backward label."""
+        prog_df = self._make_prog_df([
+            ("2024-01-01 11:30", "no_program"),
+            ("2024-01-01 13:10", "eco"),   # 70 min after 12:00 → outside tolerance
+        ])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 12:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["no_program"]
+
+    def test_forward_fallback_idle_sentinel_not_substituted(self):
+        """A forward 'no_program' event does not replace a backward '' result."""
+        prog_df = self._make_prog_df([("2024-01-01 12:30", "no_program")])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 12:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        # Forward finds 'no_program' at 12:30 but it is also idle → stay ""
+        assert result.tolist() == [""]
+
 
 # ── fetch_sub_sensor_history with program_entity_id ───────────────────────────
 
