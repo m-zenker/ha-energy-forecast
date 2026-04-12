@@ -366,10 +366,12 @@ def _resolve_programs_for_series(
     merged_back = pd.merge_asof(left, right, on="timestamp", direction="backward")
     prog_back = merged_back["program"].fillna("").astype(str)
 
-    # Fallback: forward lookup within 1 h (catches late-firing program sensors)
+    # Fallback: forward lookup within 2 h (catches late-firing program sensors).
+    # 1 h was insufficient when the sensor fires just into the following hour,
+    # e.g. cycle starts at 21:00, program fires at 22:05 → gap is 65 min.
     merged_fwd = pd.merge_asof(
         left, right, on="timestamp", direction="forward",
-        tolerance=pd.Timedelta("1h"),
+        tolerance=pd.Timedelta("2h"),
     )
     prog_fwd = merged_fwd["program"].fillna("").astype(str)
 

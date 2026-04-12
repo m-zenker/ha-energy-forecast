@@ -1206,11 +1206,21 @@ class TestResolveProgramsForSeries:
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert result.tolist() == ["eco", "intensive"]
 
-    def test_forward_fallback_not_triggered_beyond_one_hour(self):
-        """Program event more than 1 h ahead does not affect backward label."""
+    def test_forward_fallback_catches_65min_gap(self):
+        """Program event 65 min after hour boundary is attributed (was the failing case)."""
+        prog_df = self._make_prog_df([
+            ("2024-01-01 20:30", "no_program"),
+            ("2024-01-01 22:05", "power_wash"),  # 65 min after 21:00
+        ])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 21:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["power_wash"]
+
+    def test_forward_fallback_not_triggered_beyond_two_hours(self):
+        """Program event more than 2 h ahead does not affect backward label."""
         prog_df = self._make_prog_df([
             ("2024-01-01 11:30", "no_program"),
-            ("2024-01-01 13:10", "eco"),   # 70 min after 12:00 → outside tolerance
+            ("2024-01-01 14:10", "eco"),   # 2 h 10 min after 12:00 → outside tolerance
         ])
         timestamps = pd.Series(pd.to_datetime(["2024-01-01 12:00"]))
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
