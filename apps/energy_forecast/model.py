@@ -230,6 +230,7 @@ class EnergyForecastModel:
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
         dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+        program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -272,7 +273,10 @@ class EnergyForecastModel:
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
 
         # ── Appliance signature learning (Stage 3) ──────────────────────────
-        self._appliance_signatures = _learn_appliance_signatures(sub_sensors_dict)
+        self._appliance_signatures = _learn_appliance_signatures(
+            sub_sensors_dict,
+            program_histories=program_histories,
+        )
         self._save_signatures()
 
         # ── Thermal time constant calibration (#55) ──────────────────────────
@@ -1307,6 +1311,8 @@ def _add_sub_sensor_lags_training(
 def _learn_appliance_signatures(
     sub_sensors: dict | None,
     min_cycles: int = 3,
+    program_histories: dict | None = None,
+    min_cycles_per_program: int = 2,
 ) -> dict:
     """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
 
@@ -1342,6 +1348,11 @@ def _learn_appliance_signatures(
         padded = [w + [0.0] * (max_len - len(w)) for w in wins]
         arr = np.array(padded)
         return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
+
+    def _resolve_program(cycle_ts: "pd.Timestamp", prog_df: "pd.DataFrame") -> "str | None":
+        """Last-value-carry-forward lookup of program at cycle start."""
+        earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
+        return str(earlier.iloc[-1]["program"]) if not earlier.empty else None
 
     def _cov_warning(prefix: str, label: str, profile: list[float], std: list[float]) -> None:
         mean_arr = np.array(profile)
@@ -1426,6 +1437,27 @@ def _learn_appliance_signatures(
         if len(windows) < min_cycles:
             continue
 
+        # ── Per-program grouping ───────────────────────────────────────────────
+        prog_df = (program_histories or {}).get(prefix)
+        programs: dict = {}
+        if prog_df is not None and not prog_df.empty:
+            prog_windows: dict[str, list] = {}
+            for win, pos in zip(windows, valid_starts):
+                label = _resolve_program(kwh_series.index[pos], prog_df)
+                if label is None:
+                    continue
+                prog_windows.setdefault(label, []).append(win)
+            for label, pwins in prog_windows.items():
+                if len(pwins) < min_cycles_per_program:
+                    continue
+                prof, std = _avg_profile(pwins)
+                programs[label] = {
+                    "hourly_profile": prof,
+                    "std_profile": std,
+                    "total_kwh": float(sum(prof)),
+                    "n_cycles": len(pwins),
+                }
+
         # ── Duration clustering ────────────────────────────────────────────────
         # Trigger on high energy CoV (> 0.5) in addition to long median duration,
         # so bimodal consumers like heat-pump heating (many 1h pulses + occasional
@@ -1489,6 +1521,8 @@ def _learn_appliance_signatures(
         }
         if clusters:
             sig["clusters"] = clusters
+        if programs:
+            sig["programs"] = programs
 
         result[prefix] = sig
 
@@ -1497,15 +1531,19 @@ def _learn_appliance_signatures(
 
 def _composite_forecast(
     baseline_df: "pd.DataFrame",
-    schedule: "dict[str, str | None]",
+    schedule: "dict[str, str | dict | None]",
     signatures: dict,
 ) -> "pd.DataFrame":
     """Overlay appliance run profiles onto a baseline forecast.
 
     Args:
         baseline_df: DataFrame with columns [timestamp, predicted_kwh] — 48 rows, naive tz.
-        schedule:    {prefix: "HH:MM" | "off" | None} — desired appliance start times.
-                     Example: {"dishwasher": "22:30", "washing_machine": "off"}.
+        schedule:    {prefix: "HH:MM" | {"start": "HH:MM", "program": "eco"} | "off" | None}.
+                     String form: plain start time, e.g. ``"22:30"``.
+                     Dict form: ``{"start": "HH:MM", "program": "<label>"}`` — selects a
+                     per-program profile from ``sig["programs"]`` if available, otherwise
+                     falls back to ``sig["hourly_profile"]``.
+                     ``"off"`` and ``None`` skip the appliance.
                      Invalid or out-of-range time strings (e.g. "25:00", "abc") are
                      logged as warnings and skipped; ``delta_kwh`` stays 0 for that
                      prefix.
@@ -1528,7 +1566,16 @@ def _composite_forecast(
 
     forecast_start = pd.Timestamp(result["timestamp"].iloc[0])
 
-    for prefix, time_str in schedule.items():
+    for prefix, sched_value in schedule.items():
+        if sched_value is None or sched_value == "off":
+            continue
+        # Dict form: {"start": "HH:MM", "program": "eco"}
+        if isinstance(sched_value, dict):
+            time_str = sched_value.get("start")
+            program = sched_value.get("program")
+        else:
+            time_str = sched_value
+            program = None
         if time_str is None or time_str == "off":
             continue
         if prefix not in signatures:
@@ -1558,7 +1605,20 @@ def _composite_forecast(
         if offset_h >= 48 or offset_h < 0:
             continue
 
-        profile: list = signatures[prefix]["hourly_profile"]
+        # Profile selection: prefer per-program profile; fall back to combined
+        sig = signatures[prefix]
+        profile: list | None = None
+        if program is not None:
+            prog_profiles = sig.get("programs", {})
+            if program in prog_profiles:
+                profile = prog_profiles[program]["hourly_profile"]
+            else:
+                _LOGGER.debug(
+                    "_composite_forecast: no profile for program '%s' on '%s' — using combined",
+                    program, prefix,
+                )
+        if profile is None:
+            profile = sig["hourly_profile"]
         # Clip profile to available window
         profile = profile[: 48 - offset_h]
         if not profile:
