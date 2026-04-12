@@ -1106,3 +1106,212 @@ class TestFetchProgramSensorHistory:
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert result.iloc[0]["program"] == "eco"
         assert result.iloc[1]["program"] == "intensive"
+
+
+# ── _resolve_programs_for_series ──────────────────────────────────────────────
+
+class TestResolveProgramsForSeries:
+    """Tests for the _resolve_programs_for_series() last-value-carry-forward helper."""
+
+    def _make_prog_df(self, rows):
+        """Build a program event DataFrame from list of (timestamp_str, label) tuples."""
+        return pd.DataFrame(
+            [{"timestamp": pd.Timestamp(ts), "program": lbl} for ts, lbl in rows]
+        ).sort_values("timestamp").reset_index(drop=True)
+
+    def test_basic_lvfc(self):
+        """Each hourly timestamp gets the last program state before or at that time."""
+        prog_df = self._make_prog_df([
+            ("2024-01-01 09:30", "eco"),
+            ("2024-01-01 11:00", "intensive"),
+        ])
+        timestamps = pd.Series(pd.to_datetime([
+            "2024-01-01 10:00",
+            "2024-01-01 11:00",
+            "2024-01-01 12:00",
+        ]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["eco", "intensive", "intensive"]
+
+    def test_no_preceding_event_returns_empty_string(self):
+        """Timestamps before the first program event get an empty string."""
+        prog_df = self._make_prog_df([("2024-01-01 12:00", "cotton")])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 08:00", "2024-01-01 13:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["", "cotton"]
+
+    def test_empty_prog_df_returns_all_empty(self):
+        """An empty program DataFrame yields all empty strings."""
+        prog_df = pd.DataFrame(columns=["timestamp", "program"])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 10:00", "2024-01-01 11:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["", ""]
+
+    def test_exact_timestamp_match_uses_that_event(self):
+        """When the program event timestamp exactly matches the hourly row, it's used."""
+        prog_df = self._make_prog_df([("2024-01-01 10:00", "quick")])
+        timestamps = pd.Series(pd.to_datetime(["2024-01-01 10:00"]))
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert result.tolist() == ["quick"]
+
+    def test_preserves_original_index(self):
+        """Returned Series has the same index as the input timestamps Series."""
+        prog_df = self._make_prog_df([("2024-01-01 09:00", "eco")])
+        timestamps = pd.Series(
+            pd.to_datetime(["2024-01-01 10:00", "2024-01-01 11:00"]),
+            index=[5, 7],
+        )
+        result = ha_data._resolve_programs_for_series(timestamps, prog_df)
+        assert list(result.index) == [5, 7]
+
+
+# ── fetch_sub_sensor_history with program_entity_id ───────────────────────────
+
+class TestFetchSubSensorHistoryWithProgram:
+    """Tests for fetch_sub_sensor_history / fetch_recent_sub_sensor program integration."""
+
+    def _make_ha_raw(self, iso_times, values):
+        """Build a minimal HA history DataFrame (as _fetch_history returns).
+
+        Returns tz-aware Europe/Zurich timestamps, matching the real _fetch_history output.
+        """
+        return pd.DataFrame({
+            "timestamp": pd.to_datetime(iso_times, utc=True).tz_convert("Europe/Zurich"),
+            "value": values,
+        })
+
+    def _make_prog_raw(self, rows):
+        """Build a minimal program-sensor raw list (format expected by fetch_program_sensor_history)."""
+        return [[{"state": lbl, "last_changed": ts} for ts, lbl in rows]]
+
+    def test_program_column_written_to_csv(self, mock_app, tmp_path):
+        """When program_entity_id is provided, CSV contains a 'program' column."""
+        cache_path = tmp_path / "sub_dw.csv"
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
+            [10.0, 11.5],
+        )
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T07:00:00+01:00", "eco"),
+        ])
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(
+                mock_app, "sensor.dw_kwh", cache_path,
+                program_entity_id="sensor.dw_program",
+            )
+
+        assert "program" in result.columns
+        assert cache_path.exists()
+        saved = pd.read_csv(cache_path)
+        assert "program" in saved.columns
+
+    def test_program_labels_resolved_correctly(self, mock_app, tmp_path):
+        """Each hourly row gets the program active at that time."""
+        cache_path = tmp_path / "sub_dw.csv"
+        # Local timestamps after conversion: 09:00, 10:00, 11:00
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00", "2024-01-01T10:00:00+01:00"],
+            [10.0, 11.0, 11.5],
+        )
+        # Program switches from eco → intensive at 10:00 local
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T08:30:00+01:00", "eco"),
+            ("2024-01-01T10:00:00+01:00", "intensive"),
+        ])
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(
+                mock_app, "sensor.dw_kwh", cache_path,
+                program_entity_id="sensor.dw_program",
+            )
+
+        # 10:00 row (diff from 09→10) should be "eco"; 11:00 row should be "intensive"
+        rows = result.sort_values("timestamp").reset_index(drop=True)
+        assert rows.iloc[0]["program"] == "eco"
+        assert rows.iloc[1]["program"] == "intensive"
+
+    def test_no_program_entity_id_no_program_column(self, mock_app, tmp_path):
+        """Without program_entity_id, result has no 'program' column (backward compat)."""
+        cache_path = tmp_path / "sub_hp.csv"
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
+            [5.0, 6.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.hp_kwh", cache_path)
+
+        assert "program" not in result.columns
+
+    def test_existing_cache_without_program_column_is_backward_compatible(self, mock_app, tmp_path):
+        """A cached CSV without a 'program' column is loaded and extended correctly."""
+        cache_path = tmp_path / "sub_dw.csv"
+        # Old-format cache: no program column
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-01 08:00"]),
+            "kwh": [0.5],
+        }).to_csv(cache_path, index=False)
+
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T09:00:00+01:00", "2024-01-01T10:00:00+01:00"],
+            [20.0, 21.0],
+        )
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T09:30:00+01:00", "cotton"),
+        ])
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(
+                mock_app, "sensor.dw_kwh", cache_path,
+                program_entity_id="sensor.dw_program",
+            )
+
+        assert "program" in result.columns
+        # The old cached row has no program — should be empty string, not raise
+        old_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 08:00")]
+        assert len(old_row) == 1
+        assert old_row.iloc[0]["program"] == ""
+
+    def test_cached_program_labels_preserved_after_fresh_fetch(self, mock_app, tmp_path):
+        """Existing non-empty program labels in cache survive a subsequent fetch that doesn't cover them."""
+        cache_path = tmp_path / "sub_dw.csv"
+        # Cache has a labelled row from > 30 days ago (outside fresh fetch window)
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2023-11-01 10:00"]),
+            "kwh": [1.2],
+            "program": ["eco"],
+        }).to_csv(cache_path, index=False)
+
+        # Fresh HA fetch only covers a recent window — no overlap with cached row
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
+            [5.0, 6.5],
+        )
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T07:00:00+01:00", "intensive"),
+        ])
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_sub_sensor_history(
+                mock_app, "sensor.dw_kwh", cache_path,
+                program_entity_id="sensor.dw_program",
+            )
+
+        old_row = result[result["timestamp"] == pd.Timestamp("2023-11-01 10:00")]
+        assert len(old_row) == 1
+        assert old_row.iloc[0]["program"] == "eco"
+
+    def test_recent_sub_sensor_with_program(self, mock_app, tmp_path):
+        """fetch_recent_sub_sensor also persists program labels."""
+        cache_path = tmp_path / "sub_dw.csv"
+        ha_raw = self._make_ha_raw(
+            ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
+            [10.0, 10.8],
+        )
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T07:30:00+01:00", "quick"),
+        ])
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_sub_sensor(
+                mock_app, "sensor.dw_kwh", cache_path,
+                program_entity_id="sensor.dw_program",
+            )
+
+        assert "program" in result.columns
+        assert result.iloc[0]["program"] == "quick"
