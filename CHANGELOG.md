@@ -10,6 +10,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-12] — 2026-04-14
+
+### Changed
+- `apps/energy_forecast/energy_forecast.py` — Extended `_SHAP_FEATURE_LABELS` to cover all 62 model features (up from 23). Constant-only change; no behaviour difference.
+
+### Deployment
+- Merged `feat/shap-labels-complete` into `dev` (fast-forward). Deployed to HA. 468 tests passing.
+
+---
+
 ## [0.10.2-alpha-11] — 2026-04-14
 
 ### Deployment
