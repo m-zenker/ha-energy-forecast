@@ -10,6 +10,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-9] — 2026-04-14
+
+### Added
+- `apps/energy_forecast/model.py` — **Indoor Temperature Projection**: new `_project_indoor_temps()` pure function uses an RC-ODE (Euler forward integration) to project indoor temperatures for all 48 forecast hours based on outdoor forecast. Eliminates the zero-fill problem where `thermal_pressure` defaulted to 0 for hours >2h ahead due to stale `climate.current_temperature` sensor data. Starting indoor temperature uses the most-recent `current_temp` if <2h old; falls back to setpoint for stale sensors.
+- `apps/energy_forecast/model.py` — **Area-Weighted Thermal Pressure**: rooms are now weighted by floor area via new `climate_room_areas` config key (dict mapping entity_id → m²). Rooms without explicit area default to 15 m². Thermal pressure is expressed in °C·h (area-weighted cumulative deficit; τ-division removed for clearer physical interpretation).
+- `apps/energy_forecast/model.py` — **Secondary thermal features**: `thermal_pressure_max` (largest per-room deficit) and `thermal_pressure_std` (room temperature imbalance spread across rooms).
+- `apps/energy_forecast/const.py` — constants `DEFAULT_TAU = 24.0` (building thermal time constant fallback) and `DEFAULT_ROOM_AREA_M2 = 15.0` (per-room area default).
+- `apps/energy_forecast/energy_forecast.py` — SHAP labels for all three thermal pressure features; new `_parse_room_areas()` helper validates `climate_room_areas` config entries.
+- `apps.yaml.example` — `climate_room_areas` example configuration.
+
+### Tests
+- 453 passing (12 new covering RC-ODE convergence, stale-sensor fallback, area weighting, max/std features, zero-fill elimination; 1 existing test updated for removed τ-division).
+
+---
+
 ## [0.10.2-alpha-8] — 2026-04-12
 
 ### Fixed
