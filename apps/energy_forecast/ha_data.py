@@ -359,7 +359,10 @@ def _resolve_programs_for_series(
     if prog_df.empty:
         return pd.Series("", index=timestamps.index)
 
-    left = pd.DataFrame({"timestamp": timestamps}).sort_values("timestamp").reset_index(drop=True)
+    # Ensure timestamp dtype is datetime64 — an empty Series created via
+    # pd.DataFrame(columns=[...]) has object dtype, which causes merge_asof
+    # to raise "Incompatible merge dtype" in pandas 3.x.
+    left = pd.DataFrame({"timestamp": pd.to_datetime(timestamps)}).sort_values("timestamp").reset_index(drop=True)
     right = prog_df[["timestamp", "program"]].sort_values("timestamp")
 
     # Primary: backward LVFC
@@ -434,7 +437,9 @@ def fetch_sub_sensor_history(
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
-        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+        # Use explicit dtypes so downstream merge_asof / pd.concat don't see
+        # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
+        df_new = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[us]"), "kwh": pd.Series(dtype="float64")})
 
     if program_entity_id:
         prog_df = fetch_program_sensor_history(app, program_entity_id, days=30, timezone=timezone)
@@ -498,7 +503,9 @@ def fetch_recent_sub_sensor(
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
-        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+        # Use explicit dtypes so downstream merge_asof / pd.concat don't see
+        # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
+        df_new = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[us]"), "kwh": pd.Series(dtype="float64")})
 
     if program_entity_id:
         prog_df = fetch_program_sensor_history(app, program_entity_id, days=2, timezone=timezone)

@@ -1385,3 +1385,56 @@ class TestFetchSubSensorHistoryWithProgram:
 
         assert "program" in result.columns
         assert result.iloc[0]["program"] == "quick"
+
+    def test_empty_raw_ha_with_program_entity_and_cache(self, mock_app, tmp_path):
+        """fetch_recent_sub_sensor must not raise when raw HA is empty but cache
+        has data and program_entity_id is set.
+
+        Regression: pandas 3.x merge_asof raises "Incompatible merge dtype,
+        dtype('O') and dtype('<M8[us]')" when df_new was built via
+        pd.DataFrame(columns=[...]) which gives object-typed timestamp column.
+        """
+        cache_path = tmp_path / "sub_wash.csv"
+        # Pre-populate cache with one row
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-01T10:00:00"]),
+            "kwh": [0.5],
+            "program": ["eco"],
+        }).to_csv(cache_path, index=False)
+
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-01T07:00:00+01:00", "eco"),
+        ])
+
+        # raw_ha empty → df_new fallback path is exercised
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame(columns=["timestamp", "value"])):
+            result = ha_data.fetch_recent_sub_sensor(
+                mock_app, "sensor.wash_kwh", cache_path,
+                program_entity_id="sensor.wash_program",
+            )
+
+        assert len(result) == 1
+        assert result.iloc[0]["kwh"] == pytest.approx(0.5)
+
+    def test_empty_raw_ha_with_program_entity_and_cache_full_history(self, mock_app, tmp_path):
+        """fetch_sub_sensor_history must not raise when raw HA is empty but
+        cache has data and program_entity_id is set (same dtype regression)."""
+        cache_path = tmp_path / "sub_dryer.csv"
+        pd.DataFrame({
+            "timestamp": pd.to_datetime(["2024-01-02T10:00:00"]),
+            "kwh": [1.2],
+            "program": ["cotton"],
+        }).to_csv(cache_path, index=False)
+
+        mock_app.get_history.return_value = self._make_prog_raw([
+            ("2024-01-02T09:00:00+01:00", "cotton"),
+        ])
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame(columns=["timestamp", "value"])):
+            result = ha_data.fetch_sub_sensor_history(
+                mock_app, "sensor.dryer_kwh", cache_path,
+                program_entity_id="sensor.dryer_program",
+            )
+
+        assert len(result) == 1
+        assert result.iloc[0]["kwh"] == pytest.approx(1.2)
