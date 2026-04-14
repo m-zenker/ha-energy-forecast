@@ -39,29 +39,78 @@ ATTRIBUTION        = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
 
 # SHAP feature labels for narrative generation (#53)
 _SHAP_FEATURE_LABELS: dict[str, str] = {
-    "hour_sin":            "time-of-day (sine)",
-    "hour_cos":            "time-of-day (cosine)",
-    "temp_c":              "current outdoor temperature",
-    "temp_ewma_24h":       "short-term thermal inertia",
-    "temp_ewma_72h":       "multi-day thermal inertia",
-    "heating_deg_sum_24h": "accumulated heating demand (24h)",
-    "heating_deg_sum_168h":"accumulated heating demand (7d)",
-    "temp_delta_1h":       "temperature rate of change",
-    "temp_delta_24h":      "24h temperature trend",
-    "temp_lag_24h":        "yesterday's temperature",
-    "temp_lag_168h":       "last week's temperature",
-    "lag_24h":             "yesterday's same-hour consumption",
-    "lag_48h":             "2 days ago same-hour consumption",
-    "lag_168h":            "last week's same-hour consumption",
-    "is_away":             "vacation / away mode",
-    "people_home":         "number of people home",
-    "cloud_cover_pct":     "cloud cover",
-    "direct_radiation_wm2":"solar irradiance",
+    # Calendar (raw)
+    "hour":                 "hour of day",
+    "day_of_week":          "day of week",
+    "month":                "month",
+    "season":               "season",
+    "hour_of_week":         "hour of week",
+    # Cyclical encodings
+    "hour_sin":             "time-of-day (sine)",
+    "hour_cos":             "time-of-day (cosine)",
+    "month_sin":            "month (sine)",
+    "month_cos":            "month (cosine)",
+    "dow_sin":              "day-of-week (sine)",
+    "dow_cos":              "day-of-week (cosine)",
+    "how_sin":              "hour-of-week (sine)",
+    "how_cos":              "hour-of-week (cosine)",
+    "doy_sin":              "day-of-year (sine)",
+    "doy_cos":              "day-of-year (cosine)",
+    # Horizon
+    "hours_ahead":          "forecast horizon",
+    # Weather
+    "temp_c":               "current outdoor temperature",
+    "precipitation_mm":     "rainfall",
+    "sunshine_min":         "sunshine duration",
+    "wind_kmh":             "wind speed",
+    "cloud_cover_pct":      "cloud cover",
+    "direct_radiation_wm2": "solar irradiance",
+    "heating_degree":       "heating degree-hours",
+    "cooling_degree":       "cooling degree-hours",
+    "temp_rolling_3d":      "3-day average temperature",
+    # Thermal modelling
+    "temp_ewma_24h":        "short-term thermal inertia",
+    "temp_ewma_72h":        "multi-day thermal inertia",
+    "heating_deg_sum_24h":  "accumulated heating demand (24h)",
+    "heating_deg_sum_168h": "accumulated heating demand (7d)",
+    "temp_delta_1h":        "temperature rate of change",
+    "temp_delta_24h":       "24h temperature trend",
+    "temp_lag_24h":         "yesterday's temperature",
+    "temp_lag_168h":        "last week's temperature",
+    # Autoregressive lags
+    "lag_1h":               "1h ago consumption",
+    "lag_2h":               "2h ago consumption",
+    "lag_6h":               "6h ago consumption",
+    "lag_12h":              "12h ago consumption",
+    "lag_24h":              "yesterday's same-hour consumption",
+    "lag_48h":              "2 days ago same-hour consumption",
+    "lag_72h":              "3 days ago same-hour consumption",
+    "lag_168h":             "last week's same-hour consumption",
+    "lag_336h":             "2 weeks ago same-hour consumption",
+    # Rolling stats
+    "rolling_mean_24h":     "24h rolling average consumption",
+    "rolling_mean_7d":      "7-day rolling average consumption",
+    "rolling_std_24h":      "24h consumption variability",
+    # Calendar extras
+    "is_public_holiday":    "public holiday",
+    "days_to_next_holiday": "days until next holiday",
+    "days_since_last_holiday": "days since last holiday",
+    # EV
+    "likely_ev_hour":       "EV charging likely",
+    # Occupancy / away
+    "is_away":              "vacation / away mode",
+    "people_home":          "number of people home",
+    # Heat pump / solar intent features
     "thermal_pressure":     "heat debt (area-weighted)",
     "thermal_pressure_max": "coldest room heat deficit",
     "thermal_pressure_std": "room temperature imbalance",
     "thermal_pressure_cop": "heat debt electrical cost",
     "weighted_solar_gain":  "passive solar heat gain",
+    "dhw_buffer_temp":      "hot water buffer temperature",
+    "dhw_pressure":         "DHW heat demand",
+    # Optional sensor features
+    "outdoor_temp_live":    "live outdoor temperature (sensor)",
+    "temp_bias":            "temperature sensor bias",
 }
 
 
