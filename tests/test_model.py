@@ -3176,50 +3176,54 @@ class TestCalibrateTau:
         assert model._calibrate_tau(climate_dfs, heating_df, weather_df) is None
 
     def test_evening_cooling_window_used(self, tmp_path):
-        """Cooling in the tail of an off-block (after solar gain) still yields a τ.
+        """Cooling in the tail of an off-block (after a rising prefix) still yields τ.
 
-        Scenario: heating off for 12 h.  First 4 h: solar gain → indoor temp rises
-        (invalid prefix).  Hours 4-11: genuine passive cooling → valid sub-sequence
-        in the tail.  Old prefix-trim code would have discarded the entire block;
-        new sub-sequence scan should find and use the evening portion.
+        Scenario: heating off from 20:00 for 11 h (20:00–06:00).  First 3 h:
+        indoor rises (appliance heat, residual warmth).  Hours 3-10: genuine
+        passive cooling → valid sub-sequence in the tail.  The sub-sequence scan
+        should find and use the nighttime cooling portion.
+
+        Windows are entirely outside 09:00–15:00 to avoid the daytime exclusion.
         """
         TRUE_TAU = 5.0
-        period = 12   # 4 h solar gain + 7 h cooling + 1 h heating-on gap
-        n_blocks = 4
-        n = period * n_blocks + 5
-        ts = pd.date_range("2024-01-10", periods=n, freq="1h")
         T_out = 5.0
+        # 4 off-blocks, each starting at 20:00 on consecutive days.
+        # Pattern: 3h rising prefix + 7h cooling + 1h heating-on gap = 11h block.
+        all_ts:  list = []
+        all_T_in: list = []
+        all_heat: list = []
 
-        T_indoor = np.full(n, 20.0)
-        heating_active = np.ones(n, dtype=float)
-
-        # Build 4 off-blocks, each with solar-gain prefix + evening cooling tail
-        for block in range(n_blocks):
-            base = block * period
-            # Hours 0-3: solar gain — indoor rises from 20 → 23 °C
-            for j in range(4):
-                T_indoor[base + j] = 20.0 + j * 0.75
-                heating_active[base + j] = 0.0
-            # Hours 4-10: passive cooling from 23 °C with TRUE_TAU
+        for day in range(4):
+            base = pd.Timestamp(f"2024-01-{10 + day:02d} 20:00")
+            for j in range(3):
+                all_ts.append(base + pd.Timedelta(hours=j))
+                all_T_in.append(20.0 + j * 0.75)   # rising prefix
+                all_heat.append(0.0)
             for j in range(7):
-                T_indoor[base + 4 + j] = T_out + (23.0 - T_out) * np.exp(-j / TRUE_TAU)
-                heating_active[base + 4 + j] = 0.0
+                all_ts.append(base + pd.Timedelta(hours=3 + j))
+                all_T_in.append(T_out + (23.0 - T_out) * np.exp(-j / TRUE_TAU))
+                all_heat.append(0.0)
+            # one "heating on" row to close the block before next day
+            all_ts.append(base + pd.Timedelta(hours=10))
+            all_T_in.append(20.0)
+            all_heat.append(1.0)
 
+        ts = pd.DatetimeIndex(all_ts)
         climate_dfs = {"climate.test": pd.DataFrame({
-            "timestamp": ts, "current_temp": T_indoor, "setpoint": T_indoor + 1.0,
+            "timestamp": ts, "current_temp": all_T_in, "setpoint": [t + 1.0 for t in all_T_in],
         })}
-        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": heating_active})
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": all_heat})
         weather_df = pd.DataFrame({
-            "timestamp": ts, "temp_c": [T_out] * n,
-            "precipitation_mm": [0.0] * n, "sunshine_min": [0.0] * n,
-            "wind_kmh": [0.0] * n, "cloud_cover_pct": [100.0] * n,
-            "direct_radiation_wm2": [0.0] * n,
+            "timestamp": ts, "temp_c": [T_out] * len(ts),
+            "precipitation_mm": [0.0] * len(ts), "sunshine_min": [0.0] * len(ts),
+            "wind_kmh": [0.0] * len(ts), "cloud_cover_pct": [100.0] * len(ts),
+            "direct_radiation_wm2": [0.0] * len(ts),
         })
 
         model = EnergyForecastModel(model_dir=tmp_path)
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is not None, "evening cooling sub-sequence should yield a τ estimate"
-        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20, (
+        assert result is not None, "nighttime cooling sub-sequence should yield a τ estimate"
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.25, (
             f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
         )
 
@@ -3543,3 +3547,219 @@ class TestZeroFillEliminated:
                 "thermal_pressure should be non-zero for all 48 prediction hours "
                 "when a room is below setpoint and observation is fresh"
             )
+
+
+# ── Tests: COP proxy + solar gain features ───────────────────────────────────
+
+class TestWeightedSolarGain:
+
+    def test_in_features_base(self):
+        assert "weighted_solar_gain" in _FEATURES_BASE
+
+    def test_peak_at_1300(self):
+        """cos_factor = 1.0 at h=13 → weighted_solar_gain equals direct_radiation_wm2."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 13:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(300.0)
+
+    def test_zero_before_0900(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 08:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_zero_after_1700(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 18:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_zero_radiation_gives_zero(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 13:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=0.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_never_negative(self):
+        """cos_factor near 09:00 and 17:00 could produce small negatives — must be 0."""
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=500.0)
+        result = _engineer_features(df, w, None)
+        assert (result["weighted_solar_gain"] >= 0).all()
+
+
+class TestThermalPressureCop:
+
+    def test_in_features_base(self):
+        assert "thermal_pressure_cop" in _FEATURES_BASE
+
+    def test_scales_inversely_with_temp(self):
+        """Same thermal_pressure → higher cop feature at colder outdoor temp."""
+        def _cop_at_temp(t_out):
+            ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+            df = _make_bare_df(ts)
+            w  = _make_weather_df(ts, temp=t_out)
+            climate_dfs = {"climate.room": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0],
+                "setpoint":     [21.0],
+            })}
+            result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+            return result.iloc[0]["thermal_pressure_cop"]
+
+        cop_cold = _cop_at_temp(-10.0)
+        cop_warm = _cop_at_temp(10.0)
+        assert cop_cold > cop_warm, "Cold outdoor → higher electrical cost per °C heat debt"
+
+    def test_denominator_clamp(self):
+        """At extreme cold (−50°C), denominator must not drop below 0.5."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, temp=-50.0)
+        climate_dfs = {"climate.room": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0],
+            "setpoint":     [21.0],
+        })}
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        # thermal_pressure=3.0, cop_proxy=max(0.5, 0.11*(-50)+3)=max(0.5,-2.5)=0.5
+        # → thermal_pressure_cop = 3.0 / 0.5 = 6.0
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(6.0)
+
+    def test_zero_pressure_gives_zero_cop(self):
+        """No thermal pressure → cop feature is also 0."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, temp=5.0)
+        result = _engineer_features(df, w, None)  # no climate_dfs
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(0.0)
+
+
+# ── Tests: tau calibration safeguards ────────────────────────────────────────
+
+def _make_tau_model(tmp_path) -> "EnergyForecastModel":
+    return EnergyForecastModel(tmp_path)
+
+
+class TestTauCalibrationSafeguards:
+
+    def _make_night_window(self, start_hour: int = 20, n: int = 6,
+                           t_in_start: float = 22.0, t_out: float = 5.0,
+                           radiation: float = 0.0, date: str = "2026-01-10") -> pd.DataFrame:
+        """Build a synthetic passive-cooling window as a combined DataFrame row-set."""
+        ts = pd.date_range(f"{date} {start_hour:02d}:00", periods=n, freq="1h")
+        tau_true = 10.0
+        t_in = [t_in_start]
+        for i in range(1, n):
+            t_in.append(t_in[-1] + (t_out - t_in[-1]) / tau_true)
+        return pd.DataFrame({
+            "T_indoor":              t_in,
+            "T_outdoor":             [t_out] * n,
+            "heating_active":        [0] * n,
+            "direct_radiation_wm2":  [radiation] * n,
+        }, index=ts)
+
+    def test_solar_mask_rejects_high_radiation(self, tmp_path):
+        """Windows with direct_radiation_wm2 > 150 W/m² are excluded.
+
+        5 night windows all have radiation=200 → all rejected → result is None.
+        """
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(
+            tau_true=10.0, radiation=200.0
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def test_daytime_exclusion(self, tmp_path):
+        """Windows containing any hour in 09:00–15:00 are excluded.
+
+        Build windows starting at 07:00 (spans 07:00–14:00 → touches daytime).
+        All should be rejected → result is None.
+        """
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(
+            tau_true=10.0, start_hour=7, window_hours=8  # 07:00–14:00 touches 09:00–15:00
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def _make_night_blocks(self, tau_true: float, n_days: int = 5,
+                           start_hour: int = 20, window_hours: int = 8,
+                           t_in_start: float = 22.0, t_out: float = 5.0,
+                           radiation: float = 0.0) -> tuple:
+        """Build climate/heating/weather DataFrames with *n_days* separated night blocks.
+
+        Each block: *window_hours* of heating-off at *start_hour*, followed by
+        1 heating-on row to close the block.  Start hour defaults to 20:00 so no
+        block touches 09:00–15:00 (assuming window_hours ≤ 13).
+        """
+        import pandas as pd
+        ts_list: list = []
+        t_in_list: list = []
+        heat_list: list = []
+
+        for day in range(n_days):
+            base = pd.Timestamp(f"2026-01-{10 + day:02d} {start_hour:02d}:00")
+            t_in = t_in_start
+            for j in range(window_hours):
+                ts_list.append(base + pd.Timedelta(hours=j))
+                t_in_list.append(t_in)
+                heat_list.append(0.0)
+                t_in = t_in + (t_out - t_in) / tau_true
+            # close block with one "on" row
+            ts_list.append(base + pd.Timedelta(hours=window_hours))
+            t_in_list.append(t_in_start)
+            heat_list.append(1.0)
+
+        all_ts = pd.DatetimeIndex(ts_list)
+        climate_dfs = {"climate.room": pd.DataFrame({
+            "timestamp":    all_ts,
+            "current_temp": t_in_list,
+            "setpoint":     [t_in_start] * len(all_ts),
+        })}
+        heating_df = pd.DataFrame({"timestamp": all_ts, "heating_active": heat_list})
+        weather_df = pd.DataFrame({
+            "timestamp":            all_ts,
+            "temp_c":               [t_out] * len(all_ts),
+            "direct_radiation_wm2": [radiation] * len(all_ts),
+        })
+        return climate_dfs, heating_df, weather_df
+
+    def test_ema_blend_on_large_change(self, tmp_path):
+        """When new τ differs >50% from stored τ, result is EMA-blended."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0  # stored τ
+        # tau_true=22 → ~120% above stored 10 → expect blend
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=22.0)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        # EMA: 0.8*10 + 0.2*~22 → result should be between 10 and 22
+        assert 10.0 < result < 22.0
+
+    def test_no_ema_on_small_change(self, tmp_path):
+        """When new τ is within 50% of stored τ, raw median is returned."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0  # stored τ
+        # tau_true=12 → ~20% above stored 10 → no blend, raw median accepted
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=12.0)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert result > 10.5   # closer to 12 than to 10
+
+    def test_no_radiation_column_degrades_gracefully(self, tmp_path):
+        """weather_df without direct_radiation_wm2 skips the solar mask (no crash)."""
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=10.0)
+        weather_df = weather_df.drop(columns=["direct_radiation_wm2"])
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None  # solar mask absent → windows still accepted

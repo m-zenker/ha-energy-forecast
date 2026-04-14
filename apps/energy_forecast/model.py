@@ -113,6 +113,8 @@ _FEATURES_BASE = [
     "thermal_pressure",
     "thermal_pressure_max",
     "thermal_pressure_std",
+    "thermal_pressure_cop",
+    "weighted_solar_gain",
     "dhw_buffer_temp",
     "dhw_pressure",
 ]
@@ -1037,21 +1039,37 @@ class EnergyForecastModel:
 
         T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
 
-        # Outdoor temperature from weather_df
+        # Outdoor temperature + radiation from weather_df
         outdoor = weather_df[["timestamp", "temp_c"]].copy()
         outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
         T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
+
+        # Solar radiation — used to mask windows contaminated by solar gain.
+        # Gracefully absent in legacy weather_df without this column.
+        has_radiation = "direct_radiation_wm2" in weather_df.columns
+        if has_radiation:
+            rad = weather_df[["timestamp", "direct_radiation_wm2"]].copy()
+            rad["timestamp"] = pd.to_datetime(rad["timestamp"]).dt.floor("1h")
+            rad_series = rad.set_index("timestamp")["direct_radiation_wm2"]
+        else:
+            rad_series = None
 
         # Heating active status (treat any value > 0.5 as "on")
         active = heating_active_df[["timestamp", "heating_active"]].copy()
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
 
-        combined = pd.DataFrame({
+        combined_data: dict[str, "pd.Series"] = {
             "T_indoor":       T_indoor_series,
             "T_outdoor":      T_outdoor_series,
             "heating_active": active_series,
-        }).dropna().sort_index()
+        }
+        if rad_series is not None:
+            combined_data["direct_radiation_wm2"] = rad_series
+
+        combined = pd.DataFrame(combined_data).dropna(
+            subset=["T_indoor", "T_outdoor", "heating_active"]
+        ).sort_index()
 
         if combined.empty:
             return None
@@ -1064,6 +1082,18 @@ class EnergyForecastModel:
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
+
+            # §4 safeguard: exclude windows touching daytime hours (09:00–15:00).
+            # Heating behaviour and solar gain during these hours corrupt the
+            # passive-cooling signal even when the heating system is nominally off.
+            if group.index.hour.isin(range(9, 16)).any():
+                continue
+
+            # §4 safeguard: reject windows where solar radiation exceeded 150 W/m².
+            if "direct_radiation_wm2" in group.columns:
+                if group["direct_radiation_wm2"].max() > 150:
+                    continue
+
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
@@ -1104,11 +1134,29 @@ class EnergyForecastModel:
             return None
 
         tau_median = float(np.median(tau_estimates))
+
+        # §4 safeguard: EMA smoothing — if the new estimate differs from the
+        # stored τ by more than 50%, blend rather than replace outright.
+        # Prevents a single anomalous training batch from causing a large jump.
+        old_tau = self._tau_hours
+        if old_tau is not None and old_tau > 0:
+            change_frac = abs(tau_median - old_tau) / old_tau
+            if change_frac > 0.5:
+                tau_result = 0.8 * old_tau + 0.2 * tau_median
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw new estimate %.1f h, Δ=%.0f%%)",
+                    old_tau, tau_result, tau_median, change_frac * 100,
+                )
+            else:
+                tau_result = tau_median
+        else:
+            tau_result = tau_median
+
         _LOGGER.info(
             "Building τ estimated at %.1f h from %d passive-cooling windows.",
-            tau_median, len(tau_estimates),
+            tau_result, len(tau_estimates),
         )
-        return tau_median
+        return tau_result
 
     def _load(self) -> None:
         if self._model_path.exists():
@@ -2019,6 +2067,24 @@ def _engineer_features(
     else:
         df["dhw_buffer_temp"] = 50.0
         df["dhw_pressure"] = 0.0
+
+    # ── §3: Passive solar gain (time-of-day weighted radiation) ──────────────
+    # Half-cosine window peaks at 13:00, reaches 0 at 09:00 and 17:00.
+    # Captures south-facing passive gain that reduces actual heating demand.
+    hour_arr = df["timestamp"].dt.hour.values.astype(float)
+    cos_factor = np.where(
+        (hour_arr >= 9) & (hour_arr <= 17),
+        np.cos(np.pi * (hour_arr - 13.0) / 4.0),
+        0.0,
+    ).clip(0.0)  # cosine is negative near edges — floor at 0
+    df["weighted_solar_gain"] = df["direct_radiation_wm2"] * cos_factor
+
+    # ── §3: COP proxy — thermal pressure as electrical urgency ───────────────
+    # Linear COP model: COP ≈ 0.11 × T_out + 3.0 (air-to-water HP, radiators).
+    # Same °C heat debt costs ~2× more electricity at −10°C vs +10°C outdoors.
+    # Denominator clamped at 0.5 to guard against extreme negative temps.
+    cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
+    df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
 
     return df
 

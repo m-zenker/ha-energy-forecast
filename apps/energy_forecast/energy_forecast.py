@@ -60,6 +60,8 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "thermal_pressure":     "heat debt (area-weighted)",
     "thermal_pressure_max": "coldest room heat deficit",
     "thermal_pressure_std": "room temperature imbalance",
+    "thermal_pressure_cop": "heat debt electrical cost",
+    "weighted_solar_gain":  "passive solar heat gain",
 }
 
 
