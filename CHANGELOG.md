@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-11] — 2026-04-14
+
+### Deployment
+- Merged `feat/thermal-cop-safeguards` into `dev`. Deployed to HA; AppDaemon restart clean, 0 `energy_forecast` errors. 468 tests passing.
+
+---
+
 ## [0.10.2-alpha-10] — 2026-04-14
 
 ### Added
