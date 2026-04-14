@@ -215,6 +215,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.9.0] — 2026-04-10
+
+Promoted from `dev` → `main`. First stable release with thermal modelling, occupancy, and rolling MAE persistence.
+
+### Summary
+- Thermal modelling features (#49–#52): `temp_ewma_24h/72h`, `heating_deg_sum_24h/168h`, `temp_delta_1h/24h`, `temp_lag_24h/168h`
+- Occupancy feature (#21): `people_home` integer count via `presence_sensors`
+- Relative MAE sensors (`mae_7d_pct`, `mae_30d_pct`) — normalized accuracy independent of consumption scale
+- SHAP narrative attribute (`shap_narrative`) on `sensor.energy_forecast_today`
+- Rolling MAE persistence via `pred_history.json` — survives AppDaemon restarts
+- MQTT NaN guard for relative MAE and UID-slicing hardening
+
+See [[0.9.1-alpha]] and [[0.9.0-alpha]] for detailed per-change descriptions.
+
+---
+
 ## [0.9.0-alpha] — 2026-04-02
 
 ### Added
@@ -777,7 +793,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.1...HEAD
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-12...HEAD
+[0.10.2-alpha-12]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-11...v0.10.2-alpha-12
+[0.10.2-alpha-11]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-10...v0.10.2-alpha-11
+[0.10.2-alpha-10]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-9...v0.10.2-alpha-10
+[0.10.2-alpha-9]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-8...v0.10.2-alpha-9
+[0.10.2-alpha-8]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-7...v0.10.2-alpha-8
+[0.10.2-alpha-7]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-6...v0.10.2-alpha-7
+[0.10.2-alpha-6]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-5...v0.10.2-alpha-6
+[0.10.2-alpha-5]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-4...v0.10.2-alpha-5
+[0.10.2-alpha-4]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-3...v0.10.2-alpha-4
+[0.10.2-alpha-3]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-2...v0.10.2-alpha-3
+[0.10.2-alpha-2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-1...v0.10.2-alpha-2
+[0.10.2-alpha-1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.1...v0.10.2-alpha-1
+[0.10.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.0...v0.10.1
+[0.10.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0...v0.10.0
+[0.10.0-alpha]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0...v0.10.0-alpha
+[0.9.1-alpha]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0-alpha...v0.9.1-alpha
+[0.9.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.1...v0.9.0
+[0.9.0-alpha]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.1...v0.9.0-alpha
 [0.8.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.8.0...v0.8.1
 [0.8.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.2...v0.8.0
 [0.7.2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.7.1...v0.7.2

@@ -1,19 +1,19 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: v0.9.0-alpha (released 2026-04-02). Monitoring sub-sensor maturation until ~April 20.
+Current baseline: **v0.10.2-alpha-12** (2026-04-14, on dev). Stable (main): v0.9.0 (released 2026-04-10).
 
 ---
 
 ## Current Status — Sub-sensor Feature Maturation (Path A: Monitor)
 
-**Date (2026-04-07):** Monitoring sub-sensor stability. MAE showing continued improvement (0.57 → 0.52 kWh/h). Wait for natural data maturation until ~April 20.
+**Date (2026-04-14):** Sub-sensor history (~27 days, ~648 rows) approaching the 672-row threshold for full lag feature activation. MAE improvement from 0.7 → 0.52 kWh/h observed so far. No action required until after ~2026-04-20 if bouncing pattern persists.
 
-**Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — MAE improved from 0.7 to 0.57 kWh/hour (18% improvement), but short-term bouncing pattern (overshooting one hour, undershooting the next) observed. Root cause: lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows); with 14 days of sub-sensor history (~336 rows), these features remain excluded.
+**Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows). Activation is now in progress; bouncing pattern expected to flatten as the model learns temporal stability across multi-day windows.
 
-**Timeline:** By ~2026-04-20, sub-sensor history reaches 4+ weeks (≥672 rows), triggering full lag feature activation. Bouncing pattern expected to flatten as the model learns temporal stability across multi-day windows.
+**Timeline:** By ~2026-04-20, sub-sensor history reaches 4+ weeks (≥672 rows), triggering full lag feature activation.
 
-**Monitoring:** Track MAE and bouncing pattern through April 20. If pattern persists after that date, revisit Path B (HVAC/thermostat state feature to provide anticipatory signal).
+**If bouncing persists after 2026-04-20:** Revisit Path B — HVAC/thermostat state as an anticipatory signal (item #15).
 
 **No action required** until after 2026-04-20 if bouncing remains.
 
@@ -29,8 +29,11 @@ Current baseline: v0.9.0-alpha (released 2026-04-02). Monitoring sub-sensor matu
 | Entity registry | v0.6.0 | #37 MQTT Discovery (entity registry, area assignment, labels) | ✓ done |
 | Accuracy + visibility + explainability | v0.7.0 | #38 Full 48h weather features (✓ done), #25 Vacation flag (✓ done), #41 Rolling MAE sensor (✓ done), #39 Anomaly detection sensor (✓ done), #42 SHAP feature importance (✓ done), quantile interval calibration (✓ done), #43 ApexCharts dashboard (✓ done) | ✓ done |
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
-| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on dev) |
-| Occupancy + thermal modelling | v0.9.0 | #21 Occupancy (`people_home`), #49 EWMA temperature, #50 Rolling degree-hour sums, #51 Temperature rate of change, #52 Temperature lags | ✓ done (on dev) |
+| Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on main) |
+| Occupancy + thermal modelling | v0.9.0 | #21 Occupancy (`people_home`), #49 EWMA temperature, #50 Rolling degree-hour sums, #51 Temperature rate of change, #52 Temperature lags, #53 SHAP narrative, #54 Relative MAE sensors | ✓ done (on main, released 2026-04-10) |
+| Baseline + scenario API | v0.10.0 | Stage 1 baseline_mode, Stage 2 thermal/DHW intent, Stage 3 appliance signatures, Stage 4 scenario/what-if API | ✓ done (on dev) |
+| Selective baseline + dtype fix | v0.10.1 | `baseline_included_sensors`, pandas 3.x dtype coercion fix in `_merge_frames` | ✓ done (on dev) |
+| Thermal accuracy suite | v0.10.2-alpha | τ calibration (OLS passive-decay), RC-ODE indoor projection, area-weighted pressure, `thermal_pressure_cop`, `weighted_solar_gain`, program-type appliance signatures, 62 SHAP labels | in progress (on dev, alpha-12) |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
@@ -250,22 +253,22 @@ When the detection threshold is set at or above the charger power (e.g. threshol
 
 Add a validation check in `_validate_config` that logs a `WARNING` when `self._ev_threshold >= self._ev_charger_kw`, explaining that the EV sensor will report 0 kWh for all detected sessions in that configuration.
 
-### 21. Occupancy feature (`people_home`) *(✓ done — v0.9.0, on dev)*
+### 21. Occupancy feature (`people_home`) *(✓ done — v0.9.0, on main)*
 Implemented in v0.9.0. See MEMORY.md for details on presence history fetching and feature integration.
 
 ### 22. EV charging state + SoC feature *(DEFERRED)*
 EV charging hours are subtracted from the training target during model fitting, so the model never sees EV load. Adding SoC/charging state as a feature provides no direct signal to learn from. Any value as an occupancy proxy is better covered by #21 (`people_home`). Revisit only if EV load is re-included in the target or if there is evidence of improved forecast accuracy.
 
-### 49. Exponentially weighted moving average temperature *(✓ done — v0.9.0, on dev)*
+### 49. Exponentially weighted moving average temperature *(✓ done — v0.9.0, on main)*
 Implemented in v0.9.0: `temp_ewma_24h` and `temp_ewma_72h` with physically-motivated half-lives. See MEMORY.md for implementation details.
 
-### 50. Rolling accumulated heating degree-hours *(✓ done — v0.9.0, on dev)*
+### 50. Rolling accumulated heating degree-hours *(✓ done — v0.9.0, on main)*
 Implemented in v0.9.0: `heating_deg_sum_24h` and `heating_deg_sum_168h` for multi-day thermal patterns. See MEMORY.md for details.
 
-### 51. Temperature rate of change feature *(✓ done — v0.9.0, on dev)*
+### 51. Temperature rate of change feature *(✓ done — v0.9.0, on main)*
 Implemented in v0.9.0: `temp_delta_1h` and `temp_delta_24h` for HVAC anticipation signals. See MEMORY.md for details.
 
-### 52. Temperature lag features *(✓ done — v0.9.0, on dev)*
+### 52. Temperature lag features *(✓ done — v0.9.0, on main)*
 Implemented in v0.9.0: `temp_lag_24h` and `temp_lag_168h` for day/week temperature patterns. See MEMORY.md for details.
 
 ### 23. Solar PV integration *(✓ merged to dev — v0.8.0)*
@@ -448,7 +451,7 @@ LightGBM has native SHAP support (`model.predict(X, pred_contrib=True)`). After 
 Answers "why did the forecast spike?" directly from the sensor in HA.
 Expected impact: Explainability / UX; Medium effort (SHAP call + attribute serialisation).
 
-### 54. Relative MAE sensors (7d / 30d) *(✓ done — v0.9.0, on dev)*
+### 54. Relative MAE sensors (7d / 30d) *(✓ done — v0.9.0, on main)*
 
 Companion sensors to the existing `sensor.energy_forecast_mae_7d` / `_mae_30d` (#41), expressing
 accuracy as a percentage of mean consumption over the same window rather than in absolute kWh/hour.
@@ -471,7 +474,7 @@ No new data fetching required — purely a derived metric from existing state.
 **Effort:** ~30 min (two extra sensor publishes in `_publish_mae_sensors`, two new MQTT discovery
 registrations). **No model changes.**
 
-### 53. "Why today?" SHAP narrative attribute *(✓ done — v0.9.0, on dev)*
+### 53. "Why today?" SHAP narrative attribute *(✓ done — v0.9.0, on main)*
 Generate a short human-readable narrative from the top SHAP features, explaining what's
 driving today's forecast. Example: "Today's forecast is shaped primarily by time-of-day
 patterns and a cold 24-hour thermal window (accumulated heating demand is high). Yesterday's
