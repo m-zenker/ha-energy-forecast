@@ -35,6 +35,7 @@ from energy_forecast.model import (
     _FEATURES_BASE,
     _engineer_features,
     _learn_appliance_signatures,
+    _project_indoor_temps,
     EnergyForecastModel,
     LAG_HOURS,
 )
@@ -3223,7 +3224,7 @@ class TestCalibrateTau:
         )
 
     def test_thermal_pressure_scaled(self, tmp_path):
-        """_engineer_features applies 1/τ scaling when tau_hours is set."""
+        """thermal_pressure is the area-weighted °C delta (no τ-division since v0.10.3)."""
         n = 10
         ts = pd.date_range("2024-01-01", periods=n, freq="1h")
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
@@ -3247,11 +3248,11 @@ class TestCalibrateTau:
             climate_dfs={"climate.room": climate_df},
             tau_hours=TAU,
         )
-        # thermal_pressure should be 2.0 / 2.0 = 1.0 °C/h
+        # tau_hours is passed but no longer used for thermal_pressure — result is raw °C delta
         assert "thermal_pressure" in result.columns
         non_zero = result["thermal_pressure"].dropna()
         assert len(non_zero) > 0
-        np.testing.assert_allclose(non_zero.values, 1.0, atol=1e-6)
+        np.testing.assert_allclose(non_zero.values, 2.0, atol=1e-6)
 
     def test_thermal_pressure_no_tau(self, tmp_path):
         """Without τ, thermal_pressure equals the raw setpoint−current_temp delta."""
@@ -3280,3 +3281,265 @@ class TestCalibrateTau:
         non_zero = result["thermal_pressure"].dropna()
         assert len(non_zero) > 0
         np.testing.assert_allclose(non_zero.values, 3.0, atol=1e-6)
+
+
+# ── Tests: indoor temperature projection + area-weighted thermal pressure ─────
+
+class TestProjectIndoorTemps:
+    """Unit tests for _project_indoor_temps()."""
+
+    def _future_ts(self, n: int = 48) -> pd.DatetimeIndex:
+        return pd.date_range("2026-01-15 10:00", periods=n, freq="1h")
+
+    def _outdoor_series(self, ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.Series:
+        return pd.Series([temp] * len(ts), index=ts)
+
+    def test_basic_convergence(self):
+        """Cold room should converge toward outdoor temperature over 48 h (RC ODE)."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [ts[0]],          # fresh — age = 0
+                "current_temp": [10.0],            # above outdoor
+                "setpoint":     [20.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        assert "climate.room" in result
+        projected = result["climate.room"]
+        t_in = projected["current_temp"].values
+        # With T_out=5 and T_in[0]=10 the temperature should monotonically decrease
+        assert t_in[0] == pytest.approx(10.0)
+        assert t_in[-1] < t_in[0], "Room should cool toward outdoor temp"
+        # After 48 h with tau=24 the temperature should be closer to T_out
+        assert abs(t_in[-1] - 5.0) < abs(t_in[0] - 5.0)
+
+    def test_stale_sensor_falls_back_to_setpoint(self):
+        """When last observation is >2 h old, starting T_in should be the setpoint."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        # Last obs timestamp = now - 3h (stale)
+        stale_ts = ts[0] - pd.Timedelta(hours=3)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [stale_ts],
+                "current_temp": [15.0],   # stale — should be ignored
+                "setpoint":     [21.0],   # fallback
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        t_in = result["climate.room"]["current_temp"].values
+        # Starting temp should be the setpoint, not the stale current_temp
+        assert t_in[0] == pytest.approx(21.0)
+
+    def test_fresh_sensor_uses_current_temp(self):
+        """When last observation is <2 h old, starting T_in should be current_temp."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        fresh_ts = ts[0] - pd.Timedelta(minutes=30)  # 30 min old — fresh
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [fresh_ts],
+                "current_temp": [17.0],
+                "setpoint":     [22.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        t_in = result["climate.room"]["current_temp"].values
+        assert t_in[0] == pytest.approx(17.0)
+
+    def test_empty_climate_returns_empty_dict(self):
+        """Empty climate_recent dict yields empty result."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts)
+        result = _project_indoor_temps({}, ts, outdoor)
+        assert result == {}
+
+    def test_empty_df_entity_skipped(self):
+        """Climate entity with an empty DataFrame is silently skipped."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts)
+        climate_recent = {"climate.room": pd.DataFrame()}
+        result = _project_indoor_temps(climate_recent, ts, outdoor)
+        assert result == {}
+
+    def test_default_tau_applied_when_none(self):
+        """When tau_hours=None, the DEFAULT_TAU constant is used (no crash)."""
+        from energy_forecast.const import DEFAULT_TAU
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [ts[0]],
+                "current_temp": [10.0],
+                "setpoint":     [20.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=None)
+        t_in = result["climate.room"]["current_temp"].values
+        assert t_in[0] == pytest.approx(10.0)
+        # With DEFAULT_TAU=24 the first step: 10 + (5-10)/24 ≈ 9.79
+        expected_step1 = 10.0 + (5.0 - 10.0) / DEFAULT_TAU
+        assert t_in[1] == pytest.approx(expected_step1, rel=1e-4)
+
+
+class TestAreaWeightedThermalPressure:
+    """Unit tests for area-weighted thermal pressure in _engineer_features()."""
+
+    def test_single_room_std_is_zero(self):
+        """With only one room, thermal_pressure_std should be 0."""
+        ts = pd.date_range("2026-01-15 10:00", periods=3, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0] * 3,
+                "setpoint":     [21.0] * 3,  # delta = 3.0
+            })
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert "thermal_pressure_std" in result.columns
+        assert (result["thermal_pressure_std"] == 0.0).all()
+
+    def test_multi_room_weighted_mean(self):
+        """Weighted mean and max are correct for two rooms with different areas."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.large": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 3.0
+            }),
+            "climate.small": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [19.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 2.0
+            }),
+        }
+        room_areas = {"climate.large": 30.0, "climate.small": 10.0}  # 3:1 ratio
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs,
+                                    room_areas=room_areas)
+        assert "thermal_pressure" in result.columns
+        assert "thermal_pressure_max" in result.columns
+        # Weighted mean: (3.0*30 + 2.0*10) / 40 = (90+20)/40 = 2.75
+        np.testing.assert_allclose(result["thermal_pressure"].values, 2.75, atol=1e-6)
+        # Max delta: large room = 3.0
+        np.testing.assert_allclose(result["thermal_pressure_max"].values, 3.0, atol=1e-6)
+
+    def test_uniform_area_fallback(self):
+        """Without room_areas, all rooms default to DEFAULT_ROOM_AREA_M2 (equal weight)."""
+        from energy_forecast.const import DEFAULT_ROOM_AREA_M2
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [19.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 2.0
+            }),
+            "climate.room2": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [17.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 4.0
+            }),
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        # Equal areas → straight mean = (2.0 + 4.0) / 2 = 3.0
+        np.testing.assert_allclose(result["thermal_pressure"].values, 3.0, atol=1e-6)
+
+    def test_no_climate_gives_zeros(self):
+        """Without climate_dfs all three thermal features are 0."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)
+        assert (result["thermal_pressure"]     == 0.0).all()
+        assert (result["thermal_pressure_max"] == 0.0).all()
+        assert (result["thermal_pressure_std"] == 0.0).all()
+
+    def test_negative_delta_clipped_to_zero(self):
+        """Rooms above setpoint (delta<0) contribute 0 — no negative pressure."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.warm": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [23.0] * 2,  # above setpoint
+                "setpoint":     [21.0] * 2,
+            }),
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert (result["thermal_pressure"] == 0.0).all()
+
+
+class TestZeroFillEliminated:
+    """Verify that thermal_pressure is non-zero for all 48 prediction hours."""
+
+    def test_all_hours_nonzero_with_cold_room(self, tmp_path):
+        """When a room is below setpoint, projected thermal_pressure must be >0 for all 48h.
+
+        The climate_recent observation must be fresh (<2h old) so that the RC-ODE
+        starts from the actual cold temperature rather than falling back to setpoint.
+        """
+        n = 600
+        rng = np.random.default_rng(42)
+        ts  = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0] * n,
+            "precipitation_mm":     [0.0] * n,
+            "sunshine_min":         [30.0] * n,
+            "wind_kmh":             [10.0] * n,
+            "cloud_cover_pct":      [50.0] * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        # Training uses any historical climate data
+        climate_train = {
+            "climate.living": pd.DataFrame({
+                "timestamp":    [ts[-1]],
+                "current_temp": [17.0],
+                "setpoint":     [21.0],
+            })
+        }
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                climate_dfs=climate_train)
+
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast_df = pd.DataFrame({
+            "timestamp":            future_ts,
+            "temp_c":               [5.0] * 48,
+            "precipitation_mm":     [0.0] * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+
+        # Prediction uses a FRESH observation (30 min ago) so RC-ODE starts at 17°C
+        now_naive = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        climate_predict = {
+            "climate.living": pd.DataFrame({
+                "timestamp":    [now_naive - pd.Timedelta(minutes=30)],  # fresh
+                "current_temp": [17.0],   # cold — 4°C below setpoint
+                "setpoint":     [21.0],
+            })
+        }
+
+        _, X = m._prepare_prediction_X(
+            forecast_df, live_temp=None, recent_actuals=None,
+            climate_recent=climate_predict,
+        )
+        # thermal_pressure must be non-zero for all 48 hours
+        if "thermal_pressure" in X.columns:
+            assert (X["thermal_pressure"] > 0).all(), (
+                "thermal_pressure should be non-zero for all 48 prediction hours "
+                "when a room is below setpoint and observation is fresh"
+            )

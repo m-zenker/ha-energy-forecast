@@ -57,6 +57,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "people_home":         "number of people home",
     "cloud_cover_pct":     "cloud cover",
     "direct_radiation_wm2":"solar irradiance",
+    "thermal_pressure":     "heat debt (area-weighted)",
+    "thermal_pressure_max": "coldest room heat deficit",
+    "thermal_pressure_std": "room temperature imbalance",
 }
 
 
@@ -151,9 +154,13 @@ class EnergyForecast(hass.Hass):
         # climate_entities: list of HA climate entities (e.g. climate.living_room)
         # dhw_buffer_sensor: entity ID for DHW temperature sensor
         # heating_system_active_entity: binary sensor to verify "heating off" periods for Tau
+        # climate_room_areas: optional {entity_id: m²} map for area-weighted thermal pressure
         self._climate_entities: list[str] = list(self.args.get("climate_entities") or [])
         self._dhw_buffer_sensor: str | None = self.args.get("dhw_buffer_sensor") or None
         self._heating_active_entity: str | None = self.args.get("heating_system_active_entity") or None
+        self._climate_room_areas: dict[str, float] = self._parse_room_areas(
+            self.args.get("climate_room_areas") or {}
+        )
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
@@ -952,6 +959,7 @@ class EnergyForecast(hass.Hass):
             dhw_df=dhw_df if not dhw_df.empty else None,
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
             program_histories=program_histories or None,
+            room_areas=self._climate_room_areas or None,
         )
         self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
 
@@ -1066,6 +1074,7 @@ class EnergyForecast(hass.Hass):
             people_home_series=people_home_series,
             climate_recent=climate_recent or None,
             dhw_recent=dhw_recent if not dhw_recent.empty else None,
+            room_areas=self._climate_room_areas or None,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
@@ -1076,6 +1085,7 @@ class EnergyForecast(hass.Hass):
             people_home_series=people_home_series,
             climate_recent=climate_recent or None,
             dhw_recent=dhw_recent if not dhw_recent.empty else None,
+            room_areas=self._climate_room_areas or None,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
@@ -1186,6 +1196,25 @@ class EnergyForecast(hass.Hass):
             return float(state)
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _parse_room_areas(raw: Any) -> "dict[str, float]":
+        """Validate and coerce ``climate_room_areas`` from apps.yaml.
+
+        Expects a dict ``{entity_id: float}``. Non-numeric values are silently
+        dropped (invalid entries must not crash the app on startup).
+        """
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, float] = {}
+        for eid, area in raw.items():
+            try:
+                val = float(area)
+                if val > 0:
+                    result[str(eid)] = val
+            except (TypeError, ValueError):
+                pass
+        return result
 
     def _build_away_prediction_series(self, now_ts: Any) -> Any:
         """Return a 48-value pd.Series (indexed by naive prediction timestamps) of is_away flags.
