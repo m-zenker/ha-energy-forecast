@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 
 from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
+    DEFAULT_ROOM_AREA_M2,
+    DEFAULT_TAU,
     HOLDOUT_FRACTION,
     MAX_HOURLY_KWH,
     MIN_CV_ROWS,
@@ -109,6 +111,10 @@ _FEATURES_BASE = [
     "people_home",
     # Stage 2: Intent-driven features
     "thermal_pressure",
+    "thermal_pressure_max",
+    "thermal_pressure_std",
+    "thermal_pressure_cop",
+    "weighted_solar_gain",
     "dhw_buffer_temp",
     "dhw_pressure",
 ]
@@ -231,6 +237,7 @@ class EnergyForecastModel:
         dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
+        room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -304,7 +311,8 @@ class EnergyForecastModel:
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
-                                dhw_df=dhw_df, tau_hours=self._tau_hours)
+                                dhw_df=dhw_df, tau_hours=self._tau_hours,
+                                room_areas=room_areas)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -571,6 +579,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -593,10 +602,27 @@ class EnergyForecastModel:
         if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
+        # ── Indoor temperature projection ────────────────────────────────────
+        # Replace stale climate_recent with RC-ODE projected temperatures so
+        # that thermal_pressure is non-zero for all 48 prediction hours.
+        climate_dfs_for_features = climate_recent
+        if climate_recent:
+            outdoor_temp_series = (
+                outdoor_pred_df.set_index("timestamp")["outdoor_temp_live"]
+                if outdoor_pred_df is not None
+                else forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
+            )
+            climate_dfs_for_features = _project_indoor_temps(
+                climate_recent,
+                future_hours,
+                outdoor_temp_series,
+                tau_hours=self._tau_hours,
+            )
+
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
-                                     climate_dfs=climate_recent, dhw_df=dhw_recent,
-                                     tau_hours=self._tau_hours)
+                                     climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
+                                     tau_hours=self._tau_hours, room_areas=room_areas)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -654,6 +680,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -664,7 +691,7 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -682,6 +709,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -696,7 +724,7 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1011,21 +1039,37 @@ class EnergyForecastModel:
 
         T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
 
-        # Outdoor temperature from weather_df
+        # Outdoor temperature + radiation from weather_df
         outdoor = weather_df[["timestamp", "temp_c"]].copy()
         outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
         T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
+
+        # Solar radiation — used to mask windows contaminated by solar gain.
+        # Gracefully absent in legacy weather_df without this column.
+        has_radiation = "direct_radiation_wm2" in weather_df.columns
+        if has_radiation:
+            rad = weather_df[["timestamp", "direct_radiation_wm2"]].copy()
+            rad["timestamp"] = pd.to_datetime(rad["timestamp"]).dt.floor("1h")
+            rad_series = rad.set_index("timestamp")["direct_radiation_wm2"]
+        else:
+            rad_series = None
 
         # Heating active status (treat any value > 0.5 as "on")
         active = heating_active_df[["timestamp", "heating_active"]].copy()
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
 
-        combined = pd.DataFrame({
+        combined_data: dict[str, "pd.Series"] = {
             "T_indoor":       T_indoor_series,
             "T_outdoor":      T_outdoor_series,
             "heating_active": active_series,
-        }).dropna().sort_index()
+        }
+        if rad_series is not None:
+            combined_data["direct_radiation_wm2"] = rad_series
+
+        combined = pd.DataFrame(combined_data).dropna(
+            subset=["T_indoor", "T_outdoor", "heating_active"]
+        ).sort_index()
 
         if combined.empty:
             return None
@@ -1038,6 +1082,18 @@ class EnergyForecastModel:
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
+
+            # §4 safeguard: exclude windows touching daytime hours (09:00–15:00).
+            # Heating behaviour and solar gain during these hours corrupt the
+            # passive-cooling signal even when the heating system is nominally off.
+            if group.index.hour.isin(range(9, 16)).any():
+                continue
+
+            # §4 safeguard: reject windows where solar radiation exceeded 150 W/m².
+            if "direct_radiation_wm2" in group.columns:
+                if group["direct_radiation_wm2"].max() > 150:
+                    continue
+
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
@@ -1078,11 +1134,29 @@ class EnergyForecastModel:
             return None
 
         tau_median = float(np.median(tau_estimates))
+
+        # §4 safeguard: EMA smoothing — if the new estimate differs from the
+        # stored τ by more than 50%, blend rather than replace outright.
+        # Prevents a single anomalous training batch from causing a large jump.
+        old_tau = self._tau_hours
+        if old_tau is not None and old_tau > 0:
+            change_frac = abs(tau_median - old_tau) / old_tau
+            if change_frac > 0.5:
+                tau_result = 0.8 * old_tau + 0.2 * tau_median
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw new estimate %.1f h, Δ=%.0f%%)",
+                    old_tau, tau_result, tau_median, change_frac * 100,
+                )
+            else:
+                tau_result = tau_median
+        else:
+            tau_result = tau_median
+
         _LOGGER.info(
             "Building τ estimated at %.1f h from %d passive-cooling windows.",
-            tau_median, len(tau_estimates),
+            tau_result, len(tau_estimates),
         )
-        return tau_median
+        return tau_result
 
     def _load(self) -> None:
         if self._model_path.exists():
@@ -1704,6 +1778,71 @@ def _add_sub_sensor_lags_prediction(
     return future_df
 
 
+# ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
+
+def _project_indoor_temps(
+    climate_recent: "dict[str, pd.DataFrame]",
+    future_timestamps: "pd.DatetimeIndex",
+    outdoor_temp_series: "pd.Series",
+    tau_hours: float | None = None,
+) -> "dict[str, pd.Series]":
+    """Project indoor temperature for each climate entity over *future_timestamps*.
+
+    Uses a first-order RC ODE (Euler forward):
+        T_in[t+1] = T_in[t] + (T_out[t] - T_in[t]) / tau
+
+    Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
+    otherwise falls back to the most-recent ``setpoint``.
+
+    Returns a dict ``{entity_id: pd.Series}`` with ``current_temp`` projections
+    indexed by *future_timestamps*. These can be passed as *climate_dfs* to
+    ``_engineer_features()`` so that prediction-time thermal pressure reflects
+    projected — rather than stale — indoor temperatures.
+    """
+    import pandas as pd
+    import numpy as np
+
+    tau = tau_hours if (tau_hours and tau_hours > 0) else DEFAULT_TAU
+    now = future_timestamps[0]  # first step ≈ current hour (naive)
+    stale_threshold = pd.Timedelta(hours=2)
+
+    result: dict[str, pd.Series] = {}
+
+    for eid, cdf in climate_recent.items():
+        if cdf.empty:
+            continue
+
+        cdf = cdf.copy()
+        cdf["timestamp"] = pd.to_datetime(cdf["timestamp"])
+        latest = cdf.sort_values("timestamp").iloc[-1]
+
+        age = now - latest["timestamp"]
+        if age <= stale_threshold:
+            t_in_start = float(latest["current_temp"])
+        else:
+            t_in_start = float(latest["setpoint"])
+
+        # Align outdoor temps to future_timestamps
+        t_out_arr = outdoor_temp_series.reindex(future_timestamps, method="nearest").values.astype(float)
+
+        # Vectorised Euler forward over 48 steps
+        t_in_arr = np.empty(len(future_timestamps))
+        t_in_arr[0] = t_in_start
+        for i in range(1, len(future_timestamps)):
+            t_in_arr[i] = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+
+        # Build a projected climate DataFrame matching what _engineer_features expects
+        setpoint_val = float(latest["setpoint"])
+        projected_df = pd.DataFrame({
+            "timestamp": future_timestamps,
+            "current_temp": t_in_arr,
+            "setpoint": setpoint_val,  # constant — we have no future setpoint schedule
+        })
+        result[eid] = projected_df
+
+    return result
+
+
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 def _engineer_features(
@@ -1718,6 +1857,7 @@ def _engineer_features(
     climate_dfs: dict[str, pd.DataFrame] | None = None,
     dhw_df: pd.DataFrame | None = None,
     tau_hours: float | None = None,
+    room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1854,36 +1994,60 @@ def _engineer_features(
         df["people_home"] = 0
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
+    # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal
+    # thermal_pressure_max  — largest per-room deficit (cold outlier room)
+    # thermal_pressure_std  — spread across rooms (imbalance signal)
     if climate_dfs:
-        deltas = []
+        delta_series: dict[str, "pd.Series"] = {}  # entity_id → per-timestamp delta Series
+        ts_index = None
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
                 continue
             c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
             c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
-            c[f"{eid}_delta"] = c["setpoint"] - c["current_temp"]
-            deltas.append(c[["timestamp", f"{eid}_delta"]])
+            c = c.sort_values("timestamp")
+            delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
+            delta.index = c["timestamp"]
+            delta_series[eid] = delta
+            if ts_index is None:
+                ts_index = c["timestamp"]
 
-        if deltas:
-            # Join all deltas
-            from functools import reduce
-            merged_deltas = reduce(lambda left, right: pd.merge(left, right, on="timestamp", how="outer"), deltas)
-            # Average delta across all rooms as the household "thermal pressure".
-            # When τ is known, scale by 1/τ to express urgency in °C/h rather than
-            # a static °C delta — a fast-cooling building (low τ) gets higher urgency.
-            delta_cols = [c for c in merged_deltas.columns if c != "timestamp"]
-            raw_delta = merged_deltas[delta_cols].mean(axis=1)
-            merged_deltas["thermal_pressure"] = raw_delta / tau_hours if tau_hours else raw_delta
+        if delta_series:
+            delta_df = pd.DataFrame(delta_series)  # rows=timestamps, cols=entities
+            areas = {eid: (room_areas or {}).get(eid, DEFAULT_ROOM_AREA_M2) for eid in delta_series}
+            total_area = sum(areas.values()) or 1.0
+            area_weights = pd.Series(areas)
+
+            # Weighted mean (°C·h) — primary feature
+            weighted_sum = (delta_df * area_weights).sum(axis=1)
+            pressure_series = weighted_sum / total_area
+
+            # Per-row secondary stats
+            max_series = delta_df.max(axis=1)
+            std_series  = delta_df.std(axis=1).fillna(0.0)
+
+            summary = pd.DataFrame({
+                "timestamp":            delta_df.index,
+                "thermal_pressure":     pressure_series.values,
+                "thermal_pressure_max": max_series.values,
+                "thermal_pressure_std": std_series.values,
+            })
 
             df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-            df = df.merge(merged_deltas[["timestamp", "thermal_pressure"]], left_on="_ts_floor", right_on="timestamp",
+            df = df.merge(summary, left_on="_ts_floor", right_on="timestamp",
                           how="left", suffixes=("", "_tp"))
             df.drop(columns=["timestamp_tp", "_ts_floor"], errors="ignore", inplace=True)
-            df["thermal_pressure"] = df["thermal_pressure"].fillna(0.0)
+            df["thermal_pressure"]     = df["thermal_pressure"].fillna(0.0)
+            df["thermal_pressure_max"] = df["thermal_pressure_max"].fillna(0.0)
+            df["thermal_pressure_std"] = df["thermal_pressure_std"].fillna(0.0)
         else:
-            df["thermal_pressure"] = 0.0
+            df["thermal_pressure"]     = 0.0
+            df["thermal_pressure_max"] = 0.0
+            df["thermal_pressure_std"] = 0.0
     else:
-        df["thermal_pressure"] = 0.0
+        df["thermal_pressure"]     = 0.0
+        df["thermal_pressure_max"] = 0.0
+        df["thermal_pressure_std"] = 0.0
 
     # ── Stage 2: DHW Pressure ───────────────────────────────────────────
     if dhw_df is not None and not dhw_df.empty:
@@ -1903,6 +2067,24 @@ def _engineer_features(
     else:
         df["dhw_buffer_temp"] = 50.0
         df["dhw_pressure"] = 0.0
+
+    # ── §3: Passive solar gain (time-of-day weighted radiation) ──────────────
+    # Half-cosine window peaks at 13:00, reaches 0 at 09:00 and 17:00.
+    # Captures south-facing passive gain that reduces actual heating demand.
+    hour_arr = df["timestamp"].dt.hour.values.astype(float)
+    cos_factor = np.where(
+        (hour_arr >= 9) & (hour_arr <= 17),
+        np.cos(np.pi * (hour_arr - 13.0) / 4.0),
+        0.0,
+    ).clip(0.0)  # cosine is negative near edges — floor at 0
+    df["weighted_solar_gain"] = df["direct_radiation_wm2"] * cos_factor
+
+    # ── §3: COP proxy — thermal pressure as electrical urgency ───────────────
+    # Linear COP model: COP ≈ 0.11 × T_out + 3.0 (air-to-water HP, radiators).
+    # Same °C heat debt costs ~2× more electricity at −10°C vs +10°C outdoors.
+    # Denominator clamped at 0.5 to guard against extreme negative temps.
+    cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
+    df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
 
     return df
 

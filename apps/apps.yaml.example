@@ -164,6 +164,14 @@ energy_forecast:
   #   - climate.living_room
   #   - climate.bedroom
 
+  # climate_room_areas: Optional floor area (m²) per climate entity.
+  #   Used for area-weighted thermal pressure — larger rooms count more.
+  #   Rooms omitted here default to 15 m². Has no effect if climate_entities
+  #   is not configured.
+  # climate_room_areas:
+  #   climate.living_room: 35.5
+  #   climate.bedroom:     18.0
+
   # dhw_buffer_sensor: Entity ID for your DHW (Domestic Hot Water) buffer temperature.
   #                    Used to predict water heating cycles based on heat loss.
   # dhw_buffer_sensor: sensor.dhw_buffer_temperature

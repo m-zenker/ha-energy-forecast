@@ -32,3 +32,7 @@ APPLIANCE_MAX_WINDOW_HOURS = 12  # Hard cap for adaptive cycle detection
 # transitioning fully to the weather forecast.
 SENSOR_FULL_TRUST_HOURS = 2
 SENSOR_BLEND_HOURS = 6
+
+# Thermal Projection (indoor temperature RC-ODE forward simulation)
+DEFAULT_TAU = 24.0        # hours — used when τ has not been calibrated yet
+DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured

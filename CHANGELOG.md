@@ -10,6 +10,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-10] — 2026-04-14
+
+### Added
+- `apps/energy_forecast/model.py` — **`weighted_solar_gain`**: `direct_radiation_wm2` scaled by a half-cosine window peaking at 13:00, zero outside 09:00–17:00. Captures south-facing passive solar gain that reduces actual heating demand even when `thermal_pressure` looks high.
+- `apps/energy_forecast/model.py` — **`thermal_pressure_cop`**: `thermal_pressure / max(0.5, 0.11 × T_out + 3.0)`. Expresses heat debt as electrical urgency — the same 1°C deficit costs ~2× more electricity at −10°C than at +10°C outdoors. Denominator clamped at 0.5 to guard against extreme negative temperatures.
+- `apps/energy_forecast/energy_forecast.py` — SHAP labels for `thermal_pressure_cop` and `weighted_solar_gain`.
+
+### Changed
+- `apps/energy_forecast/model.py` — **τ calibration safeguards** in `_calibrate_tau()`:
+  - *Daytime exclusion*: passive-cooling windows that contain any timestamp in 09:00–15:00 are now rejected (solar gain and occupancy patterns during these hours corrupt the passive-cooling ODE fit).
+  - *Solar radiation mask*: windows where `direct_radiation_wm2 > 150 W/m²` at any point are rejected. Degrades gracefully when `weather_df` lacks the radiation column (mask skipped, no crash).
+  - *EMA smoothing*: when a new τ estimate differs from the stored value by more than 50%, the result is blended as `0.8 × old + 0.2 × new` to prevent single-batch jitter from propagating into the 48-hour forecast.
+
+### Tests
+- 468 passing (15 new covering solar gain shape, COP denominator clamp, daytime/radiation window exclusion, EMA blend thresholds; 2 existing tests updated for the new daytime exclusion filter).
+
+---
+
+## [0.10.2-alpha-9] — 2026-04-14
+
+### Added
+- `apps/energy_forecast/model.py` — **Indoor Temperature Projection**: new `_project_indoor_temps()` pure function uses an RC-ODE (Euler forward integration) to project indoor temperatures for all 48 forecast hours based on outdoor forecast. Eliminates the zero-fill problem where `thermal_pressure` defaulted to 0 for hours >2h ahead due to stale `climate.current_temperature` sensor data. Starting indoor temperature uses the most-recent `current_temp` if <2h old; falls back to setpoint for stale sensors.
+- `apps/energy_forecast/model.py` — **Area-Weighted Thermal Pressure**: rooms are now weighted by floor area via new `climate_room_areas` config key (dict mapping entity_id → m²). Rooms without explicit area default to 15 m². Thermal pressure is expressed in °C·h (area-weighted cumulative deficit; τ-division removed for clearer physical interpretation).
+- `apps/energy_forecast/model.py` — **Secondary thermal features**: `thermal_pressure_max` (largest per-room deficit) and `thermal_pressure_std` (room temperature imbalance spread across rooms).
+- `apps/energy_forecast/const.py` — constants `DEFAULT_TAU = 24.0` (building thermal time constant fallback) and `DEFAULT_ROOM_AREA_M2 = 15.0` (per-room area default).
+- `apps/energy_forecast/energy_forecast.py` — SHAP labels for all three thermal pressure features; new `_parse_room_areas()` helper validates `climate_room_areas` config entries.
+- `apps.yaml.example` — `climate_room_areas` example configuration.
+
+### Tests
+- 453 passing (12 new covering RC-ODE convergence, stale-sensor fallback, area weighting, max/std features, zero-fill elimination; 1 existing test updated for removed τ-division).
+
+---
+
 ## [0.10.2-alpha-8] — 2026-04-12
 
 ### Fixed
