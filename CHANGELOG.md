@@ -10,6 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-13] — 2026-04-14
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `fetch_recent_sub_sensor` / `fetch_sub_sensor_history`: pandas 3.x `merge_asof` raised `Incompatible merge dtype, dtype('O') and dtype('<M8[us]')` whenever the raw HA fetch returned empty data and `program_entity_id` was configured. Fix on three levels: (1) `_resolve_programs_for_series` wraps timestamps in `pd.to_datetime()` defensively; (2) both fetch functions now build their empty fallback `DataFrame` with explicit `dtype` per column instead of column-names-only. Washer and dryer were failing every hour since 13:01 today.
+
+### Tests
+- 470 passing (2 new regression tests covering both fetch paths with empty raw HA + cache + `program_entity_id`).
+
+### Deployment
+- Merged `fix/subsensor-dtype-empty-raw` into `dev`. Deployed to HA.
+
+---
+
 ## [0.10.2-alpha-12] — 2026-04-14
 
 ### Changed
