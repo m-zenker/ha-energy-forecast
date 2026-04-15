@@ -648,7 +648,7 @@ Migration reference:
 | 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | ✓ done (on dev) |
 | 53 | "Why today?" SHAP narrative attribute | explainability / UX | 2 h | ✓ done (on dev) |
 | 54 | Relative MAE sensors (7d / 30d) | visibility / UX | 30 min | ✓ done (on dev) |
-| 55 | Fix SHAP: pass climate_recent / room_areas to shap_summary() | explainability correctness | 1 h | backlog |
-| 56 | Solar-Compensated Thermal Pressure | **high** (sunny winter days) | 2 h | backlog |
-| 57 | Wind-Driven Infiltration Feature | medium | 1 h | backlog |
-| 58 | Humidity-Aware Defrost Proxy (Heat Pump) | medium | 1 h | backlog |
+| 55 | Fix SHAP: pass climate_recent / room_areas to shap_summary() | explainability correctness | 1 h | ✓ done (on feat/physics-features) |
+| 56 | Solar-Compensated Thermal Pressure | **high** (sunny winter days) | 2 h | ✓ done (on feat/physics-features) |
+| 57 | Wind-Driven Infiltration Feature | medium | 1 h | ✓ done (on feat/physics-features) |
+| 58 | Humidity-Aware Defrost Proxy (Heat Pump) | medium | 1 h | ✓ done (on feat/physics-features) |
