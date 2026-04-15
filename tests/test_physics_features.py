@@ -110,7 +110,7 @@ def _make_trained_model_with_physics(tmp_path, n: int = 600):
         "humidity":             rng.uniform(30, 90, size=n),
         "precipitation_mm":     [0.0]   * n,
         "sunshine_min":         [30.0]  * n,
-        "wind_kmh":             [10.0]  * n,
+        "wind_kmh":             rng.uniform(0, 30, size=n),   # vary so infiltration_pressure has signal
         "cloud_cover_pct":      [50.0]  * n,
         "direct_radiation_wm2": [100.0] * n,
     })
@@ -150,12 +150,12 @@ def test_shap_context_fix(tmp_path):
         })
     }
     
-    # Use a large n to see all features
+    # Use n larger than total feature count to capture all features
     shap_results = m.shap_summary(
-        forecast, 
+        forecast,
         live_temp=10.0,
         climate_recent=climate_recent,
-        n=50
+        n=100,
     )
     
     # thermal_pressure should be in SHAP results and have some value (not zeroed out)

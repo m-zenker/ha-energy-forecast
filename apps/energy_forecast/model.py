@@ -1960,9 +1960,12 @@ def _engineer_features(
     # Safety net: ensure new weather columns always exist even when weather_df
     # doesn't include them (e.g. unexpected API response gaps). The model's
     # _feature_medians fill in predict() handles the resulting NaN values.
-    for col in ["cloud_cover_pct", "direct_radiation_wm2", "humidity"]:
+    for col in ["cloud_cover_pct", "direct_radiation_wm2"]:
         if col not in df.columns:
             df[col] = np.nan
+    # humidity: default to 70 % RH when missing — avoids all-NaN dropna in training.
+    if "humidity" not in df.columns:
+        df["humidity"] = 70.0
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
