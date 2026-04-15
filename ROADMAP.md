@@ -216,6 +216,31 @@ off for weeks (τ estimation becomes noisy without an outdoor temp anchor).
 **Impact:** Medium. Sharpens `thermal_pressure` accuracy, especially on buildings with fast thermal
 decay. Pairs with #15 (HVAC state).
 
+### 56. Solar-Compensated Thermal Pressure *(backlog)*
+**Signal:** Integrate passive solar gain directly into the thermal demand signal. Passive solar heating reduces the actual energy required to maintain a setpoint, even if the temperature delta is still high. Integrating this helps the model learn to "wait" for the sun.
+
+**Formula:**
+`thermal_pressure_net = thermal_pressure - (k * weighted_solar_gain)`
+Where `k` is a learnable coefficient (or captured via feature interaction in the ML model).
+
+**Impact:** HIGH. Reduces forecast over-shooting on sunny winter days.
+
+### 57. Wind-Driven Infiltration Feature *(backlog)*
+**Signal:** Model the accelerated building heat loss caused by wind-driven air exchange and convection.
+
+**Physics:** Infiltration loss is roughly proportional to $WindSpeed \cdot (T_{indoor} - T_{outdoor})$.
+
+**Feature:** `infiltration_pressure = wind_kmh * thermal_pressure`
+
+**Impact:** MEDIUM. Captures the "wind chill" effect on the building envelope.
+
+### 58. Humidity-Aware Defrost Proxy (Heat Pump Specific) *(backlog)*
+**Signal:** Predict energy spikes caused by air-source heat pump evaporator defrosting. Defrosting is most frequent when $T_{outdoor}$ is between $-2^\circ C$ and $+5^\circ C$ and humidity is high.
+
+**Feature:** `defrost_risk = humidity * exp(-((T_out - 2)^2) / 10)`
+
+**Impact:** MEDIUM. Explains "unexplained" energy spikes during foggy, near-freezing winter days.
+
 ---
 
 ## Distribution
@@ -487,6 +512,20 @@ Map feature names to human-readable descriptions (hour → "time-of-day", heatin
 
 Expected impact: Explainability / UX; Low effort (template strings + feature name mapping).
 
+### 55. Fix SHAP: pass climate context to shap_summary() *(backlog)*
+
+`shap_summary()` (model.py:776) lacks `climate_recent`, `dhw_recent`, `people_home_series`,
+and `room_areas` params. As a result `_prepare_prediction_X()` receives `climate_recent=None`
+and `room_areas=None`, so `thermal_pressure_*` and `weighted_solar_gain` are always zero
+when SHAP values are computed. Predictions themselves are unaffected; only the SHAP narrative
+is wrong — it cannot attribute consumption to thermal load even when it dominates.
+
+Fix: add the four params to `shap_summary()`, thread through to `_prepare_prediction_X()`,
+and update the call in `energy_forecast.py:1209` to pass `self._cached_climate_recent`,
+`self._cached_dhw_recent`, `self._cached_people_home`, `self._climate_room_areas`.
+
+Expected impact: SHAP narrative correctness; Low effort (~1 h, mostly plumbing + tests).
+
 ### 46. Dashboard: personalise entity IDs + icon cleanup *(backlog)*
 `dashboard/dashboard.yaml` and `dashboard/energy-today.yaml` contain user-specific entity
 IDs (`sensor.skoda_enyaq_battery_percentage`, `sensor.kermi_*`, `sensor.gplugk_z_ei`, etc.)
@@ -609,3 +648,7 @@ Migration reference:
 | 52 | Temperature lag features (24h, 168h) | medium (thermal model) | 30 min | ✓ done (on dev) |
 | 53 | "Why today?" SHAP narrative attribute | explainability / UX | 2 h | ✓ done (on dev) |
 | 54 | Relative MAE sensors (7d / 30d) | visibility / UX | 30 min | ✓ done (on dev) |
+| 55 | Fix SHAP: pass climate_recent / room_areas to shap_summary() | explainability correctness | 1 h | backlog |
+| 56 | Solar-Compensated Thermal Pressure | **high** (sunny winter days) | 2 h | backlog |
+| 57 | Wind-Driven Infiltration Feature | medium | 1 h | backlog |
+| 58 | Humidity-Aware Defrost Proxy (Heat Pump) | medium | 1 h | backlog |

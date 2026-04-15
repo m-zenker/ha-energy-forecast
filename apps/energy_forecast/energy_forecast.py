@@ -63,6 +63,7 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "precipitation_mm":     "rainfall",
     "sunshine_min":         "sunshine duration",
     "wind_kmh":             "wind speed",
+    "humidity":             "relative humidity",
     "cloud_cover_pct":      "cloud cover",
     "direct_radiation_wm2": "solar irradiance",
     "heating_degree":       "heating degree-hours",
@@ -105,6 +106,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "thermal_pressure_max": "coldest room heat deficit",
     "thermal_pressure_std": "room temperature imbalance",
     "thermal_pressure_cop": "heat debt electrical cost",
+    "thermal_pressure_net": "solar-compensated heat debt",
+    "infiltration_pressure": "wind-driven heat loss",
+    "defrost_risk":         "heat pump defrost risk",
     "weighted_solar_gain":  "passive solar heat gain",
     "dhw_buffer_temp":      "hot water buffer temperature",
     "dhw_pressure":         "DHW heat demand",
@@ -1210,6 +1214,10 @@ class EnergyForecast(hass.Hass):
                     forecast_df, live_temp, recent_actuals,
                     sub_sensors_recent=sub_sensors_recent or None,
                     away_series=away_series,
+                    people_home_series=people_home_series,
+                    climate_recent=climate_recent or None,
+                    dhw_recent=dhw_recent if not dhw_recent.empty else None,
+                    room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
                 )
             except Exception as exc:  # noqa: BLE001
