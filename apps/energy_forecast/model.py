@@ -86,6 +86,7 @@ _FEATURES_BASE = [
     "hours_ahead",                                   # 0 at training (actuals), 0-47 at predict
     # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+    "humidity",                                      # relative humidity %
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
@@ -114,6 +115,9 @@ _FEATURES_BASE = [
     "thermal_pressure_max",
     "thermal_pressure_std",
     "thermal_pressure_cop",
+    "thermal_pressure_net",                          # #56 solar-compensated pressure
+    "infiltration_pressure",                         # #57 wind-driven heat loss
+    "defrost_risk",                                  # #58 HP defrost proxy
     "weighted_solar_gain",
     "dhw_buffer_temp",
     "dhw_pressure",
@@ -780,6 +784,10 @@ class EnergyForecastModel:
         recent_actuals: "pd.DataFrame | None" = None,
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,
+        people_home_series: "pd.Series | None" = None,
+        climate_recent: dict[str, "pd.DataFrame"] | None = None,
+        dhw_recent: "pd.DataFrame | None" = None,
+        room_areas: "dict[str, float] | None" = None,
         n: int = 5,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
@@ -799,7 +807,11 @@ class EnergyForecastModel:
             return {}
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+            room_areas=room_areas,
         )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -1935,7 +1947,7 @@ def _engineer_features(
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
-    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh", "humidity",
                 "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d",
                 # Thermal modelling features
                 "temp_ewma_24h", "temp_ewma_72h",
@@ -1951,6 +1963,9 @@ def _engineer_features(
     for col in ["cloud_cover_pct", "direct_radiation_wm2"]:
         if col not in df.columns:
             df[col] = np.nan
+    # humidity: default to 70 % RH when missing — avoids all-NaN dropna in training.
+    if "humidity" not in df.columns:
+        df["humidity"] = 70.0
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
@@ -2085,6 +2100,23 @@ def _engineer_features(
     # Denominator clamped at 0.5 to guard against extreme negative temps.
     cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
     df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
+
+    # ── §3: Solar-compensated pressure (#56) ─────────────────────────────────
+    # Primary signal: subtract passive solar gain from thermal pressure.
+    # High impact on reducing over-forecast on sunny winter days.
+    # Scaled by 0.01 to keep feature range comparable to raw pressure.
+    df["thermal_pressure_net"] = np.maximum(0.0, df["thermal_pressure"] - 0.01 * df["weighted_solar_gain"])
+
+    # ── §3: Wind-driven infiltration (#57) ───────────────────────────────────
+    # Feature interaction: infiltration loss ∝ WindSpeed * (T_in - T_out).
+    # We use thermal_pressure as a proxy for the temperature gradient.
+    df["infiltration_pressure"] = 0.01 * df["wind_kmh"] * df["thermal_pressure"]
+
+    # ── §3: Humidity-aware defrost proxy (#58) ───────────────────────────────
+    # Peaks at 2°C, falls off rapidly above 7°C and below -3°C.
+    # Scaled by relative humidity.
+    defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0)**2) / 10.0)
+    df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
 
     return df
 
