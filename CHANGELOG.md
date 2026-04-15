@@ -10,6 +10,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-14] — 2026-04-15
+
+### Added
+- `apps/energy_forecast/weather.py` — `humidity` column fetched from Open-Meteo (`relativehumidity_2m`). Added to `_FEATURES_BASE` in `model.py` (#55). Defaults to 70.0 % when the weather API omits the field.
+- `apps/energy_forecast/model.py` — **`thermal_pressure_net`**: solar-compensated thermal pressure — raw thermal pressure reduced by `weighted_solar_gain` (#56). Captures how passive solar gain offsets the building heat deficit before the heat pump acts.
+- `apps/energy_forecast/model.py` — **`infiltration_pressure`**: wind × thermal gradient interaction term (#57). High wind combined with large indoor–outdoor temperature difference drives cold-air infiltration, increasing heating demand independently of the modelled U-value losses.
+- `apps/energy_forecast/model.py` — **`defrost_risk`**: humidity-scaled Gaussian centred at +2°C (#58). Acts as a proxy for heat-pump defrost cycles, which briefly reverse the refrigerant loop and spike power draw.
+- `apps/energy_forecast/energy_forecast.py` — SHAP labels for all four new physics features.
+- `tests/test_physics_features.py` — 4 new tests covering each physics feature independently (humidity default, `thermal_pressure_net`, `infiltration_pressure`, `defrost_risk` Gaussian peak).
+
+### Tests
+- 474 passing (4 new in `test_physics_features.py`).
+
+### Deployment
+- Merged `feat/physics-features` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-15).
+
+---
+
 ## [0.10.2-alpha-13] — 2026-04-14
 
 ### Fixed
