@@ -241,6 +241,23 @@ Where `k` is a learnable coefficient (or captured via feature interaction in the
 
 **Impact:** MEDIUM. Explains "unexplained" energy spikes during foggy, near-freezing winter days.
 
+### 59. Relaxed Thermal Calibration Constraints *(backlog)*
+**Signal:** The current τ-calibration is very strict to avoid solar/daytime corruption. Relaxing these constraints may allow the model to reach a calibrated state faster in spring/autumn.
+
+**Proposed Changes:**
+- Increase max solar radiation from 150 W/m² to 250 W/m².
+- Evaluate reducing the required windows from 3 to 2 if historical variance is low.
+
+**Impact:** MEDIUM. Enables faster adaptation to building thermal response.
+
+### 60. Calibrated Default Thermal Time Constant ($\tau$) *(backlog)*
+**Signal:** The current `DEFAULT_TAU` of 24.0h is conservative (high-efficiency new build). Based on historical observations of ~1.9h in some instances, a more "middle-of-the-road" default may improve initial accuracy.
+
+**Proposed Change:**
+- Update `DEFAULT_TAU` in `const.py` to 12.0h.
+
+**Impact:** MEDIUM. Improves forward thermal projection accuracy for non-passive-house buildings before calibration finishes.
+
 ---
 
 ## Distribution
@@ -652,3 +669,5 @@ Migration reference:
 | 56 | Solar-Compensated Thermal Pressure | **high** (sunny winter days) | 2 h | ✓ done (on dev) |
 | 57 | Wind-Driven Infiltration Feature | medium | 1 h | ✓ done (on dev) |
 | 58 | Humidity-Aware Defrost Proxy (Heat Pump) | medium | 1 h | ✓ done (on dev) |
+| 59 | Relaxed Thermal Calibration Constraints | medium | 30 min | backlog |
+| 60 | Calibrated Default Thermal Time Constant | medium | 15 min | backlog |
