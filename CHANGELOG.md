@@ -10,6 +10,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-16] — 2026-04-16
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — replaced all `self.log()` calls with `_LOGGER = logging.getLogger("energy_forecast")`. All messages now appear under the `energy_forecast` logger name instead of `AppDaemon`, making log filtering and structured log routing consistent.
+- `apps/energy_forecast/energy_history_backfill.py` — same `self.log()` → `_LOGGER` migration.
+
+### Tests
+- 474 passing (unchanged). `test_energy_forecast.py` and `test_scenario_service.py` updated to assert on `caplog` records rather than mock `self.log` calls.
+
+### Deployment
+- Merged `fix/logging-consistency` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-16).
+
+---
+
 ## [0.10.2-alpha-15] — 2026-04-16
 
 ### Fixed
