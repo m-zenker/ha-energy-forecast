@@ -42,22 +42,17 @@ def _make_baseline_df(start="2024-06-01 10:00", n=48):
 
 class TestGetScenarioCb:
 
-    def test_no_cache_logs_warning(self):
+    def test_no_cache_logs_warning(self, caplog):
         """When _cached_forecast_df is None, should log WARNING and return without error."""
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app(cached_df=None)
-        EnergyForecast._get_scenario_cb(app, "homeassistant", "energy_forecast", "get_scenario", {})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(app, "homeassistant", "energy_forecast", "get_scenario", {})
 
-        # Should have logged a WARNING
-        warning_calls = [
-            call for call in app.log.call_args_list
-            if call.kwargs.get("level") == "WARNING" or (
-                len(call.args) >= 1 and "before first" in str(call.args[0])
-            )
-        ]
-        assert warning_calls, "Expected a WARNING log when cache is None"
-        # fire_event must NOT have been called
+        assert any("before first" in r.message for r in caplog.records), \
+            "Expected a WARNING log when cache is None"
         app.fire_event.assert_not_called()
 
     def test_fires_result_event_with_forecast(self):
@@ -107,43 +102,41 @@ class TestGetScenarioCb:
 
 class TestGetScenarioCbErrors:
 
-    def test_predict_scenario_exception_logged(self):
+    def test_predict_scenario_exception_logged(self, caplog):
         """When predict_scenario raises, ERROR must be logged and fire_event not called."""
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
 
         cached_df = _make_baseline_df()
         app = _make_app(cached_df=cached_df)
         app._ml_model.predict_scenario.side_effect = ValueError("boom")
 
-        EnergyForecast._get_scenario_cb(
-            app, "homeassistant", "energy_forecast", "get_scenario",
-            {"schedule": {}, "publish": False},
-        )
+        with caplog.at_level(logging.ERROR, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "homeassistant", "energy_forecast", "get_scenario",
+                {"schedule": {}, "publish": False},
+            )
 
-        error_calls = [
-            c for c in app.log.call_args_list
-            if c.kwargs.get("level") == "ERROR"
-        ]
-        assert error_calls, "Expected ERROR log when predict_scenario raises"
+        assert any(r.levelno == logging.ERROR for r in caplog.records), \
+            "Expected ERROR log when predict_scenario raises"
         app.fire_event.assert_not_called()
 
-    def test_invalid_schedule_type_logs_warning(self):
+    def test_invalid_schedule_type_logs_warning(self, caplog):
         """Passing schedule as a non-dict should log WARNING and not fire_event."""
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
 
         cached_df = _make_baseline_df()
         app = _make_app(cached_df=cached_df)
 
-        EnergyForecast._get_scenario_cb(
-            app, "homeassistant", "energy_forecast", "get_scenario",
-            {"schedule": "not-a-dict", "publish": False},
-        )
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "homeassistant", "energy_forecast", "get_scenario",
+                {"schedule": "not-a-dict", "publish": False},
+            )
 
-        warning_calls = [
-            c for c in app.log.call_args_list
-            if c.kwargs.get("level") == "WARNING"
-        ]
-        assert warning_calls, "Expected WARNING log for invalid schedule type"
+        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+            "Expected WARNING log for invalid schedule type"
         app.fire_event.assert_not_called()
 
 
