@@ -10,6 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-15] — 2026-04-16
+
+### Fixed
+- `apps/energy_forecast/const.py` — `DEFAULT_TAU` reduced from 24.0 h to 12.0 h. The previous value overestimated the thermal time-constant before calibration data is available, causing the RC-ODE indoor projection to respond too slowly to setpoint changes. 12 h is a better prior for typical residential buildings.
+
+### Tests
+- 474 passing (unchanged).
+
+### Deployment
+- Merged `fix/default-tau-12h` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-16).
+
+---
+
 ## [0.10.2-alpha-14] — 2026-04-15
 
 ### Added
