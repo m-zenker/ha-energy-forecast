@@ -429,17 +429,23 @@ class _FakeValidateSelf:
 class TestValidateConfig:
     """_validate_config must warn when ev_threshold >= ev_charger_kw."""
 
-    def test_warns_when_threshold_equals_charger_kw(self):
+    def test_warns_when_threshold_equals_charger_kw(self, caplog):
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=9.0, ev_charger_kw=9.0)
-        EnergyForecast._validate_config(fake)
-        assert fake._warnings, "Expected WARNING when ev_threshold == ev_charger_kw"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+            "Expected WARNING when ev_threshold == ev_charger_kw"
 
-    def test_warns_when_threshold_exceeds_charger_kw(self):
+    def test_warns_when_threshold_exceeds_charger_kw(self, caplog):
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=10.0, ev_charger_kw=9.0)
-        EnergyForecast._validate_config(fake)
-        assert fake._warnings, "Expected WARNING when ev_threshold > ev_charger_kw"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+            "Expected WARNING when ev_threshold > ev_charger_kw"
 
     def test_no_warning_when_threshold_below_charger_kw(self):
         from energy_forecast.energy_forecast import EnergyForecast
@@ -447,12 +453,14 @@ class TestValidateConfig:
         EnergyForecast._validate_config(fake)
         assert not fake._warnings, "No warning expected when ev_threshold < ev_charger_kw"
 
-    def test_warns_solar_sensor_without_grid_export(self):
+    def test_warns_solar_sensor_without_grid_export(self, caplog):
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         fake._solar_sensor = "sensor.solar_production"
-        EnergyForecast._validate_config(fake)
-        assert any("grid_export_sensor" in w for w in fake._warnings), (
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any("grid_export_sensor" in r.message for r in caplog.records), (
             "Expected WARNING when solar_production_sensor is set without grid_export_sensor"
         )
 
@@ -517,7 +525,6 @@ class TestCheckSetup:
         status = fake._states.get("sensor.energy_forecast_setup_status", {})
         assert status.get("state") == "missing_packages"
         assert "holidays" in status["attributes"]["missing_packages"]
-        assert fake._warnings  # warning must be logged
 
 
 # ── MQTT Discovery tests ──────────────────────────────────────────────────────
@@ -647,20 +654,22 @@ class TestMqttPublishDiscovery:
         assert "device_class" not in payload
         assert "state_class" not in payload
 
-    def test_mqtt_publish_failure_logs_warning_and_does_not_raise(self):
+    def test_mqtt_publish_failure_logs_warning_and_does_not_raise(self, caplog):
         """If call_service raises, _mqtt_publish_discovery must log WARNING and not re-raise."""
+        import logging
         fake = _FakeMqttSelf()
 
         def bad_call_service(service, **kwargs):
             raise RuntimeError("broker down")
 
         fake.call_service = bad_call_service
-        # Must not raise
-        fake._mqtt_publish_discovery(
-            "energy_forecast_today", "Today", "kWh",
-            "mdi:lightning-bolt", "energy", "measurement",
-        )
-        assert fake._warnings, "Expected WARNING on call_service failure"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            fake._mqtt_publish_discovery(
+                "energy_forecast_today", "Today", "kWh",
+                "mdi:lightning-bolt", "energy", "measurement",
+            )
+        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+            "Expected WARNING on call_service failure"
 
 
 class TestMqttSetSensor:
@@ -1447,30 +1456,29 @@ class TestPredHistoryPersistence:
         assert app._actuals_history == {}
         app.log.assert_not_called()
 
-    def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch):
+    def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch, caplog):
         """Invalid JSON → no exception, dicts remain empty, warning logged."""
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
 
         mock_path = tmp_path / "pred_history.json"
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
-        app.log = MagicMock()
         app._pred_history = {}
         app._actuals_history = {}
 
         # Write invalid JSON
         mock_path.write_text("{invalid json}")
 
-        # Should not raise
-        EnergyForecast._load_pred_history(app)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._load_pred_history(app)
 
         # Dicts remain empty
         assert app._pred_history == {}
         assert app._actuals_history == {}
         # Warning should be logged
-        app.log.assert_called_once()
-        assert "Failed to load" in app.log.call_args[0][0]
+        assert any("Failed to load" in r.message for r in caplog.records)
 
     def test_save_creates_file_atomically(self, tmp_path, monkeypatch):
         """Verify that .tmp file is used (save is atomic)."""
@@ -1501,15 +1509,15 @@ class TestPredHistoryPersistence:
         assert len(data["pred"]) == 1
         assert len(data["actuals"]) == 1
 
-    def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch):
+    def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch, caplog):
         """Save failure (OSError) is logged, doesn't raise."""
+        import logging
         from energy_forecast.energy_forecast import EnergyForecast
 
         mock_path = tmp_path / "pred_history.json"
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
-        app.log = MagicMock()
         app._pred_history = {}
         app._actuals_history = {}
 
@@ -1518,12 +1526,10 @@ class TestPredHistoryPersistence:
         mock_open.side_effect = OSError("Disk full")
         monkeypatch.setattr("builtins.open", mock_open)
 
-        # Should not raise
-        EnergyForecast._save_pred_history(app)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._save_pred_history(app)
 
-        # Warning should be logged
-        app.log.assert_called_once()
-        assert "Failed to save" in app.log.call_args[0][0]
+        assert any("Failed to save" in r.message for r in caplog.records)
 
 
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────

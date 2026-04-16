@@ -18,6 +18,7 @@ EV charging handling:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
@@ -30,6 +31,8 @@ import hassapi as hass
 from . import ha_data, weather
 from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
 from .model import EnergyForecastModel
+
+_LOGGER = logging.getLogger("energy_forecast")
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600   # weekly
@@ -133,7 +136,7 @@ class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
     def initialize(self) -> None:
-        self.log("HA Energy Forecast initialising…")
+        _LOGGER.info("HA Energy Forecast initialising…")
 
         self._energy_sensor: str         = self.args["energy_sensor"]
         self._outdoor_sensor: str | None = self.args.get("outdoor_temp_sensor")
@@ -171,9 +174,8 @@ class EnergyForecast(hass.Hass):
                 if "program_sensor" in _item:
                     self._program_sensors[_eid] = str(_item["program_sensor"])
             else:
-                self.log(
-                    f"sub_energy_sensors: unrecognized item {_item!r} — skipping",
-                    level="WARNING",
+                _LOGGER.warning(
+                    "sub_energy_sensors: unrecognized item %r — skipping", _item
                 )
         self._baseline_included_sensors: list[str] = list(
             self.args.get("baseline_included_sensors") or []
@@ -261,10 +263,9 @@ class EnergyForecast(hass.Hass):
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
 
-        self.log(
-            f"HA Energy Forecast ready. "
-            f"EV threshold: {self._ev_threshold} kWh/h, "
-            f"charger: {self._ev_charger_kw} kW"
+        _LOGGER.info(
+            "HA Energy Forecast ready. EV threshold: %s kWh/h, charger: %s kW",
+            self._ev_threshold, self._ev_charger_kw,
         )
 
         self._load_pred_history()
@@ -302,33 +303,32 @@ class EnergyForecast(hass.Hass):
                 f"model_archive_count must be >= 0, got {self._model_archive_count}"
             )
         if self._ev_threshold >= self._ev_charger_kw:
-            self.log(
-                f"ev_charging_threshold_kwh ({self._ev_threshold}) is ≥ ev_charger_kw "
-                f"({self._ev_charger_kw}). EV sessions may not be detected correctly — "
+            _LOGGER.warning(
+                "ev_charging_threshold_kwh (%s) is ≥ ev_charger_kw (%s). "
+                "EV sessions may not be detected correctly — "
                 "lower the threshold or raise ev_charger_kw.",
-                level="WARNING",
+                self._ev_threshold, self._ev_charger_kw,
             )
         if self._solar_sensor and not self._grid_export_sensor:
-            self.log(
+            _LOGGER.warning(
                 "solar_production_sensor is set but grid_export_sensor is not — "
                 "surplus solar exported to the grid will inflate the training target. "
-                "Add grid_export_sensor for accurate consumption correction.",
-                level="WARNING",
+                "Add grid_export_sensor for accurate consumption correction."
             )
         if self._mqtt_discovery:
             if not self._mqtt_namespace:
                 raise ValueError("mqtt_namespace must be a non-empty string when mqtt_discovery is True")
             if not self._mqtt_discovery_prefix:
                 raise ValueError("mqtt_discovery_prefix must be a non-empty string when mqtt_discovery is True")
-        self.log(
-            f"Config validated — lat={self._lat}, lon={self._lon}, plz={self._plz}, "
-            f"timezone={self._timezone}, holiday_country={self._holiday_country}, "
-            f"weight_halflife={self._weight_halflife}d, baseline_mode={self._baseline_mode}, "
-            f"ev_threshold={self._ev_threshold} kWh/h, ev_charger={self._ev_charger_kw} kW, "
-            f"sub_energy_sensors={len(self._sub_energy_sensors)}, "
-            f"anomaly_sigma_threshold={self._anomaly_sigma_threshold}, "
-            f"shap_top_n={self._shap_top_n}, "
-            f"mqtt_discovery={self._mqtt_discovery}"
+        _LOGGER.info(
+            "Config validated — lat=%s, lon=%s, plz=%s, timezone=%s, "
+            "holiday_country=%s, weight_halflife=%sd, baseline_mode=%s, "
+            "ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
+            "anomaly_sigma_threshold=%s, shap_top_n=%s, mqtt_discovery=%s",
+            self._lat, self._lon, self._plz, self._timezone,
+            self._holiday_country, self._weight_halflife, self._baseline_mode,
+            self._ev_threshold, self._ev_charger_kw, len(self._sub_energy_sensors),
+            self._anomaly_sigma_threshold, self._shap_top_n, self._mqtt_discovery,
         )
 
     # ── Setup checker ─────────────────────────────────────────────────────────
@@ -357,10 +357,10 @@ class EnergyForecast(hass.Hass):
 
         if missing:
             state = "missing_packages"
-            self.log(
-                f"Setup check: missing packages — {missing}. "
+            _LOGGER.warning(
+                "Setup check: missing packages — %s. "
                 "Install them via AppDaemon add-on configuration.",
-                level="WARNING",
+                missing,
             )
         else:
             state = "ok"
@@ -381,7 +381,7 @@ class EnergyForecast(hass.Hass):
                     replace=True,
                 )
         except (AttributeError, TypeError, RuntimeError) as exc:
-            self.log(f"Could not publish setup status sensor: {exc}", level="WARNING")
+            _LOGGER.warning("Could not publish setup status sensor: %s", exc)
 
     # ── Sub-sensor helpers ────────────────────────────────────────────────────
 
@@ -505,10 +505,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(
-                f"MQTT binary sensor discovery publish failed for {unique_id}: {exc}",
-                level="WARNING",
-            )
+            _LOGGER.warning("MQTT binary sensor discovery publish failed for %s: %s", unique_id, exc)
 
     def _mqtt_publish_discovery(
         self,
@@ -535,7 +532,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"MQTT discovery publish failed for {unique_id}: {exc}", level="WARNING")
+            _LOGGER.warning("MQTT discovery publish failed for %s: %s", unique_id, exc)
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         """Publish a numeric sensor state (NaN/Inf → 0.0) to the MQTT state topic."""
@@ -552,7 +549,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"MQTT state publish failed for {unique_id}: {exc}", level="WARNING")
+            _LOGGER.warning("MQTT state publish failed for %s: %s", unique_id, exc)
 
     def _mqtt_set_sensor_raw(self, unique_id: str, value_str: str) -> None:
         """Publish a verbatim string payload to the MQTT state topic."""
@@ -566,7 +563,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"MQTT raw state publish failed for {unique_id}: {exc}", level="WARNING")
+            _LOGGER.warning("MQTT raw state publish failed for %s: %s", unique_id, exc)
 
     def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict,
                                         category: str = "sensor") -> None:
@@ -581,7 +578,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"MQTT attributes publish failed for {unique_id}: {exc}", level="WARNING")
+            _LOGGER.warning("MQTT attributes publish failed for %s: %s", unique_id, exc)
 
     def _mqtt_publish_availability(self, payload: str) -> None:
         """Publish 'online' or 'offline' to the shared availability topic."""
@@ -595,7 +592,7 @@ class EnergyForecast(hass.Hass):
                 namespace=self._mqtt_namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"MQTT availability publish failed: {exc}", level="WARNING")
+            _LOGGER.warning("MQTT availability publish failed: %s", exc)
 
     def _mqtt_publish_all_discovery(self) -> None:
         """Publish discovery configs for all non-conditional sensors at init."""
@@ -687,7 +684,7 @@ class EnergyForecast(hass.Hass):
         # Accepts both timer callbacks (single positional arg) and
         # listen_event callbacks (event_name, data, kwargs).
         if not self._lock.acquire(blocking=False):
-            self.log("Retrain skipped — another operation is running.", level="DEBUG")
+            _LOGGER.debug("Retrain skipped — another operation is running.")
             return
         try:
             self._retrain()
@@ -695,21 +692,21 @@ class EnergyForecast(hass.Hass):
                 self._update_sensors()
         except Exception as exc:  # noqa: BLE001
             import traceback
-            self.log(f"Retraining failed: {exc}\n{traceback.format_exc()}", level="ERROR")
+            _LOGGER.error("Retraining failed: %s\n%s", exc, traceback.format_exc())
         finally:
             self._lock.release()
 
     def _rollback_model_cb(self, event_name=None, data=None, kwargs=None) -> None:
         """Restore the previous model snapshot and refresh sensors."""
         if not self._lock.acquire(blocking=False):
-            self.log("Rollback skipped — another operation is running.", level="DEBUG")
+            _LOGGER.debug("Rollback skipped — another operation is running.")
             return
         try:
             success = self._ml_model.rollback_model()
             if success and self._ml_model.model is not None:
                 self._update_sensors()
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Model rollback failed: {exc}", level="ERROR")
+            _LOGGER.error("Model rollback failed: %s", exc)
         finally:
             self._lock.release()
 
@@ -723,12 +720,12 @@ class EnergyForecast(hass.Hass):
         """
         try:
             if self._cached_forecast_df is None:
-                self.log("get_scenario called before first forecast cycle", level="WARNING")
+                _LOGGER.warning("get_scenario called before first forecast cycle")
                 return
 
             schedule = kwargs.get("schedule", {})
             if not isinstance(schedule, dict):
-                self.log(f"get_scenario: 'schedule' must be a dict, got {type(schedule).__name__}", level="WARNING")
+                _LOGGER.warning("get_scenario: 'schedule' must be a dict, got %s", type(schedule).__name__)
                 return
 
             result_df = self._ml_model.predict_scenario(
@@ -751,7 +748,7 @@ class EnergyForecast(hass.Hass):
                 forecast=result_df.to_dict("records"),
             )
         except Exception as exc:  # noqa: BLE001
-            self.log(f"get_scenario failed: {exc}", level="ERROR")
+            _LOGGER.error("get_scenario failed: %s", exc)
 
     def _publish_scenario_forecast(self, result_df: "pd.DataFrame") -> None:
         """Publish scenario forecast sensors to HA (called when publish=True).
@@ -828,17 +825,17 @@ class EnergyForecast(hass.Hass):
         try:
             self._update_sensors()
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Sensor update failed: {exc}", level="ERROR")
+            _LOGGER.error("Sensor update failed: %s", exc)
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
         import pandas as pd
-        self.log("Starting model retraining…")
+        _LOGGER.info("Starting model retraining…")
         energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
 
         if len(energy_df) < MIN_HISTORY_HOURS:
-            self.log(f"Insufficient history ({len(energy_df)} h). Skipping.", level="WARNING")
+            _LOGGER.warning("Insufficient history (%d h). Skipping.", len(energy_df))
             return
 
         energy_df = _strip_tz(energy_df, self._timezone)
@@ -848,10 +845,10 @@ class EnergyForecast(hass.Hass):
             energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
         )
         if len(ev_df):
-            self.log(
-                f"EV filter: {len(ev_df)} charging hours detected "
-                f"({ev_df['gross_kwh'].sum():.1f} kWh gross). "
-                f"Sessions on: {sorted(ev_df['timestamp'].dt.date.unique().tolist())}"
+            _LOGGER.info(
+                "EV filter: %d charging hours detected (%.1f kWh gross). Sessions on: %s",
+                len(ev_df), ev_df["gross_kwh"].sum(),
+                sorted(ev_df["timestamp"].dt.date.unique().tolist()),
             )
 
         # ── Solar / grid-export / battery target correction ───────────────────
@@ -871,10 +868,7 @@ class EnergyForecast(hass.Hass):
                     cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache, timezone=self._timezone)
                     correction_dfs[cache_name] = _strip_tz(cdf, self._timezone)
                 except (OSError, KeyError, ValueError) as exc:
-                    self.log(
-                        f"Target correction fetch failed ({cache_name}): {exc}",
-                        level="WARNING",
-                    )
+                    _LOGGER.warning("Target correction fetch failed (%s): %s", cache_name, exc)
                     correction_dfs[cache_name] = None
             else:
                 correction_dfs[cache_name] = None
@@ -887,12 +881,12 @@ class EnergyForecast(hass.Hass):
                 battery_charge_df=correction_dfs["battery_charge.csv"],
                 battery_discharge_df=correction_dfs["battery_discharge.csv"],
             )
-            self.log(
-                "Target corrected: total_consumption = grid_import"
-                + (" + solar" if correction_dfs["solar_production.csv"] is not None else "")
-                + (" − grid_export" if correction_dfs["grid_export.csv"] is not None else "")
-                + (" − battery_charge" if correction_dfs["battery_charge.csv"] is not None else "")
-                + (" + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "")
+            _LOGGER.info(
+                "Target corrected: total_consumption = grid_import%s%s%s%s",
+                " + solar" if correction_dfs["solar_production.csv"] is not None else "",
+                " − grid_export" if correction_dfs["grid_export.csv"] is not None else "",
+                " − battery_charge" if correction_dfs["battery_charge.csv"] is not None else "",
+                " + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "",
             )
 
         sub_sensors_dict: dict = {}
@@ -917,17 +911,17 @@ class EnergyForecast(hass.Hass):
                     if not prog_df.empty:
                         program_histories[prefix] = prog_df
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"Sub-sensor {entity_id} history fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("Sub-sensor %s history fetch failed: %s", entity_id, exc)
 
         if self._baseline_mode and sub_sensors_dict:
             subtract_dict = self._subtract_only_dict(sub_sensors_dict)
             baseline_df, removed_kwh = _subtract_sub_sensors(baseline_df, subtract_dict)
             included_prefixes = {self._sub_sensor_prefix(e) for e in self._baseline_included_sensors}
-            self.log(
-                f"Passive Baseline: removed {removed_kwh:.1f} kWh from "
-                f"({', '.join(subtract_dict.keys()) or 'none'})"
-                + (f"; keeping {', '.join(sorted(included_prefixes))} in baseline" if included_prefixes else "")
-                + "."
+            _LOGGER.info(
+                "Passive Baseline: removed %.1f kWh from (%s)%s.",
+                removed_kwh,
+                ", ".join(subtract_dict.keys()) or "none",
+                f"; keeping {', '.join(sorted(included_prefixes))} in baseline" if included_prefixes else "",
             )
 
         start_date = baseline_df["timestamp"].min().date()
@@ -937,11 +931,11 @@ class EnergyForecast(hass.Hass):
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date, timezone=self._timezone)
             weather_df = _strip_tz(weather_df, self._timezone)
         except (OSError, KeyError, ValueError) as exc:
-            self.log(
-                f"Historical weather fetch failed: {exc} — "
+            _LOGGER.warning(
+                "Historical weather fetch failed: %s — "
                 "temp_c, heating_degree, cooling_degree and temp_rolling_3d will be "
                 "imputed from training-set medians; forecast quality will be reduced.",
-                level="WARNING",
+                exc,
             )
             weather_df = _empty_weather_df()
 
@@ -966,7 +960,7 @@ class EnergyForecast(hass.Hass):
                 if not c_df.empty:
                     climate_dfs[entity_id] = _strip_tz(c_df, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"Climate {entity_id} history fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("Climate %s history fetch failed: %s", entity_id, exc)
 
         dhw_df = pd.DataFrame()
         if self._dhw_buffer_sensor:
@@ -978,7 +972,7 @@ class EnergyForecast(hass.Hass):
                 if not dhw_df.empty:
                     dhw_df = _strip_tz(dhw_df, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"DHW {self._dhw_buffer_sensor} history fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("DHW %s history fetch failed: %s", self._dhw_buffer_sensor, exc)
 
         # ── Stage 2 / #55: Heating active sensor (τ calibration) ─────────────
         heating_active_df = pd.DataFrame()
@@ -994,9 +988,8 @@ class EnergyForecast(hass.Hass):
                 if not heating_active_df.empty:
                     heating_active_df = _strip_tz(heating_active_df, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
-                self.log(
-                    f"Heating active {self._heating_active_entity} fetch failed: {exc}",
-                    level="WARNING",
+                _LOGGER.warning(
+                    "Heating active %s fetch failed: %s", self._heating_active_entity, exc
                 )
 
         self._ml_model.train(
@@ -1016,7 +1009,7 @@ class EnergyForecast(hass.Hass):
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
         )
-        self.log(f"Retrained. MAE: {self._ml_model.last_mae}")
+        _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 
     def _update_sensors(self) -> None:
         import pandas as pd
@@ -1045,7 +1038,7 @@ class EnergyForecast(hass.Hass):
                 full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
             )
         except (OSError, ValueError, KeyError) as exc:
-            self.log(f"Could not fetch recent actuals for lag features: {exc}", level="WARNING")
+            _LOGGER.warning("Could not fetch recent actuals for lag features: %s", exc)
             recent_actuals = None
             full_actuals   = None
 
@@ -1063,7 +1056,7 @@ class EnergyForecast(hass.Hass):
                 sub_df = _strip_tz(sub_df, self._timezone)
                 sub_sensors_recent[prefix] = sub_df
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"Sub-sensor {entity_id} recent fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("Sub-sensor %s recent fetch failed: %s", entity_id, exc)
 
         if self._baseline_mode and sub_sensors_recent:
             if recent_actuals is not None:
@@ -1083,7 +1076,7 @@ class EnergyForecast(hass.Hass):
                 if not c_df.empty:
                     climate_recent[entity_id] = _strip_tz(c_df, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"Climate {entity_id} recent fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("Climate %s recent fetch failed: %s", entity_id, exc)
 
         dhw_recent = pd.DataFrame()
         if self._dhw_buffer_sensor:
@@ -1095,7 +1088,7 @@ class EnergyForecast(hass.Hass):
                 if not dhw_recent.empty:
                     dhw_recent = _strip_tz(dhw_recent, self._timezone)
             except (OSError, KeyError, ValueError) as exc:
-                self.log(f"DHW {self._dhw_buffer_sensor} recent fetch failed: {exc}", level="WARNING")
+                _LOGGER.warning("DHW %s recent fetch failed: %s", self._dhw_buffer_sensor, exc)
 
         if self._heating_active_entity:
             ha_path = self._generic_sensor_cache_path(
@@ -1107,9 +1100,8 @@ class EnergyForecast(hass.Hass):
                     column_name="heating_active", timezone=self._timezone,
                 )
             except (OSError, KeyError, ValueError) as exc:
-                self.log(
-                    f"Heating active {self._heating_active_entity} recent fetch failed: {exc}",
-                    level="WARNING",
+                _LOGGER.warning(
+                    "Heating active %s recent fetch failed: %s", self._heating_active_entity, exc
                 )
 
         # Cache inputs for scenario/what-if API (Stage 4)
@@ -1221,7 +1213,7 @@ class EnergyForecast(hass.Hass):
                     n=self._shap_top_n,
                 )
             except Exception as exc:  # noqa: BLE001
-                self.log(f"SHAP summary failed: {exc}", level="WARNING")
+                _LOGGER.warning("SHAP summary failed: %s", exc)
 
         # ── Aggregate and publish ─────────────────────────────────────────────
         aggregated = self._aggregate(
@@ -1308,9 +1300,8 @@ class EnergyForecast(hass.Hass):
                     if return_dt.tzinfo is not None:
                         return_dt = return_dt.tz_convert(self._timezone).tz_localize(None)
             except (ValueError, TypeError) as exc:
-                self.log(
-                    f"Could not parse away_return_entity state as datetime: {exc}",
-                    level="WARNING",
+                _LOGGER.warning(
+                    "Could not parse away_return_entity state as datetime: %s", exc
                 )
                 return_dt = None
 
@@ -1364,11 +1355,9 @@ class EnergyForecast(hass.Hass):
         if n_pairs < 24:
             return
         if live_mae > self._adaptive_retrain_threshold * cv_mae:
-            self.log(
-                f"Adaptive retrain triggered: live_MAE={live_mae:.4f} > "
-                f"{self._adaptive_retrain_threshold}× cv_MAE={cv_mae:.4f} "
-                f"(over {n_pairs} matched hours)",
-                level="WARNING",
+            _LOGGER.warning(
+                "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
+                live_mae, self._adaptive_retrain_threshold, cv_mae, n_pairs,
             )
             self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
             self._retrain()
@@ -1666,7 +1655,7 @@ class EnergyForecast(hass.Hass):
                     namespace=self._mqtt_namespace,
                 )
             except Exception as exc:  # noqa: BLE001
-                self.log(f"MQTT anomaly state publish failed: {exc}", level="WARNING")
+                _LOGGER.warning("MQTT anomaly state publish failed: %s", exc)
             _attr_topic = (
                 f"{self._mqtt_discovery_prefix}/energy_forecast"
                 f"/binary_sensor/{_anomaly_uid}/attributes"
@@ -1680,7 +1669,7 @@ class EnergyForecast(hass.Hass):
                     namespace=self._mqtt_namespace,
                 )
             except Exception as exc:  # noqa: BLE001
-                self.log(f"MQTT anomaly attributes publish failed: {exc}", level="WARNING")
+                _LOGGER.warning("MQTT anomaly attributes publish failed: %s", exc)
         else:
             self.set_state(
                 "binary_sensor.energy_forecast_unusual_consumption",
@@ -1816,7 +1805,7 @@ class EnergyForecast(hass.Hass):
             with open(PRED_HISTORY_PATH, "r") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
-            self.log(f"Failed to load pred_history: {exc}", level="WARNING")
+            _LOGGER.warning("Failed to load pred_history: %s", exc)
             return
 
         try:
@@ -1836,9 +1825,9 @@ class EnergyForecast(hass.Hass):
 
             n_pred = len(self._pred_history)
             n_actuals = len(self._actuals_history)
-            self.log(f"Loaded pred_history: {n_pred} predictions, {n_actuals} actuals")
+            _LOGGER.info("Loaded pred_history: %d predictions, %d actuals", n_pred, n_actuals)
         except (ValueError, TypeError, IndexError) as exc:
-            self.log(f"Failed to parse pred_history data: {exc}", level="WARNING")
+            _LOGGER.warning("Failed to parse pred_history data: %s", exc)
 
     def _save_pred_history(self) -> None:
         """Serialize prediction and actuals history to JSON file.
@@ -1858,7 +1847,7 @@ class EnergyForecast(hass.Hass):
                 json.dump(data, f, default=str)
             os.replace(tmp_path, PRED_HISTORY_PATH)
         except OSError as exc:
-            self.log(f"Failed to save pred_history: {exc}", level="WARNING")
+            _LOGGER.warning("Failed to save pred_history: %s", exc)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

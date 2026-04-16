@@ -32,12 +32,15 @@ DETAILS
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import hassapi as hass
 
 from .const import CACHE_PATH
+
+_LOGGER = logging.getLogger("energy_forecast")
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 LOOKBACK_YEARS  = 1
@@ -49,17 +52,16 @@ class EnergyHistoryBackfill(hass.Hass):
     """Runs once on startup, backfills the CSV from the HA SQLite DB."""
 
     def initialize(self) -> None:
-        self.log("=" * 60)
-        self.log("EnergyHistoryBackfill starting…")
+        _LOGGER.info("=" * 60)
+        _LOGGER.info("EnergyHistoryBackfill starting…")
         self.run_in(self._run, 5)
 
     def _run(self, kwargs: dict) -> None:
         try:
             self._backfill()
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Backfill FAILED: {exc}", level="ERROR")
             import traceback
-            self.log(traceback.format_exc(), level="ERROR")
+            _LOGGER.error("Backfill FAILED: %s\n%s", exc, traceback.format_exc())
 
     # ── Main logic ────────────────────────────────────────────────────────────
 
@@ -78,7 +80,7 @@ class EnergyHistoryBackfill(hass.Hass):
                 "/homeassistant/home-assistant_v2.db (some setups)."
             )
 
-        self.log(f"Reading statistics for {entity_id} from {db_path} …")
+        _LOGGER.info("Reading statistics for %s from %s …", entity_id, db_path)
 
         cutoff_ts = (
             datetime.now(tz=timezone.utc) - timedelta(days=365 * LOOKBACK_YEARS)
@@ -127,7 +129,7 @@ class EnergyHistoryBackfill(hass.Hass):
                 "has been tracked by the recorder."
             )
 
-        self.log(f"Retrieved {len(rows)} raw statistic rows from DB.")
+        _LOGGER.info("Retrieved %d raw statistic rows from DB.", len(rows))
 
         # ── 2. Convert to hourly kWh ──────────────────────────────────────────
         df = pd.DataFrame(rows, columns=["epoch", "cumsum"])
@@ -150,7 +152,7 @@ class EnergyHistoryBackfill(hass.Hass):
         df = df[(df["gross_kwh"] > 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)]
 
         df_new = df[["timestamp", "gross_kwh"]].reset_index(drop=True)
-        self.log(f"After diff & filtering: {len(df_new)} clean hourly rows.")
+        _LOGGER.info("After diff & filtering: %d clean hourly rows.", len(df_new))
 
         # ── 3. Load existing CSV ──────────────────────────────────────────────
         df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
@@ -161,12 +163,9 @@ class EnergyHistoryBackfill(hass.Hass):
                 if ts.dt.tz is not None:
                     ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
                 df_cache["timestamp"] = ts
-                self.log(f"Loaded {len(df_cache)} existing rows from {CACHE_PATH.name}.")
+                _LOGGER.info("Loaded %d existing rows from %s.", len(df_cache), CACHE_PATH.name)
             except (OSError, pd.errors.ParserError) as exc:
-                self.log(
-                    f"Could not read existing CSV ({exc}) — will create fresh.",
-                    level="WARNING",
-                )
+                _LOGGER.warning("Could not read existing CSV (%s) — will create fresh.", exc)
 
         # ── 4. Merge — CSV wins on conflicts ──────────────────────────────────
         combined = (
@@ -186,14 +185,14 @@ class EnergyHistoryBackfill(hass.Hass):
         # ── 5. Save ───────────────────────────────────────────────────────────
         combined.to_csv(CACHE_PATH, index=False)
 
-        self.log(
-            f"Saved {len(combined)} rows to {CACHE_PATH.name} "
-            f"({added:+d} rows added). Range: {date_range}."
+        _LOGGER.info(
+            "Saved %d rows to %s (%+d rows added). Range: %s.",
+            len(combined), CACHE_PATH.name, added, date_range,
         )
-        self.log("=" * 60)
-        self.log(
+        _LOGGER.info("=" * 60)
+        _LOGGER.info(
             "Backfill complete — remove 'energy_history_backfill' from "
             "apps.yaml and delete energy_history_backfill.py."
         )
-        self.log("=" * 60)
+        _LOGGER.info("=" * 60)
         
