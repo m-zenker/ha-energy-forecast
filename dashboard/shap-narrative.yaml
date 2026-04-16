@@ -1,0 +1,7 @@
+type: markdown
+title: 📊 What Drives This Forecast?
+content: >
+  {{ state_attr('sensor.ha_energy_forecast_energy_forecast_today',
+  'shap_narrative') }}
+
+# Non-MQTT: replace entity with sensor.energy_forecast_today

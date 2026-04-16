@@ -1,13 +1,13 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: **v0.10.2-alpha-12** (2026-04-14, on dev). Stable (main): v0.9.0 (released 2026-04-10).
+Current baseline: **v0.10.2-alpha-16** (2026-04-16, on dev). Stable (main): v0.9.0 (released 2026-04-10).
 
 ---
 
 ## Current Status — Sub-sensor Feature Maturation (Path A: Monitor)
 
-**Date (2026-04-14):** Sub-sensor history (~27 days, ~648 rows) approaching the 672-row threshold for full lag feature activation. MAE improvement from 0.7 → 0.52 kWh/h observed so far. No action required until after ~2026-04-20 if bouncing pattern persists.
+**Date (2026-04-16):** Sub-sensor history (~27 days, ~648 rows) approaching the 672-row threshold for full lag feature activation. MAE improvement from 0.7 → 0.52 kWh/h observed so far. No action required until after ~2026-04-20 if bouncing pattern persists.
 
 **Context:** Sub-sensor integration for heat pump (added 2026-03-18) shows expected settling behavior — lag features like `lag_48h` and `lag_168h` only activate when `n_rows >= MIN_CV_ROWS` (500 rows). Activation is now in progress; bouncing pattern expected to flatten as the model learns temporal stability across multi-day windows.
 
@@ -33,7 +33,7 @@ Current baseline: **v0.10.2-alpha-12** (2026-04-14, on dev). Stable (main): v0.9
 | Occupancy + thermal modelling | v0.9.0 | #21 Occupancy (`people_home`), #49 EWMA temperature, #50 Rolling degree-hour sums, #51 Temperature rate of change, #52 Temperature lags, #53 SHAP narrative, #54 Relative MAE sensors | ✓ done (on main, released 2026-04-10) |
 | Baseline + scenario API | v0.10.0 | Stage 1 baseline_mode, Stage 2 thermal/DHW intent, Stage 3 appliance signatures, Stage 4 scenario/what-if API | ✓ done (on dev) |
 | Selective baseline + dtype fix | v0.10.1 | `baseline_included_sensors`, pandas 3.x dtype coercion fix in `_merge_frames` | ✓ done (on dev) |
-| Thermal accuracy suite | v0.10.2-alpha | τ calibration (OLS passive-decay), RC-ODE indoor projection, area-weighted pressure, `thermal_pressure_cop`, `weighted_solar_gain`, program-type appliance signatures, 62 SHAP labels | in progress (on dev, alpha-12) |
+| Thermal accuracy suite | v0.10.2-alpha | τ calibration (OLS passive-decay), RC-ODE indoor projection, area-weighted pressure, `thermal_pressure_cop`, `weighted_solar_gain`, program-type appliance signatures, 62 SHAP labels | in progress (on dev, alpha-16) |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
@@ -216,7 +216,7 @@ off for weeks (τ estimation becomes noisy without an outdoor temp anchor).
 **Impact:** Medium. Sharpens `thermal_pressure` accuracy, especially on buildings with fast thermal
 decay. Pairs with #15 (HVAC state).
 
-### 56. Solar-Compensated Thermal Pressure *(backlog)*
+### 56. Solar-Compensated Thermal Pressure *(✓ done (on dev))*
 **Signal:** Integrate passive solar gain directly into the thermal demand signal. Passive solar heating reduces the actual energy required to maintain a setpoint, even if the temperature delta is still high. Integrating this helps the model learn to "wait" for the sun.
 
 **Formula:**
@@ -225,7 +225,7 @@ Where `k` is a learnable coefficient (or captured via feature interaction in the
 
 **Impact:** HIGH. Reduces forecast over-shooting on sunny winter days.
 
-### 57. Wind-Driven Infiltration Feature *(backlog)*
+### 57. Wind-Driven Infiltration Feature *(✓ done (on dev))*
 **Signal:** Model the accelerated building heat loss caused by wind-driven air exchange and convection.
 
 **Physics:** Infiltration loss is roughly proportional to $WindSpeed \cdot (T_{indoor} - T_{outdoor})$.
@@ -234,7 +234,7 @@ Where `k` is a learnable coefficient (or captured via feature interaction in the
 
 **Impact:** MEDIUM. Captures the "wind chill" effect on the building envelope.
 
-### 58. Humidity-Aware Defrost Proxy (Heat Pump Specific) *(backlog)*
+### 58. Humidity-Aware Defrost Proxy (Heat Pump Specific) *(✓ done (on dev))*
 **Signal:** Predict energy spikes caused by air-source heat pump evaporator defrosting. Defrosting is most frequent when $T_{outdoor}$ is between $-2^\circ C$ and $+5^\circ C$ and humidity is high.
 
 **Feature:** `defrost_risk = humidity * exp(-((T_out - 2)^2) / 10)`
@@ -250,7 +250,7 @@ Where `k` is a learnable coefficient (or captured via feature interaction in the
 
 **Impact:** MEDIUM. Enables faster adaptation to building thermal response.
 
-### 60. Calibrated Default Thermal Time Constant ($\tau$) *(backlog)*
+### 60. Calibrated Default Thermal Time Constant ($\tau$) *(✓ done (on dev))*
 **Signal:** The current `DEFAULT_TAU` of 24.0h is conservative (high-efficiency new build). Based on historical observations of ~1.9h in some instances, a more "middle-of-the-road" default may improve initial accuracy.
 
 **Proposed Change:**
@@ -529,7 +529,7 @@ Map feature names to human-readable descriptions (hour → "time-of-day", heatin
 
 Expected impact: Explainability / UX; Low effort (template strings + feature name mapping).
 
-### 55. Fix SHAP: pass climate context to shap_summary() *(backlog)*
+### 55. Fix SHAP: pass climate_recent / room_areas to shap_summary() *(✓ done (on dev))*
 
 `shap_summary()` (model.py:776) lacks `climate_recent`, `dhw_recent`, `people_home_series`,
 and `room_areas` params. As a result `_prepare_prediction_X()` receives `climate_recent=None`
@@ -670,4 +670,4 @@ Migration reference:
 | 57 | Wind-Driven Infiltration Feature | medium | 1 h | ✓ done (on dev) |
 | 58 | Humidity-Aware Defrost Proxy (Heat Pump) | medium | 1 h | ✓ done (on dev) |
 | 59 | Relaxed Thermal Calibration Constraints | medium | 30 min | backlog |
-| 60 | Calibrated Default Thermal Time Constant | medium | 15 min | backlog |
+| 60 | Calibrated Default Thermal Time Constant | medium | 15 min | ✓ done (on dev) |

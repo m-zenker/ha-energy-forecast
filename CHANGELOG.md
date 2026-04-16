@@ -19,6 +19,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Tests
 - 474 passing (unchanged). `test_energy_forecast.py` and `test_scenario_service.py` updated to assert on `caplog` records rather than mock `self.log` calls.
 
+### Docs
+- Synchronized `README.md` and `ROADMAP.md` with current project status (`v0.10.2-alpha-16`).
+- Added four new dashboard cards to `dashboard/`: `MAE_minigraph.yaml`, `forecast-over-time_minigraph.yaml`, `overview_today-tomorrow-3h.yaml`, and `shap-narrative.yaml`.
+
 ### Deployment
 - Merged `fix/logging-consistency` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-16).
 
