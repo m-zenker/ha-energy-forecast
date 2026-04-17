@@ -10,301 +10,113 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.10.2-alpha-19] — 2026-04-17
+## [0.10.0] — 2026-04-17
 
-### Fixed
-- `apps/energy_forecast/energy_forecast.py`, `energy_history_backfill.py` — at the top of `initialize()`, assign `self.logger` (AppDaemon's per-app logger instance) to the module-level `_LOGGER` and patch `ha_data._LOGGER`, `model._LOGGER`, and `weather._LOGGER` with the same logger. This is the correct mechanism for routing all log output under the `energy_forecast` AppDaemon app category. Previous alpha attempts (alpha-16 through alpha-18) used stdlib `logging.getLogger()` which routes outside AppDaemon's hierarchy and always displays under the generic "AppDaemon" prefix regardless of logger name.
-
-### Tests
-- 474 passing (unchanged).
-
-### Deployment
-- Tagged `v0.10.2-alpha-19` on `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
-- Post-restart log verification: all expected log categories confirmed as `INFO energy_forecast:` / `WARNING energy_forecast:` — CV fold MAEs [0.6622, 0.5553, 0.4244] → mean=0.5473, appliance signatures for 5 sensors, sub-sensor NaN warnings, τ calibration skipped (0 passive-cooling windows, expected in spring). Fix confirmed working — no `AppDaemon:` prefix on application-logic log entries.
-
----
-
-## [0.10.2-alpha-18] — 2026-04-17
-
-### Fixed
-- `apps/energy_forecast/model.py`, `ha_data.py`, `weather.py` — changed `_LOGGER = logging.getLogger(__name__)` to `_LOGGER = logging.getLogger("energy_forecast")` in all three modules. AppDaemon collapses child logger names (e.g. `energy_forecast.model`) under the generic "AppDaemon" display prefix; using the flat name `"energy_forecast"` ensures all three modules share the same named logger instance and are routed through AppDaemon's per-app log handler consistently.
-
-### Tests
-- 474 passing (unchanged).
-
-### Deployment
-- Tagged `v0.10.2-alpha-18` on `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
-- Post-restart log verification: CV fold MAEs [0.6654, 0.5504, 0.4278] → mean=0.5479, appliance signatures for 5 sensors, sub-sensor NaN warnings (expected — data maturation ongoing), τ calibration skipped (0 valid passive-cooling windows, expected in spring). All energy_forecast messages confirmed delivered; no regressions.
-- Note: AppDaemon's log *display prefix* remains "AppDaemon:" for all stdlib `logging` calls regardless of the logger name — this is AppDaemon's formatting behavior, not a code defect. The fix ensures consistent logger identity for filtering/routing, not for the display label.
-
----
-
-## [0.10.2-alpha-17] — 2026-04-17
-
-### Fixed
-- `apps/energy_forecast/ha_data.py` — replaced all 30 `app.log()` calls with `_LOGGER.warning/error/info()`. The module-level `_LOGGER = logging.getLogger(__name__)` was already defined but unused; now wired up. All log entries from the data-fetch layer now appear under the `energy_forecast.ha_data` logger name, completing the logging-consistency migration started in alpha-16 (which covered `energy_forecast.py` and `energy_history_backfill.py`).
-
-### Tests
-- 474 passing (unchanged).
-
-### Deployment
-- Merged `fix/ha-data-logging` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
-
----
-
-## [0.10.2-alpha-16] — 2026-04-16
-
-### Fixed
-- `apps/energy_forecast/energy_forecast.py` — replaced all `self.log()` calls with `_LOGGER = logging.getLogger("energy_forecast")`. All messages now appear under the `energy_forecast` logger name instead of `AppDaemon`, making log filtering and structured log routing consistent.
-- `apps/energy_forecast/energy_history_backfill.py` — same `self.log()` → `_LOGGER` migration.
-
-### Tests
-- 474 passing (unchanged). `test_energy_forecast.py` and `test_scenario_service.py` updated to assert on `caplog` records rather than mock `self.log` calls.
-
-### Docs
-- Synchronized `README.md` and `ROADMAP.md` with current project status (`v0.10.2-alpha-16`).
-- Added four new dashboard cards to `dashboard/`: `MAE_minigraph.yaml`, `forecast-over-time_minigraph.yaml`, `overview_today-tomorrow-3h.yaml`, and `shap-narrative.yaml`.
-
-### Deployment
-- Merged `fix/logging-consistency` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-16).
-
----
-
-## [0.10.2-alpha-15] — 2026-04-16
-
-### Fixed
-- `apps/energy_forecast/const.py` — `DEFAULT_TAU` reduced from 24.0 h to 12.0 h. The previous value overestimated the thermal time-constant before calibration data is available, causing the RC-ODE indoor projection to respond too slowly to setpoint changes. 12 h is a better prior for typical residential buildings.
-
-### Tests
-- 474 passing (unchanged).
-
-### Deployment
-- Merged `fix/default-tau-12h` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-16).
-
----
-
-## [0.10.2-alpha-14] — 2026-04-15
+v0.10.0 transforms the forecaster from a weather-correlated statistical model into a
+physics-aware, scenario-capable energy planning engine. Four new stages add a passive-house
+baseline mode, intent-driven thermal and DHW modelling from climate entity setpoints,
+automated appliance load signature discovery, and a what-if scenario API — so the Energy
+Manager can ask "what happens if the dishwasher runs at 14:00?" and get a delta-annotated
+48-hour forecast in a single service call. A physics feature pack rounds out the release
+with solar-compensated thermal pressure, wind-driven infiltration load, heat-pump defrost
+risk, and building thermal time-constant calibration — expressed in physical units for
+climate-agnostic generalisation. 474 tests; confirmed stable on Home Assistant 2026-04-17.
 
 ### Added
-- `apps/energy_forecast/weather.py` — `humidity` column fetched from Open-Meteo (`relativehumidity_2m`). Added to `_FEATURES_BASE` in `model.py` (#55). Defaults to 70.0 % when the weather API omits the field.
-- `apps/energy_forecast/model.py` — **`thermal_pressure_net`**: solar-compensated thermal pressure — raw thermal pressure reduced by `weighted_solar_gain` (#56). Captures how passive solar gain offsets the building heat deficit before the heat pump acts.
-- `apps/energy_forecast/model.py` — **`infiltration_pressure`**: wind × thermal gradient interaction term (#57). High wind combined with large indoor–outdoor temperature difference drives cold-air infiltration, increasing heating demand independently of the modelled U-value losses.
-- `apps/energy_forecast/model.py` — **`defrost_risk`**: humidity-scaled Gaussian centred at +2°C (#58). Acts as a proxy for heat-pump defrost cycles, which briefly reverse the refrigerant loop and spike power draw.
-- `apps/energy_forecast/energy_forecast.py` — SHAP labels for all four new physics features.
-- `tests/test_physics_features.py` — 4 new tests covering each physics feature independently (humidity default, `thermal_pressure_net`, `infiltration_pressure`, `defrost_risk` Gaussian peak).
-
-### Tests
-- 474 passing (4 new in `test_physics_features.py`).
-
-### Deployment
-- Merged `feat/physics-features` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-15).
-
----
-
-## [0.10.2-alpha-13] — 2026-04-14
-
-### Fixed
-- `apps/energy_forecast/ha_data.py` — `fetch_recent_sub_sensor` / `fetch_sub_sensor_history`: pandas 3.x `merge_asof` raised `Incompatible merge dtype, dtype('O') and dtype('<M8[us]')` whenever the raw HA fetch returned empty data and `program_entity_id` was configured. Fix on three levels: (1) `_resolve_programs_for_series` wraps timestamps in `pd.to_datetime()` defensively; (2) both fetch functions now build their empty fallback `DataFrame` with explicit `dtype` per column instead of column-names-only. Washer and dryer were failing every hour since 13:01 today.
-
-### Tests
-- 470 passing (2 new regression tests covering both fetch paths with empty raw HA + cache + `program_entity_id`).
-
-### Deployment
-- Merged `fix/subsensor-dtype-empty-raw` into `dev`. Deployed to HA.
-
----
-
-## [0.10.2-alpha-12] — 2026-04-14
-
-### Changed
-- `apps/energy_forecast/energy_forecast.py` — Extended `_SHAP_FEATURE_LABELS` to cover all 62 model features (up from 23). Constant-only change; no behaviour difference.
-
-### Deployment
-- Merged `feat/shap-labels-complete` into `dev` (fast-forward). Deployed to HA. 468 tests passing.
-
----
-
-## [0.10.2-alpha-11] — 2026-04-14
-
-### Deployment
-- Merged `feat/thermal-cop-safeguards` into `dev`. Deployed to HA; AppDaemon restart clean, 0 `energy_forecast` errors. 468 tests passing.
-
----
-
-## [0.10.2-alpha-10] — 2026-04-14
-
-### Added
-- `apps/energy_forecast/model.py` — **`weighted_solar_gain`**: `direct_radiation_wm2` scaled by a half-cosine window peaking at 13:00, zero outside 09:00–17:00. Captures south-facing passive solar gain that reduces actual heating demand even when `thermal_pressure` looks high.
-- `apps/energy_forecast/model.py` — **`thermal_pressure_cop`**: `thermal_pressure / max(0.5, 0.11 × T_out + 3.0)`. Expresses heat debt as electrical urgency — the same 1°C deficit costs ~2× more electricity at −10°C than at +10°C outdoors. Denominator clamped at 0.5 to guard against extreme negative temperatures.
-- `apps/energy_forecast/energy_forecast.py` — SHAP labels for `thermal_pressure_cop` and `weighted_solar_gain`.
-
-### Changed
-- `apps/energy_forecast/model.py` — **τ calibration safeguards** in `_calibrate_tau()`:
-  - *Daytime exclusion*: passive-cooling windows that contain any timestamp in 09:00–15:00 are now rejected (solar gain and occupancy patterns during these hours corrupt the passive-cooling ODE fit).
-  - *Solar radiation mask*: windows where `direct_radiation_wm2 > 150 W/m²` at any point are rejected. Degrades gracefully when `weather_df` lacks the radiation column (mask skipped, no crash).
-  - *EMA smoothing*: when a new τ estimate differs from the stored value by more than 50%, the result is blended as `0.8 × old + 0.2 × new` to prevent single-batch jitter from propagating into the 48-hour forecast.
-
-### Tests
-- 468 passing (15 new covering solar gain shape, COP denominator clamp, daytime/radiation window exclusion, EMA blend thresholds; 2 existing tests updated for the new daytime exclusion filter).
-
----
-
-## [0.10.2-alpha-9] — 2026-04-14
-
-### Added
-- `apps/energy_forecast/model.py` — **Indoor Temperature Projection**: new `_project_indoor_temps()` pure function uses an RC-ODE (Euler forward integration) to project indoor temperatures for all 48 forecast hours based on outdoor forecast. Eliminates the zero-fill problem where `thermal_pressure` defaulted to 0 for hours >2h ahead due to stale `climate.current_temperature` sensor data. Starting indoor temperature uses the most-recent `current_temp` if <2h old; falls back to setpoint for stale sensors.
-- `apps/energy_forecast/model.py` — **Area-Weighted Thermal Pressure**: rooms are now weighted by floor area via new `climate_room_areas` config key (dict mapping entity_id → m²). Rooms without explicit area default to 15 m². Thermal pressure is expressed in °C·h (area-weighted cumulative deficit; τ-division removed for clearer physical interpretation).
-- `apps/energy_forecast/model.py` — **Secondary thermal features**: `thermal_pressure_max` (largest per-room deficit) and `thermal_pressure_std` (room temperature imbalance spread across rooms).
-- `apps/energy_forecast/const.py` — constants `DEFAULT_TAU = 24.0` (building thermal time constant fallback) and `DEFAULT_ROOM_AREA_M2 = 15.0` (per-room area default).
-- `apps/energy_forecast/energy_forecast.py` — SHAP labels for all three thermal pressure features; new `_parse_room_areas()` helper validates `climate_room_areas` config entries.
-- `apps.yaml.example` — `climate_room_areas` example configuration.
-
-### Tests
-- 453 passing (12 new covering RC-ODE convergence, stale-sensor fallback, area weighting, max/std features, zero-fill elimination; 1 existing test updated for removed τ-division).
-
----
-
-## [0.10.2-alpha-8] — 2026-04-12
+- **Stage 1: Passive House Baseline mode** — new `baseline_mode` config flag (default `false`).
+  When enabled, all controllable `sub_energy_sensors` are subtracted from the training target,
+  keeping appliance noise out of the baseline model so `predict_scenario()` deltas are meaningful.
+  Also wires `presence_sensors` config end-to-end into the hourly update and retrain cycle.
+- **Stage 2: Intent-Driven Thermal & DHW Modeling** — `fetch_climate_history()` reads setpoint
+  and current temperature from HA `climate` entities; `fetch_generic_sensor_history()` reads a
+  DHW buffer sensor. Two new model features: `thermal_pressure` (mean setpoint − current-temp
+  across configured rooms) and `dhw_pressure` (heat-loss urgency score). Config keys:
+  `climate_entities`, `dhw_buffer_sensor`, `heating_system_active_entity`.
+- **Stage 3: Automated Load Signature Discovery** — `_learn_appliance_signatures()` scans
+  sub-sensor histories for run cycles, computes per-appliance average hourly energy profiles,
+  and persists them to `models/appliance_signatures.json`. Supports adaptive cycle windows,
+  demand-surge detection for always-on devices, outlier rejection, duration clustering (short/long),
+  CoV-based reliability labels, and program-type sensor grouping (per-program profiles stored
+  under `sig["programs"][<label>]`).
+- **Stage 4: Scenario Modeling & What-If API** — `_composite_forecast()` overlays learned
+  appliance profiles onto a 48-hour baseline. `predict_scenario()` returns
+  `[timestamp, predicted_kwh, delta_kwh]`. AppDaemon service `energy_forecast/get_scenario`
+  fires `energy_forecast_scenario_result` with the full composite; optional `publish=True`
+  writes `sensor.energy_forecast_scenario_today/tomorrow/delta_today` and 8 block sensors.
+- **Physics feature pack** (`apps/energy_forecast/model.py`, `weather.py`):
+  - `humidity` — fetched from Open-Meteo `relativehumidity_2m`; defaults to 70 % when absent (#55).
+  - `thermal_pressure_net` — thermal pressure reduced by `weighted_solar_gain`; captures solar
+    gain offsetting heat deficit before the heat pump acts (#56).
+  - `infiltration_pressure` — wind × thermal gradient interaction term; infiltration load driven
+    by both wind speed and indoor–outdoor delta-T (#57).
+  - `defrost_risk` — humidity-scaled Gaussian centred at +2 °C; proxy for heat-pump defrost
+    cycles that spike power draw (#58).
+  - SHAP labels added for all four physics features.
+- **Thermal time-constant calibration (τ)** — `_calibrate_tau()` fits log-linear OLS on
+  passive-cooling windows (confirmed heating-off periods) to estimate the building time constant.
+  Safeguards: daytime exclusion (09:00–15:00), solar radiation mask (>150 W/m²), EMA smoothing
+  when estimate changes >50 %. τ persisted in `meta.pkl`; skipped gracefully when
+  `heating_system_active_entity` is not configured.
+- **RC-ODE indoor temperature projection** — `_project_indoor_temps()` integrates the RC
+  heat-balance ODE (Euler forward) to project indoor temperatures for all 48 forecast hours,
+  eliminating the zero-fill problem where `thermal_pressure` defaulted to 0 beyond hour 2.
+- **Area-weighted thermal pressure** — rooms weighted by floor area via `climate_room_areas`
+  config (m² per entity); defaults to 15 m². Secondary features: `thermal_pressure_max`,
+  `thermal_pressure_std`. `thermal_pressure_cop` divides heat debt by COP estimate to express
+  urgency in electrical terms. `weighted_solar_gain` scales direct radiation by a half-cosine
+  window (09:00–17:00, peak 13:00).
+- **Program-type sensor support** — sub-sensor CSVs persist a `program` column (LVFC label).
+  `_resolve_programs_for_series()` includes a 1-hour forward-lookup pass for late-firing sensors.
+  Forward-lookup tolerance widened to 2 hours. `program_type_sensor` config key per sub-sensor.
+- **`baseline_included_sensors`** — list of entity IDs to keep in the baseline model target when
+  `baseline_mode: true`; heating/DHW can remain in the model while schedulable appliances are
+  subtracted.
+- **Timezone generalization** — `timezone` apps.yaml key fully wired (was silently ignored);
+  all hardcoded `"Europe/Zurich"` strings replaced with `self._timezone`.
+- **`holiday_country`** config key (ISO 3166-1 alpha-2, default `CH`); propagated through
+  `train()` → `_engineer_features()` → `_add_holiday_feature()`.
+- **`DEFAULT_TAU = 12.0 h`** in `const.py` — better residential prior for the RC-ODE before
+  calibration data is available (was 24 h).
+- **4 new dashboard cards** in `dashboard/`: `MAE_minigraph.yaml`,
+  `forecast-over-time_minigraph.yaml`, `overview_today-tomorrow-3h.yaml`, `shap-narrative.yaml`.
 
 ### Fixed
-- `apps/energy_forecast/ha_data.py` — `_resolve_programs_for_series()`: increased forward-lookup tolerance from 1 h to 2 h. The 1 h window was insufficient when the program sensor fires just into the following hour (e.g. cycle starts at 21:00, sensor fires at 22:05 → 65-minute gap). The forward fallback still only activates when backward LVFC gives `""` or `"no_program"`, so labels for running cycles are unaffected.
-
----
-
-## [0.10.2-alpha-7] — 2026-04-12
-
-### Fixed
-- `apps/energy_forecast/ha_data.py` — `_resolve_programs_for_series()`: program sensor events that fire slightly *after* the hour boundary (e.g. user starts machine at 12:05, hourly row stamped 12:00) were previously mislabelled with the preceding idle state (`"no_program"`). A 1-hour forward-lookup pass now substitutes the real program label when backward LVFC gives `""` or `"no_program"` and a non-idle program event exists within the next hour. The forward pass is skipped when backward already carries a real label, so the tail of a running cycle is never overwritten by the next cycle's program. (4 new tests.)
-
----
-
-## [0.10.2-alpha-6] — 2026-04-12
-
-### Changed
-- `apps/energy_forecast/ha_data.py` — sub-sensor CSVs (`sub_<id>.csv`) now include a `program` column: the program label active at each hourly timestamp, resolved via last-value-carry-forward (`pd.merge_asof`). Hours before the first program event get an empty string. Backward-compatible: existing CSVs without the column are loaded and extended transparently.
-- `apps/energy_forecast/ha_data.py` — new `_resolve_programs_for_series()` helper encapsulates the last-value-carry-forward logic; `fetch_sub_sensor_history()` and `fetch_recent_sub_sensor()` accept a new optional `program_entity_id` param that triggers program label resolution and persistence.
-- `apps/energy_forecast/ha_data.py` — `_merge_sub_sensor_frames()` extended to preserve non-empty program labels from the cache when the fresh window doesn't cover older rows (winner's label wins; loser's label fills gaps; column only added when at least one frame has it).
-- `apps/energy_forecast/energy_forecast.py` — `_retrain()` now derives `program_histories` from the persisted CSV `program` column instead of a separate 30-day `fetch_program_sensor_history()` call. Program attribution accumulates indefinitely rather than being capped to the last 30 days.
-- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` threads `program_entity_id` into `fetch_recent_sub_sensor()` so every hourly write also captures the current program state.
-
-### Tests
-- 436 passing (11 new: `TestResolveProgramsForSeries` × 5 covering LVFC correctness, empty input, index preservation; `TestFetchSubSensorHistoryWithProgram` × 6 covering column written to CSV, label resolution, backward compat, cached-label preservation, recent fetch).
-
----
-
-## [0.10.2-alpha-5] — 2026-04-12
-
-### Added
-- `apps/energy_forecast/model.py` — **Program-type sensor support**: `_learn_appliance_signatures()` now accepts a `program_histories` dict mapping timestamps to program labels; cycles are grouped per program and per-program hourly profiles stored under `sig["programs"][<label>]` (with `hourly_profile`, `std_profile`, `total_kwh`, `n_cycles`). Requires ≥ 2 cycles per program to avoid overfitting single runs. Backward-compatible: without program states, behavior is identical to alpha-4.
-- `apps/energy_forecast/model.py` — `_composite_forecast()` scenario API accepts dict-form schedule entries `{"start": "HH:MM", "program": "<label>"}`. When a program label is provided the matching per-program profile is used; falls back gracefully to the combined signature when unknown or not specified.
-- `apps/energy_forecast/energy_forecast.py` — `train()` fetches program-type sensor history for all sub-sensors that have `program_type_sensor` configured and passes it to `_learn_appliance_signatures()`.
-- `apps/energy_forecast/ha_data.py` — new `fetch_program_type_history()` retrieves categorical state history for program-type sensors (e.g. `sensor.washing_machine_program`) over the training window, returning a DataFrame of timestamp → program label for cycle labelling.
+- **Logging consistency** — all modules (`energy_forecast.py`, `energy_history_backfill.py`,
+  `ha_data.py`, `model.py`, `weather.py`) now route through AppDaemon's per-app logger by
+  wiring `self.logger` into the module-level `_LOGGER` in `initialize()` and patching the same
+  logger into sub-module globals. Ensures all entries appear under the `energy_forecast`
+  AppDaemon app category.
+- **pandas 3.x dtype coercion** — `_merge_frames()` coerces the value column back to `float64`
+  after `pd.concat()`; pandas 3.0.2 promoted to `object` dtype even on empty DataFrames,
+  causing LightGBM to reject the feature matrix.
+- **Sub-sensor dtype error** — `fetch_recent_sub_sensor` / `fetch_sub_sensor_history`: fixed
+  `merge_asof` `Incompatible merge dtype` error when raw HA fetch returns empty data and
+  `program_entity_id` is configured; empty fallback DataFrames now use explicit `dtype=` per column.
+- **τ calibration data pipeline** — `_fetch_history()` now maps `"on"` → `1.0` / `"off"` → `0.0`
+  before `float()`, fixing silent empty returns for `input_boolean` entities. `_update_sensors()`
+  incrementally caches `heating_active` each prediction cycle. Passive-cooling windows trimmed at
+  first ΔT ≤ 0 or rising delta; prefix-trim replaced with full sub-sequence scan to capture
+  evening cooling windows.
+- **Concurrency** — `_update_cb` no longer acquires the training lock; hourly sensor updates
+  always run against the last-good model during a background retrain, eliminating the
+  ~60-second sensor-silent window.
+- **CSV tail read** — `fetch_recent_energy()` uses `deque(maxlen=400)`: O(400) memory instead
+  of O(all rows) per hourly call.
+- **Rolling MAE persistence** — `pred_history.json` is loaded at startup with 30-day pruning,
+  eliminating the ~24-hour recovery period of high-volatility relative MAE after AppDaemon restart.
+- **MQTT NaN guard** — relative MAE published safely when mean consumption is zero or undefined.
+- **UID slicing robustness** — topic splitting validates segment count before slicing; malformed
+  UIDs logged at DEBUG and dropped cleanly.
+- Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` throughout.
+- Eliminated pandas `PerformanceWarning` in lag column accumulation loops.
+- Retrain exception handler logs full traceback for diagnosability.
+- Replaced three broad `except Exception` clauses with narrower exception types.
 
 ### Tests
-- 425 passing (19 new covering per-program signature learning, minimum-cycle filtering, per-program scenario profile selection, graceful fallback to aggregate signature, and config schema validation for the new `program_type_sensor` key).
+- 474 passing (up from 325 in v0.9.0; +149 new tests covering all new features, regression
+  cases, and edge conditions).
 
----
-
-## [0.10.2-alpha-4] — 2026-04-11
-
-### Added
-- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: each signature now includes quality metadata: `cov` (coefficient of variation of cycle total_kwh), `reliability` (`"high"` / `"medium"` / `"low"` based on CoV thresholds), `n_cycles` is now also stored per cluster. Duration clusters (`short`, `long`) each carry `cov` and `reliability` independently, so mixed-program appliances (e.g., quick-wash vs. cotton) report accurate reliability per mode.
-- `apps/energy_forecast/model.py` — CoV-based clustering: cycles are split into CoV groups and a Jenks-like median-split heuristic assigns `"high"` (CoV < 0.25), `"medium"` (0.25–0.5), or `"low"` (> 0.5) reliability labels, enabling downstream consumers (scenario API, dashboards) to suppress or weight signatures by confidence.
-
-### Tests
-- 406 passing (5 new tests: `TestApplianceSignaturesMetadata` covering CoV computation, reliability labelling thresholds, per-cluster metadata, and JSON serialization round-trip).
-
----
-
-## [0.10.2-alpha-3] — 2026-04-11
-
-### Added
-- `apps/energy_forecast/const.py` — new `APPLIANCE_MAX_WINDOW_HOURS = 12` constant caps the adaptive cycle window to prevent runaway detection.
-- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **adaptive window** — cycle end is now detected at the first return to idle instead of a fixed 4-hour cutoff. The `window_hours` parameter is removed. Fixes truncated profiles for long-duration appliances (tumble dryer cotton, DHW heating).
-- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **demand-surge detection** — appliances with < 5 % zero-hours (e.g. heat pump heating in winter) use the 25th-percentile consumption as idle baseline; cycle starts/ends are upward/downward threshold crossings instead of strict 0→>0 transitions. Eliminates "no cycles found" for always-on devices.
-- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **outlier cycle rejection** — cycles with total_kwh > median + 2σ are discarded before averaging (≥ 4 cycles required). Stored as `n_rejected` in the signature JSON.
-- `apps/energy_forecast/model.py` — `_learn_appliance_signatures()`: **duration clustering** — cycles with median duration ≥ 2 h are split into `short` and `long` clusters via median-duration split. Each cluster stores its own `hourly_profile`, `std_profile`, and `total_kwh`. CoV warnings are evaluated per cluster, eliminating false positives caused by mixed programs (quick wash vs. cotton 90°, ECO dishwasher vs. intensive). Top-level keys preserved for backward compatibility; `_composite_forecast()` unchanged.
-
-### Tests
-- 401 passing (11 new in `TestApplianceSignatures` covering adaptive window, demand-surge detection, outlier rejection, duration clustering, CoV warning suppression, and backward-compatible JSON schema).
-
----
-
-## [0.10.2-alpha-2] — 2026-04-11
-
-### Fixed
-- `apps/energy_forecast/ha_data.py` — `_fetch_history()` now maps `"on"` → `1.0` and `"off"` → `0.0` before attempting `float()`. Previously, `input_boolean` entities (e.g. `heating_system_active_entity: input_boolean.heizung_wintermodus`) caused `float("on")` to raise `ValueError` which was silently swallowed, returning an empty DataFrame and logging "No history found" despite HA having the data. τ calibration was therefore never receiving any `heating_active_df`. Two regression tests added.
-- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` now calls `fetch_recent_generic_sensor()` for `heating_system_active_entity` each prediction cycle, mirroring the DHW pattern. Previously the CSV cache was only written during training; HA's short history window (~10 days) meant the cache would drift stale between weekly retrains.
-- `apps/energy_forecast/model.py` — `_calibrate_tau()`: passive-cooling windows are now trimmed at the first hour where T_indoor ≤ T_outdoor (instead of rejecting the whole block). In spring, a single warm afternoon hour where outdoor temp briefly reaches indoor temp was discarding otherwise-valid multi-hour cooling curves.
-- `apps/energy_forecast/model.py` — `_calibrate_tau()`: windows are additionally trimmed at the first hour where ΔT stops declining (instead of rejecting on slope ≥ 0). Solar gain during off-periods pushes indoor temps up mid-block; the initial decay portion remains physically valid for the OLS fit.
-- `apps/energy_forecast/model.py` — `_calibrate_tau()`: replaced prefix-trim approach with a full sub-sequence scan. Each off-block is now scanned for all maximal contiguous intervals where `delta > 0` AND `diff(delta) < 0` simultaneously; each qualifying run of ≥ 2 hours is evaluated independently. This captures evening cooling windows (the most valuable signal when heating turns off in the morning and solar gain dominates the early hours) that the prefix-trim approach discarded entirely.
-
-### Tests
-- 390 passing (3 new: `test_fetch_history_boolean_states`, `test_fetch_history_numeric_states_unchanged`, `test_evening_cooling_window_used`)
-
----
-
-## [0.10.2-alpha-1] — 2026-04-11
-
-### Added
-- `apps/energy_forecast/model.py` — **#55 Verified Passive Decay (τ calibration)**: new `_calibrate_tau()` method fits log-linear OLS on passive-cooling windows (contiguous periods where the heating system is confirmed off) to estimate the building thermal time constant τ (hours). Result is the median τ across all qualifying windows (minimum 3). τ is used to scale `thermal_pressure` by `1/τ`, expressing heating urgency in °C/h rather than a static °C delta — more physically meaningful and transfer-learned between climates. τ persisted in `meta.pkl` so it survives AppDaemon restarts without re-fitting.
-- `apps/energy_forecast/energy_forecast.py` — fetches `heating_system_active_entity` history (30 days, binary 0/1) and passes it to `train()` as `heating_active_df` for τ calibration. Fully backward-compatible: if `heating_system_active_entity` is not configured, calibration is skipped and `thermal_pressure` remains unchanged.
-
-### Tests
-- 387 passing (5 new since v0.10.1: `TestCalibrateTau` covering the OLS fit, sanity bounds, minimum-window guard, non-positive-delta skip, and rising-temperature skip)
-
----
-
-## [0.10.1] — 2026-04-10
-
-### Added
-- `apps/energy_forecast/energy_forecast.py` — new `baseline_included_sensors` config key (list of HA sensor entity IDs). When `baseline_mode: true` is set, only sub-sensors NOT in `baseline_included_sensors` are subtracted from the training target; sensors listed there (e.g., heating and DHW) remain in the baseline model target. Previously all `sub_energy_sensors` were subtracted. This allows the model to learn heating/DHW consumption as a baseline pattern (leveraging thermal/weather/occupancy features) while still removing schedulable appliances for clean scenario modeling.
-
-### Fixed
-- `apps/energy_forecast/ha_data.py` — `_merge_frames()` now explicitly coerces the value column back to `float64` after `pd.concat()`. In pandas 3.0.2, `pd.concat([float64_df, empty_object_df])` promotes the result to `object` dtype even when the empty DataFrame contributes no rows. This caused all lag feature columns to become object dtype, which LightGBM rejected with "pandas dtypes must be int, float or bool". Fix: `result[value_col] = pd.to_numeric(result[value_col], errors="coerce")` applied after concat in `_merge_frames`.
-- `apps/energy_forecast/model.py` — coerce feature matrix to `float64` via `.astype(float)` before fitting, providing a belt-and-suspenders guard against dtype incompatibility errors when `int32` or pandas extension types appear in the feature columns.
-- `apps/energy_forecast/energy_forecast.py` — retrain exception handler now logs the full traceback (`traceback.format_exc()`) alongside the error message, making dtype and other unexpected retrain failures diagnosable from HA logs without needing a debugger.
-
-### Tests
-- 382 passing (5 new since v0.10.0: `TestBaselineIncludedSensors` covering selective inclusion logic, and `test_empty_winner_preserves_float_dtype` in `TestMergeEnergyFrames` for the pandas 3.x dtype regression)
-
----
-
-## [0.10.0] — 2026-04-10
-
-### Added
-- `apps/energy_forecast/energy_forecast.py` — **Stage 1: Passive House Baseline mode**: new `baseline_mode` config flag (default `false`). When enabled, the model trains on and predicts only the household baseline by subtracting all controllable `sub_energy_sensors` from the total consumption target before training, and mirrors that subtraction at prediction time. Keeps appliance noise out of the baseline model so `predict_scenario()` deltas are meaningful. Also wires `presence_sensors` config into the hourly update and retrain cycle (model feature `people_home` was added in v0.9.0; Stage 1 connects the config key end-to-end).
-- `apps/energy_forecast/ha_data.py` + `model.py` — **Stage 2: Intent-Driven Thermal & DHW Modeling**: new `fetch_climate_history()` reads setpoint and current temperature from any HA `climate` entities listed in `climate_entities`; new `fetch_generic_sensor_history()` reads a DHW buffer temperature sensor. `model.py` derives two new features: `thermal_pressure` (mean of setpoint − current-temp across all configured climate entities; 0 when none configured) and `dhw_pressure` (heat-loss urgency score `1 / (max(0.5, buffer_temp − 40) + 1)²`; 0 when not configured). Both features are added to `_FEATURES_BASE` and the NaN-fill loop. Config keys: `climate_entities` (list), `dhw_buffer_sensor`, `heating_system_active_entity`.
-- `apps/energy_forecast/model.py` — **Stage 3: Automated Load Signature Discovery**: new `_learn_appliance_signatures()` scans sub-sensor histories for run cycles (0→>0 kWh transitions) and computes an average hourly energy profile per appliance prefix. Signatures persisted to `models/appliance_signatures.json`, reloaded on startup, and ready for Stage 4 scenario modeling. Per-prefix log: `Appliance signature | <prefix> | cycles=N | total=X.XX kWh | peak_hour=H`. 8 new unit + integration tests in `TestApplianceSignatures`.
-- `apps/energy_forecast/model.py` — **Stage 4: Scenario Modeling & What-If API**: new `_composite_forecast()` pure function overlays learned appliance hourly run profiles onto a baseline 48h forecast given a schedule dict `{prefix: "HH:MM" | "off" | None}`. New `predict_scenario()` method on `EnergyForecastModel` wraps `predict()` + composite overlay, returning `[timestamp, predicted_kwh, delta_kwh]`. Enables the Energy Manager to ask "what is the expected import if dishwasher runs at 14:00?" and receive a delta-annotated composite forecast instantly.
-- `apps/energy_forecast/energy_forecast.py` — **Scenario service**: AppDaemon service `energy_forecast/get_scenario` registered in `initialize()`. Callback `_get_scenario_cb()` validates cached inputs, calls `predict_scenario()`, fires `energy_forecast_scenario_result` event with full 48h records. `publish=True` additionally writes `sensor.energy_forecast_scenario_today`, `_tomorrow`, `_delta_today`, and 8 block sensors via `_publish_scenario_forecast()`. Input cache (`_cached_forecast_df`, `_cached_live_temp`, etc.) populated each `_update_sensors()` cycle for zero-latency scenario re-use.
-
-### Fixed
-- `apps/energy_forecast/requirements.txt` — added `holidays>=0.46` explicitly; absence caused a silent holiday-feature fallback and `sensor.energy_forecast_setup_status` showing `missing_packages` on fresh installs.
-- `apps/energy_forecast/model.py` / `energy_forecast.py` — replaced deprecated `datetime.utcnow()` calls with `datetime.now(timezone.utc)` throughout.
-- `apps/energy_forecast/model.py` — eliminated pandas `PerformanceWarning` in `_add_lag_and_rolling_training()` and `_add_sub_sensor_lags_training()` by accumulating new columns in a dict and calling `pd.concat` once instead of assigning per-column in a loop.
-- `apps/energy_forecast/model.py` — **DS-1**: appliance signatures now store `std_profile` (per-hour standard deviation across all observed cycles alongside `hourly_profile`); logs a `WARNING` when the coefficient of variation exceeds 0.5, flagging high-variability appliances (e.g. oven) where a fixed mean profile is unreliable.
-- `apps/energy_forecast/model.py` — **DS-2**: scenario time-slot offset now uses `int()` floor instead of `round()`, ensuring deterministic slot assignment (e.g. "00:30" always maps to offset 0, not randomly 0 or 1 depending on floating-point rounding).
-- `apps/energy_forecast/ha_data.py` / `model.py` — **SE-3**: replaced three broad `except Exception` clauses with narrower types: `OSError`/`ValueError` in `validate_energy_cache`, `KeyError`/`TypeError` in `_add_holiday_feature`, and specific LightGBM exception types in the early-stopping fallback paths.
-
-### Tests
-- 377 passing (25 new since Stage 3: 8 for Stage 3 `TestApplianceSignatures`, 13 for Stage 4 `TestCompositeForecast` × 10 + `TestGetScenarioCb` × 3, plus T3b/T4/T5 regression tests and `TestConcurrency` from DS-1/DS-2/SE-3 review fixes)
-
----
-
-## [0.10.0-alpha] — 2026-04-09
-
-### Added
-- `apps/energy_forecast/energy_forecast.py` — **Timezone generalisation + holiday country**: `timezone` apps.yaml key is now fully wired up (was silently ignored); all 18 hardcoded `"Europe/Zurich"` strings replaced with `self._timezone`. New `holiday_country` config key (ISO 3166-1 alpha-2, default `CH`) propagated through `train()` → `_engineer_features()` → `_add_holiday_feature()`, replacing three hardcoded `"CH"` references.
-
-### Fixed
-- `apps/energy_forecast/energy_forecast.py` — **Concurrency**: `_update_cb` no longer acquires the training lock; hourly sensor updates always run against the last-good model during a background retrain, eliminating the ~60-second sensor-silent window that previously occurred when retraining and an update raced.
-- `apps/energy_forecast/ha_data.py` — **CSV tail read**: `fetch_recent_energy()` now uses `deque(maxlen=400)` to read the last 400 rows, reducing memory from O(all rows) to O(400) per hourly call.
-- `apps/energy_forecast/energy_forecast.py` — **Relative MAE sensors volatility** (`mae_7d_pct`, `mae_30d_pct`): relative MAE sensors now remain stable across AppDaemon restarts. Root cause was loss of `_pred_history` and `_actuals_history` dicts on restart, causing ~24h recovery period with very low `n_pairs` and high volatility. Implemented JSON persistence layer: `_load_pred_history()` reads `pred_history.json` at startup (with 30-day pruning), `_save_pred_history()` atomically writes JSON after each forecast cycle. Includes 7 new tests covering roundtrip, pruning, keep-first semantics, error handling, and atomic writes.
-- `apps/energy_forecast/mqtt_mixin.py` — **MQTT NaN handling in relative MAE**: relative MAE percentages are now safely published even when mean consumption is zero or undefined (e.g., first day of month). Prevents NaN/inf from propagating to MQTT and breaking Lovelace graphs. Explicitly sets value to 0.0 and logs WARNING.
-- `apps/energy_forecast/mqtt_mixin.py` — **UID slicing fragility**: topic splitting for sub-entity UID extraction was fragile to extra colons or missing segments. Replaced naive `split(':')[X]` with robust parsing that validates segment count before slicing and logs DEBUG for dropped malformed UIDs.
-
----
+----
 
 ## [0.9.1-alpha] — 2026-04-07
 

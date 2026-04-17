@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.10.2--alpha--16-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.10.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -19,7 +19,15 @@ Plan EV charging, avoid bill surprises, and know your daily energy use before th
 |---|---|
 | ![Forecast overview](assets/dashboard_overview.png) | ![SHAP feature importance](assets/dashboard_shap.png) |
 
-The left card shows today/tomorrow forecasts with prediction-interval min/max and the live ApexCharts "Forecast vs. Real" graph. The right card shows the SHAP feature importance table (rendered via native Lovelace Jinja2 — no custom cards needed). Dashboard YAML is in `dashboard/`.
+The left card shows today/tomorrow forecasts with prediction-interval min/max and the live ApexCharts "Forecast vs. Real" graph. The right card shows the SHAP feature importance table (rendered via native Lovelace Jinja2 — no custom cards needed).
+
+| What drives today's forecast | MAE & anomaly detection |
+|---|---|
+| ![What drives today's forecast](assets/dashboard_shap_narrative.png) | ![MAE and anomaly detection](assets/dashboard_mae_anomaly.png) |
+
+Left: SHAP narrative card explaining the top drivers of today's forecast. Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
+
+Dashboard YAML is in `dashboard/`.
 
 ---
 

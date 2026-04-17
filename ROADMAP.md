@@ -1,7 +1,7 @@
 # Forecast Accuracy Roadmap
 
 Proposed improvements to `ha-energy-forecast`, ordered by impact tier.
-Current baseline: **v0.10.2-alpha-17** (2026-04-17, on dev). Stable (main): v0.9.0 (released 2026-04-10).
+Current baseline: **v0.10.0** (2026-04-17, on main). Stable (main): v0.10.0 (released 2026-04-17).
 
 ---
 
@@ -31,9 +31,7 @@ Current baseline: **v0.10.2-alpha-17** (2026-04-17, on dev). Stable (main): v0.9
 | Bug-fix + dashboard polish | v0.7.1 | #47 entity_exists guard (404 DELETE spam), #48 MQTT anomaly sensor attrs | ✓ done |
 | Solar + battery + ops safety | v0.8.0 | #23 B1 target correction; #44 model versioning + rollback; #45 CSV health checks | ✓ done (on main) |
 | Occupancy + thermal modelling | v0.9.0 | #21 Occupancy (`people_home`), #49 EWMA temperature, #50 Rolling degree-hour sums, #51 Temperature rate of change, #52 Temperature lags, #53 SHAP narrative, #54 Relative MAE sensors | ✓ done (on main, released 2026-04-10) |
-| Baseline + scenario API | v0.10.0 | Stage 1 baseline_mode, Stage 2 thermal/DHW intent, Stage 3 appliance signatures, Stage 4 scenario/what-if API | ✓ done (on dev) |
-| Selective baseline + dtype fix | v0.10.1 | `baseline_included_sensors`, pandas 3.x dtype coercion fix in `_merge_frames` | ✓ done (on dev) |
-| Thermal accuracy suite | v0.10.2-alpha | τ calibration (OLS passive-decay), RC-ODE indoor projection, area-weighted pressure, `thermal_pressure_cop`, `weighted_solar_gain`, program-type appliance signatures, 62 SHAP labels | in progress (on dev, alpha-16) |
+| Baseline + scenario + physics | v0.10.0 | Stage 1 baseline_mode, Stage 2 thermal/DHW intent, Stage 3 appliance signatures, Stage 4 scenario/what-if API; τ calibration, RC-ODE indoor projection, area-weighted pressure, `thermal_pressure_cop`, `weighted_solar_gain`, physics feature pack (#55–#58), program-type signatures, 62 SHAP labels | ✓ done (on main, released 2026-04-17) |
 | Long-term | v1.x+ | #16 HACS, #10 School holidays, #15 HVAC, #18 Config flow | backlog |
 
 ### Deployment workflow (per release)
