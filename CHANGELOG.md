@@ -10,6 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-17] — 2026-04-17
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — replaced all 30 `app.log()` calls with `_LOGGER.warning/error/info()`. The module-level `_LOGGER = logging.getLogger(__name__)` was already defined but unused; now wired up. All log entries from the data-fetch layer now appear under the `energy_forecast.ha_data` logger name, completing the logging-consistency migration started in alpha-16 (which covered `energy_forecast.py` and `energy_history_backfill.py`).
+
+### Tests
+- 474 passing (unchanged).
+
+### Deployment
+- Merged `fix/ha-data-logging` into `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
+
+---
+
 ## [0.10.2-alpha-16] — 2026-04-16
 
 ### Fixed
