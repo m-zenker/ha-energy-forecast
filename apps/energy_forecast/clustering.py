@@ -70,9 +70,19 @@ class DailyProfileClusterer:
             # Prepare sample weights for valid days
             fit_kwargs = {}
             if sample_weight is not None:
-                # Reindex to match the pivoted dates and fill missing weights with 0
-                w = sample_weight.reindex(pivoted.index).fillna(0).values
-                fit_kwargs["sample_weight"] = w
+                # Align weights to pivoted index; fill missing with the mean weight so
+                # unmatched days get a neutral contribution rather than zero weight.
+                # A zero-weight day causes sample_weight.sum()==0 → KMeans NaN divide.
+                mean_w = sample_weight.mean() if len(sample_weight) > 0 else 1.0
+                w = sample_weight.reindex(pivoted.index).fillna(mean_w).values
+                # Final safety guard: if all weights are zero or NaN, drop them entirely
+                if not np.isfinite(w).all() or w.sum() == 0:
+                    _LOGGER.warning(
+                        "Regime Clustering: sample_weight is invalid (all-zero or NaN) — "
+                        "falling back to uniform weights."
+                    )
+                else:
+                    fit_kwargs["sample_weight"] = w
 
             # 2. Fit KMeans
             # Use raw values to capture both shape and magnitude (e.g. high-heating vs low-heating)
@@ -123,7 +133,10 @@ class RegimePredictor:
             
             fit_kwargs = {}
             if sample_weight is not None:
-                fit_kwargs["sample_weight"] = sample_weight.reindex(common_idx).fillna(0).values
+                mean_w = sample_weight.mean() if len(sample_weight) > 0 else 1.0
+                w = sample_weight.reindex(common_idx).fillna(mean_w).values
+                if np.isfinite(w).all() and w.sum() > 0:
+                    fit_kwargs["sample_weight"] = w
 
             if len(X) < 14:
                 return

@@ -104,6 +104,27 @@ def test_regime_predictor():
     pred = predictor.predict(test_features)
     assert pred[0] == 1  # Should predict Cold regime
 
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_zero_weight_guard():
+    """Regression: all-zero sample_weight must not crash KMeans (NaN divide)."""
+    dates = pd.date_range("2024-01-01", periods=30, freq="D")
+    rows = []
+    for i, dt in enumerate(dates):
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": float(i % 3 + 1)})
+    df = pd.DataFrame(rows)
+
+    # Weights indexed on dates NOT in the df — reindex would yield all NaN, fillna(0) → sum=0
+    mismatched_idx = pd.date_range("2025-01-01", periods=30, freq="D").date
+    all_zero_weights = pd.Series(np.zeros(30), index=mismatched_idx)
+
+    clusterer = DailyProfileClusterer(n_clusters=3)
+    labels = clusterer.fit(df, sample_weight=all_zero_weights)
+    # Should succeed (fallback to uniform) rather than raise
+    assert clusterer.is_fitted
+    assert labels is not None
+
+
 def test_clusterer_no_sklearn_fallback():
     """If sklearn is missing (simulated), clusterer should fail gracefully."""
     import apps.energy_forecast.clustering as cl
