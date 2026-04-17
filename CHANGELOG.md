@@ -10,6 +10,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-19] — 2026-04-17
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py`, `energy_history_backfill.py` — at the top of `initialize()`, assign `self.logger` (AppDaemon's per-app logger instance) to the module-level `_LOGGER` and patch `ha_data._LOGGER`, `model._LOGGER`, and `weather._LOGGER` with the same logger. This is the correct mechanism for routing all log output under the `energy_forecast` AppDaemon app category. Previous alpha attempts (alpha-16 through alpha-18) used stdlib `logging.getLogger()` which routes outside AppDaemon's hierarchy and always displays under the generic "AppDaemon" prefix regardless of logger name.
+
+### Tests
+- 474 passing (unchanged).
+
+### Deployment
+- Tagged `v0.10.2-alpha-19` on `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
+- Post-restart log verification: all expected log categories confirmed as `INFO energy_forecast:` / `WARNING energy_forecast:` — CV fold MAEs [0.6622, 0.5553, 0.4244] → mean=0.5473, appliance signatures for 5 sensors, sub-sensor NaN warnings, τ calibration skipped (0 passive-cooling windows, expected in spring). Fix confirmed working — no `AppDaemon:` prefix on application-logic log entries.
+
+---
+
 ## [0.10.2-alpha-18] — 2026-04-17
 
 ### Fixed
