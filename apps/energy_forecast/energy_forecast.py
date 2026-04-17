@@ -32,6 +32,9 @@ from . import ha_data, weather
 from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
 from .model import EnergyForecastModel
 
+# Placeholder replaced in initialize() with AppDaemon's per-app logger.
+# Using logging.getLogger() here would produce an "AppDaemon" category in HA logs
+# because AppDaemon only routes its own app-hierarchy loggers (self.logger) correctly.
 _LOGGER = logging.getLogger("energy_forecast")
 
 # ── Operational constants l ─────────────────────────────────────────────────────
@@ -136,6 +139,17 @@ class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
     def initialize(self) -> None:
+        # Wire AppDaemon's per-app logger into all sub-modules so every log entry
+        # appears under "energy_forecast" in HA logs, not the generic "AppDaemon" category.
+        global _LOGGER
+        _LOGGER = self.logger
+        from . import ha_data as _hd
+        from . import model as _mdl
+        from . import weather as _wth
+        _hd._LOGGER = self.logger
+        _mdl._LOGGER = self.logger
+        _wth._LOGGER = self.logger
+
         _LOGGER.info("HA Energy Forecast initialising…")
 
         self._energy_sensor: str         = self.args["energy_sensor"]

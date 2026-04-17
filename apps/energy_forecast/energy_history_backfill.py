@@ -52,6 +52,8 @@ class EnergyHistoryBackfill(hass.Hass):
     """Runs once on startup, backfills the CSV from the HA SQLite DB."""
 
     def initialize(self) -> None:
+        global _LOGGER
+        _LOGGER = self.logger
         _LOGGER.info("=" * 60)
         _LOGGER.info("EnergyHistoryBackfill starting…")
         self.run_in(self._run, 5)
