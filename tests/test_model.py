@@ -334,7 +334,7 @@ class TestShortHorizonLags:
         """Short lags must NOT emit the NaN coverage warning even though most hours are NaN."""
         import logging
         actuals_df = _make_actuals(200)
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
         for rec in caplog.records:
             assert "lag_1h" not in rec.message
@@ -1130,7 +1130,7 @@ class TestSubSensorFeatures:
         sparse_ts = ts[::40]
         sub_df = pd.DataFrame({"timestamp": sparse_ts, "kwh": [1.0] * len(sparse_ts)})
 
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
 
         assert "sub_hp" in caplog.text
@@ -1181,7 +1181,7 @@ class TestSubSensorFeatures:
         # Sub-sensor data from 30 days before the future window — all lags will be NaN.
         old_ts = pd.date_range("2023-12-01", periods=48, freq="1h")
         sub_df = pd.DataFrame({"timestamp": old_ts, "kwh": [1.0] * 48})
-        with caplog.at_level(logging.DEBUG, logger="energy_forecast.model"):
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
             _add_sub_sensor_lags_prediction(future_df.copy(), {"sub_sparse": sub_df})
         warning_msgs = [r for r in caplog.records if r.levelno >= logging.WARNING and "sub_sparse" in r.message]
         assert warning_msgs == [], f"Expected no WARNING for sparse sub-sensor, got: {warning_msgs}"
@@ -1309,7 +1309,7 @@ class TestFeatureImportanceLogging:
     def test_feature_importances_logged_after_training(self, tmp_path, caplog):
         """Feature importances (top 10) must appear in logs after a successful train."""
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=600)
         assert any("Feature importances" in r.message for r in caplog.records), (
             "Expected 'Feature importances' in log output after train()"
@@ -1322,7 +1322,7 @@ class TestFeatureImportanceLogging:
         for TimeSeriesSplit (MIN_CV_ROWS=500).
         """
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=900)
         cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
         assert cv_logs, "Expected 'CV fold MAEs' log entry when n≥500 clean rows"
@@ -1449,7 +1449,7 @@ class TestNumLeavesSweep:
     def test_num_leaves_sweep_logged_when_cv_runs(self, tmp_path, caplog):
         """With enough rows for CV and LightGBM absent, sweep is skipped gracefully."""
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=900)
         # If LightGBM is present, expect sweep log; if not (sklearn fallback), no crash.
         # Either way CV must complete without error.
@@ -1932,7 +1932,7 @@ class TestModelVersioning:
         })
         m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
         archive_name = sorted((tmp_path / "archive").iterdir())[-1].name
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             m.rollback_model()
         assert any(archive_name in r.message for r in caplog.records)
 
@@ -2228,7 +2228,7 @@ class TestApplianceSignatures:
         kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1] + [0.0] * 12
         ts = pd.date_range("2026-01-01", periods=len(kwh), freq="1h")
         df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _learn_appliance_signatures({"hp": df}, min_cycles=2)
         assert any("high variability" in r.message for r in caplog.records)
 
@@ -2448,7 +2448,7 @@ class TestApplianceSignatures:
             ts_list.append(t + pd.Timedelta(hours=h))
             kwh_list.append(0.0)
         df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             sigs = _learn_appliance_signatures({"wm": df})
         # Clusters should exist; no high-variability warning expected
         assert "wm" in sigs

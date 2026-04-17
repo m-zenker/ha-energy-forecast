@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, date
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 # Module-level OAuth token cache.  Avoids a new token request on every hourly
 # forecast update (~24+ per day) and reduces the risk of SRG rate-limiting.

@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 from .const import CACHE_PATH, MAX_HOURLY_KWH
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 
 def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:

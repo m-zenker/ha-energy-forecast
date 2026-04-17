@@ -417,7 +417,7 @@ class TestCheckDstDuplicates:
             ["2024-10-27 01:00", "2024-10-27 03:00", "2024-10-27 04:00"],
             [1.0, 1.0, 1.0],
         )
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         assert not any("DST" in r.message or "duplicate" in r.message.lower() for r in caplog.records)
 
@@ -428,7 +428,7 @@ class TestCheckDstDuplicates:
             ["2024-10-27 02:00", "2024-10-27 02:00", "2024-10-27 03:00"],
             [1.0, 1.1, 1.0],
         )
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         assert any("duplicate" in r.message.lower() or "DST" in r.message for r in caplog.records)
 
@@ -438,7 +438,7 @@ class TestCheckDstDuplicates:
             ["2024-10-27 02:00", "2024-10-27 02:00"],
             [1.0, 1.1],
         )
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, "expected at least one WARNING"
@@ -447,14 +447,14 @@ class TestCheckDstDuplicates:
     def test_empty_dataframe_no_warning(self, caplog):
         """Empty DataFrame does not raise and emits no warning."""
         df = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         assert not caplog.records
 
     def test_single_row_no_warning(self, caplog):
         """Single-row DataFrame cannot have duplicates."""
         df = make_energy_df(["2024-10-27 02:00"], [1.0])
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         assert not caplog.records
 
@@ -467,7 +467,7 @@ class TestCheckDstDuplicates:
             ["2024-03-31 01:00", "2024-03-31 03:00", "2024-03-31 04:00"],
             [1.0, 1.0, 1.0],
         )
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _check_dst_duplicates(df, _LOGGER)
         assert not caplog.records
 
@@ -491,7 +491,7 @@ class TestCheckDstDuplicates:
         )
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             with patch.object(ha_data, "_merge_energy_frames", return_value=dup_df):
-                with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+                with caplog.at_level(logging.WARNING, logger="energy_forecast"):
                     ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert any("duplicate" in r.message.lower() or "DST" in r.message for r in caplog.records)
@@ -755,7 +755,7 @@ class TestValidateEnergyCache:
         """5 rows, 1h apart, valid values → no WARNING logged."""
         ts = pd.date_range("2024-03-15 08:00", periods=5, freq="1h")
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5, 2.0, 1.2, 0.8]})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
         assert not caplog.records
 
@@ -765,7 +765,7 @@ class TestValidateEnergyCache:
                               "2024-03-15 08:30",  # goes backwards
                               "2024-03-15 10:00"])
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5, 0.8, 2.0]})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
         assert any("non-monotonic" in r.message for r in caplog.records)
 
@@ -773,7 +773,7 @@ class TestValidateEnergyCache:
         """A 3.5h gap between consecutive rows triggers WARNING."""
         ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 11:30"])
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
         assert any("gap" in r.message.lower() for r in caplog.records)
 
@@ -781,7 +781,7 @@ class TestValidateEnergyCache:
         """Exactly 2h gap is NOT flagged (threshold is strictly > 2h)."""
         ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 10:00"])
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
         assert not any("gap" in r.message.lower() for r in caplog.records)
 
@@ -790,7 +790,7 @@ class TestValidateEnergyCache:
         # 2024-03-31: clocks spring forward; use 00:00→03:00 (3h gap)
         ts = pd.to_datetime(["2024-03-31 00:00", "2024-03-31 03:00"])
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5]})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
         assert any("DST" in r.message for r in caplog.records)
 
@@ -799,11 +799,11 @@ class TestValidateEnergyCache:
         ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
         df_over = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 60.0]})  # 60 > 50
         df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})   # 0 not positive
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df_over, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df_zero, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
 
@@ -811,7 +811,7 @@ class TestValidateEnergyCache:
         """DataFrame without gross_kwh column must not raise."""
         ts = pd.date_range("2024-03-15 08:00", periods=3, freq="1h")
         df = pd.DataFrame({"timestamp": ts})  # no gross_kwh
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.ha_data"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)  # must not raise
 
 

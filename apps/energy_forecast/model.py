@@ -57,7 +57,7 @@ from .const import (
     SENSOR_FULL_TRUST_HOURS,
 )
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 # ── Lag hours used as autoregressive features ─────────────────────────────────
 # All are safe for a 48-hour forecast: target is always ≥1h ahead,
