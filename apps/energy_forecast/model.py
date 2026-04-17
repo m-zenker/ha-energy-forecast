@@ -354,15 +354,15 @@ class EnergyForecastModel:
                 # 3. Create hourly regime_kwh_series (vectorized)
                 # Map daily labels to hourly timestamps
                 ts_idx = pd.to_datetime(df["timestamp"])
-                hourly_labels = ts_idx.date
+                hourly_labels = ts_idx.dt.date
                 # Reindex labels to all dates in df, ffill any gaps
                 mapped_labels = labels.reindex(hourly_labels).ffill().fillna(-1).astype(int).values
-                
+
                 # Use centroids matrix to lookup values for each hour
                 regime_rows = np.zeros(len(ts_idx))
                 valid_mask = (mapped_labels >= 0)
                 if valid_mask.any():
-                    hours = ts_idx.hour.values
+                    hours = ts_idx.dt.hour.values
                     regime_rows[valid_mask] = self._clusterer.centroids[
                         mapped_labels[valid_mask], hours[valid_mask]
                     ]
@@ -700,13 +700,13 @@ class EnergyForecastModel:
                 
                 # 3. Populate regime_kwh column (vectorized)
                 ts_idx = pd.to_datetime(feat_df["timestamp"])
-                hourly_labels = ts_idx.date
+                hourly_labels = ts_idx.dt.date
                 mapped_labels = np.array([regime_map.get(d, -1) for d in hourly_labels])
-                
+
                 regime_vals = np.zeros(len(ts_idx))
                 valid_mask = (mapped_labels >= 0)
                 if valid_mask.any():
-                    hours = ts_idx.hour.values
+                    hours = ts_idx.dt.hour.values
                     regime_vals[valid_mask] = self._clusterer.centroids[
                         mapped_labels[valid_mask], hours[valid_mask]
                     ]
