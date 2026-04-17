@@ -10,6 +10,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-5] — 2026-04-17 (current dev)
+
+### Fixed
+- **`Series` has no attribute `date`** (`model.py`) — `ts_idx` is a `pd.Series`, not a
+  `DatetimeIndex`. Both the train path (regime_kwh vectorised lookup) and the predict path
+  used bare `.date` / `.hour`; replaced with `.dt.date` / `.dt.hour`. With `enable_regimes`
+  on, every retraining cycle raised this exception, blocking all subsequent predictions.
+
+---
+
 ## [0.11.0-alpha-4] — 2026-04-17
 
 ### Fixed
