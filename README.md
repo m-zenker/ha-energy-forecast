@@ -8,7 +8,7 @@
 ![Version](https://img.shields.io/badge/version-v0.11.0--alpha--1-blue)
  ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
-Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
+Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
 
@@ -26,7 +26,7 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 |---|---|
 | ![What drives today's forecast](assets/dashboard_shap_narrative.png) | ![MAE and anomaly detection](assets/dashboard_mae_anomaly.png) |
 
-Left: SHAP narrative card explaining the top drivers of today's forecast. Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
+Left: SHAP narrative card explaining the top drivers of today's forecast (e.g. "Mainly driven by: daily regime pattern; yesterday's same-hour consumption"). Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
 
 Dashboard YAML is in `dashboard/`.
 
@@ -110,7 +110,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
 - **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
 - **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
-- **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns and predicts tomorrow's regime from the weather forecast, providing a stable baseline for the hourly model
+- **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns (e.g. Workday, Weekend, High-Heating) and predicts the most likely regime for tomorrow; this provides the hourly model with a stable "physics-informed" prior (`regime_kwh`) that significantly improves baseline accuracy
 - **Passive / Baseline mode** — optional `baseline_mode` flag strips controllable sub-sensor loads from the training target, giving the model a cleaner household baseline signal and making scenario deltas more meaningful
 - **Thermal & DHW intent modeling** — optional climate entity setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
 - **Scenario / What-If API** — ask "what would my consumption look like if I run the dishwasher at 22:00?" without changing the live forecast; results fire an event and optionally publish dedicated HA sensors
@@ -198,7 +198,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 | `numpy` ≥ 1.24.0 | |
 | `requests` ≥ 2.31.0 | |
 | `holidays` ≥ 0.46 | Swiss public holiday feature |
-| `scikit-learn` ≥ 1.4.0, tested with 1.8.0 | Required — GBR fallback engine |
+| `scikit-learn` ≥ 1.4.0 | Required — GBR fallback engine + Daily Regime Clustering |
 | `lightgbm` ≥ 4.0.0 | Optional — primary engine |
 
 ---
@@ -295,6 +295,10 @@ energy_forecast:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
 
+  # Daily Regime Clustering (optional, requires scikit-learn).
+  # enable_regimes: true
+  # regime_count: 5
+
   # Vacation / away mode (optional).
   # away_mode_entity: input_boolean.vacation_mode
   # away_return_entity: input_datetime.vacation_return
@@ -336,6 +340,8 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `enable_regimes` | No | `false` | Enable [Daily Regime Clustering](#daily-regime-clustering-optional). Groups historical 24h profiles and predicts the regime for tomorrow. Requires `scikit-learn`. |
+| `regime_count` | No | `5` | Number of distinct daily patterns to identify (e.g. Workday, Weekend, High-Heating). |
 | `baseline_mode` | No | `false` | When `true`, subtracts all `sub_energy_sensors` from the training target so the model learns the household baseline without controllable-appliance noise. Mirrors the same subtraction at prediction time. See [Baseline / Passive mode](#baseline--passive-mode). |
 | `baseline_included_sensors` | No | `[]` | When `baseline_mode: true`, sensors listed here are **kept** in the training target (not subtracted). Use to include heating/DHW sub-sensors in the baseline model while still removing schedulable appliances (dishwasher, washer) for clean scenario deltas. Sensors absent from this list are subtracted as before. |
 | `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (area-weighted setpoint − current temp, in °C·h). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
@@ -497,6 +503,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
+| Daily Regime | `regime_kwh` — expected hourly profile for the predicted daily regime (e.g. Workday, Weekend, High-Heating); provides a stable physics-informed prior |
 | Away / vacation | `is_away` — binary flag; 1 during periods when `away_mode_entity` is "on"; teaches the model lower vacation-period consumption |
 | Occupancy | `people_home` — integer count of people home (from `presence_sensors`) |
 
