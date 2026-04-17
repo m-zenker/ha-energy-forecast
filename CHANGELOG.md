@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-7] — 2026-04-17
+
+### Fixed
+- **`fillna(method=)` crash in heating active projection** (`energy_forecast.py`) — `pandas 3.x` removed the `method=` kwarg from `NDFrame.fillna()`; replaced with `.ffill().bfill()` chain. The `_build_heating_active_projection()` helper raised on every prediction cycle, silently falling back to flat setpoints.
+
+---
+
 ## [0.11.0-alpha-6] — 2026-04-17
 
 ### Fixed
