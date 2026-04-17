@@ -140,6 +140,21 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #62 — Adaptive Regime Selection (Auto-K)
+
+**Signal:** Instead of a fixed `regime_count`, automatically find the optimal number of clusters ($K$) that maximizes the balance between clustering quality (Silhouette Score) and weather-based predictability.
+
+**Proposed changes:**
+- Iterate $K \in [2, 8]$ during the clustering stage.
+- Calculate `silhouette_score` for each $K$ via `sklearn.metrics`.
+- Run internal cross-validation on `RegimePredictor` to measure predictability.
+- Select $K$ that maximizes $\text{Silhouette} \times \text{Accuracy}$.
+- Activate when `regime_count: 0`.
+
+**Effort:** ~2 h. **Impact:** MEDIUM — zero-config optimization.
+
+---
+
 ### Deferred
 
 | # | Item | Reason |

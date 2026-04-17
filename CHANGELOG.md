@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-6] — 2026-04-17
+
+### Fixed
+- **Thermal pressure discontinuities at heating system on/off** (`model.py`, `energy_forecast.py`) — when `heating_system_active_entity` toggled, all climate setpoints previously flipped between 12 °C (off) and configured values (on) for the entire 48-hour prediction window, causing thermal_pressure to collapse to zero or spike abruptly. `_project_indoor_temps()` now accepts `heating_active_series` and computes a smooth per-hour setpoint trajectory using outdoor-temperature hysteresis (configurable `temp_on`/`temp_off` thresholds with dead-band hold). `_build_heating_active_projection()` generates the series from current heating state + outdoor forecast before each prediction cycle. No model retrain required — feature values preserved, only setpoint projection logic changed. 8 new regression tests in `test_setpoint_projection.py`.
+
+---
+
 ## [0.11.0-alpha-5] — 2026-04-17 (current dev)
 
 ### Fixed
