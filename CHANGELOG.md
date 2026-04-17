@@ -10,6 +10,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.10.2-alpha-18] — 2026-04-17
+
+### Fixed
+- `apps/energy_forecast/model.py`, `ha_data.py`, `weather.py` — changed `_LOGGER = logging.getLogger(__name__)` to `_LOGGER = logging.getLogger("energy_forecast")` in all three modules. AppDaemon collapses child logger names (e.g. `energy_forecast.model`) under the generic "AppDaemon" display prefix; using the flat name `"energy_forecast"` ensures all three modules share the same named logger instance and are routed through AppDaemon's per-app log handler consistently.
+
+### Tests
+- 474 passing (unchanged).
+
+### Deployment
+- Tagged `v0.10.2-alpha-18` on `dev`. Deployed to HA (Samba upload + AppDaemon restart 2026-04-17).
+- Post-restart log verification: CV fold MAEs [0.6654, 0.5504, 0.4278] → mean=0.5479, appliance signatures for 5 sensors, sub-sensor NaN warnings (expected — data maturation ongoing), τ calibration skipped (0 valid passive-cooling windows, expected in spring). All energy_forecast messages confirmed delivered; no regressions.
+- Note: AppDaemon's log *display prefix* remains "AppDaemon:" for all stdlib `logging` calls regardless of the logger name — this is AppDaemon's formatting behavior, not a code defect. The fix ensures consistent logger identity for filtering/routing, not for the display label.
+
+---
+
 ## [0.10.2-alpha-17] — 2026-04-17
 
 ### Fixed
