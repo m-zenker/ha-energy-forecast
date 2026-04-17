@@ -34,11 +34,12 @@ class DailyProfileClusterer:
         self.centroids: np.ndarray | None = None
         self.is_fitted = False
 
-    def fit(self, df: pd.DataFrame) -> pd.Series | None:
+    def fit(self, df: pd.DataFrame, sample_weight: pd.Series | None = None) -> pd.Series | None:
         """Find clusters in hourly energy data.
 
         Args:
             df: DataFrame with 'timestamp' and 'gross_kwh'.
+            sample_weight: Optional Series of daily weights indexed by date.
 
         Returns:
             A Series of cluster labels indexed by date, or None if failed.
@@ -66,11 +67,18 @@ class DailyProfileClusterer:
             # Interpolate to fill missing hours (up to 2 per day)
             pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1).ffill(axis=1).bfill(axis=1)
             
+            # Prepare sample weights for valid days
+            fit_kwargs = {}
+            if sample_weight is not None:
+                # Reindex to match the pivoted dates and fill missing weights with 0
+                w = sample_weight.reindex(pivoted.index).fillna(0).values
+                fit_kwargs["sample_weight"] = w
+
             # 2. Fit KMeans
             # Use raw values to capture both shape and magnitude (e.g. high-heating vs low-heating)
             n = min(self.n_clusters, len(pivoted))
             km = KMeans(n_clusters=n, random_state=42, n_init=10)
-            labels = km.fit_predict(pivoted)
+            labels = km.fit_predict(pivoted, **fit_kwargs)
             
             self.centroids = km.cluster_centers_
             self.is_fitted = True
@@ -96,12 +104,13 @@ class RegimePredictor:
         self.model: Any = None
         self.is_fitted = False
 
-    def fit(self, daily_features: pd.DataFrame, labels: pd.Series):
+    def fit(self, daily_features: pd.DataFrame, labels: pd.Series, sample_weight: pd.Series | None = None):
         """Train the regime classifier.
 
         Args:
             daily_features: DataFrame indexed by date with weather/calendar features.
             labels: Series of cluster IDs indexed by date.
+            sample_weight: Optional Series of daily weights indexed by date.
         """
         if not SKLEARN_AVAILABLE:
             return
@@ -111,12 +120,16 @@ class RegimePredictor:
             common_idx = daily_features.index.intersection(labels.index)
             X = daily_features.loc[common_idx]
             y = labels.loc[common_idx]
+            
+            fit_kwargs = {}
+            if sample_weight is not None:
+                fit_kwargs["sample_weight"] = sample_weight.reindex(common_idx).fillna(0).values
 
             if len(X) < 14:
                 return
 
             self.model = RandomForestClassifier(n_estimators=100, random_state=42)
-            self.model.fit(X, y)
+            self.model.fit(X, y, **fit_kwargs)
             self.is_fitted = True
             
             acc = self.model.score(X, y)

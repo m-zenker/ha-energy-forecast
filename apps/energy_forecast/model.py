@@ -322,6 +322,17 @@ class EnergyForecastModel:
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
         self._likely_ev_hours = likely_ev_hours
 
+        # ── Sample weighting for decay (Stage 1.5) ──────────────────────────
+        # Calculate hourly weights for all rows in energy_df
+        hourly_weights = None
+        daily_weights = None
+        if weight_halflife_days > 0:
+            end_ts = energy_df["timestamp"].max()
+            days_ago = (end_ts - energy_df["timestamp"]).dt.total_seconds() / 86400
+            h_weights = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
+            hourly_weights = pd.Series(h_weights, index=energy_df["timestamp"])
+            daily_weights = hourly_weights.groupby(energy_df["timestamp"].dt.date).mean()
+
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes
         self._regime_count = regime_count
@@ -329,7 +340,7 @@ class EnergyForecastModel:
 
         if enable_regimes:
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=regime_count)
-            labels = self._clusterer.fit(energy_df)
+            labels = self._clusterer.fit(energy_df, sample_weight=daily_weights)
             
             if labels is not None and not labels.empty:
                 # ── Train Regime Predictor ──
@@ -338,7 +349,7 @@ class EnergyForecastModel:
                 )
                 
                 self._regime_model = clustering.RegimePredictor()
-                self._regime_model.fit(daily_features, labels)
+                self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
                 
                 # 3. Create hourly regime_kwh_series (vectorized)
                 # Map daily labels to hourly timestamps
@@ -437,12 +448,11 @@ class EnergyForecastModel:
         y = df["gross_kwh"].to_numpy(dtype=float)
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
-        # ── Exponential sample weighting ────────────────────────────────────
+        # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
-        if weight_halflife_days > 0:
-            end_ts = df["timestamp"].max()
-            days_ago = (end_ts - df["timestamp"]).dt.total_seconds() / 86400
-            sample_weight = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
+        if hourly_weights is not None:
+            # Map hourly weights to the (potentially subsetted) training df
+            sample_weight = hourly_weights.reindex(df["timestamp"]).fillna(0).values
 
         # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
         # Also used to determine optimal n_estimators via LightGBM early stopping.
