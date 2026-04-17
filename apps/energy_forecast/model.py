@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pandas as pd
 
+from . import clustering
 from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
@@ -110,6 +111,8 @@ _FEATURES_BASE = [
     "is_away",
     # Occupancy
     "people_home",
+    # Daily regime profile (optional module)
+    "regime_kwh",
     # Stage 2: Intent-driven features
     "thermal_pressure",
     "thermal_pressure_max",
@@ -217,6 +220,12 @@ class EnergyForecastModel:
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
 
+        # Daily Regime Clustering (optional)
+        self._enable_regimes: bool = False
+        self._regime_count: int = 5
+        self._clusterer: clustering.DailyProfileClusterer | None = None
+        self._regime_model: clustering.RegimePredictor | None = None
+
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
         self._model_archive_count: int = model_archive_count
@@ -242,6 +251,8 @@ class EnergyForecastModel:
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
+        enable_regimes: bool = False,
+        regime_count: int = 5,
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -311,12 +322,49 @@ class EnergyForecastModel:
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
         self._likely_ev_hours = likely_ev_hours
 
+        # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
+        self._enable_regimes = enable_regimes
+        self._regime_count = regime_count
+        regime_kwh_series = None
+
+        if enable_regimes:
+            self._clusterer = clustering.DailyProfileClusterer(n_clusters=regime_count)
+            labels = self._clusterer.fit(energy_df)
+            
+            if labels is not None and not labels.empty:
+                # ── Train Regime Predictor ──
+                daily_features = _prepare_daily_regime_features(
+                    weather_df, country=country, canton=canton
+                )
+                
+                self._regime_model = clustering.RegimePredictor()
+                self._regime_model.fit(daily_features, labels)
+                
+                # 3. Create hourly regime_kwh_series (vectorized)
+                # Map daily labels to hourly timestamps
+                ts_idx = pd.to_datetime(df["timestamp"])
+                hourly_labels = ts_idx.date
+                # Reindex labels to all dates in df, ffill any gaps
+                mapped_labels = labels.reindex(hourly_labels).ffill().fillna(-1).astype(int).values
+                
+                # Use centroids matrix to lookup values for each hour
+                regime_rows = np.zeros(len(ts_idx))
+                valid_mask = (mapped_labels >= 0)
+                if valid_mask.any():
+                    hours = ts_idx.hour.values
+                    regime_rows[valid_mask] = self._clusterer.centroids[
+                        mapped_labels[valid_mask], hours[valid_mask]
+                    ]
+                
+                regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
+
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
                                 dhw_df=dhw_df, tau_hours=self._tau_hours,
-                                room_areas=room_areas)
+                                room_areas=room_areas,
+                                regime_kwh_series=regime_kwh_series)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -628,6 +676,37 @@ class EnergyForecastModel:
                                      climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
                                      tau_hours=self._tau_hours, room_areas=room_areas)
 
+        # ── Daily Regime Profile Prediction ──────────────────────────────────
+        if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
+            try:
+                # 1. Prepare daily features for Today and Tomorrow
+                daily_features = _prepare_daily_regime_features(
+                    forecast_df, country=self._country, canton=self._canton
+                )
+                
+                # 2. Predict regime IDs
+                predicted_labels = self._regime_model.predict(daily_features)
+                regime_map = dict(zip(daily_features.index, predicted_labels))
+                
+                # 3. Populate regime_kwh column (vectorized)
+                ts_idx = pd.to_datetime(feat_df["timestamp"])
+                hourly_labels = ts_idx.date
+                mapped_labels = np.array([regime_map.get(d, -1) for d in hourly_labels])
+                
+                regime_vals = np.zeros(len(ts_idx))
+                valid_mask = (mapped_labels >= 0)
+                if valid_mask.any():
+                    hours = ts_idx.hour.values
+                    regime_vals[valid_mask] = self._clusterer.centroids[
+                        mapped_labels[valid_mask], hours[valid_mask]
+                    ]
+                feat_df["regime_kwh"] = regime_vals
+            except Exception as e:
+                _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
+                feat_df["regime_kwh"] = 0.0
+        else:
+            feat_df["regime_kwh"] = 0.0
+
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
         # Merge by timestamp; fill unmatched rows with 0 (default: not away).
@@ -864,6 +943,8 @@ class EnergyForecastModel:
                 self._model_q10_path,
                 self._model_q90_path,
                 self._interval_correction_path,
+                self._model_dir / "clusterer.pkl",
+                self._model_dir / "regime_model.pkl",
             ]
             for src in _artifacts:
                 if src.exists():
@@ -910,6 +991,14 @@ class EnergyForecastModel:
             pickle.dump(self.model, fh)
         _write_hash(self._model_path)
 
+        # Save regime components if present
+        if self._clusterer:
+            with open(self._model_dir / "clusterer.pkl", "wb") as fh:
+                pickle.dump(self._clusterer, fh)
+        if self._regime_model:
+            with open(self._model_dir / "regime_model.pkl", "wb") as fh:
+                pickle.dump(self._regime_model, fh)
+
         meta = {
             "feature_cols":              self.feature_cols,
             "last_trained":              self.last_trained,
@@ -923,6 +1012,8 @@ class EnergyForecastModel:
             "likely_ev_hours":           self._likely_ev_hours,
             "sub_sensor_prefixes":       self._sub_sensor_prefixes,
             "tau_hours":                 self._tau_hours,
+            "enable_regimes":            self._enable_regimes,
+            "regime_count":              self._regime_count,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1206,11 +1297,70 @@ class EnergyForecastModel:
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
                     self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
                     self._tau_hours            = meta.get("tau_hours",             None)
+                    self._enable_regimes       = meta.get("enable_regimes",        False)
+                    self._regime_count         = meta.get("regime_count",          5)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
+        # Load regime models if they exist
+        c_path = self._model_dir / "clusterer.pkl"
+        if c_path.exists():
+            try:
+                with open(c_path, "rb") as fh:
+                    self._clusterer = pickle.load(fh)
+            except Exception:
+                self._clusterer = None
+        r_path = self._model_dir / "regime_model.pkl"
+        if r_path.exists():
+            try:
+                with open(r_path, "rb") as fh:
+                    self._regime_model = pickle.load(fh)
+            except Exception:
+                self._regime_model = None
+
         self._load_quantile_models()
         self._load_signatures()
+
+
+def _prepare_daily_regime_features(
+    weather_df: pd.DataFrame,
+    country: str = "CH",
+    canton: str | None = None
+) -> pd.DataFrame:
+    """Aggregate hourly weather into daily features for regime prediction."""
+    import pandas as pd
+    
+    # 1. Aggregate daily weather features
+    w_daily = weather_df.copy()
+    w_daily["date"] = pd.to_datetime(w_daily["timestamp"]).dt.date
+    w_daily = w_daily.groupby("date").agg({
+        "temp_c": ["mean", "min", "max"],
+        "sunshine_min": "sum",
+        "precipitation_mm": "sum"
+    })
+    w_daily.columns = ["temp_mean", "temp_min", "temp_max", "sun_total", "precip_total"]
+    
+    # 2. Add calendar features
+    cal_df = pd.DataFrame(index=w_daily.index)
+    cal_dates = pd.to_datetime(cal_df.index)
+    cal_df["day_of_week"] = cal_dates.dayofweek
+    
+    # Reuse holiday logic
+    try:
+        import holidays as hd
+        years = cal_dates.year.unique().tolist()
+        ch_hols = hd.country_holidays(country, years=years)
+        # Add cantonal holidays if provided
+        if canton and country.upper() == "CH":
+            try:
+                ch_hols = hd.country_holidays(country, prov=canton, years=years)
+            except Exception:
+                pass
+        cal_df["is_holiday"] = pd.Series(cal_df.index).map(lambda d: 1 if d in ch_hols else 0).values
+    except Exception:
+        cal_df["is_holiday"] = 0
+        
+    return pd.concat([w_daily, cal_df], axis=1).dropna()
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
@@ -1870,6 +2020,7 @@ def _engineer_features(
     dhw_df: pd.DataFrame | None = None,
     tau_hours: float | None = None,
     room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
+    regime_kwh_series: "pd.Series | None" = None,  # hourly regime profile
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -2117,6 +2268,21 @@ def _engineer_features(
     # Scaled by relative humidity.
     defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0)**2) / 10.0)
     df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
+
+    # ── Daily Regime Profile (optional) ──────────────────────────────────────
+    if regime_kwh_series is not None:
+        # Merge hourly profile by timestamp
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(
+            regime_kwh_series.to_frame("regime_kwh"),
+            left_on="_ts_floor",
+            right_index=True,
+            how="left"
+        )
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["regime_kwh"] = df["regime_kwh"].fillna(0.0)
+    else:
+        df["regime_kwh"] = 0.0
 
     return df
 

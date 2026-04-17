@@ -10,6 +10,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-1] — 2026-04-17
+
+v0.11.0 introduces Daily Regime Clustering as an optional module. This feature explicitly
+extracts typical 24-hour energy consumption patterns (regimes) and uses a secondary
+classifier to predict the most likely regime for any given day based on weather and calendar.
+The predicted regime's profile is then used as a stable "physics-informed" prior (`regime_kwh`)
+for the main hourly forecast model, significantly improving baseline stability.
+
+### Added
+- **Optional Daily Regime Clustering** (`clustering.py`, `model.py`) — new feature that
+  clusters historical 24-hour profiles into $K$ regimes (default 5) using K-Means.
+- **Regime Predictor Model** — a secondary Random Forest classifier that predicts the
+  daily regime from weather (temp, sunshine) and calendar (day of week, holiday).
+- **`regime_kwh` feature** — adds the expected consumption for the predicted regime
+  to the main hourly model's feature set.
+- **Optional Dependency Guard** — the module is designed to fall back gracefully if
+  `scikit-learn` is missing or if the feature is disabled in config.
+- **Config Toggle** — `enable_regimes` and `regime_count` keys in `apps.yaml`.
+- **SHAP label** — added label for `regime_kwh` feature.
+
+### Changed
+- **`EnergyForecastModel.train`** — now accepts `enable_regimes` and `regime_count`.
+- **`EnergyForecastModel.predict`** — integrated regime prediction into the 48h horizon.
+- **`ROADMAP.md`**, **`README.md`** — updated with documentation for the new feature.
+- **`sw_version`** — updated to `0.11.0` in MQTT discovery payloads.
+
+---
+
 ## [0.10.0] — 2026-04-17
 
 v0.10.0 transforms the forecaster from a weather-correlated statistical model into a

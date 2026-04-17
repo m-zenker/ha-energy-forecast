@@ -107,6 +107,7 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     # Occupancy / away
     "is_away":              "vacation / away mode",
     "people_home":          "number of people home",
+    "regime_kwh":           "typical daily pattern (regime)",
     # Heat pump / solar intent features
     "thermal_pressure":     "heat debt (area-weighted)",
     "thermal_pressure_max": "coldest room heat deficit",
@@ -220,6 +221,10 @@ class EnergyForecast(hass.Hass):
         self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Model versioning: number of archived model snapshots to retain
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
+
+        # Daily Regime Clustering (Stage 4)
+        self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
+        self._regime_count: int = int(self.args.get("regime_count", 5))
 
         # Stage 2: Intent-Driven Thermal & DHW Modeling
         # climate_entities: list of HA climate entities (e.g. climate.living_room)
@@ -455,7 +460,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.6.0",
+                "sw_version": "0.11.0-alpha-1",
             },
         }
         if device_class is not None:
@@ -487,7 +492,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.6.0",
+                "sw_version": "0.11.0-alpha-1",
             },
         }
         if device_class is not None:
@@ -1022,6 +1027,8 @@ class EnergyForecast(hass.Hass):
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
+            enable_regimes=self._enable_regimes,
+            regime_count=self._regime_count,
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 

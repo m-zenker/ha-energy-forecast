@@ -1,14 +1,15 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.10.0** — 2026-04-17, main. 474 tests.
+Current: **v0.11.0-alpha-1** — 2026-04-17, main. 474 tests.
 
 ---
 
 ## Current Status
 
-Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to reach full lag-feature activation (~672 rows) around 2026-04-20. MAE has improved from 0.7 → 0.52 kWh/h. No action required unless the bouncing pattern persists after that date.
+Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to reach full lag-feature activation (~672 rows) around 2026-04-20. MAE has improved from 0.7 → 0.52 kWh/h.
 
-**If bouncing persists after 2026-04-20:** escalate to #15 — HVAC/thermostat state as an anticipatory signal.
+**v0.11.0-alpha-1 Update:** Daily Regime Clustering implemented as an optional module.
+ This explicitly extracts 24h consumption patterns and uses a secondary model to predict the expected "regime" for tomorrow, providing a stable physics-informed prior to the main model.
 
 ---
 
@@ -173,7 +174,8 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| v0.10.0 | 2026-04-17 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
+| v0.11.0 | 2026-04-17 | Daily Regime Clustering (optional module), K-Means 24h profiles, secondary regime predictor model |
+| v0.10.0 | 2026-04-10 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
 | v0.9.0 | 2026-04-10 | Thermal modelling (#49–#52), occupancy (`people_home`), SHAP narrative, relative MAE sensors, rolling MAE persistence |
 | v0.8.0 | 2026-03-31 | Solar/battery target correction, model versioning + rollback, CSV health checks, temperature bias-fade |
 | v0.7.1 | 2026-03-24 | 404 DELETE fix, MQTT anomaly attrs, dashboard cards (anomaly + SHAP) |
@@ -236,3 +238,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 57 | Wind-Driven Infiltration Feature (`infiltration_pressure`) | v0.10.0 |
 | 58 | Humidity-Aware Defrost Proxy (`defrost_risk`) | v0.10.0 |
 | 60 | Calibrated default thermal time constant (`DEFAULT_TAU = 12 h`) | v0.10.0 |
+| 61 | Daily Regime Clustering (`regime_kwh`) | v0.11.0 |

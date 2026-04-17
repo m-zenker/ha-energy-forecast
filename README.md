@@ -5,7 +5,8 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.10.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.11.0--alpha--1-blue)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -46,6 +47,7 @@ Dashboard YAML is in `dashboard/`.
 - [EV charging detection](#ev-charging-detection)
 - [Solar PV + battery](#solar-pv--battery)
 - [Sub-energy sensors](#sub-energy-sensors)
+- [Daily Regime Clustering](#daily-regime-clustering-optional)
 - [Vacation / Away mode](#vacation--away-mode)
 - [Occupancy / Presence](#occupancy--presence)
 - [Baseline / Passive mode](#baseline--passive-mode)
@@ -108,6 +110,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
 - **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
 - **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
+- **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns and predicts tomorrow's regime from the weather forecast, providing a stable baseline for the hourly model
 - **Passive / Baseline mode** — optional `baseline_mode` flag strips controllable sub-sensor loads from the training target, giving the model a cleaner household baseline signal and making scenario deltas more meaningful
 - **Thermal & DHW intent modeling** — optional climate entity setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
 - **Scenario / What-If API** — ask "what would my consumption look like if I run the dishwasher at 22:00?" without changing the live forecast; results fire an event and optionally publish dedicated HA sensors
@@ -627,6 +630,29 @@ For each sensor the model gains four features:
 **How many sensors?** 3–5 is a practical limit — each sensor adds 2 feature columns and a separate HA history fetch on every retrain and hourly update.
 
 **Backward compatibility:** Omitting `sub_energy_sensors` (or leaving it commented out) produces no behaviour change. Old model files without sub-sensor features load cleanly and continue to work.
+
+---
+
+## Daily Regime Clustering (optional)
+
+Daily Regime Clustering explicitly extracts 24-hour energy consumption patterns (regimes) and uses them as a stable baseline for the hourly model. This is especially useful for homes with distinct routines (e.g., Workday vs. Home Office vs. Weekend).
+
+### Configuration
+
+Add the following to `apps.yaml` (requires `scikit-learn`):
+
+```yaml
+  enable_regimes: true   # default: false
+  regime_count: 5        # default: 5
+```
+
+### How it works
+
+1.  **Clustering**: The system takes your historical 24-hour consumption profiles and groups them into $K$ regimes using K-Means.
+2.  **Regime Predictor**: A secondary classifier is trained to predict which regime a given day belongs to, based on the **weather forecast** and the **calendar**.
+3.  **Feature Integration**: For the 48-hour forecast, the system predicts the regime for "Today" and "Tomorrow" and passes the expected 24-hour profile as a strong hint (`regime_kwh`) to the main forecast model.
+
+**Dependency Note:** This feature requires `scikit-learn`. If the package is missing or the feature is disabled, the system falls back gracefully to standard hourly forecasting without any characteristically different behaviour.
 
 ---
 
