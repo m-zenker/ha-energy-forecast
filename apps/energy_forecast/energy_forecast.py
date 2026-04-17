@@ -1425,7 +1425,7 @@ class EnergyForecast(hass.Hass):
         # Align outdoor forecast temps to future hours
         forecast_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
         outdoor_temps = (
-            forecast_indexed.reindex(future_hours, method="nearest").fillna(method="ffill").fillna(method="bfill").values
+            forecast_indexed.reindex(future_hours, method="nearest").ffill().bfill().values
         )
 
         # Hysteresis projection
