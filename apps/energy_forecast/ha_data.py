@@ -150,9 +150,9 @@ def fetch_energy_history(
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
-            app.log(f"Loaded {len(df_cache)} records from local cache.")
+            _LOGGER.info(f"Loaded {len(df_cache)} records from local cache.")
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load cache: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load cache: {e}")
 
     # 2. Fetch fresh data from HA
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
@@ -181,9 +181,9 @@ def fetch_energy_history(
     # append-only path (HA-wins corrections are applied here on the next retrain).
     try:
         combined.to_csv(cache_path, index=False)
-        app.log(f"Cache compacted. Total history: {len(combined)} hours.")
+        _LOGGER.info(f"Cache compacted. Total history: {len(combined)} hours.")
     except OSError as e:
-        app.log(f"Failed to save cache: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save cache: {e}")
 
     return combined
 
@@ -223,7 +223,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load cache: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load cache: {e}")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
     #    plus a small overlap buffer for the diff() boundary.
@@ -259,7 +259,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
             write_header = not cache_path.exists() or cache_path.stat().st_size == 0
             new_rows.to_csv(cache_path, mode="a", header=write_header, index=False)
         except OSError as e:
-            app.log(f"Failed to save cache: {e}", level="ERROR")
+            _LOGGER.error(f"Failed to save cache: {e}")
 
     return combined
 
@@ -421,12 +421,12 @@ def fetch_sub_sensor_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load sub-sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for sub-sensor {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for sub-sensor {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
@@ -450,7 +450,7 @@ def fetch_sub_sensor_history(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save sub-sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -487,12 +487,12 @@ def fetch_recent_sub_sensor(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load sub-sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for sub-sensor {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for sub-sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
@@ -516,7 +516,7 @@ def fetch_recent_sub_sensor(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save sub-sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -540,12 +540,12 @@ def fetch_generic_sensor_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load generic sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for sensor {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for sensor {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
@@ -562,7 +562,7 @@ def fetch_generic_sensor_history(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save generic sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -586,12 +586,12 @@ def fetch_recent_generic_sensor(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load generic sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for sensor {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
@@ -608,7 +608,7 @@ def fetch_recent_generic_sensor(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save generic sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -631,12 +631,12 @@ def fetch_climate_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load climate cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone, include_attributes=True)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for climate {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for climate {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
@@ -667,7 +667,7 @@ def fetch_climate_history(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save climate cache {cache_path.name}: {e}")
 
     return combined
 
@@ -690,12 +690,12 @@ def fetch_recent_climate(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load climate cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone, include_attributes=True)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for climate {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for climate {entity_id}.")
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
@@ -721,7 +721,7 @@ def fetch_recent_climate(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save climate cache {cache_path.name}: {e}")
 
     return combined
 
@@ -750,7 +750,7 @@ def fetch_boolean_entity_history(
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:  # noqa: BLE001
-        app.log(f"get_history failed for away entity {entity_id}: {exc}", level="WARNING")
+        _LOGGER.warning(f"get_history failed for away entity {entity_id}: {exc}")
         return pd.DataFrame(columns=["timestamp", "is_away"])
 
     if isinstance(raw, dict):
@@ -772,9 +772,8 @@ def fetch_boolean_entity_history(
             continue
 
     if not events:
-        app.log(
-            f"No usable history for away entity {entity_id} — is_away will be 0.",
-            level="WARNING",
+        _LOGGER.warning(
+            f"No usable history for away entity {entity_id} — is_away will be 0."
         )
         return pd.DataFrame(columns=["timestamp", "is_away"])
 
@@ -831,9 +830,8 @@ def fetch_presence_history(
         try:
             raw = app.get_history(entity_id=entity_id, days=days)
         except Exception as exc:  # noqa: BLE001
-            app.log(
-                f"get_history failed for presence entity {entity_id}: {exc}",
-                level="WARNING",
+            _LOGGER.warning(
+                f"get_history failed for presence entity {entity_id}: {exc}"
             )
             continue
 
@@ -856,9 +854,8 @@ def fetch_presence_history(
                 continue
 
         if not events:
-            app.log(
-                f"No usable history for presence entity {entity_id}.",
-                level="WARNING",
+            _LOGGER.warning(
+                f"No usable history for presence entity {entity_id}."
             )
             continue
 
@@ -877,9 +874,8 @@ def fetch_presence_history(
         all_per_entity[entity_id] = (filled == "home").astype(int)
 
     if not all_per_entity:
-        app.log(
-            f"No usable presence history from {entity_ids} — people_home will be 0.",
-            level="WARNING",
+        _LOGGER.warning(
+            f"No usable presence history from {entity_ids} — people_home will be 0."
         )
         return pd.DataFrame(columns=["timestamp", "people_home"])
 
@@ -925,7 +921,7 @@ def fetch_program_sensor_history(
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:  # noqa: BLE001
-        app.log(f"get_history failed for program sensor {entity_id}: {exc}", level="WARNING")
+        _LOGGER.warning(f"get_history failed for program sensor {entity_id}: {exc}")
         return pd.DataFrame(columns=["timestamp", "program"])
 
     if isinstance(raw, dict):
@@ -961,7 +957,7 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = 
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:
-        app.log(f"get_history failed for {entity_id}: {exc}", level="ERROR")
+        _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
         return pd.DataFrame()
 
     if isinstance(raw, dict):
