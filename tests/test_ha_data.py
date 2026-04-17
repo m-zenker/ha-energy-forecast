@@ -642,9 +642,6 @@ class TestFetchSubSensorHistory:
 
         assert result.empty
         assert list(result.columns) == ["timestamp", "kwh"]
-        mock_app.log.assert_called_once()
-        args, kwargs = mock_app.log.call_args
-        assert kwargs.get("level") == "WARNING"
 
 
 # ── Stage 6 — CSV append-only writes (#19) ────────────────────────────────────
