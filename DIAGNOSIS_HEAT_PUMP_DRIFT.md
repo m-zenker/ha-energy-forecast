@@ -47,8 +47,8 @@ sub_hp_lag_24h, sub_hp_active_24h, sub_hp_runs_7d = additional input features
 Evidence from code:
 - `ha_data.py::split_ev_charging()` subtracts EV load from `gross_kwh` before training
 - No equivalent function exists for sub-sensors — they remain as separate features
-- `model.py::_add_sub_sensor_lags_training()` creates lag columns, fills with 0 if missing
-- Sub-sensor columns are dropped during training if >50% NaN (line 289-291 in model.py)
+- `model.py::_add_sub_sensor_lags_training()` creates lag columns (lines 1073–1088)
+- A warning is logged if >50% NaN (line 1066), but columns are still created and filled with 0 (lines 298–300)
 
 ### What Happens During Training
 
@@ -99,8 +99,8 @@ New: "lag_24h = 3.5 kWh, sub_hp_lag_24h = 1.8 kWh means expect consumption ≈ ?
 
 **However**: The code has defensive measures:
 - `_add_sub_sensor_lags_training()` fills NaN with 0 (safe: means appliance off)
-- Sub-sensor columns are dropped if >50% NaN
-- Training-time warning logged at line 1046 if reindex introduces >50% NaN
+- Sub-sensor columns are **not dropped** if >50% NaN — a warning is logged, but columns are created anyway
+- NaN values in sub-sensor columns are filled with 0 before training dropna() (lines 298–300), so sparse data doesn't break training
 
 ### Hypothesis 3: Model Not Being Retrained
 

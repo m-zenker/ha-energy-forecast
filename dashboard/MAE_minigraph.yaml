@@ -1,0 +1,32 @@
+type: horizontal-stack
+cards:
+  - type: custom:mini-graph-card
+    name: Model
+    line_width: 15
+    font_size: 85
+    hours_to_show: 1312
+    group_by: day
+    height: 150
+    entities:
+      - sensor.ha_energy_forecast_energy_forecast_model_mae
+  - type: custom:mini-graph-card
+    name: 30d
+    line_color: lightblue
+    line_width: 15
+    font_size: 85
+    hours_to_show: 656
+    height: 150
+    group_by: day
+    entities:
+      - sensor.ha_energy_forecast_energy_forecast_mae_30d
+  - type: custom:mini-graph-card
+    name: 7d
+    line_color: grey
+    line_width: 15
+    font_size: 85
+    hours_to_show: 328
+    height: 150
+    group_by: day
+    entities:
+      - sensor.ha_energy_forecast_energy_forecast_mae_7d
+title: Forecast MAE

@@ -24,8 +24,15 @@ PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
 # Occupancy Detection
 PRESENCE_STATE_HOME = "home"
 
+# Appliance Signature Learning
+APPLIANCE_MAX_WINDOW_HOURS = 12  # Hard cap for adaptive cycle detection
+
 # Sensor Blending Logic
 # How many hours to trust the local outdoor sensor before
 # transitioning fully to the weather forecast.
 SENSOR_FULL_TRUST_HOURS = 2
 SENSOR_BLEND_HOURS = 6
+
+# Thermal Projection (indoor temperature RC-ODE forward simulation)
+DEFAULT_TAU = 12.0        # hours — used when τ has not been calibrated yet
+DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured

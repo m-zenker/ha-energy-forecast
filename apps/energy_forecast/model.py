@@ -37,6 +37,7 @@ import json
 import logging
 import pickle
 import shutil
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from .const import (
+    APPLIANCE_MAX_WINDOW_HOURS,
+    DEFAULT_ROOM_AREA_M2,
+    DEFAULT_TAU,
     HOLDOUT_FRACTION,
     MAX_HOURLY_KWH,
     MIN_CV_ROWS,
@@ -53,7 +57,7 @@ from .const import (
     SENSOR_FULL_TRUST_HOURS,
 )
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 # ── Lag hours used as autoregressive features ─────────────────────────────────
 # All are safe for a 48-hour forecast: target is always ≥1h ahead,
@@ -82,6 +86,7 @@ _FEATURES_BASE = [
     "hours_ahead",                                   # 0 at training (actuals), 0-47 at predict
     # Weather
     "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+    "humidity",                                      # relative humidity %
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
     "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
@@ -107,6 +112,13 @@ _FEATURES_BASE = [
     "people_home",
     # Stage 2: Intent-driven features
     "thermal_pressure",
+    "thermal_pressure_max",
+    "thermal_pressure_std",
+    "thermal_pressure_cop",
+    "thermal_pressure_net",                          # #56 solar-compensated pressure
+    "infiltration_pressure",                         # #57 wind-driven heat loss
+    "defrost_risk",                                  # #58 HP defrost proxy
+    "weighted_solar_gain",
     "dhw_buffer_temp",
     "dhw_pressure",
 ]
@@ -202,6 +214,8 @@ class EnergyForecastModel:
         self._interval_correction_path = model_dir / "energy_model_interval_correction.json"
         # Sub-energy sensor prefixes used in last training run
         self._sub_sensor_prefixes: list[str] = []
+        # Building thermal time constant (hours) — calibrated from passive-cooling windows
+        self._tau_hours: float | None = None
 
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
@@ -225,6 +239,9 @@ class EnergyForecastModel:
         presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
         dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
+        heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+        program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
+        room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -267,8 +284,21 @@ class EnergyForecastModel:
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
 
         # ── Appliance signature learning (Stage 3) ──────────────────────────
-        self._appliance_signatures = _learn_appliance_signatures(sub_sensors_dict)
+        self._appliance_signatures = _learn_appliance_signatures(
+            sub_sensors_dict,
+            program_histories=program_histories,
+        )
         self._save_signatures()
+
+        # ── Thermal time constant calibration (#55) ──────────────────────────
+        if climate_dfs and heating_active_df is not None and not heating_active_df.empty:
+            self._tau_hours = self._calibrate_tau(climate_dfs, heating_active_df, weather_df)
+        else:
+            if not climate_dfs:
+                _LOGGER.debug("τ calibration skipped: no climate_entities configured.")
+            elif heating_active_df is None or heating_active_df.empty:
+                _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
+
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
@@ -285,7 +315,8 @@ class EnergyForecastModel:
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
-                                dhw_df=dhw_df)
+                                dhw_df=dhw_df, tau_hours=self._tau_hours,
+                                room_areas=room_areas)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -354,7 +385,7 @@ class EnergyForecastModel:
         else:
             self._feature_medians_by_how = {}
 
-        X = df[feature_cols]            # keep as DataFrame for LightGBM feature names
+        X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
@@ -552,6 +583,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -574,9 +606,27 @@ class EnergyForecastModel:
         if live_temp is not None and "outdoor_temp_live" in self.feature_cols:
             outdoor_pred_df = _build_prediction_temp_df(future_hours, forecast_df, live_temp)
 
+        # ── Indoor temperature projection ────────────────────────────────────
+        # Replace stale climate_recent with RC-ODE projected temperatures so
+        # that thermal_pressure is non-zero for all 48 prediction hours.
+        climate_dfs_for_features = climate_recent
+        if climate_recent:
+            outdoor_temp_series = (
+                outdoor_pred_df.set_index("timestamp")["outdoor_temp_live"]
+                if outdoor_pred_df is not None
+                else forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
+            )
+            climate_dfs_for_features = _project_indoor_temps(
+                climate_recent,
+                future_hours,
+                outdoor_temp_series,
+                tau_hours=self._tau_hours,
+            )
+
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
-                                     climate_dfs=climate_recent, dhw_df=dhw_recent)
+                                     climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
+                                     tau_hours=self._tau_hours, room_areas=room_areas)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -634,6 +684,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -644,7 +695,7 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -662,6 +713,7 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
+        room_areas: "dict[str, float] | None" = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -676,7 +728,7 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -732,6 +784,10 @@ class EnergyForecastModel:
         recent_actuals: "pd.DataFrame | None" = None,
         sub_sensors_recent: dict | None = None,
         away_series: "pd.Series | None" = None,
+        people_home_series: "pd.Series | None" = None,
+        climate_recent: dict[str, "pd.DataFrame"] | None = None,
+        dhw_recent: "pd.DataFrame | None" = None,
+        room_areas: "dict[str, float] | None" = None,
         n: int = 5,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
@@ -751,7 +807,11 @@ class EnergyForecastModel:
             return {}
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series
+            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+            room_areas=room_areas,
         )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -862,6 +922,7 @@ class EnergyForecastModel:
             "canton":                    self._canton,
             "likely_ev_hours":           self._likely_ev_hours,
             "sub_sensor_prefixes":       self._sub_sensor_prefixes,
+            "tau_hours":                 self._tau_hours,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -949,9 +1010,165 @@ class EnergyForecastModel:
             return
         try:
             with open(self._signatures_path) as fh:
-                self._appliance_signatures = json.load(fh)
+                raw = json.load(fh)
+            # JSON serialises dict keys as strings; convert hour_of_day_distribution
+            # keys back to int so the in-memory representation is consistent.
+            for sig in raw.values():
+                if "hour_of_day_distribution" in sig:
+                    sig["hour_of_day_distribution"] = {
+                        int(k): v for k, v in sig["hour_of_day_distribution"].items()
+                    }
+            self._appliance_signatures = raw
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _LOGGER.warning("Could not load appliance signatures: %s", exc)
+
+    def _calibrate_tau(
+        self,
+        climate_dfs: "dict[str, pd.DataFrame]",
+        heating_active_df: "pd.DataFrame",  # cols: timestamp, heating_active (0/1)
+        weather_df: "pd.DataFrame",          # cols: timestamp, temp_c
+    ) -> "float | None":
+        """Estimate building thermal time constant τ (hours) from passive-cooling windows.
+
+        Fits log-linear OLS on `ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ` for each
+        window where the heating system was confirmed off for ≥ 2 consecutive hours.
+        Returns median τ across valid windows, or None if fewer than 3 windows qualify.
+        """
+        import pandas as pd
+        import numpy as np
+
+        # Average indoor temperature across all climate entities
+        indoor_parts = []
+        for eid, c_df in climate_dfs.items():
+            if c_df.empty:
+                continue
+            c = c_df[["timestamp", "current_temp"]].copy()
+            c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
+            indoor_parts.append(c.set_index("timestamp")["current_temp"])
+
+        if not indoor_parts:
+            return None
+
+        T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
+
+        # Outdoor temperature + radiation from weather_df
+        outdoor = weather_df[["timestamp", "temp_c"]].copy()
+        outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
+        T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
+
+        # Solar radiation — used to mask windows contaminated by solar gain.
+        # Gracefully absent in legacy weather_df without this column.
+        has_radiation = "direct_radiation_wm2" in weather_df.columns
+        if has_radiation:
+            rad = weather_df[["timestamp", "direct_radiation_wm2"]].copy()
+            rad["timestamp"] = pd.to_datetime(rad["timestamp"]).dt.floor("1h")
+            rad_series = rad.set_index("timestamp")["direct_radiation_wm2"]
+        else:
+            rad_series = None
+
+        # Heating active status (treat any value > 0.5 as "on")
+        active = heating_active_df[["timestamp", "heating_active"]].copy()
+        active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
+        active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
+
+        combined_data: dict[str, "pd.Series"] = {
+            "T_indoor":       T_indoor_series,
+            "T_outdoor":      T_outdoor_series,
+            "heating_active": active_series,
+        }
+        if rad_series is not None:
+            combined_data["direct_radiation_wm2"] = rad_series
+
+        combined = pd.DataFrame(combined_data).dropna(
+            subset=["T_indoor", "T_outdoor", "heating_active"]
+        ).sort_index()
+
+        if combined.empty:
+            return None
+
+        # Label contiguous off-blocks
+        combined["off"] = (combined["heating_active"] == 0).astype(int)
+        combined["block"] = (combined["off"].diff().ne(0)).cumsum()
+
+        tau_estimates: list[float] = []
+        for _, group in combined[combined["off"] == 1].groupby("block"):
+            if len(group) < 2:
+                continue
+
+            # §4 safeguard: exclude windows touching daytime hours (09:00–15:00).
+            # Heating behaviour and solar gain during these hours corrupt the
+            # passive-cooling signal even when the heating system is nominally off.
+            if group.index.hour.isin(range(9, 16)).any():
+                continue
+
+            # §4 safeguard: reject windows where solar radiation exceeded 150 W/m².
+            if "direct_radiation_wm2" in group.columns:
+                if group["direct_radiation_wm2"].max() > 150:
+                    continue
+
+            group = group.iloc[:12]  # cap at 12h to avoid ambient drift
+
+            delta = group["T_indoor"].values - group["T_outdoor"].values
+
+            # Scan ALL maximal contiguous sub-sequences where indoor is both
+            # warmer than outdoor (delta > 0) and cooling (diff < 0).
+            # Prefix-only trimming missed evening cooling windows when heating
+            # turns off in the morning — solar gain invalidates the early hours
+            # but the valuable signal is in the tail (no sun, outdoor temp sinking).
+            valid = delta > 0
+            declining = np.concatenate([[False], np.diff(delta) < 0])
+            mask = valid & declining
+
+            if not np.any(mask):
+                continue
+
+            edges = np.diff(mask.astype(int), prepend=0, append=0)
+            starts = np.where(edges == 1)[0]
+            ends   = np.where(edges == -1)[0]
+
+            for s, e in zip(starts, ends):
+                if e - s < 2:
+                    continue
+                d = delta[s:e]
+                t = np.arange(len(d), dtype=float)
+                slope, _ = np.polyfit(t, np.log(d), 1)
+                if slope >= 0:  # safety net for noisy data
+                    continue
+                tau = -1.0 / slope
+                if 0.5 <= tau <= 200:  # physics sanity guard
+                    tau_estimates.append(tau)
+
+        if len(tau_estimates) < 3:
+            _LOGGER.info(
+                "τ calibration: only %d valid passive-cooling windows found (need ≥3) — skipping.",
+                len(tau_estimates),
+            )
+            return None
+
+        tau_median = float(np.median(tau_estimates))
+
+        # §4 safeguard: EMA smoothing — if the new estimate differs from the
+        # stored τ by more than 50%, blend rather than replace outright.
+        # Prevents a single anomalous training batch from causing a large jump.
+        old_tau = self._tau_hours
+        if old_tau is not None and old_tau > 0:
+            change_frac = abs(tau_median - old_tau) / old_tau
+            if change_frac > 0.5:
+                tau_result = 0.8 * old_tau + 0.2 * tau_median
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw new estimate %.1f h, Δ=%.0f%%)",
+                    old_tau, tau_result, tau_median, change_frac * 100,
+                )
+            else:
+                tau_result = tau_median
+        else:
+            tau_result = tau_median
+
+        _LOGGER.info(
+            "Building τ estimated at %.1f h from %d passive-cooling windows.",
+            tau_result, len(tau_estimates),
+        )
+        return tau_result
 
     def _load(self) -> None:
         if self._model_path.exists():
@@ -988,6 +1205,7 @@ class EnergyForecastModel:
                     self._canton               = meta.get("canton",                None)
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
                     self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
+                    self._tau_hours            = meta.get("tau_hours",             None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -1178,19 +1396,29 @@ def _add_sub_sensor_lags_training(
 
 def _learn_appliance_signatures(
     sub_sensors: dict | None,
-    window_hours: int = 4,
-    min_cycles: int = 2,
+    min_cycles: int = 3,
+    program_histories: dict | None = None,
+    min_cycles_per_program: int = 2,
 ) -> dict:
     """Learn the energy shape (kWh per hour) for each sub-sensor appliance.
 
-    For each prefix, detect run cycles (0→>0 transitions), extract a
-    ``window_hours``-wide kWh profile for every cycle, and average them.
-    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
-    detected cycles are omitted.
+    Improvements over the original fixed-window approach:
 
-    Each signature includes ``std_profile`` (per-hour standard deviation across
-    cycles) and logs a WARNING if the coefficient of variation exceeds 0.3,
-    indicating that scenario predictions for that appliance may be inaccurate.
+    * **Adaptive window** — cycle end is detected when consumption drops back to
+      the idle level rather than using a hard 4-hour cutoff. A cap of
+      ``APPLIANCE_MAX_WINDOW_HOURS`` prevents runaway windows.
+    * **Demand-surge detection** — appliances that never drop to zero (e.g. heat
+      pumps in heating season) use the 25th-percentile consumption as the idle
+      baseline; starts are detected as upward crossings of that threshold.
+    * **Outlier cycle rejection** — cycles whose total kWh exceeds
+      ``median + 2 × σ`` are discarded before averaging (requires ≥ 4 cycles).
+    * **Duration clustering** — if detected cycles naturally split into short
+      and long programs (median duration ≥ 2 h), separate cluster profiles are
+      stored under ``"clusters"``.  The top-level ``hourly_profile`` is always
+      present for backward compatibility with ``_composite_forecast()``.
+
+    Returns a dict keyed by prefix; prefixes with fewer than ``min_cycles``
+    valid cycles are omitted.
     """
     import numpy as np
     import pandas as pd
@@ -1198,12 +1426,39 @@ def _learn_appliance_signatures(
     if not sub_sensors:
         return {}
 
+    def _avg_profile(
+        wins: list[list[float]],
+    ) -> tuple[list[float], list[float]]:
+        """Pad variable-length windows to the same length and average column-wise."""
+        max_len = max(len(w) for w in wins)
+        padded = [w + [0.0] * (max_len - len(w)) for w in wins]
+        arr = np.array(padded)
+        return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
+
+    def _resolve_program(cycle_ts: "pd.Timestamp", prog_df: "pd.DataFrame") -> "str | None":
+        """Last-value-carry-forward lookup of program at cycle start."""
+        earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
+        return str(earlier.iloc[-1]["program"]) if not earlier.empty else None
+
+    def _cov_warning(prefix: str, label: str, profile: list[float], std: list[float]) -> None:
+        mean_arr = np.array(profile)
+        std_arr = np.array(std)
+        nonzero = mean_arr > 0
+        if nonzero.any():
+            cov_max = float((std_arr[nonzero] / mean_arr[nonzero]).max())
+            if cov_max > 0.3:
+                _LOGGER.warning(
+                    "Appliance '%s' (%s) signature has high variability (CoV=%.2f)"
+                    " — scenario predictions may be inaccurate.",
+                    prefix, label, cov_max,
+                )
+
     result: dict = {}
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
             continue
 
-        # Align to hourly index (same as lag helper)
+        # ── Align to hourly index ──────────────────────────────────────────────
         kwh_series = (
             sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
             .sort_index()
@@ -1211,60 +1466,170 @@ def _learn_appliance_signatures(
             .sum()
             .astype(float)
         )
-        filled = kwh_series.fillna(0)
+        filled = kwh_series.fillna(0.0)
+        n = len(filled)
 
-        # Detect cycle starts: previous hour was 0, current hour > 0
-        is_start = (filled > 0) & (filled.shift(1).fillna(0) == 0)
+        # ── Idle threshold (adaptive) ──────────────────────────────────────────
+        # Appliances that never truly idle (e.g. HP heating in winter) have
+        # <5 % zero-hours; use the bottom-quartile level as the "off" baseline.
+        zero_frac = float((filled == 0).mean())
+        if zero_frac >= 0.05:
+            idle_thresh = 0.0
+        else:
+            idle_thresh = float(filled.quantile(0.25))
+
+        # ── Cycle start detection ──────────────────────────────────────────────
+        prev = filled.shift(1).fillna(idle_thresh)
+        is_start = (filled > idle_thresh) & (prev <= idle_thresh)
         start_positions = [i for i, v in enumerate(is_start) if v]
 
+        # ── Extract variable-length windows ────────────────────────────────────
         windows: list[list[float]] = []
+        valid_starts: list[int] = []  # parallel to windows; tracks start index in filled
         for pos in start_positions:
-            window = filled.iloc[pos : pos + window_hours]
-            if len(window) < window_hours:
-                continue  # truncated at end of history — skip
-            windows.append(window.tolist())
+            end = pos + 1
+            while (
+                end < n
+                and end - pos < APPLIANCE_MAX_WINDOW_HOURS
+                and filled.iloc[end] > idle_thresh
+            ):
+                end += 1
+            # Skip if the cycle was still running when history ended (truncated).
+            # A cycle that hit the MAX_WINDOW cap is kept — it's complete enough.
+            if end >= n and filled.iloc[end - 1] > idle_thresh:
+                continue
+            windows.append(filled.iloc[pos:end].tolist())
+            valid_starts.append(pos)
 
         if len(windows) < min_cycles:
             continue
 
-        arr = np.array(windows)  # shape: (n_cycles, window_hours)
-        hourly_profile = np.mean(arr, axis=0).tolist()
-        std_profile = np.std(arr, axis=0).tolist()
-
-        mean_arr = np.mean(arr, axis=0)
-        std_arr = np.std(arr, axis=0)
-        nonzero_mask = mean_arr > 0
-        if nonzero_mask.any():
-            cov_max = float((std_arr[nonzero_mask] / mean_arr[nonzero_mask]).max())
-            if cov_max > 0.3:
-                _LOGGER.warning(
-                    "Appliance '%s' signature has high variability (CoV=%.2f) across %d cycles"
-                    " — scenario predictions may be inaccurate.",
-                    prefix, cov_max, len(windows),
+        # ── Outlier cycle rejection (requires ≥ 4 cycles) ─────────────────────
+        totals = np.array([sum(w) for w in windows])
+        n_rejected = 0
+        if len(totals) >= 4:
+            median_t = float(np.median(totals))
+            std_t = float(np.std(totals))
+            keep_mask = totals <= median_t + 2.0 * std_t
+            n_rejected = int((~keep_mask).sum())
+            if n_rejected:
+                windows = [w for w, keep in zip(windows, keep_mask) if keep]
+                valid_starts = [s for s, keep in zip(valid_starts, keep_mask) if keep]
+                _LOGGER.debug(
+                    "Appliance '%s': rejected %d outlier cycle(s) (total kWh > median + 2σ)",
+                    prefix, n_rejected,
                 )
 
-        result[prefix] = {
+        if len(windows) < min_cycles:
+            continue
+
+        # ── Per-program grouping ───────────────────────────────────────────────
+        prog_df = (program_histories or {}).get(prefix)
+        programs: dict = {}
+        if prog_df is not None and not prog_df.empty:
+            prog_windows: dict[str, list] = {}
+            for win, pos in zip(windows, valid_starts):
+                label = _resolve_program(kwh_series.index[pos], prog_df)
+                if label is None:
+                    continue
+                prog_windows.setdefault(label, []).append(win)
+            for label, pwins in prog_windows.items():
+                if len(pwins) < min_cycles_per_program:
+                    continue
+                prof, std = _avg_profile(pwins)
+                programs[label] = {
+                    "hourly_profile": prof,
+                    "std_profile": std,
+                    "total_kwh": float(sum(prof)),
+                    "n_cycles": len(pwins),
+                }
+
+        # ── Duration clustering ────────────────────────────────────────────────
+        # Trigger on high energy CoV (> 0.5) in addition to long median duration,
+        # so bimodal consumers like heat-pump heating (many 1h pulses + occasional
+        # multi-hour runs) are also split into short/long clusters.
+        durations = [len(w) for w in windows]
+        median_dur = statistics.median(durations)
+        cycle_totals = np.array([sum(w) for w in windows])
+        mean_total = float(np.mean(cycle_totals))
+        energy_cov = float(np.std(cycle_totals) / mean_total) if mean_total > 0 else 0.0
+        clusters: dict = {}
+        if median_dur >= 2 or energy_cov > 0.5:
+            short_wins = [w for w, d in zip(windows, durations) if d <= median_dur]
+            long_wins = [w for w, d in zip(windows, durations) if d > median_dur]
+            for label, wins in [("short", short_wins), ("long", long_wins)]:
+                if not wins:
+                    continue
+                prof, std = _avg_profile(wins)
+                clusters[label] = {
+                    "n_cycles": len(wins),
+                    "median_duration_h": int(statistics.median(len(w) for w in wins)),
+                    "hourly_profile": prof,
+                    "std_profile": std,
+                    "total_kwh": float(sum(prof)),
+                }
+                _cov_warning(prefix, label, prof, std)
+
+        # ── Combined profile (backward-compatible top-level keys) ──────────────
+        hourly_profile, std_profile = _avg_profile(windows)
+
+        # CoV warning only if clustering did not split (or only one cluster exists)
+        if len(clusters) <= 1:
+            _cov_warning(prefix, "combined", hourly_profile, std_profile)
+
+        # ── Hour-of-day distribution ───────────────────────────────────────────
+        from collections import Counter as _Counter
+        hour_dist = _Counter(int(kwh_series.index[pos].hour) for pos in valid_starts)
+
+        # ── Signature quality metadata ─────────────────────────────────────────
+        n_data_days = int(
+            (kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400
+        )
+        last_cycle_ts = str(kwh_series.index[valid_starts[-1]]) if valid_starts else ""
+        quality = (
+            "good" if len(windows) >= 15
+            else "fair" if len(windows) >= 5
+            else "poor"
+        )
+
+        sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
             "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),
+            "n_rejected": n_rejected,
+            "idle_threshold": idle_thresh,
+            "quality": quality,
+            "n_data_days": n_data_days,
+            "last_cycle_ts": last_cycle_ts,
+            "hour_of_day_distribution": dict(sorted(hour_dist.items())),
         }
+        if clusters:
+            sig["clusters"] = clusters
+        if programs:
+            sig["programs"] = programs
+
+        result[prefix] = sig
 
     return result
 
 
 def _composite_forecast(
     baseline_df: "pd.DataFrame",
-    schedule: "dict[str, str | None]",
+    schedule: "dict[str, str | dict | None]",
     signatures: dict,
 ) -> "pd.DataFrame":
     """Overlay appliance run profiles onto a baseline forecast.
 
     Args:
         baseline_df: DataFrame with columns [timestamp, predicted_kwh] — 48 rows, naive tz.
-        schedule:    {prefix: "HH:MM" | "off" | None} — desired appliance start times.
-                     Example: {"dishwasher": "22:30", "washing_machine": "off"}.
+        schedule:    {prefix: "HH:MM" | {"start": "HH:MM", "program": "eco"} | "off" | None}.
+                     String form: plain start time, e.g. ``"22:30"``.
+                     Dict form: ``{"start": "HH:MM", "program": "<label>"}`` — selects a
+                     per-program profile from ``sig["programs"]`` if available, otherwise
+                     falls back to ``sig["hourly_profile"]``.
+                     ``"off"`` and ``None`` skip the appliance.
                      Invalid or out-of-range time strings (e.g. "25:00", "abc") are
                      logged as warnings and skipped; ``delta_kwh`` stays 0 for that
                      prefix.
@@ -1287,7 +1652,16 @@ def _composite_forecast(
 
     forecast_start = pd.Timestamp(result["timestamp"].iloc[0])
 
-    for prefix, time_str in schedule.items():
+    for prefix, sched_value in schedule.items():
+        if sched_value is None or sched_value == "off":
+            continue
+        # Dict form: {"start": "HH:MM", "program": "eco"}
+        if isinstance(sched_value, dict):
+            time_str = sched_value.get("start")
+            program = sched_value.get("program")
+        else:
+            time_str = sched_value
+            program = None
         if time_str is None or time_str == "off":
             continue
         if prefix not in signatures:
@@ -1317,7 +1691,20 @@ def _composite_forecast(
         if offset_h >= 48 or offset_h < 0:
             continue
 
-        profile: list = signatures[prefix]["hourly_profile"]
+        # Profile selection: prefer per-program profile; fall back to combined
+        sig = signatures[prefix]
+        profile: list | None = None
+        if program is not None:
+            prog_profiles = sig.get("programs", {})
+            if program in prog_profiles:
+                profile = prog_profiles[program]["hourly_profile"]
+            else:
+                _LOGGER.debug(
+                    "_composite_forecast: no profile for program '%s' on '%s' — using combined",
+                    program, prefix,
+                )
+        if profile is None:
+            profile = sig["hourly_profile"]
         # Clip profile to available window
         profile = profile[: 48 - offset_h]
         if not profile:
@@ -1403,6 +1790,71 @@ def _add_sub_sensor_lags_prediction(
     return future_df
 
 
+# ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
+
+def _project_indoor_temps(
+    climate_recent: "dict[str, pd.DataFrame]",
+    future_timestamps: "pd.DatetimeIndex",
+    outdoor_temp_series: "pd.Series",
+    tau_hours: float | None = None,
+) -> "dict[str, pd.Series]":
+    """Project indoor temperature for each climate entity over *future_timestamps*.
+
+    Uses a first-order RC ODE (Euler forward):
+        T_in[t+1] = T_in[t] + (T_out[t] - T_in[t]) / tau
+
+    Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
+    otherwise falls back to the most-recent ``setpoint``.
+
+    Returns a dict ``{entity_id: pd.Series}`` with ``current_temp`` projections
+    indexed by *future_timestamps*. These can be passed as *climate_dfs* to
+    ``_engineer_features()`` so that prediction-time thermal pressure reflects
+    projected — rather than stale — indoor temperatures.
+    """
+    import pandas as pd
+    import numpy as np
+
+    tau = tau_hours if (tau_hours and tau_hours > 0) else DEFAULT_TAU
+    now = future_timestamps[0]  # first step ≈ current hour (naive)
+    stale_threshold = pd.Timedelta(hours=2)
+
+    result: dict[str, pd.Series] = {}
+
+    for eid, cdf in climate_recent.items():
+        if cdf.empty:
+            continue
+
+        cdf = cdf.copy()
+        cdf["timestamp"] = pd.to_datetime(cdf["timestamp"])
+        latest = cdf.sort_values("timestamp").iloc[-1]
+
+        age = now - latest["timestamp"]
+        if age <= stale_threshold:
+            t_in_start = float(latest["current_temp"])
+        else:
+            t_in_start = float(latest["setpoint"])
+
+        # Align outdoor temps to future_timestamps
+        t_out_arr = outdoor_temp_series.reindex(future_timestamps, method="nearest").values.astype(float)
+
+        # Vectorised Euler forward over 48 steps
+        t_in_arr = np.empty(len(future_timestamps))
+        t_in_arr[0] = t_in_start
+        for i in range(1, len(future_timestamps)):
+            t_in_arr[i] = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+
+        # Build a projected climate DataFrame matching what _engineer_features expects
+        setpoint_val = float(latest["setpoint"])
+        projected_df = pd.DataFrame({
+            "timestamp": future_timestamps,
+            "current_temp": t_in_arr,
+            "setpoint": setpoint_val,  # constant — we have no future setpoint schedule
+        })
+        result[eid] = projected_df
+
+    return result
+
+
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 def _engineer_features(
@@ -1416,6 +1868,8 @@ def _engineer_features(
     presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
     climate_dfs: dict[str, pd.DataFrame] | None = None,
     dhw_df: pd.DataFrame | None = None,
+    tau_hours: float | None = None,
+    room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1493,7 +1947,7 @@ def _engineer_features(
                   how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
-    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
+    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh", "humidity",
                 "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d",
                 # Thermal modelling features
                 "temp_ewma_24h", "temp_ewma_72h",
@@ -1509,6 +1963,9 @@ def _engineer_features(
     for col in ["cloud_cover_pct", "direct_radiation_wm2"]:
         if col not in df.columns:
             df[col] = np.nan
+    # humidity: default to 70 % RH when missing — avoids all-NaN dropna in training.
+    if "humidity" not in df.columns:
+        df["humidity"] = 70.0
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
@@ -1552,33 +2009,60 @@ def _engineer_features(
         df["people_home"] = 0
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
+    # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal
+    # thermal_pressure_max  — largest per-room deficit (cold outlier room)
+    # thermal_pressure_std  — spread across rooms (imbalance signal)
     if climate_dfs:
-        deltas = []
+        delta_series: dict[str, "pd.Series"] = {}  # entity_id → per-timestamp delta Series
+        ts_index = None
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
                 continue
             c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
             c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
-            c[f"{eid}_delta"] = c["setpoint"] - c["current_temp"]
-            deltas.append(c[["timestamp", f"{eid}_delta"]])
+            c = c.sort_values("timestamp")
+            delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
+            delta.index = c["timestamp"]
+            delta_series[eid] = delta
+            if ts_index is None:
+                ts_index = c["timestamp"]
 
-        if deltas:
-            # Join all deltas
-            from functools import reduce
-            merged_deltas = reduce(lambda left, right: pd.merge(left, right, on="timestamp", how="outer"), deltas)
-            # Average delta across all rooms as the household "thermal pressure"
-            delta_cols = [c for c in merged_deltas.columns if c != "timestamp"]
-            merged_deltas["thermal_pressure"] = merged_deltas[delta_cols].mean(axis=1)
+        if delta_series:
+            delta_df = pd.DataFrame(delta_series)  # rows=timestamps, cols=entities
+            areas = {eid: (room_areas or {}).get(eid, DEFAULT_ROOM_AREA_M2) for eid in delta_series}
+            total_area = sum(areas.values()) or 1.0
+            area_weights = pd.Series(areas)
+
+            # Weighted mean (°C·h) — primary feature
+            weighted_sum = (delta_df * area_weights).sum(axis=1)
+            pressure_series = weighted_sum / total_area
+
+            # Per-row secondary stats
+            max_series = delta_df.max(axis=1)
+            std_series  = delta_df.std(axis=1).fillna(0.0)
+
+            summary = pd.DataFrame({
+                "timestamp":            delta_df.index,
+                "thermal_pressure":     pressure_series.values,
+                "thermal_pressure_max": max_series.values,
+                "thermal_pressure_std": std_series.values,
+            })
 
             df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-            df = df.merge(merged_deltas[["timestamp", "thermal_pressure"]], left_on="_ts_floor", right_on="timestamp",
+            df = df.merge(summary, left_on="_ts_floor", right_on="timestamp",
                           how="left", suffixes=("", "_tp"))
             df.drop(columns=["timestamp_tp", "_ts_floor"], errors="ignore", inplace=True)
-            df["thermal_pressure"] = df["thermal_pressure"].fillna(0.0)
+            df["thermal_pressure"]     = df["thermal_pressure"].fillna(0.0)
+            df["thermal_pressure_max"] = df["thermal_pressure_max"].fillna(0.0)
+            df["thermal_pressure_std"] = df["thermal_pressure_std"].fillna(0.0)
         else:
-            df["thermal_pressure"] = 0.0
+            df["thermal_pressure"]     = 0.0
+            df["thermal_pressure_max"] = 0.0
+            df["thermal_pressure_std"] = 0.0
     else:
-        df["thermal_pressure"] = 0.0
+        df["thermal_pressure"]     = 0.0
+        df["thermal_pressure_max"] = 0.0
+        df["thermal_pressure_std"] = 0.0
 
     # ── Stage 2: DHW Pressure ───────────────────────────────────────────
     if dhw_df is not None and not dhw_df.empty:
@@ -1598,6 +2082,41 @@ def _engineer_features(
     else:
         df["dhw_buffer_temp"] = 50.0
         df["dhw_pressure"] = 0.0
+
+    # ── §3: Passive solar gain (time-of-day weighted radiation) ──────────────
+    # Half-cosine window peaks at 13:00, reaches 0 at 09:00 and 17:00.
+    # Captures south-facing passive gain that reduces actual heating demand.
+    hour_arr = df["timestamp"].dt.hour.values.astype(float)
+    cos_factor = np.where(
+        (hour_arr >= 9) & (hour_arr <= 17),
+        np.cos(np.pi * (hour_arr - 13.0) / 4.0),
+        0.0,
+    ).clip(0.0)  # cosine is negative near edges — floor at 0
+    df["weighted_solar_gain"] = df["direct_radiation_wm2"] * cos_factor
+
+    # ── §3: COP proxy — thermal pressure as electrical urgency ───────────────
+    # Linear COP model: COP ≈ 0.11 × T_out + 3.0 (air-to-water HP, radiators).
+    # Same °C heat debt costs ~2× more electricity at −10°C vs +10°C outdoors.
+    # Denominator clamped at 0.5 to guard against extreme negative temps.
+    cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
+    df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
+
+    # ── §3: Solar-compensated pressure (#56) ─────────────────────────────────
+    # Primary signal: subtract passive solar gain from thermal pressure.
+    # High impact on reducing over-forecast on sunny winter days.
+    # Scaled by 0.01 to keep feature range comparable to raw pressure.
+    df["thermal_pressure_net"] = np.maximum(0.0, df["thermal_pressure"] - 0.01 * df["weighted_solar_gain"])
+
+    # ── §3: Wind-driven infiltration (#57) ───────────────────────────────────
+    # Feature interaction: infiltration loss ∝ WindSpeed * (T_in - T_out).
+    # We use thermal_pressure as a proxy for the temperature gradient.
+    df["infiltration_pressure"] = 0.01 * df["wind_kmh"] * df["thermal_pressure"]
+
+    # ── §3: Humidity-aware defrost proxy (#58) ───────────────────────────────
+    # Peaks at 2°C, falls off rapidly above 7°C and below -3°C.
+    # Scaled by relative humidity.
+    defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0)**2) / 10.0)
+    df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
 
     return df
 

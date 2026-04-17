@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.10.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-377%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.10.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
 
@@ -19,7 +19,15 @@ Plan EV charging, avoid bill surprises, and know your daily energy use before th
 |---|---|
 | ![Forecast overview](assets/dashboard_overview.png) | ![SHAP feature importance](assets/dashboard_shap.png) |
 
-The left card shows today/tomorrow forecasts with prediction-interval min/max and the live ApexCharts "Forecast vs. Real" graph. The right card shows the SHAP feature importance table (rendered via native Lovelace Jinja2 — no custom cards needed). Dashboard YAML is in `dashboard/`.
+The left card shows today/tomorrow forecasts with prediction-interval min/max and the live ApexCharts "Forecast vs. Real" graph. The right card shows the SHAP feature importance table (rendered via native Lovelace Jinja2 — no custom cards needed).
+
+| What drives today's forecast | MAE & anomaly detection |
+|---|---|
+| ![What drives today's forecast](assets/dashboard_shap_narrative.png) | ![MAE and anomaly detection](assets/dashboard_mae_anomaly.png) |
+
+Left: SHAP narrative card explaining the top drivers of today's forecast. Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
+
+Dashboard YAML is in `dashboard/`.
 
 ---
 
@@ -326,9 +334,11 @@ energy_forecast:
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
 | `baseline_mode` | No | `false` | When `true`, subtracts all `sub_energy_sensors` from the training target so the model learns the household baseline without controllable-appliance noise. Mirrors the same subtraction at prediction time. See [Baseline / Passive mode](#baseline--passive-mode). |
-| `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (mean setpoint − current temp). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
+| `baseline_included_sensors` | No | `[]` | When `baseline_mode: true`, sensors listed here are **kept** in the training target (not subtracted). Use to include heating/DHW sub-sensors in the baseline model while still removing schedulable appliances (dishwasher, washer) for clean scenario deltas. Sensors absent from this list are subtracted as before. |
+| `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (area-weighted setpoint − current temp, in °C·h). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
+| `climate_room_areas` | No | `{}` | Dict mapping `climate` entity IDs to floor areas in m² (e.g. `climate.living_room: 30`). Used to area-weight `thermal_pressure` so larger rooms have more influence. Rooms not listed default to 15 m². |
 | `dhw_buffer_sensor` | No | — | Entity ID of a DHW buffer temperature sensor (°C). Used to derive `dhw_pressure`. See [Thermal & DHW modeling](#thermal--dhw-modeling). |
-| `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run. Used to isolate passive-decay periods for thermal calibration. |
+| `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-cooling windows for τ calibration (log-linear OLS fit on periods where the building decays freely). Enables `thermal_pressure_cop`. Accepts `input_boolean` entities (`"on"`/`"off"` states). |
 | `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
@@ -478,7 +488,8 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
-| Thermal & DHW intent | `thermal_pressure` (mean HVAC setpoint − current temp across `climate_entities`; 0 when not configured), `dhw_pressure` (buffer heat-loss urgency score; 0 when not configured) |
+| Thermal & DHW intent | `thermal_pressure` (area-weighted HVAC setpoint − current temp; °C·h), `thermal_pressure_max` (largest per-room deficit), `thermal_pressure_std` (room temperature spread), `thermal_pressure_cop` (deficit scaled by inverse outdoor COP — electrical urgency), `thermal_pressure_net` (thermal pressure reduced by passive solar gain), `weighted_solar_gain` (direct radiation weighted by south-facing half-cosine window), `dhw_pressure` (buffer heat-loss urgency score); all zero when not configured |
+| Physics | `humidity` (relative humidity %), `infiltration_pressure` (wind speed × thermal gradient — cold-air infiltration proxy), `defrost_risk` (humidity-scaled Gaussian at +2 °C — heat-pump defrost cycle proxy) |
 | Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_24h`, `lag_48h`, `lag_72h`, `lag_168h`, `lag_336h` (daily/weekly) |
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
@@ -683,9 +694,17 @@ When `baseline_mode: true` is set, the model trains on and predicts only the *ho
   sub_energy_sensors:
     - sensor.dishwasher_energy_kwh
     - sensor.washing_machine_energy_kwh
+    - sensor.heat_pump_energy_kwh
+    - sensor.dhw_energy_kwh
+  # Keep heating/DHW in the baseline model; only subtract schedulable appliances:
+  baseline_included_sensors:
+    - sensor.heat_pump_energy_kwh
+    - sensor.dhw_energy_kwh
 ```
 
 `sub_energy_sensors` must be configured for `baseline_mode` to have any effect. Without sub-sensors the flag is a no-op.
+
+`baseline_included_sensors` (optional) lets you selectively keep certain sub-sensors in the training target. Sensors in this list are **not** subtracted from `gross_kwh`, even when `baseline_mode: true`. This is useful when you want the model to learn heating and DHW patterns (which are well-correlated with weather features) while still removing the stochastic noise of schedulable appliances.
 
 ### How it works
 
@@ -721,9 +740,10 @@ Both features are zero-safe — omitting the config keys leaves them at 0 for al
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `climate_entities` | No | List of HA `climate` entity IDs. Each entity contributes its `(setpoint − current_temp)` delta to `thermal_pressure`. |
+| `climate_entities` | No | List of HA `climate` entity IDs. Each entity contributes its `(setpoint − current_temp)` delta to `thermal_pressure`, weighted by `climate_room_areas`. |
+| `climate_room_areas` | No | Dict of `entity_id: area_m2`. Rooms not listed default to 15 m². |
 | `dhw_buffer_sensor` | No | Entity ID of a temperature sensor measuring the DHW buffer (°C). |
-| `heating_system_active_entity` | No | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-decay periods for future thermal calibration steps. |
+| `heating_system_active_entity` | No | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run. Used for τ calibration and `thermal_pressure_cop`. |
 
 ### How it works
 
@@ -731,7 +751,22 @@ Both features are zero-safe — omitting the config keys leaves them at 0 for al
 - `model.py` merges these time series into the training dataframe and computes `thermal_pressure` and `dhw_pressure` per row before fitting.
 - At prediction time the same logic applies to the 48-hour forecast window, using current sensor states.
 
-**Backward compatibility:** All three config keys are optional. Omitting them leaves both features at 0 and the model behaves identically to prior versions.
+**Backward compatibility:** All config keys are optional. Omitting them leaves all thermal features at 0 and the model behaves identically to prior versions.
+
+### Advanced thermal features
+
+The following features activate when the corresponding sensors are configured and enough history has accumulated:
+
+| Feature | Requires | Description |
+|---------|----------|-------------|
+| `thermal_pressure` | `climate_entities` | Area-weighted mean (setpoint − current temp) across all rooms (°C·h). Projects forward using RC-ODE for hours >2h ahead — eliminates the zero-fill problem for distant forecast hours. |
+| `thermal_pressure_max` | `climate_entities` | Largest per-room deficit at each hour. Captures the room requiring the most heating even when the average is mild. |
+| `thermal_pressure_std` | `climate_entities` (≥2) | Standard deviation of per-room deficits. Non-zero when rooms are at very different temperatures (e.g. one room cold, others warm). |
+| `thermal_pressure_cop` | `climate_entities` + `heating_system_active_entity` | `thermal_pressure / COP(T_outdoor)` — expresses the same heating deficit in *electrical urgency*: a 1°C deficit costs ~2× more electricity at −10°C than at +10°C outdoors. Denominator clamped at 0.5. |
+| `weighted_solar_gain` | weather (`direct_radiation_wm2`) | Direct radiation weighted by a half-cosine window peaking at 13:00, zero outside 09:00–17:00. Captures south-facing passive solar gain that reduces actual heating demand even when `thermal_pressure` is high. |
+| `dhw_pressure` | `dhw_buffer_sensor` | Heat-loss urgency: `1 / (max(0.5, buffer_temp − 40) + 1)²`. Rises steeply as the DHW buffer cools toward its reheat threshold. |
+
+**τ calibration** (building thermal time constant): when `heating_system_active_entity` is configured, the model periodically fits a log-linear OLS on passive-cooling windows (periods where the heating system is confirmed off and indoor temperature decays freely). The resulting τ (hours) scales `thermal_pressure` to express heating urgency in °C/h rather than a static °C delta. τ is persisted in `meta.pkl` and survives AppDaemon restarts; falls back to 24h if calibration fails or `heating_system_active_entity` is absent.
 
 ---
 

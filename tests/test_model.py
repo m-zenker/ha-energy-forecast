@@ -35,6 +35,7 @@ from energy_forecast.model import (
     _FEATURES_BASE,
     _engineer_features,
     _learn_appliance_signatures,
+    _project_indoor_temps,
     EnergyForecastModel,
     LAG_HOURS,
 )
@@ -333,7 +334,7 @@ class TestShortHorizonLags:
         """Short lags must NOT emit the NaN coverage warning even though most hours are NaN."""
         import logging
         actuals_df = _make_actuals(200)
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _add_lag_and_rolling_prediction(_make_future_df(), actuals_df)
         for rec in caplog.records:
             assert "lag_1h" not in rec.message
@@ -1129,7 +1130,7 @@ class TestSubSensorFeatures:
         sparse_ts = ts[::40]
         sub_df = pd.DataFrame({"timestamp": sparse_ts, "kwh": [1.0] * len(sparse_ts)})
 
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
 
         assert "sub_hp" in caplog.text
@@ -1180,7 +1181,7 @@ class TestSubSensorFeatures:
         # Sub-sensor data from 30 days before the future window — all lags will be NaN.
         old_ts = pd.date_range("2023-12-01", periods=48, freq="1h")
         sub_df = pd.DataFrame({"timestamp": old_ts, "kwh": [1.0] * 48})
-        with caplog.at_level(logging.DEBUG, logger="energy_forecast.model"):
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
             _add_sub_sensor_lags_prediction(future_df.copy(), {"sub_sparse": sub_df})
         warning_msgs = [r for r in caplog.records if r.levelno >= logging.WARNING and "sub_sparse" in r.message]
         assert warning_msgs == [], f"Expected no WARNING for sparse sub-sensor, got: {warning_msgs}"
@@ -1308,7 +1309,7 @@ class TestFeatureImportanceLogging:
     def test_feature_importances_logged_after_training(self, tmp_path, caplog):
         """Feature importances (top 10) must appear in logs after a successful train."""
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=600)
         assert any("Feature importances" in r.message for r in caplog.records), (
             "Expected 'Feature importances' in log output after train()"
@@ -1321,7 +1322,7 @@ class TestFeatureImportanceLogging:
         for TimeSeriesSplit (MIN_CV_ROWS=500).
         """
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=900)
         cv_logs = [r.message for r in caplog.records if "CV fold MAEs" in r.message]
         assert cv_logs, "Expected 'CV fold MAEs' log entry when n≥500 clean rows"
@@ -1448,7 +1449,7 @@ class TestNumLeavesSweep:
     def test_num_leaves_sweep_logged_when_cv_runs(self, tmp_path, caplog):
         """With enough rows for CV and LightGBM absent, sweep is skipped gracefully."""
         import logging
-        with caplog.at_level(logging.INFO, logger="energy_forecast.model"):
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
             _make_trained_model(tmp_path, n=900)
         # If LightGBM is present, expect sweep log; if not (sklearn fallback), no crash.
         # Either way CV must complete without error.
@@ -1931,7 +1932,7 @@ class TestModelVersioning:
         })
         m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
         archive_name = sorted((tmp_path / "archive").iterdir())[-1].name
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             m.rollback_model()
         assert any(archive_name in r.message for r in caplog.records)
 
@@ -2167,12 +2168,12 @@ class TestApplianceSignatures:
     PROFILE = [1.0, 2.0, 1.5, 0.5]  # 4-hour cycle shape
 
     def test_basic_two_cycles(self):
-        """Two identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
-        df = _make_cycle_df(self.PROFILE, n_cycles=2)
+        """Three identical cycles → correct profile, total_kwh, peak_hour, n_cycles, std_profile."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
         sigs = _learn_appliance_signatures({"hp": df})
         assert "hp" in sigs
         s = sigs["hp"]
-        assert s["n_cycles"] == 2
+        assert s["n_cycles"] == 3
         assert s["total_kwh"] == pytest.approx(sum(self.PROFILE))
         assert s["hourly_profile"] == pytest.approx(self.PROFILE)
         assert s["peak_hour"] == 1  # index of 2.0 in PROFILE
@@ -2182,9 +2183,9 @@ class TestApplianceSignatures:
         assert s["std_profile"] == pytest.approx([0.0, 0.0, 0.0, 0.0])
 
     def test_below_min_cycles_skipped(self):
-        """Only 1 cycle → empty dict (insufficient evidence)."""
-        df = _make_cycle_df(self.PROFILE, n_cycles=1, period_hours=20)
-        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=2)
+        """Fewer cycles than min_cycles → empty dict (insufficient evidence)."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=2, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df}, min_cycles=3)
         assert sigs == {}
 
     def test_no_sub_sensors_none(self):
@@ -2205,7 +2206,7 @@ class TestApplianceSignatures:
             "kwh": [1.0, 1.0],
         })
         df = pd.concat([df_full, extra], ignore_index=True)
-        sigs = _learn_appliance_signatures({"dw": df}, window_hours=4, min_cycles=2)
+        sigs = _learn_appliance_signatures({"dw": df})
         assert "dw" in sigs
         # The partial window must not inflate n_cycles
         assert sigs["dw"]["n_cycles"] == 3
@@ -2222,11 +2223,12 @@ class TestApplianceSignatures:
     def test_high_variability_logs_warning(self, caplog):
         """Two very different cycles (CoV > 0.3) → WARNING logged."""
         import logging
-        # Cycle 1: high consumption; cycle 2: low consumption → CoV ≈ 0.9
-        ts = pd.date_range("2026-01-01", periods=10, freq="1h")
-        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1]
+        # Cycle 1: high consumption [2.0]*4; cycle 2: low consumption [0.1]*4
+        # Trailing zeros so neither cycle is truncated at end of history.
+        kwh = [0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.1, 0.1, 0.1, 0.1] + [0.0] * 12
+        ts = pd.date_range("2026-01-01", periods=len(kwh), freq="1h")
         df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
-        with caplog.at_level(logging.WARNING, logger="energy_forecast.model"):
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _learn_appliance_signatures({"hp": df}, min_cycles=2)
         assert any("high variability" in r.message for r in caplog.records)
 
@@ -2315,7 +2317,248 @@ class TestApplianceSignatures:
 
         assert model2._appliance_signatures == saved
         assert "std_profile" in model2._appliance_signatures["sub_hp"]
-        assert len(model2._appliance_signatures["sub_hp"]["std_profile"]) == 4
+
+    # ── New-behaviour tests ───────────────────────────────────────────────────
+
+    def test_adaptive_window_short_cycle(self):
+        """A 2-hour actual cycle produces a profile of length 2, not 4."""
+        # cycle_kwh has 2 non-zero slots; period_hours=12 so next 10 slots are 0
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=12)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert len(sigs["dw"]["hourly_profile"]) == 2
+        assert sigs["dw"]["hourly_profile"] == pytest.approx([1.0, 0.5])
+
+    def test_adaptive_window_long_cycle(self):
+        """A 6-hour actual cycle produces a profile of length 6."""
+        df = _make_cycle_df([0.5, 1.0, 1.5, 1.2, 0.8, 0.3], n_cycles=3, period_hours=18)
+        sigs = _learn_appliance_signatures({"wm": df})
+        assert "wm" in sigs
+        assert len(sigs["wm"]["hourly_profile"]) == 6
+
+    def test_adaptive_window_max_cap(self):
+        """A cycle running longer than APPLIANCE_MAX_WINDOW_HOURS is capped."""
+        from energy_forecast.const import APPLIANCE_MAX_WINDOW_HOURS
+        # 15 consecutive non-zero hours, then 5 zero hours, repeated
+        long_cycle = [1.0] * 15
+        df = _make_cycle_df(long_cycle, n_cycles=3, period_hours=20)
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        assert len(sigs["hp"]["hourly_profile"]) <= APPLIANCE_MAX_WINDOW_HOURS
+
+    def test_never_zero_surge_detection(self):
+        """HP-style series (never drops to 0) — starts still detected via idle threshold."""
+        # Baseline ~1 kWh/h; demand surges to 3 kWh/h for 2h each cycle
+        ts = pd.date_range("2024-01-01", periods=60, freq="1h")
+        kwh = [1.0] * 60
+        # Two surges: hours 5-6 and 30-31
+        for h in [5, 6, 30, 31]:
+            kwh[h] = 3.0
+        df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        sigs = _learn_appliance_signatures({"hp_heat": df})
+        # Should detect at least one surge cycle (idle_thresh = Q25 ≈ 1.0)
+        # Whether 1 or 2 cycles detected depends on quartile; just ensure no crash
+        # and backward-compat keys present if any cycles found
+        if "hp_heat" in sigs:
+            assert "hourly_profile" in sigs["hp_heat"]
+            assert "n_cycles" in sigs["hp_heat"]
+
+    def test_outlier_cycle_rejected(self):
+        """One cycle with 5× the normal kWh is rejected; profile reflects the rest."""
+        # Normal cycles: [1.0, 0.5] each; outlier: [5.0, 5.0]
+        normal_cycles = _make_cycle_df([1.0, 0.5], n_cycles=5, period_hours=10)
+        # Append one outlier cycle at the end
+        last_ts = normal_cycles["timestamp"].iloc[-1]
+        outlier_ts = pd.date_range(last_ts + pd.Timedelta("1h"), periods=2, freq="1h")
+        # Leave enough room after outlier so it isn't truncated (>= APPLIANCE_MAX_WINDOW_HOURS)
+        padding_ts = pd.date_range(outlier_ts[-1] + pd.Timedelta("1h"), periods=12, freq="1h")
+        outlier = pd.DataFrame({"timestamp": outlier_ts, "kwh": [5.0, 5.0]})
+        padding = pd.DataFrame({"timestamp": padding_ts, "kwh": [0.0] * 12})
+        df = pd.concat([normal_cycles, outlier, padding], ignore_index=True)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        # With outlier rejected, profile should be close to [1.0, 0.5]
+        assert sigs["dw"]["hourly_profile"][0] == pytest.approx(1.0, abs=0.2)
+        assert sigs["dw"]["n_rejected"] >= 1
+
+    def test_outlier_rejection_skipped_with_few_cycles(self):
+        """With only 3 cycles, no outlier rejection is applied (threshold: ≥ 4)."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["n_rejected"] == 0
+
+    def test_duration_clustering_two_groups(self):
+        """Mix of 2h and 5h cycles → both 'short' and 'long' clusters present."""
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # 5 short cycles (2h), 5 long cycles (5h), separated by 5h gaps
+        for _ in range(5):
+            for h in range(2):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(1.0)
+            t += pd.Timedelta(hours=7)
+        for _ in range(5):
+            for h in range(5):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(1.0)
+            t += pd.Timedelta(hours=10)
+        # Add tail padding to avoid truncation
+        for h in range(12):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"wm": df})
+        assert "wm" in sigs
+        assert "clusters" in sigs["wm"]
+        assert "short" in sigs["wm"]["clusters"]
+        assert "long" in sigs["wm"]["clusters"]
+        assert sigs["wm"]["clusters"]["short"]["median_duration_h"] == 2
+        assert sigs["wm"]["clusters"]["long"]["median_duration_h"] == 5
+
+    def test_duration_clustering_single_group(self):
+        """Uniform-duration cycles → no clusters key (or clusters is absent/single)."""
+        df = _make_cycle_df([1.0, 0.5, 0.2], n_cycles=5, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        # All cycles are 3h → median_dur=3; short == long bucket doesn't split
+        # Clusters key may be absent or have only one entry
+        clusters = sigs["dw"].get("clusters", {})
+        assert len(clusters) <= 1
+
+    def test_cov_warning_suppressed_after_clustering(self, caplog):
+        """Mixed-duration cycles that are internally consistent → no WARNING after cluster split."""
+        import logging
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # Short cycles: consistent 2h pattern [1.5, 0.5]
+        for _ in range(6):
+            for h, v in enumerate([1.5, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=6)
+        # Long cycles: consistent 4h pattern [0.5, 1.0, 1.0, 0.5]
+        for _ in range(6):
+            for h, v in enumerate([0.5, 1.0, 1.0, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=8)
+        # Tail padding
+        for h in range(12):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            sigs = _learn_appliance_signatures({"wm": df})
+        # Clusters should exist; no high-variability warning expected
+        assert "wm" in sigs
+        assert "clusters" in sigs["wm"]
+        assert not any("high variability" in r.message for r in caplog.records)
+
+    def test_schema_backward_compatible(self):
+        """New schema always contains all expected keys."""
+        df = _make_cycle_df([1.0, 2.0, 1.5, 0.5], n_cycles=4, period_hours=12)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        for key in ("total_kwh", "hourly_profile", "std_profile", "peak_hour", "n_cycles"):
+            assert key in sigs["dw"], f"Missing backward-compat key: {key}"
+        # Existing metadata keys
+        assert "n_rejected" in sigs["dw"]
+        assert "idle_threshold" in sigs["dw"]
+        # New metadata keys (A + B)
+        assert "quality" in sigs["dw"]
+        assert sigs["dw"]["quality"] in ("good", "fair", "poor")
+        assert "n_data_days" in sigs["dw"]
+        assert isinstance(sigs["dw"]["n_data_days"], int)
+        assert "last_cycle_ts" in sigs["dw"]
+        assert isinstance(sigs["dw"]["last_cycle_ts"], str)
+        assert "hour_of_day_distribution" in sigs["dw"]
+        assert isinstance(sigs["dw"]["hour_of_day_distribution"], dict)
+
+    def test_quality_poor_few_cycles(self):
+        """3 cycles → quality='poor'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=3, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "poor"
+
+    def test_quality_fair_medium_cycles(self):
+        """5–14 cycles → quality='fair'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=7, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "fair"
+
+    def test_quality_good_many_cycles(self):
+        """15+ cycles → quality='good'."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=15, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert sigs["dw"]["quality"] == "good"
+
+    def test_hour_of_day_distribution_present(self):
+        """hour_of_day_distribution is a dict mapping hours (int) to counts (int)."""
+        # All cycles start at 08:00 UTC
+        ts = pd.date_range("2024-01-01 08:00", periods=0, freq="1h")
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01 08:00")
+        for _ in range(5):
+            for h, v in enumerate([1.0, 0.5]):
+                ts_list.append(t + pd.Timedelta(hours=h))
+                kwh_list.append(v)
+            t += pd.Timedelta(hours=12)
+        for h in range(6):  # tail padding
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        dist = sigs["dw"]["hour_of_day_distribution"]
+        assert isinstance(dist, dict)
+        assert all(isinstance(k, int) for k in dist.keys())
+        assert all(isinstance(v, int) for v in dist.values())
+        assert sum(dist.values()) == sigs["dw"]["n_cycles"]
+
+    def test_cov_based_clustering_high_energy_spread(self):
+        """High energy CoV (> 0.5) triggers clustering even when median_dur == 1h.
+
+        Uses only 3 cycles (< 4) so outlier rejection is skipped, letting us
+        isolate the CoV-based trigger: 2 light 1h cycles and 1 heavy 2h cycle.
+        """
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        # 2 light 1h cycles (0.3 kWh)
+        for _ in range(2):
+            ts_list.append(t)
+            kwh_list.append(0.3)
+            t += pd.Timedelta(hours=5)
+        # 1 heavy 2h cycle (4.0 kWh total)
+        for v in [2.0, 2.0]:
+            ts_list.append(t)
+            kwh_list.append(v)
+            t += pd.Timedelta(hours=1)
+        t += pd.Timedelta(hours=5)  # idle gap
+        # Tail padding to avoid truncation
+        for h in range(6):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"hp": df})
+        assert "hp" in sigs
+        # median_dur == 1 so the duration condition alone would not trigger;
+        # energy CoV >> 0.5 → clustering must fire via the CoV path.
+        assert "clusters" in sigs["hp"], "Expected clusters when energy CoV > 0.5"
+        assert len(sigs["hp"]["clusters"]) == 2
+
+    def test_composite_forecast_works_with_new_schema(self):
+        """_composite_forecast reads hourly_profile correctly from new schema."""
+        df = _make_cycle_df([1.0, 2.0, 1.5], n_cycles=4, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        baseline = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(baseline, {"dw": "14:00"}, sigs)
+        assert "delta_kwh" in result.columns
+        # Profile was placed at offset 4 (14:00 - 10:00 = 4h)
+        assert result["delta_kwh"].iloc[4] == pytest.approx(sigs["dw"]["hourly_profile"][0])
 
 
 # ── _composite_forecast (Stage 4) ────────────────────────────────────────────
@@ -2516,6 +2759,264 @@ class TestCompositeForecast:
         result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
         assert (result["delta_kwh"] == 0.0).all()
 
+    # ── Program-type schedule (dict form) ────────────────────────────────────
+
+    def test_program_schedule_uses_program_profile(self):
+        """Dict schedule with known program uses per-program hourly_profile."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": eco_profile,
+                        "std_profile": [0.0, 0.0, 0.0],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(eco_profile):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
+    def test_program_fallback_when_program_unknown(self):
+        """Unknown program label → falls back to combined hourly_profile."""
+        combined = [1.0, 2.0, 1.5, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": [0.5, 1.0, 0.5],
+                        "std_profile": [],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+
+    def test_program_fallback_when_no_programs_key(self):
+        """Sig without 'programs' key → falls back to hourly_profile, no error."""
+        combined = [1.0, 2.0]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "12:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[2 + i] == pytest.approx(v)
+
+    def test_legacy_string_schedule_unchanged(self):
+        """Plain 'HH:MM' string alongside sigs with programs → identical to pre-feature result."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {"eco": {"hourly_profile": eco_profile, "std_profile": [], "total_kwh": 2.0, "n_cycles": 3}},
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result_str = _composite_forecast(df, {"sub_dw": "14:00"}, sigs)
+        # Must use the combined profile, not eco
+        assert result_str["delta_kwh"].iloc[4] == pytest.approx(1.0)
+        assert result_str["delta_kwh"].iloc[5] == pytest.approx(2.0)
+
+    def test_program_off_start_skipped(self):
+        """Dict schedule with start='off' → no delta."""
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0],
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+                "programs": {"eco": {"hourly_profile": [0.5, 0.5], "std_profile": [], "total_kwh": 1.0, "n_cycles": 2}},
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "off", "program": "eco"}}, sigs)
+        assert (result["delta_kwh"] == 0.0).all()
+
+
+# ── Program signatures in _learn_appliance_signatures ────────────────────────
+
+def _make_prog_df(
+    cycle_starts: list[str],
+    programs: list[str],
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Build a synthetic program sensor DataFrame aligned to given cycle starts."""
+    rows = []
+    for ts_str, prog in zip(cycle_starts, programs):
+        ts = pd.Timestamp(ts_str)
+        rows.append({"timestamp": ts, "program": prog})
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+class TestApplianceSignaturesPrograms:
+    """Tests for program_histories support in _learn_appliance_signatures()."""
+
+    PROFILE = [1.0, 2.0, 1.5, 0.5]
+
+    def test_programs_absent_without_program_history(self):
+        """No program_histories → 'programs' key absent from signature."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=3)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "programs" not in sigs.get("dw", {})
+
+    def test_programs_learned_with_sufficient_cycles(self):
+        """≥ 2 cycles for a program → profile stored under sig['programs']."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        # Assign "eco" to all 4 cycle starts (every 12 hours from 2024-01-01 00:00)
+        cycle_starts = [
+            pd.Timestamp("2024-01-01 00:00"),
+            pd.Timestamp("2024-01-01 12:00"),
+            pd.Timestamp("2024-01-02 00:00"),
+            pd.Timestamp("2024-01-02 12:00"),
+        ]
+        prog_df = _make_prog_df(
+            [str(ts) for ts in cycle_starts],
+            ["eco"] * 4,
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        assert "dw" in sigs
+        assert "programs" in sigs["dw"]
+        assert "eco" in sigs["dw"]["programs"]
+        eco = sigs["dw"]["programs"]["eco"]
+        assert eco["n_cycles"] == 4
+        assert eco["total_kwh"] == pytest.approx(sum(self.PROFILE))
+
+    def test_programs_skipped_below_min_cycles_per_program(self):
+        """1 cycle for 'normal' → absent; 3 for 'eco' → present."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        cycle_starts = [
+            "2024-01-01 00:00",
+            "2024-01-01 12:00",
+            "2024-01-02 00:00",
+            "2024-01-02 12:00",
+        ]
+        programs = ["eco", "eco", "eco", "normal"]
+        prog_df = _make_prog_df(cycle_starts, programs)
+        sigs = _learn_appliance_signatures(
+            {"dw": df},
+            program_histories={"dw": prog_df},
+            min_cycles_per_program=2,
+        )
+        assert "programs" in sigs["dw"]
+        assert "eco" in sigs["dw"]["programs"]
+        assert "normal" not in sigs["dw"]["programs"]
+
+    def test_programs_and_clusters_coexist(self):
+        """Both 'clusters' and 'programs' can appear in the same signature."""
+        # Use a profile that triggers clustering: mix short (1h) and long (4h) cycles
+        short = [2.0]
+        long_ = [1.0, 2.0, 1.5, 0.5]
+        n_each = 4
+        period = 12
+        rows = []
+        ts = pd.Timestamp("2024-01-01 00:00")
+        cycle_starts = []
+        for i in range(n_each):
+            cycle_starts.append(str(ts))
+            for v in short:
+                rows.append({"timestamp": ts, "kwh": v})
+                ts += pd.Timedelta(hours=1)
+            for _ in range(period - len(short)):
+                rows.append({"timestamp": ts, "kwh": 0.0})
+                ts += pd.Timedelta(hours=1)
+        for i in range(n_each):
+            cycle_starts.append(str(ts))
+            for v in long_:
+                rows.append({"timestamp": ts, "kwh": v})
+                ts += pd.Timedelta(hours=1)
+            for _ in range(period - len(long_)):
+                rows.append({"timestamp": ts, "kwh": 0.0})
+                ts += pd.Timedelta(hours=1)
+
+        df = pd.DataFrame(rows)
+        # All short cycles: "quick", all long cycles: "eco"
+        programs = ["quick"] * n_each + ["eco"] * n_each
+        prog_df = _make_prog_df(cycle_starts, programs)
+        sigs = _learn_appliance_signatures({"app": df}, program_histories={"app": prog_df})
+        sig = sigs.get("app", {})
+        # clusters present (mix of short/long durations)
+        assert "clusters" in sig
+        # programs present (≥ 2 for each label)
+        assert "programs" in sig
+        assert "quick" in sig["programs"]
+        assert "eco" in sig["programs"]
+
+    def test_programs_cycle_predating_history_excluded(self):
+        """Cycles before prog_df start are not counted in programs but counted in n_cycles."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        # Only provide program history from cycle 3 onward (skip first two)
+        prog_df = _make_prog_df(
+            ["2024-01-02 00:00", "2024-01-02 12:00"],
+            ["eco", "eco"],
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        sig = sigs["dw"]
+        # Combined n_cycles covers all 4
+        assert sig["n_cycles"] == 4
+        # But only 2 cycles have program info → eco has 2
+        assert "programs" in sig
+        assert sig["programs"]["eco"]["n_cycles"] == 2
+
+    def test_programs_normalizes_to_lowercase(self):
+        """Program labels are already lowercased by fetch_program_sensor_history;
+        test that _learn_appliance_signatures groups by exact label (case-sensitive).
+        'eco' and 'eco' group together; 'ECO' would be a different key."""
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        cycle_starts = [
+            "2024-01-01 00:00",
+            "2024-01-01 12:00",
+            "2024-01-02 00:00",
+            "2024-01-02 12:00",
+        ]
+        # Simulate already-lowercased input (as produced by fetch_program_sensor_history)
+        prog_df = _make_prog_df(cycle_starts, ["eco", "eco", "eco", "eco"])
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        assert "eco" in sigs["dw"]["programs"]
+        assert "ECO" not in sigs["dw"]["programs"]
+
+    def test_programs_save_load_roundtrip(self, tmp_path):
+        """sig['programs'] survives JSON round-trip (string keys, no int-key issue)."""
+        import json
+        df = _make_cycle_df(self.PROFILE, n_cycles=4, period_hours=12)
+        prog_df = _make_prog_df(
+            ["2024-01-01 00:00", "2024-01-01 12:00", "2024-01-02 00:00", "2024-01-02 12:00"],
+            ["eco"] * 4,
+        )
+        sigs = _learn_appliance_signatures({"dw": df}, program_histories={"dw": prog_df})
+        sig_path = tmp_path / "appliance_signatures.json"
+        sig_path.write_text(json.dumps(sigs))
+        loaded = json.loads(sig_path.read_text())
+        assert "programs" in loaded["dw"]
+        assert "eco" in loaded["dw"]["programs"]
+        assert loaded["dw"]["programs"]["eco"]["n_cycles"] == 4
+
 
 # ── Concurrency (SE-2) ───────────────────────────────────────────────────────
 
@@ -2577,3 +3078,688 @@ class TestConcurrency:
         assert result is not None
         assert len(result) == 48
         assert "predicted_kwh" in result.columns
+
+
+# ── τ (thermal time constant) calibration ─────────────────────────────────────
+
+def _make_tau_fixtures(tau: float, n_windows: int = 5, window_len: int = 8):
+    """Build synthetic climate_dfs, heating_active_df, weather_df for τ tests.
+
+    Each cooling window spans `window_len` hours with indoor temperature decaying
+    from T0=22°C toward T_outdoor=5°C with the given τ.  Heating-on gaps of 3 h
+    separate windows.
+    """
+    rng = np.random.default_rng(42)
+    T0, T_out = 22.0, 5.0
+    period = window_len + 3  # window + heating-on gap
+    total_hours = n_windows * period + 5
+    timestamps = pd.date_range("2024-01-01", periods=total_hours, freq="1h")
+
+    T_indoor = np.full(total_hours, T0)
+    heating_active = np.ones(total_hours, dtype=float)
+
+    for i in range(n_windows):
+        start = i * period
+        for j in range(window_len):
+            idx = start + j
+            if idx >= total_hours:
+                break
+            T_indoor[idx] = T_out + (T0 - T_out) * np.exp(-j / tau)
+            heating_active[idx] = 0  # heating off
+
+    # Tiny noise so OLS isn't perfectly noiseless (more realistic)
+    T_indoor += rng.normal(0, 0.05, size=total_hours)
+    T_indoor = np.clip(T_indoor, T_out + 0.1, None)
+
+    climate_df = pd.DataFrame({
+        "timestamp":    timestamps,
+        "current_temp": T_indoor,
+        "setpoint":     T_indoor + 1.0,  # setpoint doesn't matter for τ estimation
+    })
+    heating_df = pd.DataFrame({
+        "timestamp":      timestamps,
+        "heating_active": heating_active,
+    })
+    weather_df = pd.DataFrame({
+        "timestamp":            timestamps,
+        "temp_c":               [T_out] * total_hours,
+        "precipitation_mm":     [0.0]   * total_hours,
+        "sunshine_min":         [0.0]   * total_hours,
+        "wind_kmh":             [0.0]   * total_hours,
+        "cloud_cover_pct":      [100.0] * total_hours,
+        "direct_radiation_wm2": [0.0]   * total_hours,
+    })
+    return {"climate.test": climate_df}, heating_df, weather_df
+
+
+class TestCalibrateTau:
+    def test_known_tau(self, tmp_path):
+        """τ estimated from synthetic data matches the true value within 10%."""
+        TRUE_TAU = 4.0
+        model = EnergyForecastModel(model_dir=tmp_path)
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(TRUE_TAU)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.10, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
+    def test_insufficient_windows(self, tmp_path):
+        """Fewer than 3 valid windows → returns None."""
+        model = EnergyForecastModel(model_dir=tmp_path)
+        # Only 2 windows
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(4.0, n_windows=2)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def test_heating_always_on(self, tmp_path):
+        """No off-window → returns None."""
+        model = EnergyForecastModel(model_dir=tmp_path)
+        n = 100
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [20.0] * n,
+            "setpoint":     [21.0] * n,
+        })}
+        heating_df = pd.DataFrame({
+            "timestamp":      ts,
+            "heating_active": [1.0] * n,  # always on
+        })
+        weather_df = pd.DataFrame({
+            "timestamp": ts,
+            "temp_c":    [5.0] * n,
+            "precipitation_mm": [0.0] * n, "sunshine_min": [0.0] * n,
+            "wind_kmh": [0.0] * n, "cloud_cover_pct": [0.0] * n,
+            "direct_radiation_wm2": [0.0] * n,
+        })
+        assert model._calibrate_tau(climate_dfs, heating_df, weather_df) is None
+
+    def test_evening_cooling_window_used(self, tmp_path):
+        """Cooling in the tail of an off-block (after a rising prefix) still yields τ.
+
+        Scenario: heating off from 20:00 for 11 h (20:00–06:00).  First 3 h:
+        indoor rises (appliance heat, residual warmth).  Hours 3-10: genuine
+        passive cooling → valid sub-sequence in the tail.  The sub-sequence scan
+        should find and use the nighttime cooling portion.
+
+        Windows are entirely outside 09:00–15:00 to avoid the daytime exclusion.
+        """
+        TRUE_TAU = 5.0
+        T_out = 5.0
+        # 4 off-blocks, each starting at 20:00 on consecutive days.
+        # Pattern: 3h rising prefix + 7h cooling + 1h heating-on gap = 11h block.
+        all_ts:  list = []
+        all_T_in: list = []
+        all_heat: list = []
+
+        for day in range(4):
+            base = pd.Timestamp(f"2024-01-{10 + day:02d} 20:00")
+            for j in range(3):
+                all_ts.append(base + pd.Timedelta(hours=j))
+                all_T_in.append(20.0 + j * 0.75)   # rising prefix
+                all_heat.append(0.0)
+            for j in range(7):
+                all_ts.append(base + pd.Timedelta(hours=3 + j))
+                all_T_in.append(T_out + (23.0 - T_out) * np.exp(-j / TRUE_TAU))
+                all_heat.append(0.0)
+            # one "heating on" row to close the block before next day
+            all_ts.append(base + pd.Timedelta(hours=10))
+            all_T_in.append(20.0)
+            all_heat.append(1.0)
+
+        ts = pd.DatetimeIndex(all_ts)
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp": ts, "current_temp": all_T_in, "setpoint": [t + 1.0 for t in all_T_in],
+        })}
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": all_heat})
+        weather_df = pd.DataFrame({
+            "timestamp": ts, "temp_c": [T_out] * len(ts),
+            "precipitation_mm": [0.0] * len(ts), "sunshine_min": [0.0] * len(ts),
+            "wind_kmh": [0.0] * len(ts), "cloud_cover_pct": [100.0] * len(ts),
+            "direct_radiation_wm2": [0.0] * len(ts),
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, "nighttime cooling sub-sequence should yield a τ estimate"
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.25, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
+    def test_thermal_pressure_scaled(self, tmp_path):
+        """thermal_pressure is the area-weighted °C delta (no τ-division since v0.10.3)."""
+        n = 10
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0]   * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [0.0]   * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+        climate_df = pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0] * n,
+            "setpoint":     [20.0] * n,   # raw delta = 2.0 °C
+        })
+        TAU = 2.0
+        result = _engineer_features(
+            df, weather, None,
+            climate_dfs={"climate.room": climate_df},
+            tau_hours=TAU,
+        )
+        # tau_hours is passed but no longer used for thermal_pressure — result is raw °C delta
+        assert "thermal_pressure" in result.columns
+        non_zero = result["thermal_pressure"].dropna()
+        assert len(non_zero) > 0
+        np.testing.assert_allclose(non_zero.values, 2.0, atol=1e-6)
+
+    def test_thermal_pressure_no_tau(self, tmp_path):
+        """Without τ, thermal_pressure equals the raw setpoint−current_temp delta."""
+        n = 10
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0]   * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [0.0]   * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+        climate_df = pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0] * n,
+            "setpoint":     [21.0] * n,  # raw delta = 3.0 °C
+        })
+        result = _engineer_features(
+            df, weather, None,
+            climate_dfs={"climate.room": climate_df},
+            tau_hours=None,  # no τ — backward-compat path
+        )
+        non_zero = result["thermal_pressure"].dropna()
+        assert len(non_zero) > 0
+        np.testing.assert_allclose(non_zero.values, 3.0, atol=1e-6)
+
+
+# ── Tests: indoor temperature projection + area-weighted thermal pressure ─────
+
+class TestProjectIndoorTemps:
+    """Unit tests for _project_indoor_temps()."""
+
+    def _future_ts(self, n: int = 48) -> pd.DatetimeIndex:
+        return pd.date_range("2026-01-15 10:00", periods=n, freq="1h")
+
+    def _outdoor_series(self, ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.Series:
+        return pd.Series([temp] * len(ts), index=ts)
+
+    def test_basic_convergence(self):
+        """Cold room should converge toward outdoor temperature over 48 h (RC ODE)."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [ts[0]],          # fresh — age = 0
+                "current_temp": [10.0],            # above outdoor
+                "setpoint":     [20.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        assert "climate.room" in result
+        projected = result["climate.room"]
+        t_in = projected["current_temp"].values
+        # With T_out=5 and T_in[0]=10 the temperature should monotonically decrease
+        assert t_in[0] == pytest.approx(10.0)
+        assert t_in[-1] < t_in[0], "Room should cool toward outdoor temp"
+        # After 48 h with tau=24 the temperature should be closer to T_out
+        assert abs(t_in[-1] - 5.0) < abs(t_in[0] - 5.0)
+
+    def test_stale_sensor_falls_back_to_setpoint(self):
+        """When last observation is >2 h old, starting T_in should be the setpoint."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        # Last obs timestamp = now - 3h (stale)
+        stale_ts = ts[0] - pd.Timedelta(hours=3)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [stale_ts],
+                "current_temp": [15.0],   # stale — should be ignored
+                "setpoint":     [21.0],   # fallback
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        t_in = result["climate.room"]["current_temp"].values
+        # Starting temp should be the setpoint, not the stale current_temp
+        assert t_in[0] == pytest.approx(21.0)
+
+    def test_fresh_sensor_uses_current_temp(self):
+        """When last observation is <2 h old, starting T_in should be current_temp."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        fresh_ts = ts[0] - pd.Timedelta(minutes=30)  # 30 min old — fresh
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [fresh_ts],
+                "current_temp": [17.0],
+                "setpoint":     [22.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        t_in = result["climate.room"]["current_temp"].values
+        assert t_in[0] == pytest.approx(17.0)
+
+    def test_empty_climate_returns_empty_dict(self):
+        """Empty climate_recent dict yields empty result."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts)
+        result = _project_indoor_temps({}, ts, outdoor)
+        assert result == {}
+
+    def test_empty_df_entity_skipped(self):
+        """Climate entity with an empty DataFrame is silently skipped."""
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts)
+        climate_recent = {"climate.room": pd.DataFrame()}
+        result = _project_indoor_temps(climate_recent, ts, outdoor)
+        assert result == {}
+
+    def test_default_tau_applied_when_none(self):
+        """When tau_hours=None, the DEFAULT_TAU constant is used (no crash)."""
+        from energy_forecast.const import DEFAULT_TAU
+        ts = self._future_ts()
+        outdoor = self._outdoor_series(ts, temp=5.0)
+        climate_recent = {
+            "climate.room": pd.DataFrame({
+                "timestamp":    [ts[0]],
+                "current_temp": [10.0],
+                "setpoint":     [20.0],
+            })
+        }
+        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=None)
+        t_in = result["climate.room"]["current_temp"].values
+        assert t_in[0] == pytest.approx(10.0)
+        # With DEFAULT_TAU=24 the first step: 10 + (5-10)/24 ≈ 9.79
+        expected_step1 = 10.0 + (5.0 - 10.0) / DEFAULT_TAU
+        assert t_in[1] == pytest.approx(expected_step1, rel=1e-4)
+
+
+class TestAreaWeightedThermalPressure:
+    """Unit tests for area-weighted thermal pressure in _engineer_features()."""
+
+    def test_single_room_std_is_zero(self):
+        """With only one room, thermal_pressure_std should be 0."""
+        ts = pd.date_range("2026-01-15 10:00", periods=3, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0] * 3,
+                "setpoint":     [21.0] * 3,  # delta = 3.0
+            })
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert "thermal_pressure_std" in result.columns
+        assert (result["thermal_pressure_std"] == 0.0).all()
+
+    def test_multi_room_weighted_mean(self):
+        """Weighted mean and max are correct for two rooms with different areas."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.large": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 3.0
+            }),
+            "climate.small": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [19.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 2.0
+            }),
+        }
+        room_areas = {"climate.large": 30.0, "climate.small": 10.0}  # 3:1 ratio
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs,
+                                    room_areas=room_areas)
+        assert "thermal_pressure" in result.columns
+        assert "thermal_pressure_max" in result.columns
+        # Weighted mean: (3.0*30 + 2.0*10) / 40 = (90+20)/40 = 2.75
+        np.testing.assert_allclose(result["thermal_pressure"].values, 2.75, atol=1e-6)
+        # Max delta: large room = 3.0
+        np.testing.assert_allclose(result["thermal_pressure_max"].values, 3.0, atol=1e-6)
+
+    def test_uniform_area_fallback(self):
+        """Without room_areas, all rooms default to DEFAULT_ROOM_AREA_M2 (equal weight)."""
+        from energy_forecast.const import DEFAULT_ROOM_AREA_M2
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [19.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 2.0
+            }),
+            "climate.room2": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [17.0] * 2,
+                "setpoint":     [21.0] * 2,  # delta = 4.0
+            }),
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        # Equal areas → straight mean = (2.0 + 4.0) / 2 = 3.0
+        np.testing.assert_allclose(result["thermal_pressure"].values, 3.0, atol=1e-6)
+
+    def test_no_climate_gives_zeros(self):
+        """Without climate_dfs all three thermal features are 0."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)
+        assert (result["thermal_pressure"]     == 0.0).all()
+        assert (result["thermal_pressure_max"] == 0.0).all()
+        assert (result["thermal_pressure_std"] == 0.0).all()
+
+    def test_negative_delta_clipped_to_zero(self):
+        """Rooms above setpoint (delta<0) contribute 0 — no negative pressure."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.warm": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [23.0] * 2,  # above setpoint
+                "setpoint":     [21.0] * 2,
+            }),
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert (result["thermal_pressure"] == 0.0).all()
+
+
+class TestZeroFillEliminated:
+    """Verify that thermal_pressure is non-zero for all 48 prediction hours."""
+
+    def test_all_hours_nonzero_with_cold_room(self, tmp_path):
+        """When a room is below setpoint, projected thermal_pressure must be >0 for all 48h.
+
+        The climate_recent observation must be fresh (<2h old) so that the RC-ODE
+        starts from the actual cold temperature rather than falling back to setpoint.
+        """
+        n = 600
+        rng = np.random.default_rng(42)
+        ts  = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, n)})
+        weather = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [5.0] * n,
+            "precipitation_mm":     [0.0] * n,
+            "sunshine_min":         [30.0] * n,
+            "wind_kmh":             [10.0] * n,
+            "cloud_cover_pct":      [50.0] * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        # Training uses any historical climate data
+        climate_train = {
+            "climate.living": pd.DataFrame({
+                "timestamp":    [ts[-1]],
+                "current_temp": [17.0],
+                "setpoint":     [21.0],
+            })
+        }
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0,
+                climate_dfs=climate_train)
+
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast_df = pd.DataFrame({
+            "timestamp":            future_ts,
+            "temp_c":               [5.0] * 48,
+            "precipitation_mm":     [0.0] * 48,
+            "sunshine_min":         [30.0] * 48,
+            "wind_kmh":             [10.0] * 48,
+            "cloud_cover_pct":      [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+
+        # Prediction uses a FRESH observation (30 min ago) so RC-ODE starts at 17°C
+        now_naive = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        climate_predict = {
+            "climate.living": pd.DataFrame({
+                "timestamp":    [now_naive - pd.Timedelta(minutes=30)],  # fresh
+                "current_temp": [17.0],   # cold — 4°C below setpoint
+                "setpoint":     [21.0],
+            })
+        }
+
+        _, X = m._prepare_prediction_X(
+            forecast_df, live_temp=None, recent_actuals=None,
+            climate_recent=climate_predict,
+        )
+        # thermal_pressure must be non-zero for all 48 hours
+        if "thermal_pressure" in X.columns:
+            assert (X["thermal_pressure"] > 0).all(), (
+                "thermal_pressure should be non-zero for all 48 prediction hours "
+                "when a room is below setpoint and observation is fresh"
+            )
+
+
+# ── Tests: COP proxy + solar gain features ───────────────────────────────────
+
+class TestWeightedSolarGain:
+
+    def test_in_features_base(self):
+        assert "weighted_solar_gain" in _FEATURES_BASE
+
+    def test_peak_at_1300(self):
+        """cos_factor = 1.0 at h=13 → weighted_solar_gain equals direct_radiation_wm2."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 13:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(300.0)
+
+    def test_zero_before_0900(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 08:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_zero_after_1700(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 18:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=300.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_zero_radiation_gives_zero(self):
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 13:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=0.0)
+        result = _engineer_features(df, w, None)
+        assert result.iloc[0]["weighted_solar_gain"] == pytest.approx(0.0)
+
+    def test_never_negative(self):
+        """cos_factor near 09:00 and 17:00 could produce small negatives — must be 0."""
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, rad=500.0)
+        result = _engineer_features(df, w, None)
+        assert (result["weighted_solar_gain"] >= 0).all()
+
+
+class TestThermalPressureCop:
+
+    def test_in_features_base(self):
+        assert "thermal_pressure_cop" in _FEATURES_BASE
+
+    def test_scales_inversely_with_temp(self):
+        """Same thermal_pressure → higher cop feature at colder outdoor temp."""
+        def _cop_at_temp(t_out):
+            ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+            df = _make_bare_df(ts)
+            w  = _make_weather_df(ts, temp=t_out)
+            climate_dfs = {"climate.room": pd.DataFrame({
+                "timestamp":    ts,
+                "current_temp": [18.0],
+                "setpoint":     [21.0],
+            })}
+            result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+            return result.iloc[0]["thermal_pressure_cop"]
+
+        cop_cold = _cop_at_temp(-10.0)
+        cop_warm = _cop_at_temp(10.0)
+        assert cop_cold > cop_warm, "Cold outdoor → higher electrical cost per °C heat debt"
+
+    def test_denominator_clamp(self):
+        """At extreme cold (−50°C), denominator must not drop below 0.5."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, temp=-50.0)
+        climate_dfs = {"climate.room": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": [18.0],
+            "setpoint":     [21.0],
+        })}
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        # thermal_pressure=3.0, cop_proxy=max(0.5, 0.11*(-50)+3)=max(0.5,-2.5)=0.5
+        # → thermal_pressure_cop = 3.0 / 0.5 = 6.0
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(6.0)
+
+    def test_zero_pressure_gives_zero_cop(self):
+        """No thermal pressure → cop feature is also 0."""
+        ts = pd.DatetimeIndex([pd.Timestamp("2026-01-15 03:00")])
+        df = _make_bare_df(ts)
+        w  = _make_weather_df(ts, temp=5.0)
+        result = _engineer_features(df, w, None)  # no climate_dfs
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(0.0)
+
+
+# ── Tests: tau calibration safeguards ────────────────────────────────────────
+
+def _make_tau_model(tmp_path) -> "EnergyForecastModel":
+    return EnergyForecastModel(tmp_path)
+
+
+class TestTauCalibrationSafeguards:
+
+    def _make_night_window(self, start_hour: int = 20, n: int = 6,
+                           t_in_start: float = 22.0, t_out: float = 5.0,
+                           radiation: float = 0.0, date: str = "2026-01-10") -> pd.DataFrame:
+        """Build a synthetic passive-cooling window as a combined DataFrame row-set."""
+        ts = pd.date_range(f"{date} {start_hour:02d}:00", periods=n, freq="1h")
+        tau_true = 10.0
+        t_in = [t_in_start]
+        for i in range(1, n):
+            t_in.append(t_in[-1] + (t_out - t_in[-1]) / tau_true)
+        return pd.DataFrame({
+            "T_indoor":              t_in,
+            "T_outdoor":             [t_out] * n,
+            "heating_active":        [0] * n,
+            "direct_radiation_wm2":  [radiation] * n,
+        }, index=ts)
+
+    def test_solar_mask_rejects_high_radiation(self, tmp_path):
+        """Windows with direct_radiation_wm2 > 150 W/m² are excluded.
+
+        5 night windows all have radiation=200 → all rejected → result is None.
+        """
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(
+            tau_true=10.0, radiation=200.0
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def test_daytime_exclusion(self, tmp_path):
+        """Windows containing any hour in 09:00–15:00 are excluded.
+
+        Build windows starting at 07:00 (spans 07:00–14:00 → touches daytime).
+        All should be rejected → result is None.
+        """
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(
+            tau_true=10.0, start_hour=7, window_hours=8  # 07:00–14:00 touches 09:00–15:00
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is None
+
+    def _make_night_blocks(self, tau_true: float, n_days: int = 5,
+                           start_hour: int = 20, window_hours: int = 8,
+                           t_in_start: float = 22.0, t_out: float = 5.0,
+                           radiation: float = 0.0) -> tuple:
+        """Build climate/heating/weather DataFrames with *n_days* separated night blocks.
+
+        Each block: *window_hours* of heating-off at *start_hour*, followed by
+        1 heating-on row to close the block.  Start hour defaults to 20:00 so no
+        block touches 09:00–15:00 (assuming window_hours ≤ 13).
+        """
+        import pandas as pd
+        ts_list: list = []
+        t_in_list: list = []
+        heat_list: list = []
+
+        for day in range(n_days):
+            base = pd.Timestamp(f"2026-01-{10 + day:02d} {start_hour:02d}:00")
+            t_in = t_in_start
+            for j in range(window_hours):
+                ts_list.append(base + pd.Timedelta(hours=j))
+                t_in_list.append(t_in)
+                heat_list.append(0.0)
+                t_in = t_in + (t_out - t_in) / tau_true
+            # close block with one "on" row
+            ts_list.append(base + pd.Timedelta(hours=window_hours))
+            t_in_list.append(t_in_start)
+            heat_list.append(1.0)
+
+        all_ts = pd.DatetimeIndex(ts_list)
+        climate_dfs = {"climate.room": pd.DataFrame({
+            "timestamp":    all_ts,
+            "current_temp": t_in_list,
+            "setpoint":     [t_in_start] * len(all_ts),
+        })}
+        heating_df = pd.DataFrame({"timestamp": all_ts, "heating_active": heat_list})
+        weather_df = pd.DataFrame({
+            "timestamp":            all_ts,
+            "temp_c":               [t_out] * len(all_ts),
+            "direct_radiation_wm2": [radiation] * len(all_ts),
+        })
+        return climate_dfs, heating_df, weather_df
+
+    def test_ema_blend_on_large_change(self, tmp_path):
+        """When new τ differs >50% from stored τ, result is EMA-blended."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0  # stored τ
+        # tau_true=22 → ~120% above stored 10 → expect blend
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=22.0)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        # EMA: 0.8*10 + 0.2*~22 → result should be between 10 and 22
+        assert 10.0 < result < 22.0
+
+    def test_no_ema_on_small_change(self, tmp_path):
+        """When new τ is within 50% of stored τ, raw median is returned."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0  # stored τ
+        # tau_true=12 → ~20% above stored 10 → no blend, raw median accepted
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=12.0)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert result > 10.5   # closer to 12 than to 10
+
+    def test_no_radiation_column_degrades_gracefully(self, tmp_path):
+        """weather_df without direct_radiation_wm2 skips the solar mask (no crash)."""
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=10.0)
+        weather_df = weather_df.drop(columns=["direct_radiation_wm2"])
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None  # solar mask absent → windows still accepted

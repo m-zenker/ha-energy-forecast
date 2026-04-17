@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 from .const import CACHE_PATH, MAX_HOURLY_KWH
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 
 def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:
@@ -113,13 +113,17 @@ def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: st
     either key column.
     """
     import pandas as pd
-    return (
+    result = (
         pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
         .drop_duplicates(subset=["timestamp"], keep="last")
         .sort_values("timestamp")
         .dropna(subset=["timestamp", value_col])
         .reset_index(drop=True)
     )
+    # pandas 3.x promotes concat(float64_df, empty_object_df) to object dtype.
+    # Coerce the value column back to float64 so downstream lag features stay numeric.
+    result[value_col] = pd.to_numeric(result[value_col], errors="coerce")
+    return result
 
 
 def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
@@ -146,9 +150,9 @@ def fetch_energy_history(
             if ts.dt.tz is not None:
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
-            app.log(f"Loaded {len(df_cache)} records from local cache.")
+            _LOGGER.info(f"Loaded {len(df_cache)} records from local cache.")
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load cache: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load cache: {e}")
 
     # 2. Fetch fresh data from HA
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
@@ -177,9 +181,9 @@ def fetch_energy_history(
     # append-only path (HA-wins corrections are applied here on the next retrain).
     try:
         combined.to_csv(cache_path, index=False)
-        app.log(f"Cache compacted. Total history: {len(combined)} hours.")
+        _LOGGER.info(f"Cache compacted. Total history: {len(combined)} hours.")
     except OSError as e:
-        app.log(f"Failed to save cache: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save cache: {e}")
 
     return combined
 
@@ -219,7 +223,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load cache: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load cache: {e}")
 
     # 2. Fetch only the last 2 days from HA — enough to cover `hours`
     #    plus a small overlap buffer for the diff() boundary.
@@ -255,7 +259,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
             write_header = not cache_path.exists() or cache_path.stat().st_size == 0
             new_rows.to_csv(cache_path, mode="a", header=write_header, index=False)
         except OSError as e:
-            app.log(f"Failed to save cache: {e}", level="ERROR")
+            _LOGGER.error(f"Failed to save cache: {e}")
 
     return combined
 
@@ -295,8 +299,93 @@ def split_ev_charging(
 
 
 def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame") -> "pd.DataFrame":
-    """Merge two sub-sensor DataFrames (column 'kwh'); fresh HA data wins on conflicts."""
-    return _merge_frames(df_winner, df_loser, "kwh")
+    """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
+
+    Fresh HA data wins on kwh conflicts.  For the 'program' column the rule is
+    "keep existing non-empty label if the winner has none" — program history is
+    only fetched for the recent window so older cached labels must be preserved.
+    """
+    import pandas as pd
+
+    combined = _merge_frames(df_winner, df_loser, "kwh")
+
+    # Preserve program labels: if the winner had an empty/NaN program for a row
+    # that the loser already labelled, restore the loser's label.
+    if "program" in df_winner.columns or "program" in df_loser.columns:
+        # Re-merge only the program column from both sides.
+        # Build a loser index: timestamp → program (non-empty only)
+        loser_prog = df_loser.copy() if "program" in df_loser.columns else pd.DataFrame(columns=["timestamp", "program"])
+        loser_prog = loser_prog[loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        loser_prog = loser_prog.set_index("timestamp")["program"]
+
+        winner_prog = df_winner.copy() if "program" in df_winner.columns else pd.DataFrame(columns=["timestamp", "program"])
+        winner_prog = winner_prog[winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        winner_prog = winner_prog.set_index("timestamp")["program"]
+
+        # Winner takes precedence; loser fills gaps
+        merged_prog = winner_prog.combine_first(loser_prog)
+        combined["program"] = combined["timestamp"].map(merged_prog).fillna("")
+
+    return combined
+
+
+def _resolve_programs_for_series(
+    timestamps: "pd.Series",
+    prog_df: "pd.DataFrame",
+) -> "pd.Series":
+    """Assign a program label to each hourly timestamp using last-value-carry-forward.
+
+    Args:
+        timestamps: Series of naive hourly timestamps (the energy CSV rows).
+        prog_df:    DataFrame with columns ``timestamp`` (naive) and ``program``
+                    (str), representing program state-change events.
+
+    Returns:
+        Series of str (same length / index as *timestamps*).  Rows with no
+        preceding program event get an empty string.
+
+    The primary strategy is backward LVFC: each row gets the last program state
+    at or before its timestamp.  A forward-lookup fallback (tolerance: 1 h) is
+    applied when the backward result is empty or the idle sentinel
+    ``"no_program"``: this handles the common case where a user starts the
+    machine at (say) 12:05, the hourly row is stamped 12:00, and the backward
+    lookup still sees the previous ``"no_program"`` state — the forward pass
+    finds the real ``"eco"`` event at 12:05 and substitutes it.  The forward
+    pass is *not* applied when backward already has a real program label, so
+    the tail of a running cycle is never overwritten by the next cycle's program.
+    """
+    import pandas as pd
+
+    if prog_df.empty:
+        return pd.Series("", index=timestamps.index)
+
+    # Ensure timestamp dtype is datetime64 — an empty Series created via
+    # pd.DataFrame(columns=[...]) has object dtype, which causes merge_asof
+    # to raise "Incompatible merge dtype" in pandas 3.x.
+    left = pd.DataFrame({"timestamp": pd.to_datetime(timestamps)}).sort_values("timestamp").reset_index(drop=True)
+    right = prog_df[["timestamp", "program"]].sort_values("timestamp")
+
+    # Primary: backward LVFC
+    merged_back = pd.merge_asof(left, right, on="timestamp", direction="backward")
+    prog_back = merged_back["program"].fillna("").astype(str)
+
+    # Fallback: forward lookup within 2 h (catches late-firing program sensors).
+    # 1 h was insufficient when the sensor fires just into the following hour,
+    # e.g. cycle starts at 21:00, program fires at 22:05 → gap is 65 min.
+    merged_fwd = pd.merge_asof(
+        left, right, on="timestamp", direction="forward",
+        tolerance=pd.Timedelta("2h"),
+    )
+    prog_fwd = merged_fwd["program"].fillna("").astype(str)
+
+    # Substitute forward result only when backward gives "no signal"
+    idle = prog_back.isin(["", "no_program"])
+    has_real_fwd = ~prog_fwd.isin(["", "no_program"])
+    result = prog_back.copy()
+    result[idle & has_real_fwd] = prog_fwd[idle & has_real_fwd]
+
+    result.index = timestamps.index
+    return result
 
 
 def fetch_sub_sensor_history(
@@ -304,6 +393,7 @@ def fetch_sub_sensor_history(
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
+    program_entity_id: str | None = None,
 ) -> pd.DataFrame:
     """Pull sub-sensor kWh history, merging local CSV cache with fresh HA data.
 
@@ -313,6 +403,12 @@ def fetch_sub_sensor_history(
       appliance being off and must appear as 0 so lag features return 0 (not NaN)
       during idle hours.
     - Suitable for any cumulative kWh meter (heat pump, dishwasher, etc.)
+
+    When *program_entity_id* is provided the returned DataFrame (and the written
+    CSV) will contain a ``program`` column: the program label active at each
+    hourly timestamp, resolved via last-value-carry-forward from the program
+    sensor's state-change history.  Existing non-empty labels in the cache are
+    preserved even when the fresh window does not cover them.
     """
     import pandas as pd
 
@@ -325,12 +421,12 @@ def fetch_sub_sensor_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load sub-sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for sub-sensor {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for sub-sensor {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
@@ -341,14 +437,20 @@ def fetch_sub_sensor_history(
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
-        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+        # Use explicit dtypes so downstream merge_asof / pd.concat don't see
+        # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
+        df_new = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[us]"), "kwh": pd.Series(dtype="float64")})
+
+    if program_entity_id:
+        prog_df = fetch_program_sensor_history(app, program_entity_id, days=30, timezone=timezone)
+        df_new["program"] = _resolve_programs_for_series(df_new["timestamp"], prog_df)
 
     combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save sub-sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -358,6 +460,7 @@ def fetch_recent_sub_sensor(
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
+    program_entity_id: str | None = None,
 ) -> pd.DataFrame:
     """Lightweight update for sub-sensor hourly refreshes.
 
@@ -368,6 +471,10 @@ def fetch_recent_sub_sensor(
     Unlike fetch_energy_history (raises ValueError when both sources empty),
     this function returns an empty DataFrame silently so a missing sub-sensor
     does not abort the hourly update for the main sensor.
+
+    When *program_entity_id* is provided the new rows written to the CSV will
+    include a ``program`` label resolved from the last 2 days of program sensor
+    history.  Existing cached labels for older rows are preserved.
     """
     import pandas as pd
 
@@ -380,12 +487,12 @@ def fetch_recent_sub_sensor(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load sub-sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load sub-sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for sub-sensor {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for sub-sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
@@ -396,14 +503,20 @@ def fetch_recent_sub_sensor(
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
     else:
-        df_new = pd.DataFrame(columns=["timestamp", "kwh"])
+        # Use explicit dtypes so downstream merge_asof / pd.concat don't see
+        # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
+        df_new = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[us]"), "kwh": pd.Series(dtype="float64")})
+
+    if program_entity_id:
+        prog_df = fetch_program_sensor_history(app, program_entity_id, days=2, timezone=timezone)
+        df_new["program"] = _resolve_programs_for_series(df_new["timestamp"], prog_df)
 
     combined = _merge_sub_sensor_frames(df_winner=df_new, df_loser=df_cache)
 
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save sub-sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save sub-sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -427,12 +540,12 @@ def fetch_generic_sensor_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load generic sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for sensor {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for sensor {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
@@ -449,7 +562,7 @@ def fetch_generic_sensor_history(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save generic sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -473,12 +586,12 @@ def fetch_recent_generic_sensor(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load generic sensor cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load generic sensor cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for sensor {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
@@ -495,7 +608,7 @@ def fetch_recent_generic_sensor(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save generic sensor cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save generic sensor cache {cache_path.name}: {e}")
 
     return combined
 
@@ -518,12 +631,12 @@ def fetch_climate_history(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load climate cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone, include_attributes=True)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No history found for climate {entity_id} — skipping.", level="WARNING")
+        _LOGGER.warning(f"No history found for climate {entity_id} — skipping.")
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
@@ -554,7 +667,7 @@ def fetch_climate_history(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save climate cache {cache_path.name}: {e}")
 
     return combined
 
@@ -577,12 +690,12 @@ def fetch_recent_climate(
                 ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
             df_cache["timestamp"] = ts
         except (OSError, pd.errors.ParserError, ValueError) as e:
-            app.log(f"Failed to load climate cache {cache_path.name}: {e}", level="WARNING")
+            _LOGGER.warning(f"Failed to load climate cache {cache_path.name}: {e}")
 
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone, include_attributes=True)
 
     if raw_ha.empty and df_cache.empty:
-        app.log(f"No recent data for climate {entity_id}.", level="WARNING")
+        _LOGGER.warning(f"No recent data for climate {entity_id}.")
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
@@ -608,7 +721,7 @@ def fetch_recent_climate(
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
-        app.log(f"Failed to save climate cache {cache_path.name}: {e}", level="ERROR")
+        _LOGGER.error(f"Failed to save climate cache {cache_path.name}: {e}")
 
     return combined
 
@@ -637,7 +750,7 @@ def fetch_boolean_entity_history(
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:  # noqa: BLE001
-        app.log(f"get_history failed for away entity {entity_id}: {exc}", level="WARNING")
+        _LOGGER.warning(f"get_history failed for away entity {entity_id}: {exc}")
         return pd.DataFrame(columns=["timestamp", "is_away"])
 
     if isinstance(raw, dict):
@@ -659,9 +772,8 @@ def fetch_boolean_entity_history(
             continue
 
     if not events:
-        app.log(
-            f"No usable history for away entity {entity_id} — is_away will be 0.",
-            level="WARNING",
+        _LOGGER.warning(
+            f"No usable history for away entity {entity_id} — is_away will be 0."
         )
         return pd.DataFrame(columns=["timestamp", "is_away"])
 
@@ -718,9 +830,8 @@ def fetch_presence_history(
         try:
             raw = app.get_history(entity_id=entity_id, days=days)
         except Exception as exc:  # noqa: BLE001
-            app.log(
-                f"get_history failed for presence entity {entity_id}: {exc}",
-                level="WARNING",
+            _LOGGER.warning(
+                f"get_history failed for presence entity {entity_id}: {exc}"
             )
             continue
 
@@ -743,9 +854,8 @@ def fetch_presence_history(
                 continue
 
         if not events:
-            app.log(
-                f"No usable history for presence entity {entity_id}.",
-                level="WARNING",
+            _LOGGER.warning(
+                f"No usable history for presence entity {entity_id}."
             )
             continue
 
@@ -764,9 +874,8 @@ def fetch_presence_history(
         all_per_entity[entity_id] = (filled == "home").astype(int)
 
     if not all_per_entity:
-        app.log(
-            f"No usable presence history from {entity_ids} — people_home will be 0.",
-            level="WARNING",
+        _LOGGER.warning(
+            f"No usable presence history from {entity_ids} — people_home will be 0."
         )
         return pd.DataFrame(columns=["timestamp", "people_home"])
 
@@ -795,13 +904,60 @@ def fetch_presence_history(
     })
 
 
+def fetch_program_sensor_history(
+    app: "hass.Hass",
+    entity_id: str,
+    days: int = 30,
+    timezone: str = "Europe/Zurich",
+) -> "pd.DataFrame":
+    """Return state-change history for a string program sensor.
+
+    Columns: timestamp (naive, local tz), program (str, lowercased).
+    States "unavailable"/"unknown"/"" are dropped.
+    Returns empty DataFrame on failure — not cached to CSV.
+    """
+    import pandas as pd
+
+    try:
+        raw = app.get_history(entity_id=entity_id, days=days)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning(f"get_history failed for program sensor {entity_id}: {exc}")
+        return pd.DataFrame(columns=["timestamp", "program"])
+
+    if isinstance(raw, dict):
+        states = raw.get(entity_id, [])
+    elif isinstance(raw, list) and raw:
+        states = raw[0] if isinstance(raw[0], list) else raw
+    else:
+        states = []
+
+    rows = []
+    for state in states:
+        try:
+            s = str(state.get("state", "")).strip().lower()
+            if s in ("unavailable", "unknown", ""):
+                continue
+            ts = pd.to_datetime(state["last_changed"]).tz_convert(timezone)
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            rows.append({"timestamp": ts, "program": s})
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    return (
+        pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        if rows
+        else pd.DataFrame(columns=["timestamp", "program"])
+    )
+
+
 def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:
-        app.log(f"get_history failed for {entity_id}: {exc}", level="ERROR")
+        _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
         return pd.DataFrame()
 
     if isinstance(raw, dict):
@@ -822,7 +978,13 @@ def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = 
                 row.update(attrs)
                 rows.append(row)
             else:
-                val = float(state["state"])
+                raw_state = state["state"]
+                if raw_state.lower() == "on":
+                    val = 1.0
+                elif raw_state.lower() == "off":
+                    val = 0.0
+                else:
+                    val = float(raw_state)
                 rows.append({"timestamp": ts, "value": val})
         except (ValueError, KeyError, TypeError):
             continue

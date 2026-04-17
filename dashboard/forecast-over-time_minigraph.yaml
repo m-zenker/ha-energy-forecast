@@ -1,0 +1,16 @@
+type: custom:mini-graph-card
+name: Energy Forecast vs. Real
+hour24: true
+points_per_hour: 4
+icon: mdi:power-plug
+entities:
+  - entity: sensor.ha_energy_forecast_energy_forecast_today
+    name: Heute
+    show_state: true
+    fill: true
+  - entity: sensor.ha_energy_forecast_energy_forecast_tomorrow
+    name: Morgen
+  - entity: sensor.energy_in_daily
+    name: Actual Today
+    show_graph: false
+    show_state: true

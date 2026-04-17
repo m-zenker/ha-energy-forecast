@@ -89,6 +89,14 @@ energy_forecast:
   # subtracting all controllable sub_energy_sensors from the total.
   # baseline_mode: true
 
+  # Optional: sub_energy_sensors that are part of the base forecast (e.g. heating, DHW).
+  # When baseline_mode is true, these are NOT subtracted from the training target — the
+  # main model predicts them using its thermal/weather/occupancy features.
+  # Only sensors absent from this list (e.g. dishwasher) are subtracted.
+  # baseline_included_sensors:
+  #   - sensor.heat_pump_energy_kwh
+  #   - sensor.dhw_energy_kwh
+
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
   # Must be total_increasing kWh meters (e.g. heat pump, dishwasher monitor).
@@ -96,6 +104,10 @@ energy_forecast:
   # sub_energy_sensors:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
+  # Each item may also be a dict with an optional program_sensor to learn
+  # per-program energy profiles (≥ 2 cycles per program required):
+  #   - entity_id: sensor.dishwasher_energy_kwh
+  #     program_sensor: sensor.dishwasher_selected_program
 
   # Optional: EV charging detection.
   # Hours where gross consumption exceeds ev_charging_threshold_kwh are treated
@@ -151,6 +163,14 @@ energy_forecast:
   # climate_entities:
   #   - climate.living_room
   #   - climate.bedroom
+
+  # climate_room_areas: Optional floor area (m²) per climate entity.
+  #   Used for area-weighted thermal pressure — larger rooms count more.
+  #   Rooms omitted here default to 15 m². Has no effect if climate_entities
+  #   is not configured.
+  # climate_room_areas:
+  #   climate.living_room: 35.5
+  #   climate.bedroom:     18.0
 
   # dhw_buffer_sensor: Entity ID for your DHW (Domestic Hot Water) buffer temperature.
   #                    Used to predict water heating cycles based on heat loss.

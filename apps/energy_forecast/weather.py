@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 from datetime import datetime, date
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("energy_forecast")
 
 # Module-level OAuth token cache.  Avoids a new token request on every hourly
 # forecast update (~24+ per day) and reduces the risk of SRG rate-limiting.
@@ -42,7 +42,7 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
     Returns a DataFrame with columns:
         timestamp (naive, UTC+local via timezone param), temp_c,
         precipitation_mm, sunshine_min, wind_kmh,
-        cloud_cover_pct, direct_radiation_wm2
+        cloud_cover_pct, direct_radiation_wm2, humidity
     """
     import urllib.parse
     tz_encoded = urllib.parse.quote(timezone, safe="")
@@ -51,7 +51,7 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
         f"?latitude={lat}&longitude={lon}"
         f"&start_date={start_date.isoformat()}&end_date={end_date.isoformat()}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
-        ",cloud_cover,direct_radiation"
+        ",cloud_cover,direct_radiation,relative_humidity_2m"
         f"&timezone={tz_encoded}"
     )
     res = requests.get(url, timeout=30)
@@ -70,6 +70,7 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
         # (which would falsely imply a perfectly clear sky).
         "cloud_cover_pct":       h.get("cloud_cover",      [np.nan] * n),
         "direct_radiation_wm2":  h.get("direct_radiation", [np.nan] * n),
+        "humidity":              h.get("relative_humidity_2m", [np.nan] * n),
     })
 
 
@@ -167,8 +168,8 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timez
       - Historical rows (timestamps before the SRG window) from Open-Meteo only,
         providing the 3-day tail needed to anchor temp_rolling_3d.
       - Future rows (SRG timestamps): SRG values for temp_c, precipitation_mm,
-        sunshine_min, wind_kmh; cloud_cover_pct and direct_radiation_wm2 from
-        Open-Meteo (joined by timestamp, NaN where OM has no matching row).
+        sunshine_min, wind_kmh; cloud_cover_pct, direct_radiation_wm2, and
+        humidity from Open-Meteo (joined by timestamp, NaN where OM has no matching row).
 
     If om_df is empty (Open-Meteo call failed), returns srg_df unchanged.
     """
@@ -193,13 +194,13 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timez
     # Historical tail: Open-Meteo rows before the SRG window
     om_hist = om_df[om_df["timestamp"] < srg_start].copy()
 
-    # Cloud/radiation columns to pull from Open-Meteo for future rows.
+    # Cloud/radiation/humidity columns to pull from Open-Meteo for future rows.
     # Guard against API schema drift: only select columns that actually exist.
-    desired_supplement = ["cloud_cover_pct", "direct_radiation_wm2"]
+    desired_supplement = ["cloud_cover_pct", "direct_radiation_wm2", "humidity"]
     available_supplement = [c for c in desired_supplement if c in om_df.columns]
     if not available_supplement:
         _LOGGER.warning(
-            "_supplement_from_open_meteo: Open-Meteo response missing cloud/radiation columns "
+            "_supplement_from_open_meteo: Open-Meteo response missing supplement columns "
             "(%s) — SRG forecast returned without supplement.",
             desired_supplement,
         )
@@ -207,7 +208,7 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timez
     om_supplement_cols = ["timestamp"] + available_supplement
     om_future = om_df[om_df["timestamp"] >= srg_start][om_supplement_cols]
 
-    # Join cloud/radiation onto SRG future rows
+    # Join supplement columns onto SRG future rows
     srg_df = srg_df.merge(om_future, on="timestamp", how="left")
 
     # Stack historical tail above SRG future rows
@@ -227,7 +228,7 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") ->
     url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
-        ",cloud_cover,direct_radiation"
+        ",cloud_cover,direct_radiation,relative_humidity_2m"
         "&past_days=3"
         f"&timezone={tz_encoded}"
     )
@@ -249,6 +250,7 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") ->
             # interpreted as "perfectly clear sky" / "zero radiation".
             "cloud_cover_pct":      h.get("cloud_cover",      [np.nan] * n),
             "direct_radiation_wm2": h.get("direct_radiation", [np.nan] * n),
+            "humidity":             h.get("relative_humidity_2m", [np.nan] * n),
         })
     except (requests.RequestException, KeyError, ValueError):
         return pd.DataFrame()
