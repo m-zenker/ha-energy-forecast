@@ -10,6 +10,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-4] — 2026-04-17
+
+### Fixed
+- **Regime Clustering NaN crash** (`clustering.py`) — `DailyProfileClusterer.fit()` and
+  `RegimePredictor.fit()` now fill missing weights with the mean weight (instead of 0) when
+  reindexing `sample_weight` to the pivoted date index. A final safety guard drops the weight
+  argument entirely if the resulting array is still all-zero or contains NaN, preventing a
+  `sample_weight.sum()==0` division-by-zero inside KMeans's initialisation routine. Regression
+  test added.
+
+---
+
+## [0.11.0-alpha-3] — 2026-04-17
+
+### Changed
+- Regime Clustering weights now synchronised with training data decay weights (same halflife).
+
+---
+
+## [0.11.0-alpha-2] — 2026-04-17
+
+See `0.11.0-alpha-1` notes below; alpha-2 added README documentation.
+
+---
+
 ## [0.11.0-alpha-1] — 2026-04-17
 
 v0.11.0 introduces Daily Regime Clustering as an optional module. This feature explicitly
