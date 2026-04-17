@@ -642,6 +642,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -679,6 +682,9 @@ class EnergyForecastModel:
                 future_hours,
                 outdoor_temp_series,
                 tau_hours=self._tau_hours,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
             )
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
@@ -774,6 +780,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -784,7 +793,8 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
+            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -803,6 +813,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -817,7 +830,8 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
+            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -844,6 +858,9 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,
         climate_recent: "dict[str, pd.DataFrame] | None" = None,
         dhw_recent: "pd.DataFrame | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> "pd.DataFrame":
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
@@ -863,6 +880,9 @@ class EnergyForecastModel:
             people_home_series=people_home_series,
             climate_recent=climate_recent,
             dhw_recent=dhw_recent,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
         return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 
@@ -878,6 +898,9 @@ class EnergyForecastModel:
         dhw_recent: "pd.DataFrame | None" = None,
         room_areas: "dict[str, float] | None" = None,
         n: int = 5,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
 
@@ -901,6 +924,9 @@ class EnergyForecastModel:
             climate_recent=climate_recent,
             dhw_recent=dhw_recent,
             room_areas=room_areas,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -1957,6 +1983,9 @@ def _project_indoor_temps(
     future_timestamps: "pd.DatetimeIndex",
     outdoor_temp_series: "pd.Series",
     tau_hours: float | None = None,
+    heating_active_series: "pd.Series | None" = None,
+    setpoint_on: "float | None" = None,
+    setpoint_off: "float | None" = None,
 ) -> "dict[str, pd.Series]":
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
@@ -2005,10 +2034,20 @@ def _project_indoor_temps(
 
         # Build a projected climate DataFrame matching what _engineer_features expects
         setpoint_val = float(latest["setpoint"])
+        if (
+            heating_active_series is not None
+            and setpoint_on is not None
+            and setpoint_off is not None
+        ):
+            ha_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values
+            setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
+        else:
+            setpoint_arr = np.full(len(future_timestamps), setpoint_val)
+
         projected_df = pd.DataFrame({
             "timestamp": future_timestamps,
             "current_temp": t_in_arr,
-            "setpoint": setpoint_val,  # constant — we have no future setpoint schedule
+            "setpoint": setpoint_arr,
         })
         result[eid] = projected_df
 

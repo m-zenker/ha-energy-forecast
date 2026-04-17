@@ -237,6 +237,10 @@ class EnergyForecast(hass.Hass):
         self._climate_room_areas: dict[str, float] = self._parse_room_areas(
             self.args.get("climate_room_areas") or {}
         )
+        self._heating_temp_on: float = float(self.args.get("heating_temp_on", 14.0))
+        self._heating_temp_off: float = float(self.args.get("heating_temp_off", 18.0))
+        self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
+        self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
@@ -1125,6 +1129,18 @@ class EnergyForecast(hass.Hass):
                     "Heating active %s recent fetch failed: %s", self._heating_active_entity, exc
                 )
 
+        # ── Heating active projection (setpoint hysteresis) ──────────────────
+        heating_active_series = None
+        heating_setpoint_on   = None
+        heating_setpoint_off  = None
+        if self._heating_active_entity and climate_recent:
+            try:
+                heating_active_series, heating_setpoint_on, heating_setpoint_off = (
+                    self._build_heating_active_projection(forecast_df, climate_recent)
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Heating active projection failed: %s", exc)
+
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df    = forecast_df
         self._cached_live_temp      = live_temp
@@ -1143,6 +1159,9 @@ class EnergyForecast(hass.Hass):
             climate_recent=climate_recent or None,
             dhw_recent=dhw_recent if not dhw_recent.empty else None,
             room_areas=self._climate_room_areas or None,
+            heating_active_series=heating_active_series,
+            setpoint_on=heating_setpoint_on,
+            setpoint_off=heating_setpoint_off,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
@@ -1154,6 +1173,9 @@ class EnergyForecast(hass.Hass):
             climate_recent=climate_recent or None,
             dhw_recent=dhw_recent if not dhw_recent.empty else None,
             room_areas=self._climate_room_areas or None,
+            heating_active_series=heating_active_series,
+            setpoint_on=heating_setpoint_on,
+            setpoint_off=heating_setpoint_off,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
@@ -1357,6 +1379,67 @@ class EnergyForecast(hass.Hass):
         )
 
         return pd.Series(n_home, index=future_hours, dtype=int)
+
+    def _build_heating_active_projection(
+        self,
+        forecast_df: Any,
+        climate_recent: "dict[str, Any]",
+    ) -> "tuple[Any, float, float]":
+        """Return (heating_active_series, setpoint_on, setpoint_off) for 48-hour window.
+
+        heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
+        setpoint_on/off: live values derived from climate entities when available, else config defaults.
+        Uses outdoor temp hysteresis to project future heating state.
+        Only call when _heating_active_entity is configured.
+        """
+        import pandas as pd
+        import numpy as np
+
+        now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
+
+        active = self.get_state(self._heating_active_entity) in ("on", "1", "true", "True")
+
+        # Derive setpoint_on / setpoint_off from live climate entity data when available
+        live_setpoints = []
+        for eid, cdf in (climate_recent or {}).items():
+            if cdf is not None and not cdf.empty and "setpoint" in cdf.columns:
+                latest_sp = cdf.sort_values("timestamp").iloc[-1]["setpoint"]
+                try:
+                    live_setpoints.append(float(latest_sp))
+                except (TypeError, ValueError):
+                    pass
+
+        live_setpoint = float(np.mean(live_setpoints)) if live_setpoints else None
+
+        if active:
+            s_on = live_setpoint if live_setpoint is not None else self._heating_setpoint_on
+            s_off = self._heating_setpoint_off
+        else:
+            s_off = live_setpoint if live_setpoint is not None else self._heating_setpoint_off
+            s_on = self._heating_setpoint_on
+
+        temp_on = self._heating_temp_on
+        temp_off = self._heating_temp_off
+
+        # Align outdoor forecast temps to future hours
+        forecast_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
+        outdoor_temps = (
+            forecast_indexed.reindex(future_hours, method="nearest").fillna(method="ffill").fillna(method="bfill").values
+        )
+
+        # Hysteresis projection
+        state = int(active)
+        states: list[int] = []
+        for temp in outdoor_temps:
+            if temp < temp_on:
+                state = 1
+            elif temp > temp_off:
+                state = 0
+            states.append(state)
+
+        heating_active_series = pd.Series(states, index=future_hours, dtype=int)
+        return heating_active_series, float(s_on), float(s_off)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""
