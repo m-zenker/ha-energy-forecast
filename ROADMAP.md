@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.11.0-alpha-1** — 2026-04-17, main. 474 tests.
+Current: **v0.11.0-alpha-6** — 2026-04-17, dev. 492 tests.
 
 ---
 
