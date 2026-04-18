@@ -429,6 +429,9 @@ See [[0.9.1-alpha]] and [[0.9.0-alpha]] for detailed per-change descriptions.
 
 ## [0.6.0] — 2026-03-23
 
+### Breaking Changes
+- **MQTT Discovery changes all sensor entity IDs.** Enabling `mqtt_discovery: true` creates entities under the device "HA Energy Forecast" with IDs in the form `sensor.ha_energy_forecast_<unique_id>` (e.g. `sensor.ha_energy_forecast_energy_forecast_today`). The previous `set_state()` IDs (`sensor.energy_forecast_*`) are removed by `_cleanup_legacy_states()` on startup. **Update all automations, dashboards, and template sensors before enabling MQTT Discovery.**
+
 ### Fixed
 - **Doubled "Energy Forecast" prefix in MQTT Discovery sensor names** (`energy_forecast.py`): HA
   prepends the device name ("HA Energy Forecast") to the sensor `name` field, so names like
