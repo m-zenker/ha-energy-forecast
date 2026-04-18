@@ -1174,14 +1174,25 @@ class EnergyForecastModel:
     ) -> "float | None":
         """Estimate building thermal time constant τ (hours) from passive-cooling windows.
 
-        Fits log-linear OLS on `ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ` for each
-        window where the heating system was confirmed off for ≥ 2 consecutive hours.
-        Returns median τ across valid windows, or None if fewer than 3 windows qualify.
+        Fits log-linear OLS on ``ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ`` for each
+        contiguous sub-sequence where indoor is warmer than outdoor and cooling.
+
+        Windows are scored rather than hard-filtered.  Each candidate receives a
+        composite quality score (0–1):
+
+        * ``r²``       — goodness of OLS log-linear fit (primary signal quality indicator;
+                         candidates with r² ≤ 0 are dropped as physics failures)
+        * ``ΔT score`` — initial indoor−outdoor gap normalised to 5 °C (SNR proxy)
+        * ``n score``  — length bonus, capped at 6 points
+        * ``solar``    — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
+        * ``hour``     — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.3 daytime
+
+        The top 50 % of candidates by quality (minimum 1) are used to compute the
+        median τ, which is then EMA-smoothed against the stored value.
         """
         import pandas as pd
         import numpy as np
 
-        # Average indoor temperature across all climate entities
         indoor_parts = []
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
@@ -1195,13 +1206,10 @@ class EnergyForecastModel:
 
         T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
 
-        # Outdoor temperature + radiation from weather_df
         outdoor = weather_df[["timestamp", "temp_c"]].copy()
         outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
         T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
 
-        # Solar radiation — used to mask windows contaminated by solar gain.
-        # Gracefully absent in legacy weather_df without this column.
         has_radiation = "direct_radiation_wm2" in weather_df.columns
         if has_radiation:
             rad = weather_df[["timestamp", "direct_radiation_wm2"]].copy()
@@ -1210,7 +1218,6 @@ class EnergyForecastModel:
         else:
             rad_series = None
 
-        # Heating active status (treat any value > 0.5 as "on")
         active = heating_active_df[["timestamp", "heating_active"]].copy()
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
@@ -1230,35 +1237,19 @@ class EnergyForecastModel:
         if combined.empty:
             return None
 
-        # Label contiguous off-blocks
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
-        tau_estimates: list[float] = []
+        candidates: list[tuple[float, float]] = []  # (tau, quality)
+
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
-
-            # §4 safeguard: exclude windows touching daytime hours (09:00–15:00).
-            # Heating behaviour and solar gain during these hours corrupt the
-            # passive-cooling signal even when the heating system is nominally off.
-            if group.index.hour.isin(range(9, 16)).any():
-                continue
-
-            # §4 safeguard: reject windows where solar radiation exceeded 150 W/m².
-            if "direct_radiation_wm2" in group.columns:
-                if group["direct_radiation_wm2"].max() > 150:
-                    continue
 
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
 
-            # Scan ALL maximal contiguous sub-sequences where indoor is both
-            # warmer than outdoor (delta > 0) and cooling (diff < 0).
-            # Prefix-only trimming missed evening cooling windows when heating
-            # turns off in the morning — solar gain invalidates the early hours
-            # but the valuable signal is in the tail (no sun, outdoor temp sinking).
             valid = delta > 0
             declining = np.concatenate([[False], np.diff(delta) < 0])
             mask = valid & declining
@@ -1273,34 +1264,84 @@ class EnergyForecastModel:
             for s, e in zip(starts, ends):
                 if e - s < 2:
                     continue
+
                 d = delta[s:e]
                 t = np.arange(len(d), dtype=float)
-                slope, _ = np.polyfit(t, np.log(d), 1)
-                if slope >= 0:  # safety net for noisy data
+                log_d = np.log(d)
+                slope, intercept = np.polyfit(t, log_d, 1)
+
+                if slope >= 0:
                     continue
                 tau = -1.0 / slope
-                if 0.5 <= tau <= 200:  # physics sanity guard
-                    tau_estimates.append(tau)
+                if not (0.5 <= tau <= 200.0):
+                    continue
 
-        if len(tau_estimates) < 3:
-            _LOGGER.info(
-                "τ calibration: only %d valid passive-cooling windows found (need ≥3) — skipping.",
-                len(tau_estimates),
-            )
+                # R² of the log-linear fit — windows where the fit explains no
+                # variance (flat decay profile, noisy sensor) are discarded.
+                y_hat = slope * t + intercept
+                ss_res = float(np.sum((log_d - y_hat) ** 2))
+                ss_tot = float(np.sum((log_d - log_d.mean()) ** 2))
+                r2 = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 1e-9 else 0.0
+                if r2 <= 0.0:
+                    continue
+
+                # ΔT SNR: normalised to 5 °C ceiling (larger gap = cleaner signal)
+                delta_t_score = min(d[0] / 5.0, 1.0)
+
+                # Length bonus — capped at 6 points
+                n_score = min(len(d) / 6.0, 1.0)
+
+                # Continuous solar penalty — no hard threshold
+                if "direct_radiation_wm2" in group.columns:
+                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e].max())
+                else:
+                    sub_max_rad = 0.0
+                solar_score = float(np.exp(-sub_max_rad / 400.0))
+
+                # Hour-of-day penalty applied at sub-sequence level
+                sub_hours = np.asarray(group.index[s:e].hour)
+                hour_scores = np.where(
+                    (sub_hours >= 9) & (sub_hours < 16),
+                    0.3,
+                    np.where(
+                        ((sub_hours >= 6) & (sub_hours < 9))
+                        | ((sub_hours >= 16) & (sub_hours < 22)),
+                        0.7,
+                        1.0,
+                    ),
+                )
+                hour_score = float(hour_scores.min())
+
+                quality = r2 * delta_t_score * n_score * solar_score * hour_score
+                candidates.append((tau, quality))
+
+        if not candidates:
+            _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
+
+        # Use top 50 % by quality (minimum 1 window)
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        n_select = max(1, len(candidates) // 2)
+        selected = candidates[:n_select]
+        tau_estimates = [c[0] for c in selected]
+
+        _LOGGER.debug(
+            "τ calibration: %d candidates, using top %d "
+            "(quality %.2f–%.2f, τ range %.1f–%.1f h)",
+            len(candidates), n_select,
+            selected[-1][1], selected[0][1],
+            min(tau_estimates), max(tau_estimates),
+        )
 
         tau_median = float(np.median(tau_estimates))
 
-        # §4 safeguard: EMA smoothing — if the new estimate differs from the
-        # stored τ by more than 50%, blend rather than replace outright.
-        # Prevents a single anomalous training batch from causing a large jump.
         old_tau = self._tau_hours
         if old_tau is not None and old_tau > 0:
             change_frac = abs(tau_median - old_tau) / old_tau
             if change_frac > 0.5:
                 tau_result = 0.8 * old_tau + 0.2 * tau_median
                 _LOGGER.info(
-                    "τ EMA blend: %.1f h → %.1f h (raw new estimate %.1f h, Δ=%.0f%%)",
+                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
                     old_tau, tau_result, tau_median, change_frac * 100,
                 )
             else:
@@ -1309,8 +1350,8 @@ class EnergyForecastModel:
             tau_result = tau_median
 
         _LOGGER.info(
-            "Building τ estimated at %.1f h from %d passive-cooling windows.",
-            tau_result, len(tau_estimates),
+            "Building τ estimated at %.1f h from %d passive-cooling windows (%d candidates scored).",
+            tau_result, len(tau_estimates), len(candidates),
         )
         return tau_result
 

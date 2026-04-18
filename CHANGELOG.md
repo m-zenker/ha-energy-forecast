@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-9] — 2026-04-18
+
+### Changed
+- **Quality-scored τ calibration windows** (`model.py`) — `_calibrate_tau()` no longer hard-filters daytime (09:00–15:00) or high-solar (>150 W/m²) windows. All sub-sequences passing physics sanity (τ ∈ [0.5, 200], ≥2 points, declining ΔT, r²>0) become candidates and receive a composite quality score: r² × ΔT_SNR × length_score × solar_score × hour_score. `solar_score = exp(−max_radiation/400)` provides a continuous penalty; `hour_score` is 1.0 at night (22–06), 0.7 at shoulder (06–09, 16–22), and 0.3 during daytime (09–16). The top 50 % of candidates by quality (minimum 1) are used for the unweighted median τ. Minimum qualifying window count lowered from 3 → 1 — EMA smoothing already guards against single-batch jumps. Closes #59; 8 updated/new tests in `TestTauCalibrationSafeguards`, 502 passing.
+
+---
+
 ## [0.11.0-alpha-8] — 2026-04-17
 
 ### Fixed

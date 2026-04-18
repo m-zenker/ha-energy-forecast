@@ -87,18 +87,6 @@ night_setback_end: 6
 
 ---
 
-### #59 — Relaxed Thermal Calibration Constraints
-
-**Signal:** The current τ-calibration is conservative to avoid solar/daytime corruption. Relaxing slightly may allow faster calibration in spring/autumn.
-
-**Proposed changes:**
-- Raise max solar radiation mask from 150 → 250 W/m².
-- Allow 2 qualifying windows (down from 3) when historical variance is low.
-
-**Effort:** ~30 min. **Impact:** MEDIUM — faster τ convergence.
-
----
-
 ### #10 — School Holiday Feature
 
 Swiss Schulferien dates are canton-specific but stable year-to-year. During school holidays daytime consumption rises. Implement a static lookup table per canton via `apps.yaml`; add `is_school_holiday` to `_FEATURES_BASE`.
@@ -170,7 +158,7 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
-| 59 | Relaxed τ calibration | medium | 30 min | backlog |
+| 62 | Adaptive Regime Selection (Auto-K) | medium | 2 h | backlog |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | done (partial — personal IDs replaced) |
 | 16 | HACS support | distribution | 1 h | long-term |
@@ -255,3 +243,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 60 | Calibrated default thermal time constant (`DEFAULT_TAU = 12 h`) | v0.10.0 |
 | 61 | Daily Regime Clustering (`regime_kwh`) | v0.11.0 |
 | 63 | Fix RegimePredictor overfitting (OOB score + constraints + occupancy features) | v0.11.0-alpha-8 |
+| 59 | Relaxed τ calibration — quality-scored windows replace hard daytime/solar filters | v0.11.0-alpha-9 |

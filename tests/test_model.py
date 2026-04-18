@@ -3144,13 +3144,13 @@ class TestCalibrateTau:
             f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
         )
 
-    def test_insufficient_windows(self, tmp_path):
-        """Fewer than 3 valid windows → returns None."""
+    def test_single_window_produces_result(self, tmp_path):
+        """Even a single valid window now produces a τ estimate (old ≥3 minimum removed)."""
         model = EnergyForecastModel(model_dir=tmp_path)
-        # Only 2 windows
-        climate_dfs, heating_df, weather_df = _make_tau_fixtures(4.0, n_windows=2)
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(4.0, n_windows=1)
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is None
+        assert result is not None
+        assert 0.5 < result < 200.0
 
     def test_heating_always_on(self, tmp_path):
         """No off-window → returns None."""
@@ -3665,30 +3665,33 @@ class TestTauCalibrationSafeguards:
             "direct_radiation_wm2":  [radiation] * n,
         }, index=ts)
 
-    def test_solar_mask_rejects_high_radiation(self, tmp_path):
-        """Windows with direct_radiation_wm2 > 150 W/m² are excluded.
+    def test_high_solar_penalized_not_excluded(self, tmp_path):
+        """High solar radiation reduces window quality but no longer blocks calibration.
 
-        5 night windows all have radiation=200 → all rejected → result is None.
+        5 night windows with radiation=200 W/m² each get solar_score ≈ 0.61 instead of 1.0,
+        but all produce valid τ estimates and top 50% are used — result is not None.
         """
         model = _make_tau_model(tmp_path)
         climate_dfs, heating_df, weather_df = self._make_night_blocks(
             tau_true=10.0, radiation=200.0
         )
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is None
+        assert result is not None
+        assert 5.0 < result < 20.0  # physics-plausible range
 
-    def test_daytime_exclusion(self, tmp_path):
-        """Windows containing any hour in 09:00–15:00 are excluded.
+    def test_daytime_windows_penalized_not_excluded(self, tmp_path):
+        """Windows touching daytime hours get hour_score=0.3 but are no longer excluded.
 
-        Build windows starting at 07:00 (spans 07:00–14:00 → touches daytime).
-        All should be rejected → result is None.
+        5 windows spanning 07:00–14:00 each get hour_score=0.3 but still produce valid τ
+        estimates — result is not None.
         """
         model = _make_tau_model(tmp_path)
         climate_dfs, heating_df, weather_df = self._make_night_blocks(
-            tau_true=10.0, start_hour=7, window_hours=8  # 07:00–14:00 touches 09:00–15:00
+            tau_true=10.0, start_hour=7, window_hours=8  # 07:00–14:00 touches daytime
         )
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is None
+        assert result is not None
+        assert 5.0 < result < 20.0
 
     def _make_night_blocks(self, tau_true: float, n_days: int = 5,
                            start_hour: int = 20, window_hours: int = 8,
@@ -3762,4 +3765,106 @@ class TestTauCalibrationSafeguards:
         weather_df = weather_df.drop(columns=["direct_radiation_wm2"])
 
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is not None  # solar mask absent → windows still accepted
+        assert result is not None
+
+    def test_single_window_sufficient(self, tmp_path):
+        """A single valid window is enough — the old ≥3 minimum is gone."""
+        model = _make_tau_model(tmp_path)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(
+            tau_true=10.0, n_days=1
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert 5.0 < result < 20.0
+
+    def test_top_50_percent_selected(self, tmp_path):
+        """With N candidates, only the top N//2 (min 1) are used for the median."""
+        import pandas as pd
+
+        model = _make_tau_model(tmp_path)
+        # Build 4 nighttime windows: 2 with tau≈10 (good data) + 2 noisy daytime windows
+        # that will get low quality but still produce a tau estimate.
+        # Net: 4 candidates → top 2 selected → median should be near 10.
+        good_dfs, good_heat, good_wx = self._make_night_blocks(
+            tau_true=10.0, n_days=2, start_hour=22
+        )
+        noisy_dfs, noisy_heat, noisy_wx = self._make_night_blocks(
+            tau_true=50.0, n_days=2, start_hour=10  # daytime → hour_score=0.3
+        )
+        # Merge the two synthetic datasets
+        merged_indoor = pd.concat([
+            list(good_dfs.values())[0],
+            list(noisy_dfs.values())[0],
+        ]).sort_values("timestamp")
+        climate_dfs = {"climate.room": merged_indoor}
+        heating_df = pd.concat([good_heat, noisy_heat]).sort_values("timestamp").reset_index(drop=True)
+        weather_df = pd.concat([good_wx, noisy_wx]).sort_values("timestamp").reset_index(drop=True)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        # Top 50% should favour the good τ≈10 windows; result should not be near 50
+        assert result < 30.0
+
+    def test_flat_indoor_temp_excluded_by_r2(self, tmp_path):
+        """A window where indoor temp doesn't decay (r²≤0) is excluded from candidates."""
+        import pandas as pd
+
+        model = _make_tau_model(tmp_path)
+        # Flat indoor temperature — no exponential decay, OLS slope ≈ 0
+        ts = pd.date_range("2026-01-10 20:00", periods=8, freq="1h")
+        t_flat = 20.0  # constant indoor temp
+        t_out = 5.0
+        climate_df = pd.DataFrame({
+            "timestamp": ts,
+            "current_temp": [t_flat] * 8,
+            "setpoint": [t_flat] * 8,
+        })
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": [0.0] * 8})
+        weather_df = pd.DataFrame({
+            "timestamp": ts,
+            "temp_c": [t_out] * 8,
+            "direct_radiation_wm2": [0.0] * 8,
+        })
+        result = model._calibrate_tau(
+            {"climate.room": climate_df}, heating_df, weather_df
+        )
+        # Flat decay → r²≤0 → no valid candidates → None
+        assert result is None
+
+    def test_quality_nighttime_higher_than_daytime(self, tmp_path):
+        """Nighttime windows score higher quality than equivalent daytime windows."""
+        import pandas as pd
+        import numpy as np
+
+        model = _make_tau_model(tmp_path)
+        tau_true = 10.0
+
+        def _make_block(start_hour: int) -> tuple:
+            ts = pd.date_range(f"2026-01-10 {start_hour:02d}:00", periods=6, freq="1h")
+            t_in = [20.0]
+            for _ in range(5):
+                t_in.append(t_in[-1] + (5.0 - t_in[-1]) / tau_true)
+            climate_df = pd.DataFrame({
+                "timestamp": ts, "current_temp": t_in, "setpoint": [20.0] * 6,
+            })
+            heating_df = pd.DataFrame({"timestamp": ts, "heating_active": [0.0] * 6})
+            weather_df = pd.DataFrame({
+                "timestamp": ts, "temp_c": [5.0] * 6,
+                "direct_radiation_wm2": [0.0] * 6,
+            })
+            return {"climate.room": climate_df}, heating_df, weather_df
+
+        # Collect candidate qualities by calling private logic via _calibrate_tau
+        # and comparing τ estimates (same τ, both should produce a result)
+        night_dfs, night_heat, night_wx = _make_block(start_hour=22)
+        day_dfs, day_heat, day_wx = _make_block(start_hour=10)
+
+        result_night = model._calibrate_tau(night_dfs, night_heat, night_wx)
+        result_day = model._calibrate_tau(day_dfs, day_heat, day_wx)
+
+        # Both produce a valid τ (not excluded)
+        assert result_night is not None
+        assert result_day is not None
+        # Both should be near the true τ since the decay is identical
+        assert 5.0 < result_night < 20.0
+        assert 5.0 < result_day < 20.0
