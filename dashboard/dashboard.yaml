@@ -1,3 +1,14 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# HA Energy Forecast — Example Dashboard
+#
+# BEFORE IMPORTING: replace every entity ID marked with  # ← EDIT
+# with the actual entity ID from your Home Assistant instance.
+#
+# Required custom cards (install via HACS → Frontend):
+#   - custom:mushroom-entity-card  (lovelace-mushroom)
+#   - custom:mini-graph-card
+# ──────────────────────────────────────────────────────────────────────────────
+
 views:
   - type: masonry
     path: energy-prediction
@@ -65,7 +76,7 @@ views:
             fill: true
           - entity: sensor.ha_energy_forecast_energy_forecast_tomorrow
             name: Tomorrow
-          - entity: sensor.energy_in_daily
+          - entity: sensor.your_daily_energy_import_kwh  # ← EDIT: your daily grid import sensor
             name: Actual Today
             show_graph: false
             show_state: true
@@ -91,23 +102,26 @@ views:
         tap_action:
           action: more-info
       - type: gauge
-        entity: sensor.skoda_enyaq_battery_percentage
+        entity: sensor.your_ev_battery_percentage  # ← EDIT: your EV battery sensor (or remove card)
         needle: false
         severity:
           green: 40
           yellow: 20
           red: 0
   - type: masonry
-    path: warmepumpe
-    title: Wärmepumpe
+    path: heat-pump
+    title: Heat Pump
     icon: m3of:heat-pump-balance
     show_icon_and_title: true
     cards:
+      # ← EDIT: replace the entities below with your heat pump sensor entity IDs.
+      # This section is an example for Kermi heat pumps via kermi-ha-bridge.
+      # Remove or adapt for your hardware.
       - type: entities
         entities:
-          - sensor.kermi_bridge_status
-          - sensor.kermi_energy_mode_mk1
-          - sensor.kermi_hp_state
+          - sensor.your_heat_pump_bridge_status       # ← EDIT
+          - sensor.your_heat_pump_energy_mode         # ← EDIT
+          - sensor.your_heat_pump_state               # ← EDIT
       - type: horizontal-stack
         cards:
           - type: gauge
@@ -116,11 +130,11 @@ views:
               yellow: 35
               red: 45
             needle: true
-            entity: sensor.kermi_buffer_temp
-            name: Puffer
+            entity: sensor.your_heat_pump_buffer_temp  # ← EDIT
+            name: Buffer
           - type: gauge
-            entity: sensor.kermi_setpoint_mk1
-            name: Vorlauf Soll
+            entity: sensor.your_heat_pump_setpoint     # ← EDIT
+            name: Setpoint
             severity:
               green: 28
               yellow: 35
@@ -132,13 +146,13 @@ views:
               yellow: 35
               red: 45
             needle: true
-            entity: sensor.kermi_flow_temp_mk1
-            name: Vorlauf Ist
+            entity: sensor.your_heat_pump_flow_temp    # ← EDIT
+            name: Flow
           - type: gauge
             severity:
               green: 38
               yellow: 45
               red: 60
             needle: true
-            entity: sensor.kermi_hot_water_temp
-            name: Warmwasser
+            entity: sensor.your_dhw_buffer_temp        # ← EDIT
+            name: Hot Water

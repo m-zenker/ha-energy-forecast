@@ -140,23 +140,6 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
-### #63 — Fix RegimePredictor Overfitting (OOB score + constraints)
-
-**Priority:** Next session — address before relying on regime signal for accuracy improvements.
-
-**Problem:** `RegimePredictor` is a `RandomForestClassifier(n_estimators=100)` with no depth or leaf-size constraints. It logs `Training accuracy: 1.00` because it evaluates on its own training data — a meaningless metric. With ~45 days of history and 5 clusters (~9 days/cluster), the RF has almost certainly memorized the training set rather than learning generalizable weather → regime mappings. On unseen forecast days it may assign arbitrary labels, corrupting the `regime_kwh` prior fed to LightGBM.
-
-**Fix:**
-1. Add `oob_score=True` to `RandomForestClassifier` and log OOB accuracy instead of (or alongside) training accuracy. OOB is a near-unbiased generalization estimate at zero extra cost.
-2. Add mild regularization: `max_depth=6`, `min_samples_leaf=3` to prevent single-sample leaves.
-3. Optionally: log per-class OOB support to flag regimes with too few training days (< 7).
-
-**Also:** Add `people_home` (current count) and `is_away` as daily features in `_prepare_daily_regime_features()` — currently missing, causes occupied/unoccupied days to be indistinguishable from weather alone.
-
-**Effort:** ~1 h. **Impact:** HIGH — if OOB accuracy is low (<60%), the regime signal is noise at prediction time and should be disabled or redesigned.
-
----
-
 ### #62 — Adaptive Regime Selection (Auto-K)
 
 **Signal:** Instead of a fixed `regime_count`, automatically find the optimal number of clusters ($K$) that maximizes the balance between clustering quality (Silhouette Score) and weather-based predictability.
@@ -189,7 +172,7 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 59 | Relaxed τ calibration | medium | 30 min | backlog |
 | 10 | School holidays | medium | 4 h | long-term |
-| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | pre-HACS |
+| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | done (partial — personal IDs replaced) |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
@@ -271,3 +254,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 58 | Humidity-Aware Defrost Proxy (`defrost_risk`) | v0.10.0 |
 | 60 | Calibrated default thermal time constant (`DEFAULT_TAU = 12 h`) | v0.10.0 |
 | 61 | Daily Regime Clustering (`regime_kwh`) | v0.11.0 |
+| 63 | Fix RegimePredictor overfitting (OOB score + constraints + occupancy features) | v0.11.0-alpha-8 |
