@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-8] — 2026-04-17
+
+### Fixed
+- **RegimePredictor overfitting** (`clustering.py`, `model.py`) — `RandomForestClassifier` was trained without depth or leaf constraints, causing it to memorise training data and report 100% training accuracy. Added `max_depth=6` and `min_samples_leaf=3` to prevent overfitting. Enabled `oob_score=True`; the predictor now logs the out-of-bag accuracy after each fit and emits a WARNING if OOB score is below 0.5 (indicates insufficient training data or degenerate regime splits). Added `is_away` and `people_home` as daily regime features so occupancy state informs regime selection in addition to weather and calendar signals. 6 new tests in `test_clustering.py`.
+
+---
+
 ## [0.11.0-alpha-7] — 2026-04-17
 
 ### Fixed
