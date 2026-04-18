@@ -345,9 +345,10 @@ class EnergyForecastModel:
             if labels is not None and not labels.empty:
                 # ── Train Regime Predictor ──
                 daily_features = _prepare_daily_regime_features(
-                    weather_df, country=country, canton=canton
+                    weather_df, country=country, canton=canton,
+                    away_df=away_df, presence_df=presence_df,
                 )
-                
+
                 self._regime_model = clustering.RegimePredictor()
                 self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
                 
@@ -696,8 +697,24 @@ class EnergyForecastModel:
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
             try:
                 # 1. Prepare daily features for Today and Tomorrow
+                # Convert hourly away/occupancy series → DataFrames for regime predictor
+                _away_df_r = None
+                if away_series is not None and not away_series.empty:
+                    _away_df_r = (
+                        away_series.rename("is_away")
+                        .reset_index()
+                        .rename(columns={"index": "timestamp"})
+                    )
+                _presence_df_r = None
+                if people_home_series is not None and not people_home_series.empty:
+                    _presence_df_r = (
+                        people_home_series.rename("people_home")
+                        .reset_index()
+                        .rename(columns={"index": "timestamp"})
+                    )
                 daily_features = _prepare_daily_regime_features(
-                    forecast_df, country=self._country, canton=self._canton
+                    forecast_df, country=self._country, canton=self._canton,
+                    away_df=_away_df_r, presence_df=_presence_df_r,
                 )
                 
                 # 2. Predict regime IDs
@@ -1361,11 +1378,13 @@ class EnergyForecastModel:
 def _prepare_daily_regime_features(
     weather_df: pd.DataFrame,
     country: str = "CH",
-    canton: str | None = None
+    canton: str | None = None,
+    away_df: "pd.DataFrame | None" = None,      # cols: timestamp, is_away
+    presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home
 ) -> pd.DataFrame:
     """Aggregate hourly weather into daily features for regime prediction."""
     import pandas as pd
-    
+
     # 1. Aggregate daily weather features
     w_daily = weather_df.copy()
     w_daily["date"] = pd.to_datetime(w_daily["timestamp"]).dt.date
@@ -1375,12 +1394,12 @@ def _prepare_daily_regime_features(
         "precipitation_mm": "sum"
     })
     w_daily.columns = ["temp_mean", "temp_min", "temp_max", "sun_total", "precip_total"]
-    
+
     # 2. Add calendar features
     cal_df = pd.DataFrame(index=w_daily.index)
     cal_dates = pd.to_datetime(cal_df.index)
     cal_df["day_of_week"] = cal_dates.dayofweek
-    
+
     # Reuse holiday logic
     try:
         import holidays as hd
@@ -1395,7 +1414,26 @@ def _prepare_daily_regime_features(
         cal_df["is_holiday"] = pd.Series(cal_df.index).map(lambda d: 1 if d in ch_hols else 0).values
     except Exception:
         cal_df["is_holiday"] = 0
-        
+
+    # 3. Occupancy features
+    # is_away: 1 if any hour of the day was marked away
+    if away_df is not None and not away_df.empty and "is_away" in away_df.columns:
+        a = away_df.copy()
+        a["date"] = pd.to_datetime(a["timestamp"]).dt.date
+        daily_away = a.groupby("date")["is_away"].max()
+        cal_df["is_away"] = daily_away.reindex(cal_df.index).fillna(0).astype(int)
+    else:
+        cal_df["is_away"] = 0
+
+    # people_home: mean occupied count across the day
+    if presence_df is not None and not presence_df.empty and "people_home" in presence_df.columns:
+        p = presence_df.copy()
+        p["date"] = pd.to_datetime(p["timestamp"]).dt.date
+        daily_pres = p.groupby("date")["people_home"].mean()
+        cal_df["people_home"] = daily_pres.reindex(cal_df.index).fillna(0)
+    else:
+        cal_df["people_home"] = 0
+
     return pd.concat([w_daily, cal_df], axis=1).dropna()
 
 

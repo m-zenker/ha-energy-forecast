@@ -141,12 +141,27 @@ class RegimePredictor:
             if len(X) < 14:
                 return
 
-            self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                random_state=42,
+                max_depth=6,
+                min_samples_leaf=3,
+                oob_score=True,
+            )
             self.model.fit(X, y, **fit_kwargs)
             self.is_fitted = True
-            
-            acc = self.model.score(X, y)
-            _LOGGER.info(f"Regime Predictor trained. Training accuracy: {acc:.2f}")
+
+            train_acc = self.model.score(X, y)
+            oob_acc = self.model.oob_score_
+            _LOGGER.info(
+                "Regime Predictor trained — train acc: %.2f, OOB acc: %.2f (n=%d, k=%d)",
+                train_acc, oob_acc, len(X), len(y.unique()),
+            )
+            if oob_acc < 0.5:
+                _LOGGER.warning(
+                    "Regime Predictor OOB accuracy %.2f is near chance — regime signal may be "
+                    "unreliable. More training history needed.", oob_acc
+                )
             
         except Exception as e:
             _LOGGER.error(f"Regime Predictor training failed: {e}")
