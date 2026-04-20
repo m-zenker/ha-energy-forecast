@@ -53,9 +53,9 @@ class DailyProfileClusterer:
             daily["date"] = daily["timestamp"].dt.date
             daily["hour"] = daily["timestamp"].dt.hour
             
-            # Keep only days with at least 22 hours
-            counts = daily.groupby("date")["hour"].count()
-            valid_days = counts[counts >= 22].index
+            # Filter days with too much missing data
+            daily_counts = daily.groupby("date")["gross_kwh"].count()
+            valid_days = daily_counts[daily_counts >= 18].index
             if len(valid_days) < 14:  # Minimum 2 weeks for meaningful clustering
                 _LOGGER.info(f"Not enough history for clustering ({len(valid_days)}/14 days).")
                 return None
@@ -64,8 +64,8 @@ class DailyProfileClusterer:
                 index="date", columns="hour", values="gross_kwh"
             )
             
-            # Interpolate to fill missing hours (up to 2 per day)
-            pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1).ffill(axis=1).bfill(axis=1)
+            # Interpolate to fill missing hours (up to 6 per day)
+            pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1, limit=6).ffill(axis=1).bfill(axis=1)
             
             # Prepare sample weights for valid days
             fit_kwargs = {}
@@ -234,37 +234,62 @@ def find_optimal_k(
             return k_values[0]
 
         # First pass: collect inertias for all K
-        inertias: dict[int, float] = {}
+        raw_inertias: dict[int, float] = {}
         for k in k_values:
             try:
                 km = KMeans(n_clusters=k, random_state=42, n_init=10)
                 km.fit(pivoted, **fit_kwargs)
-                inertias[k] = float(km.inertia_)
-                _LOGGER.debug("Auto-K: K=%d  inertia=%.1f", k, inertias[k])
+                raw_inertias[k] = float(km.inertia_)
             except Exception as e:
                 _LOGGER.debug("Auto-K: K=%d fit failed: %s", k, e)
 
-        if not inertias:
+        if not raw_inertias:
             return k_lo
 
-        available_k = sorted(inertias)
+        # Normalize inertias to 0-1 range
+        min_i, max_i = min(raw_inertias.values()), max(raw_inertias.values())
+        inertias = {k: (i - min_i) / (max_i - min_i + 1e-9) for k, i in raw_inertias.items()}
+        
+        # Smooth inertias slightly (rolling average)
+        sorted_k = sorted(inertias.keys())
+        smoothed = {k: inertias[k] for k in sorted_k}
+        if len(sorted_k) > 3:
+            for i in range(1, len(sorted_k) - 1):
+                smoothed[sorted_k[i]] = (inertias[sorted_k[i-1]] + inertias[sorted_k[i]] + inertias[sorted_k[i+1]]) / 3
 
-        # Edge case: only 2 candidates → return the higher one
-        if len(available_k) == 2:
-            selected_k = available_k[1]
+        # Second pass: compute d2 and track potential K candidates
+        candidates = []
+        best_d2 = -np.inf
+        
+        # Compute d2
+        for i in range(1, len(sorted_k) - 1):
+            k_prev, k_cur, k_next = sorted_k[i - 1], sorted_k[i], sorted_k[i + 1]
+            d2 = smoothed[k_prev] - 2 * smoothed[k_cur] + smoothed[k_next]
+            if d2 > best_d2:
+                best_d2 = d2
+            candidates.append((k_cur, d2))
+            
+        # Select candidates within 10% of best_d2
+        best_candidates = [k for k, d2 in candidates if d2 >= best_d2 * 0.9]
+        
+        # Tie-break using OOB score
+        if len(best_candidates) > 1:
+            best_oob = -1.0
+            selected_k = best_candidates[0]
+            for k in best_candidates:
+                try:
+                    km_test = KMeans(n_clusters=k, random_state=42, n_init=10)
+                    labels = km_test.fit_predict(pivoted, **fit_kwargs)
+                    predictor = RegimePredictor()
+                    predictor.fit(daily_features, pd.Series(labels, index=pivoted.index), sample_weight=sample_weight)
+                    oob = predictor.model.oob_score_ if predictor.is_fitted else -1.0
+                    if oob > best_oob:
+                        best_oob = oob
+                        selected_k = k
+                except Exception:
+                    continue
         else:
-            # Elbow = argmax of second differences (interior K values only)
-            # d2[k] = inertia[k-1] - 2*inertia[k] + inertia[k+1]
-            best_k = available_k[1]   # default: second candidate
-            best_d2 = -np.inf
-            for i in range(1, len(available_k) - 1):
-                k_prev, k_cur, k_next = available_k[i - 1], available_k[i], available_k[i + 1]
-                d2 = inertias[k_prev] - 2 * inertias[k_cur] + inertias[k_next]
-                _LOGGER.debug("Auto-K: K=%d  d2=%.2f", k_cur, d2)
-                if d2 > best_d2:
-                    best_d2 = d2
-                    best_k = k_cur
-            selected_k = best_k
+            selected_k = best_candidates[0]
 
         # Second pass (informational): log OOB for selected K
         try:

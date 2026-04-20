@@ -8,6 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0-alpha-13] — 2026-04-20
+
+### Changed
+- `apps/energy_forecast/clustering.py` — **Outlier guard**: days with more than 6 hours of missing data are now excluded from the auto-K training set (threshold lowered from requiring ≥22 hours present to ≥18 hours), preventing sparse days from distorting cluster centroids.
+- `apps/energy_forecast/clustering.py` — **Inertia normalisation and smoothing**: raw KMeans inertias are normalised to [0, 1] and passed through a 3-point rolling average before elbow detection, making second-derivative scores comparable across training runs with different data volumes.
+- `apps/energy_forecast/clustering.py` — **OOB tie-breaking**: when multiple K candidates have second-derivative scores within 10 % of the best, `find_optimal_k()` fits a `RegimePredictor` at each tied K and selects the one with the highest OOB accuracy, favouring both accuracy and granularity simultaneously.
+- `apps/energy_forecast/clustering.py` — **Interpolation tolerance raised to 6 h/day**: `pivoted.interpolate(axis=1, limit=6)` replaces the previous unlimited interpolation, capping gap-fill at 6 consecutive missing hours per day and avoiding runaway extrapolation on very sparse days.
+
 ## [0.11.0-alpha-12] — 2026-04-20
 
 ### Fixed
