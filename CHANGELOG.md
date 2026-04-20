@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-11] — 2026-04-20
+
+### Fixed
+- **Auto-K scoring bias** (`clustering.py`) — `find_optimal_k()` replaced `silhouette × OOB` product scoring with silhouette maximisation subject to an OOB quality gate. The product was doubly biased toward K=2 (both silhouette and OOB accuracy peak at binary splits), causing auto-K to under-cluster and degrade MAE. New behaviour: maximise cluster granularity (silhouette) among K values where the regime is weather-predictable (OOB ≥ `regime_auto_k_oob_min`, default 0.5). Falls back to highest-silhouette K with a WARNING if no K clears the gate. New `regime_auto_k_oob_min` config key (float, default 0.5). 1 new test; 509 total passing.
+
+---
+
 ## [0.11.0-alpha-10] — 2026-04-20
 
 ### Added
