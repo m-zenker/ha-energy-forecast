@@ -339,14 +339,30 @@ class EnergyForecastModel:
         regime_kwh_series = None
 
         if enable_regimes:
-            self._clusterer = clustering.DailyProfileClusterer(n_clusters=regime_count)
-            labels = self._clusterer.fit(energy_df, sample_weight=daily_weights)
-            
-            if labels is not None and not labels.empty:
-                # ── Train Regime Predictor ──
-                daily_features = _prepare_daily_regime_features(
+            _actual_k = regime_count
+            _prebuilt_daily_features = None
+            if regime_count == 0:
+                # Auto-K: build daily features once and reuse for both selection and predictor
+                _prebuilt_daily_features = _prepare_daily_regime_features(
                     weather_df, country=country, canton=canton,
                     away_df=away_df, presence_df=presence_df,
+                )
+                _actual_k = clustering.find_optimal_k(
+                    energy_df, _prebuilt_daily_features, sample_weight=daily_weights,
+                )
+            self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
+            self._regime_count = _actual_k
+            labels = self._clusterer.fit(energy_df, sample_weight=daily_weights)
+
+            if labels is not None and not labels.empty:
+                # ── Train Regime Predictor ──
+                daily_features = (
+                    _prebuilt_daily_features
+                    if _prebuilt_daily_features is not None
+                    else _prepare_daily_regime_features(
+                        weather_df, country=country, canton=canton,
+                        away_df=away_df, presence_df=presence_df,
+                    )
                 )
 
                 self._regime_model = clustering.RegimePredictor()

@@ -3868,3 +3868,65 @@ class TestTauCalibrationSafeguards:
         # Both should be near the true τ since the decay is identical
         assert 5.0 < result_night < 20.0
         assert 5.0 < result_day < 20.0
+
+
+# ── Auto-K Regime Selection ───────────────────────────────────────────────────
+
+class TestAutoKRegimeSelection:
+    """Integration: regime_count=0 triggers auto-K selection during train()."""
+
+    def _make_regime_train_data(self, n: int = 400, n_regimes: int = 3):
+        """Return (energy_df, weather_df) with distinct daily consumption regimes."""
+        rng = np.random.default_rng(7)
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        gross = []
+        for i, t in enumerate(ts):
+            regime = (t.date().toordinal()) % n_regimes
+            base = [0.5, 2.5, 1.5][regime]
+            gross.append(base + rng.uniform(-0.1, 0.1))
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": gross})
+        weather_df = pd.DataFrame({
+            "timestamp": ts,
+            "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0] * n,
+            "sunshine_min": [30.0] * n,
+            "wind_kmh": [10.0] * n,
+            "cloud_cover_pct": [50.0] * n,
+            "direct_radiation_wm2": [100.0] * n,
+        })
+        return energy_df, weather_df
+
+    def test_auto_k_selects_valid_k(self, tmp_path):
+        """regime_count=0 → train() completes and model._regime_count is in [2, 8]."""
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        energy_df, weather_df = self._make_regime_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df, weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=0,
+        )
+        assert m._regime_count >= 2, f"Expected K≥2, got {m._regime_count}"
+        assert m._regime_count <= 8, f"Expected K≤8, got {m._regime_count}"
+
+    def test_fixed_k_unchanged(self, tmp_path):
+        """regime_count=3 → model._regime_count remains 3 (auto-K not triggered)."""
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        energy_df, weather_df = self._make_regime_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df, weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=3,
+        )
+        assert m._regime_count == 3

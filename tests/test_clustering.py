@@ -2,7 +2,12 @@
 import pandas as pd
 import numpy as np
 import pytest
-from apps.energy_forecast.clustering import DailyProfileClusterer, RegimePredictor, SKLEARN_AVAILABLE
+from apps.energy_forecast.clustering import (
+    DailyProfileClusterer,
+    RegimePredictor,
+    find_optimal_k,
+    SKLEARN_AVAILABLE,
+)
 from apps.energy_forecast.model import _prepare_daily_regime_features
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
@@ -268,3 +273,95 @@ def test_daily_features_no_occupancy_defaults_zero():
     assert "people_home" in result.columns
     assert (result["is_away"] == 0).all()
     assert (result["people_home"] == 0.0).all()
+
+
+# ── find_optimal_k ────────────────────────────────────────────────────────────
+
+def _make_energy_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFrame:
+    """Synthetic energy data with `n_regimes` distinct 24h profiles repeated over `n_days`."""
+    rows = []
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+    for i, dt in enumerate(dates):
+        regime = i % n_regimes
+        for h in range(24):
+            val = 0.5
+            if regime == 1 and 7 <= h <= 9:
+                val = 3.0
+            elif regime == 2 and 18 <= h <= 20:
+                val = 4.5
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": val})
+    return pd.DataFrame(rows)
+
+
+def _make_aligned_weather_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFrame:
+    """Hourly weather correlated with energy regimes so RegimePredictor has signal."""
+    # Each regime gets a distinct temperature band so OOB accuracy is high
+    temp_map = {0: 5.0, 1: 15.0, 2: 25.0}
+    rows = []
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+    for i, dt in enumerate(dates):
+        regime = i % n_regimes
+        temp = temp_map.get(regime % 3, 10.0)
+        for h in range(24):
+            rows.append({
+                "timestamp": dt + pd.Timedelta(hours=h),
+                "temp_c": temp,
+                "sunshine_min": 30.0,
+                "precipitation_mm": 0.0,
+            })
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_selects_best():
+    """3-regime synthetic data with correlated weather: auto-K should select K=3 (or nearby)."""
+    n_days, n_regimes = 30, 3
+    energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
+    weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
+
+    assert 2 <= k <= 5, f"K={k} outside search range"
+    # 3 is the natural answer; allow 2 (OOB chance with small N) or 4 (minor overfit)
+    assert k in (2, 3, 4), f"Expected K near 3, got {k}"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_too_few_days():
+    """Fewer than 14 valid days → returns k_range[0] without raising."""
+    energy_df = _make_energy_df(n_days=10, n_regimes=2)
+    weather_df = _make_aligned_weather_df(n_days=10, n_regimes=2)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
+
+    assert k == 2
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_respects_range():
+    """Result is always within the requested k_range."""
+    energy_df = _make_energy_df(n_days=40, n_regimes=3)
+    weather_df = _make_aligned_weather_df(n_days=40, n_regimes=3)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    for lo, hi in [(2, 3), (3, 6), (2, 8)]:
+        k = find_optimal_k(energy_df, daily_features, k_range=(lo, hi))
+        assert lo <= k <= hi, f"K={k} outside [{lo}, {hi}]"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_weighted():
+    """find_optimal_k runs without error when sample_weight is provided."""
+    n_days, n_regimes = 30, 3
+    energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
+    weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D").date
+    weights = pd.Series(np.linspace(0.5, 1.5, n_days), index=dates)
+
+    k = find_optimal_k(energy_df, daily_features, sample_weight=weights, k_range=(2, 4))
+
+    assert 2 <= k <= 4
