@@ -464,7 +464,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.11.0-alpha-1",
+                "sw_version": "0.11.0-alpha-13",
             },
         }
         if device_class is not None:
@@ -496,7 +496,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.11.0-alpha-1",
+                "sw_version": "0.11.0-alpha-13",
             },
         }
         if device_class is not None:
