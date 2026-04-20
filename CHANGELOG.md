@@ -8,6 +8,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0-alpha-12] — 2026-04-20
+
+### Fixed
+- **Auto-K silhouette K=2 bias** (`clustering.py`) — `find_optimal_k()` replaced silhouette+OOB gate selection with inertia elbow detection (second derivative of KMeans inertia). Root cause: silhouette score always peaks at K=2 for daily energy profiles regardless of gate thresholds or multipliers, systematically under-clustering and degrading forecast granularity. Elbow method is unbiased toward small K and naturally selects K=4–6 for real household energy data with multiple load patterns. OOB accuracy now logged at INFO level (informational signal only); no longer acts as a gate. Removed `oob_min` parameter from `find_optimal_k()`, `model.train()`, and `energy_forecast.py` config. Adds `test_find_optimal_k_elbow_prefers_higher_k` (verifies 5-regime synthetic data selects K≥3); removes obsolete `test_find_optimal_k_oob_gate_fallback`. 509 tests passing.
+
 ---
 
 ## [0.11.0-alpha-11] — 2026-04-20
