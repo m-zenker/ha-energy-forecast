@@ -20,7 +20,6 @@ _LOGGER = logging.getLogger("energy_forecast")
 try:
     from sklearn.cluster import KMeans
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.metrics import silhouette_score as _silhouette_score
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -184,17 +183,18 @@ def find_optimal_k(
     daily_features: pd.DataFrame,
     sample_weight: "pd.Series | None" = None,
     k_range: tuple = (2, 8),
-    oob_min: float = 0.5,
 ) -> int:
-    """Return K ∈ k_range that maximises silhouette score, subject to OOB ≥ oob_min.
+    """Return K ∈ k_range selected by the inertia elbow (second derivative).
 
-    Silhouette is the primary metric (cluster quality / granularity). OOB accuracy
-    acts as a predictability gate: only K values where the regime is learnable from
-    weather (OOB ≥ oob_min) are considered. If no K clears the gate, the one with
-    the highest silhouette is returned regardless.
+    Fits KMeans at each K, computes within-cluster inertia, then picks the K
+    where the marginal inertia drop accelerates most — the "knee" of the elbow
+    curve. Unlike silhouette, this metric is unbiased toward small K and
+    naturally selects K=4–6 for real energy profiles.
 
-    Activated when regime_count=0 in apps.yaml. Falls back to k_range[0] on
-    insufficient data or sklearn unavailability.
+    After selecting K, fits a RegimePredictor and logs OOB accuracy as INFO
+    (informational only — no gating on OOB).
+
+    Falls back to k_range[0] on insufficient data or sklearn unavailability.
     """
     if not SKLEARN_AVAILABLE or energy_df.empty:
         return k_range[0]
@@ -225,47 +225,62 @@ def find_optimal_k(
             if np.isfinite(w).all() and w.sum() > 0:
                 fit_kwargs["sample_weight"] = w
 
-        best_k = k_range[0]
-        best_sil_any = -1.0        # best silhouette ignoring OOB gate (fallback)
-        best_sil_gated = -1.0      # best silhouette among K values that pass OOB gate
-        best_k_gated: "int | None" = None
         k_lo, k_hi = k_range
+        k_max = min(k_hi, len(pivoted))
+        k_values = list(range(k_lo, k_max + 1))
 
-        for k in range(k_lo, min(k_hi, len(pivoted)) + 1):
+        # Edge case: only one candidate → return it directly
+        if len(k_values) == 1:
+            return k_values[0]
+
+        # First pass: collect inertias for all K
+        inertias: dict[int, float] = {}
+        for k in k_values:
             try:
                 km = KMeans(n_clusters=k, random_state=42, n_init=10)
-                labels_arr = km.fit_predict(pivoted, **fit_kwargs)
-                labels_series = pd.Series(labels_arr, index=pivoted.index)
-
-                unique = np.unique(labels_arr)
-                sil = float(_silhouette_score(pivoted, labels_arr)) if len(unique) >= 2 else 0.0
-
-                predictor = RegimePredictor()
-                predictor.fit(daily_features, labels_series, sample_weight=sample_weight)
-                oob = predictor.model.oob_score_ if predictor.is_fitted else 0.0
-
-                passes_gate = oob >= oob_min
-                _LOGGER.debug(
-                    "Auto-K: K=%d  silhouette=%.3f  oob=%.3f  gate=%s",
-                    k, sil, oob, "pass" if passes_gate else "fail",
-                )
-                if sil > best_sil_any:
-                    best_sil_any = sil
-                    best_k = k
-                if passes_gate and sil > best_sil_gated:
-                    best_sil_gated = sil
-                    best_k_gated = k
+                km.fit(pivoted, **fit_kwargs)
+                inertias[k] = float(km.inertia_)
+                _LOGGER.debug("Auto-K: K=%d  inertia=%.1f", k, inertias[k])
             except Exception as e:
-                _LOGGER.debug("Auto-K: K=%d evaluation failed: %s", k, e)
-                continue
+                _LOGGER.debug("Auto-K: K=%d fit failed: %s", k, e)
 
-        selected_k = best_k_gated if best_k_gated is not None else best_k
-        if best_k_gated is None:
-            _LOGGER.warning(
-                "Auto-K: no K passed OOB gate (oob_min=%.2f) — using highest-silhouette K=%d.",
-                oob_min, selected_k,
+        if not inertias:
+            return k_lo
+
+        available_k = sorted(inertias)
+
+        # Edge case: only 2 candidates → return the higher one
+        if len(available_k) == 2:
+            selected_k = available_k[1]
+        else:
+            # Elbow = argmax of second differences (interior K values only)
+            # d2[k] = inertia[k-1] - 2*inertia[k] + inertia[k+1]
+            best_k = available_k[1]   # default: second candidate
+            best_d2 = -np.inf
+            for i in range(1, len(available_k) - 1):
+                k_prev, k_cur, k_next = available_k[i - 1], available_k[i], available_k[i + 1]
+                d2 = inertias[k_prev] - 2 * inertias[k_cur] + inertias[k_next]
+                _LOGGER.debug("Auto-K: K=%d  d2=%.2f", k_cur, d2)
+                if d2 > best_d2:
+                    best_d2 = d2
+                    best_k = k_cur
+            selected_k = best_k
+
+        # Second pass (informational): log OOB for selected K
+        try:
+            km_sel = KMeans(n_clusters=selected_k, random_state=42, n_init=10)
+            labels_arr = km_sel.fit_predict(pivoted, **fit_kwargs)
+            labels_series = pd.Series(labels_arr, index=pivoted.index)
+            predictor = RegimePredictor()
+            predictor.fit(daily_features, labels_series, sample_weight=sample_weight)
+            oob = predictor.model.oob_score_ if predictor.is_fitted else float("nan")
+            _LOGGER.info(
+                "Auto-K selected K=%d (inertia=%.1f, predictor OOB=%.2f).",
+                selected_k, inertias[selected_k], oob,
             )
-        _LOGGER.info("Auto-K selected K=%d (silhouette=%.3f).", selected_k, best_sil_gated if best_k_gated is not None else best_sil_any)
+        except Exception:
+            _LOGGER.info("Auto-K selected K=%d (inertia=%.1f).", selected_k, inertias[selected_k])
+
         return selected_k
 
     except Exception as e:

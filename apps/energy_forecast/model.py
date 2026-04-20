@@ -253,7 +253,6 @@ class EnergyForecastModel:
         room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
         regime_count: int = 5,
-        regime_auto_k_oob_min: float = 0.5,
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -350,7 +349,6 @@ class EnergyForecastModel:
                 )
                 _actual_k = clustering.find_optimal_k(
                     energy_df, _prebuilt_daily_features, sample_weight=daily_weights,
-                    oob_min=regime_auto_k_oob_min,
                 )
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
             self._regime_count = _actual_k

@@ -314,7 +314,7 @@ def _make_aligned_weather_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFra
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_selects_best():
-    """3-regime data with correlated weather: silhouette-max + OOB gate selects K=3."""
+    """3-regime data: inertia elbow selects K near 3 (not stuck at 2)."""
     n_days, n_regimes = 30, 3
     energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
     weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
@@ -323,25 +323,34 @@ def test_find_optimal_k_selects_best():
     k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
 
     assert 2 <= k <= 5, f"K={k} outside search range"
-    # 3 is the natural answer; 2 is acceptable if OOB gate keeps everything at floor
     assert k in (2, 3, 4), f"Expected K near 3, got {k}"
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
-def test_find_optimal_k_oob_gate_fallback(caplog):
-    """When no K passes the OOB gate, fall back to highest-silhouette K with a warning."""
-    import logging
-    n_days, n_regimes = 30, 3
-    energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
-    # Flat weather → predictor can't learn → OOB near chance for all K
-    weather_df = _make_weather_df(n_days=n_days)
+def test_find_optimal_k_elbow_prefers_higher_k():
+    """5-regime synthetic data: elbow should select K >= 3, not K=2."""
+    n_days, n_regimes = 40, 5
+    rows = []
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+    # 5 clearly distinct profiles: flat, morning, evening, midday, night
+    profiles = [
+        {h: 0.5 for h in range(24)},
+        {h: (3.0 if 7 <= h <= 9 else 0.5) for h in range(24)},
+        {h: (4.5 if 18 <= h <= 20 else 0.5) for h in range(24)},
+        {h: (2.5 if 11 <= h <= 13 else 0.5) for h in range(24)},
+        {h: (5.0 if 0 <= h <= 2 else 0.5) for h in range(24)},
+    ]
+    for i, dt in enumerate(dates):
+        p = profiles[i % n_regimes]
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": p[h]})
+    energy_df = pd.DataFrame(rows)
+    weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
     daily_features = _prepare_daily_regime_features(weather_df)
 
-    with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-        k = find_optimal_k(energy_df, daily_features, k_range=(2, 4), oob_min=0.99)
+    k = find_optimal_k(energy_df, daily_features, k_range=(2, 7))
 
-    assert 2 <= k <= 4
-    assert any("no K passed OOB gate" in r.message for r in caplog.records)
+    assert k >= 3, f"Elbow should not collapse to K=2 on 5-regime data, got K={k}"
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")

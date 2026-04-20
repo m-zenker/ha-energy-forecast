@@ -225,7 +225,6 @@ class EnergyForecast(hass.Hass):
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
         self._regime_count: int = int(self.args.get("regime_count", 5))
-        self._regime_auto_k_oob_min: float = float(self.args.get("regime_auto_k_oob_min", 0.5))
 
         # Stage 2: Intent-Driven Thermal & DHW Modeling
         # climate_entities: list of HA climate entities (e.g. climate.living_room)
@@ -1034,7 +1033,6 @@ class EnergyForecast(hass.Hass):
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
             regime_count=self._regime_count,
-            regime_auto_k_oob_min=self._regime_auto_k_oob_min,
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 
