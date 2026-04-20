@@ -184,8 +184,14 @@ def find_optimal_k(
     daily_features: pd.DataFrame,
     sample_weight: "pd.Series | None" = None,
     k_range: tuple = (2, 8),
+    oob_min: float = 0.5,
 ) -> int:
-    """Return K ∈ k_range that maximises silhouette_score × OOB_accuracy.
+    """Return K ∈ k_range that maximises silhouette score, subject to OOB ≥ oob_min.
+
+    Silhouette is the primary metric (cluster quality / granularity). OOB accuracy
+    acts as a predictability gate: only K values where the regime is learnable from
+    weather (OOB ≥ oob_min) are considered. If no K clears the gate, the one with
+    the highest silhouette is returned regardless.
 
     Activated when regime_count=0 in apps.yaml. Falls back to k_range[0] on
     insufficient data or sklearn unavailability.
@@ -220,7 +226,9 @@ def find_optimal_k(
                 fit_kwargs["sample_weight"] = w
 
         best_k = k_range[0]
-        best_score = -1.0
+        best_sil_any = -1.0        # best silhouette ignoring OOB gate (fallback)
+        best_sil_gated = -1.0      # best silhouette among K values that pass OOB gate
+        best_k_gated: "int | None" = None
         k_lo, k_hi = k_range
 
         for k in range(k_lo, min(k_hi, len(pivoted)) + 1):
@@ -236,20 +244,29 @@ def find_optimal_k(
                 predictor.fit(daily_features, labels_series, sample_weight=sample_weight)
                 oob = predictor.model.oob_score_ if predictor.is_fitted else 0.0
 
-                score = sil * oob
+                passes_gate = oob >= oob_min
                 _LOGGER.debug(
-                    "Auto-K: K=%d  silhouette=%.3f  oob=%.3f  score=%.4f",
-                    k, sil, oob, score,
+                    "Auto-K: K=%d  silhouette=%.3f  oob=%.3f  gate=%s",
+                    k, sil, oob, "pass" if passes_gate else "fail",
                 )
-                if score > best_score:
-                    best_score = score
+                if sil > best_sil_any:
+                    best_sil_any = sil
                     best_k = k
+                if passes_gate and sil > best_sil_gated:
+                    best_sil_gated = sil
+                    best_k_gated = k
             except Exception as e:
                 _LOGGER.debug("Auto-K: K=%d evaluation failed: %s", k, e)
                 continue
 
-        _LOGGER.info("Auto-K selected K=%d (score=%.4f).", best_k, best_score)
-        return best_k
+        selected_k = best_k_gated if best_k_gated is not None else best_k
+        if best_k_gated is None:
+            _LOGGER.warning(
+                "Auto-K: no K passed OOB gate (oob_min=%.2f) — using highest-silhouette K=%d.",
+                oob_min, selected_k,
+            )
+        _LOGGER.info("Auto-K selected K=%d (silhouette=%.3f).", selected_k, best_sil_gated if best_k_gated is not None else best_sil_any)
+        return selected_k
 
     except Exception as e:
         _LOGGER.error("Auto-K selection failed: %s — using K=%d.", e, k_range[0])

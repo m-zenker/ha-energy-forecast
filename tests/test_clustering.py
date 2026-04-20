@@ -314,7 +314,7 @@ def _make_aligned_weather_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFra
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_selects_best():
-    """3-regime synthetic data with correlated weather: auto-K should select K=3 (or nearby)."""
+    """3-regime data with correlated weather: silhouette-max + OOB gate selects K=3."""
     n_days, n_regimes = 30, 3
     energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
     weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
@@ -323,8 +323,25 @@ def test_find_optimal_k_selects_best():
     k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
 
     assert 2 <= k <= 5, f"K={k} outside search range"
-    # 3 is the natural answer; allow 2 (OOB chance with small N) or 4 (minor overfit)
+    # 3 is the natural answer; 2 is acceptable if OOB gate keeps everything at floor
     assert k in (2, 3, 4), f"Expected K near 3, got {k}"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_oob_gate_fallback(caplog):
+    """When no K passes the OOB gate, fall back to highest-silhouette K with a warning."""
+    import logging
+    n_days, n_regimes = 30, 3
+    energy_df = _make_energy_df(n_days=n_days, n_regimes=n_regimes)
+    # Flat weather → predictor can't learn → OOB near chance for all K
+    weather_df = _make_weather_df(n_days=n_days)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+        k = find_optimal_k(energy_df, daily_features, k_range=(2, 4), oob_min=0.99)
+
+    assert 2 <= k <= 4
+    assert any("no K passed OOB gate" in r.message for r in caplog.records)
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
