@@ -10,6 +10,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.0-alpha-10] — 2026-04-20
+
+### Added
+- **Adaptive Regime Selection (Auto-K)** (`clustering.py`, `model.py`, closes #62) — when `regime_count: 0` is set in `apps.yaml`, the system now selects the optimal number of daily-regime clusters automatically at each training run. `find_optimal_k()` sweeps K ∈ [2, 8] (configurable via `k_range`), fits a KMeans clusterer and a `RegimePredictor` at each K, and selects the K that maximises `silhouette_score × OOB_accuracy`. Daily features are pre-built once and reused across all K evaluations to avoid redundant computation. Falls back to `k_range[0]` on insufficient history (<14 valid days), sklearn unavailability, or any unexpected error. `model.train()` stores the chosen K in `self._regime_count` for observability. 6 new tests in `test_clustering.py` and `test_model.py`; 508 total passing.
+
+---
+
 ## [0.11.0-alpha-9] — 2026-04-18
 
 ### Changed
