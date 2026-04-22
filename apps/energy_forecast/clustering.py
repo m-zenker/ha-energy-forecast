@@ -147,11 +147,13 @@ class RegimePredictor:
                 n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3
             )
             tscv_scores = cross_val_score(clf_proto, X, y, cv=tscv, scoring="accuracy")
+            dist = y.value_counts(normalize=True).sort_index()
+            dist_str = ", ".join(f"{k}: {v:.0%}" for k, v in dist.items())
             _LOGGER.info(
                 "Regime Predictor trained — train acc: %.2f, OOB=%.2f, "
-                "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d)",
+                "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d) | class dist: %s",
                 train_acc, oob_acc, tscv_scores.mean(), tscv_scores.std(),
-                len(X), len(y.unique()),
+                len(X), len(y.unique()), dist_str,
             )
             if tscv_scores.mean() < 0.5:
                 _LOGGER.warning(
