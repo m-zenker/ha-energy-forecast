@@ -8,6 +8,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0-alpha-14] — 2026-04-22
+
+### Fixed
+- `apps/energy_forecast/model.py` — CQR calibration now uses a reproducible random holdout (RNG seed 42) instead of a temporal tail slice, satisfying the exchangeability assumption for valid ≥80% marginal coverage guarantees across all hours of the day (#64).
+- `apps/energy_forecast/clustering.py` — `RegimePredictor.train()` now runs TimeSeriesSplit CV alongside OOB scoring; the WARNING threshold uses TSCV mean (forward-generalization measure) instead of OOB accuracy, which overestimates performance on time-series data (#65).
+- `apps/energy_forecast/clustering.py` — `find_optimal_k()` bails out immediately to `k_lo` when inertia range < 1e-6 (homogeneous daily load), preventing degenerate elbow selection and logging a WARNING with diagnostic context (#66).
+- `apps/energy_forecast/model.py` — Prediction path now forward-fills regime labels (matching training semantics) instead of using `dict.get(-1)`, which incorrectly dropped gap days at forecast boundaries to zero (#67).
+- `apps/energy_forecast/model.py` — EWMA temperature features (`temp_ewma_24h`, `temp_ewma_72h`) reset at weather data gaps > 2h by inserting NaN sentinels before `.ewm()`, preventing stale temperature from bleeding across API outages. Logs WARNING with gap count when triggered (#69).
+- `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/weather.py` — `strip_tz()` moved to `const.py` as a shared utility; `weather.py` inline `tz_convert/tz_localize` pattern replaced; `energy_forecast.py` `.replace(tzinfo=None)` fixed to `.tz_localize(None)` for pandas 3.x correctness (#68).
+- `apps/energy_forecast/model.py` — Sub-sensor quality label now demotes from `"good"` to `"fair"` when `energy_cov > 0.5` (high cycle variability overrides high sample count); `energy_cov` now stored in signature dict for observability (#71).
+- `apps/energy_forecast/energy_forecast.py` — `get_scenario` service now validates schedule keys against known appliance prefixes and HH:MM format; unknown or malformed entries are dropped with WARNING logs, preventing silent wrong output from typos in service calls (#72).
+- `apps/energy_forecast/__init__.py` — Added `__version__ = "0.11.0-alpha-13"` as single source of truth; MQTT `sw_version` in both discovery payloads now references it instead of a hardcoded string (#73).
+
+### Changed
+- `apps/energy_forecast/clustering.py` — `find_optimal_k()` docstring expanded to document all algorithm steps: inertia normalization to [0,1], homogeneous bail-out (range < 1e-6), 3-point smoothing, 10% d2 tolerance band with lowest-K tie-breaking, and OOB/TSCV informational-only note (#80).
+- `apps/energy_forecast/model.py` — Physics feature scaling constants (0.01 for infiltration/solar, 10.0 for defrost Gaussian width) now documented in inline comment block explaining empirical basis and order-of-magnitude normalization rationale (#70).
+
+### Tests
+- `tests/test_clustering.py` — `_make_energy_df()` helper adds Gaussian noise (σ=0.05) to synthetic profiles, reducing KMeans ConvergenceWarnings in the test suite from 18 to 9 (#74).
+- `tests/test_clustering.py` — Added `test_clusterer_pkl_corruption_recovery` — corrupt `clusterer.pkl` triggers cold-start fallback (`_clusterer=None`) without raising (#75).
+- `tests/test_clustering.py` — Added `test_find_optimal_k_single_cluster_collapse` — homogeneous data hits inertia bail-out and returns `k_lo` (#76).
+- `tests/test_model.py` — Added `TestTrainEdgeCases` — empty DataFrame, below `MIN_TRAINING_ROWS`, constant `gross_kwh` values (#77).
+- `tests/test_weather.py` — Added `TestFetchOpenMeteoNetworkErrors` — 6 tests covering HTTP 404/500, Timeout, ConnectionError, malformed JSON, and missing `hourly` key; all expect empty DataFrame (#78).
+- Total test count: **535** (up from 510; +25 new tests).
+
 ## [0.11.0-alpha-13] — 2026-04-20
 
 ### Changed
