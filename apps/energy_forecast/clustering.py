@@ -99,7 +99,7 @@ class RegimePredictor:
         self.model: Any = None
         self.is_fitted = False
 
-    def fit(self, daily_features: pd.DataFrame, labels: pd.Series, sample_weight: pd.Series | None = None):
+    def fit(self, daily_features: pd.DataFrame, labels: pd.Series, sample_weight: pd.Series | None = None, verbose: bool = True):
         """Train the regime classifier.
 
         Args:
@@ -147,14 +147,15 @@ class RegimePredictor:
                 n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3
             )
             tscv_scores = cross_val_score(clf_proto, X, y, cv=tscv, scoring="accuracy")
-            dist = y.value_counts(normalize=True).sort_index()
-            dist_str = ", ".join(f"{k}: {v:.0%}" for k, v in dist.items())
-            _LOGGER.info(
-                "Regime Predictor trained — train acc: %.2f, OOB=%.2f, "
-                "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d) | class dist: %s",
-                train_acc, oob_acc, tscv_scores.mean(), tscv_scores.std(),
-                len(X), len(y.unique()), dist_str,
-            )
+            if verbose:
+                dist = y.value_counts(normalize=True).sort_index()
+                dist_str = ", ".join(f"{k}: {v:.0%}" for k, v in dist.items())
+                _LOGGER.info(
+                    "Regime Predictor trained — train acc: %.2f, OOB=%.2f, "
+                    "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d) | class dist: %s",
+                    train_acc, oob_acc, tscv_scores.mean(), tscv_scores.std(),
+                    len(X), len(y.unique()), dist_str,
+                )
             if tscv_scores.mean() < 0.5:
                 _LOGGER.warning(
                     "Regime Predictor TimeSeriesCV accuracy %.2f is near chance — regime signal "
@@ -284,7 +285,7 @@ def find_optimal_k(
             labels_arr = km_sel.fit_predict(pivoted)
             labels_series = pd.Series(labels_arr, index=pivoted.index)
             predictor = RegimePredictor()
-            predictor.fit(daily_features, labels_series, sample_weight=sample_weight)
+            predictor.fit(daily_features, labels_series, sample_weight=sample_weight, verbose=False)
             oob = predictor.model.oob_score_ if predictor.is_fitted else float("nan")
             _LOGGER.info(
                 "Auto-K: inertia elbow selected K=%d. RegimePredictor OOB=%.2f (informational only).",
