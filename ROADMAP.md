@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.11.0-alpha-8** — 2026-04-17, dev. 498 tests.
+Current: **v0.11.0-alpha-14** — 2026-04-22, dev. 535 tests.
 
 ---
 
@@ -147,29 +147,9 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
-| 64 | CQR calibration: use random split (not temporal tail) for valid coverage guarantee | HIGH/accuracy | ~3 h | backlog |
-| 65 | RegimePredictor: replace OOB with TimeSeriesSplit CV to prevent temporal overfitting | HIGH/accuracy | ~2 h | backlog |
-| 66 | Inertia normalization: bail out if range < 1e-6 (homogeneous data guard) | HIGH/robustness | ~1 h | backlog |
-| 67 | Train/predict regime mismatch: use consistent ffill for missing-day labels in both paths | MEDIUM/correctness | ~1 h | backlog |
-| 68 | Timezone normalization: extract `_normalize_timestamps()` utility (deduplication) | MEDIUM/maintainability | ~2 h | backlog |
-| 69 | EWMA temperature: detect and reset on weather data gaps > 2h | MEDIUM/robustness | ~2 h | backlog |
-| 70 | Physics feature scaling: document empirical basis for `0.01` infiltration multiplier and `10.0` defrost Gaussian width; consider learnable interaction terms | MEDIUM/explainability | ~3 h | backlog |
-| 71 | Sub-sensor signature quality: incorporate CoV into quality rating (not just cycle count) | MEDIUM/accuracy | ~1 h | backlog |
-| 72 | Scenario service: add input validation on schedule dict in `_get_scenario_cb()` | MEDIUM/robustness | ~1 h | backlog |
-| 73 | MQTT discovery: source version string from `__version__` instead of hardcoded string | LOW/maintainability | <1 h | backlog |
-| 74 | Tests: fix 19 KMeans ConvergenceWarnings in clustering tests (synthetic data too degenerate) | MEDIUM/test quality | ~1 h | backlog |
-| 75 | Tests: add pickle corruption recovery tests (clusterer.pkl has no SHA256 sidecar) | HIGH/test coverage | ~2 h | backlog |
-| 76 | Tests: add K=1 fallback test (single-cluster natural collapse) | HIGH/test coverage | ~1 h | backlog |
-| 77 | Tests: add `train()` edge cases — empty DataFrame, constant values, <100 rows boundary | HIGH/test coverage | ~2 h | backlog |
-| 78 | Tests: add network failure scenarios (HA unavailable during retrain, weather timeout) | HIGH/test coverage | ~2 h | backlog |
-| 79 | Tests: use timezone-aware fixtures to avoid UTC vs UTC+1 test environment traps | MEDIUM/test quality | ~1 h | backlog |
-| 80 | Docs: expand `find_optimal_k()` docstring — explain inertia elbow choice vs silhouette, fallback logic | LOW/maintainability | ~1 h | backlog |
-| 81 | Docs: expand `_calibrate_tau()` and `_project_indoor_temps()` inline docs (RC-ODE basis, stale-sensor fallback) | LOW/maintainability | ~1 h | backlog |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
-
----
 
 ---
 
@@ -179,6 +159,7 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.11.0-alpha-14 | 2026-04-22 | Algorithmic correctness (#64–#69), code quality (#68, #71–#73), test coverage (#74–#78), documentation (#70, #80–#81). 535 tests. |
 | v0.11.0 | 2026-04-17 | Daily Regime Clustering (optional module), K-Means 24h profiles, secondary regime predictor model |
 | v0.10.0 | 2026-04-10 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
 | v0.9.0 | 2026-04-10 | Thermal modelling (#49–#52), occupancy (`people_home`), SHAP narrative, relative MAE sensors, rolling MAE persistence |
@@ -247,3 +228,21 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 63 | Fix RegimePredictor overfitting (OOB score + constraints + occupancy features) | v0.11.0-alpha-8 |
 | 59 | Relaxed τ calibration — quality-scored windows replace hard daytime/solar filters | v0.11.0-alpha-9 |
 | 62 | Adaptive Regime Selection (Auto-K) — inertia elbow, K ∈ [2, 8], `regime_count: 0` | v0.11.0-alpha-10 |
+| 64 | CQR calibration: random holdout split (rng seed 42) for valid exchangeability guarantee | v0.11.0-alpha-14 |
+| 65 | RegimePredictor: TimeSeriesSplit CV logged alongside OOB; warning uses TSCV mean | v0.11.0-alpha-14 |
+| 66 | Inertia normalization: bail out to k_lo when range < 1e-6 (homogeneous data guard) | v0.11.0-alpha-14 |
+| 67 | Regime label ffill in prediction path — matches training semantics for gap days | v0.11.0-alpha-14 |
+| 68 | `strip_tz()` moved to `const.py` as shared utility; weather.py and energy_forecast.py deduped | v0.11.0-alpha-14 |
+| 69 | EWMA temperature resets at weather gaps > 2h via NaN sentinels before `.ewm()` | v0.11.0-alpha-14 |
+| 70 | Physics feature scaling constants (0.01, 10.0) documented with empirical basis | v0.11.0-alpha-14 |
+| 71 | Sub-sensor quality demoted to "fair" when energy_cov > 0.5; CoV stored in signature dict | v0.11.0-alpha-14 |
+| 72 | `get_scenario` validates schedule keys and HH:MM format; drops invalid entries with WARNING | v0.11.0-alpha-14 |
+| 73 | `__version__` in `__init__.py` is single source of truth for MQTT `sw_version` | v0.11.0-alpha-14 |
+| 74 | Gaussian noise in `_make_energy_df()` — KMeans ConvergenceWarnings reduced from 18 → 9 | v0.11.0-alpha-14 |
+| 75 | Pickle corruption recovery test for `clusterer.pkl` | v0.11.0-alpha-14 |
+| 76 | K=1 fallback test — homogeneous data hits inertia bail-out | v0.11.0-alpha-14 |
+| 77 | `train()` edge cases: empty DataFrame, below MIN_TRAINING_ROWS, constant values | v0.11.0-alpha-14 |
+| 78 | Network failure tests for `fetch_open_meteo` (404, 500, Timeout, ConnectionError, bad JSON) | v0.11.0-alpha-14 |
+| 79 | Timezone-aware fixture audit — confirmed existing tests use naive timestamps correctly; no changes needed | v0.11.0-alpha-14 |
+| 80 | `find_optimal_k()` docstring fully documents normalization, bail-out, smoothing, tolerance band, OOB note | v0.11.0-alpha-14 |
+| 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
