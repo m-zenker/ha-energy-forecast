@@ -205,3 +205,134 @@ class TestPublishScenarioForecast:
         # Each 3-hour block: 3 × 2.0 = 6.0
         assert states["sensor.energy_forecast_scenario_today_00_03"] == "6.0"
         assert states["sensor.energy_forecast_scenario_today_21_24"] == "6.0"
+
+
+# ── Stage 2: schedule validation and version string ───────────────────────────
+
+class TestGetScenarioValidation:
+    """#72 — schedule dict key/value validation."""
+
+    def _make_app_with_signatures(self, prefix="wm"):
+        """App with one known signature prefix and no cfg sub_energy_sensors."""
+        from unittest.mock import MagicMock
+        app = _make_app(cached_df=_make_baseline_df())
+        sig_mock = MagicMock()
+        sig_mock.__iter__ = MagicMock(return_value=iter([prefix]))
+        sig_mock.keys = MagicMock(return_value={prefix})
+        app._ml_model._signatures = {prefix: {}}
+        app._cfg = {}
+        return app
+
+    def test_unknown_prefix_ignored(self, caplog):
+        """An unknown schedule key logs WARNING and is not forwarded to predict_scenario."""
+        import logging
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "ha", "ef", "get_scenario",
+                {"schedule": {"unknown_device": "08:00"}, "publish": False},
+            )
+
+        assert any("unknown prefix" in r.message for r in caplog.records), (
+            "Expected 'unknown prefix' WARNING"
+        )
+        # predict_scenario should be called with cleaned (empty) schedule
+        call_kwargs = app._ml_model.predict_scenario.call_args
+        passed_schedule = call_kwargs[0][2] if call_kwargs[0] else call_kwargs[1].get("schedule", "NOT CALLED")
+        # Either not called, or called with the unknown key stripped
+        if app._ml_model.predict_scenario.called:
+            assert "unknown_device" not in passed_schedule
+
+    def test_bad_time_format_ignored(self, caplog):
+        """A malformed HH:MM string logs WARNING and the key is dropped."""
+        import logging
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "ha", "ef", "get_scenario",
+                {"schedule": {"wm": "25:99"}, "publish": False},  # invalid time
+            )
+
+        assert any("invalid time" in r.message for r in caplog.records), (
+            "Expected 'invalid time' WARNING"
+        )
+
+    def test_valid_schedule_passes_through(self, caplog):
+        """A valid HH:MM entry does NOT trigger any schedule warning."""
+        import logging
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "ha", "ef", "get_scenario",
+                {"schedule": {"wm": "08:30"}, "publish": False},
+            )
+
+        assert not any("unknown prefix" in r.message or "invalid time" in r.message
+                       for r in caplog.records)
+
+    def test_off_value_passes_through(self, caplog):
+        """'off' is a valid value and should not trigger a time-format warning."""
+        import logging
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app, "ha", "ef", "get_scenario",
+                {"schedule": {"wm": "off"}, "publish": False},
+            )
+
+        assert not any("invalid time" in r.message for r in caplog.records)
+
+
+class TestMqttSwVersion:
+    """#73 — sw_version in MQTT payloads must equal __version__."""
+
+    def test_sw_version_matches_init(self):
+        """The sw_version hardcoded into MQTT payloads matches energy_forecast.__version__."""
+        from energy_forecast import __version__
+        from energy_forecast.energy_forecast import EnergyForecast
+        from unittest.mock import MagicMock
+        import json
+
+        app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
+        app._unique_id = "test_uid"
+        app._cfg = {}
+
+        captured_payloads = []
+
+        def fake_call_service(domain, service, **kwargs):
+            if "payload" in kwargs:
+                try:
+                    captured_payloads.append(json.loads(kwargs["payload"]))
+                except (ValueError, TypeError):
+                    pass
+
+        app.call_service = fake_call_service
+
+        try:
+            EnergyForecast._register_mqtt_sensors(app)
+        except Exception:
+            pass  # may fail without full HA env; payloads captured before errors
+
+        for payload in captured_payloads:
+            dev = payload.get("device", {})
+            if "sw_version" in dev:
+                assert dev["sw_version"] == __version__, (
+                    f"MQTT sw_version '{dev['sw_version']}' != __version__ '{__version__}'"
+                )

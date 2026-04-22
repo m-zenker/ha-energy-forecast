@@ -6,6 +6,8 @@ import requests
 import pandas as pd
 from datetime import datetime, date
 
+from .const import strip_tz as _strip_tz
+
 _LOGGER = logging.getLogger("energy_forecast")
 
 # Module-level OAuth token cache.  Avoids a new token request on every hourly
@@ -178,14 +180,12 @@ def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timez
 
     srg_df = srg_df.copy()
     try:
-        _ts = pd.to_datetime(srg_df["timestamp"])
+        srg_df["timestamp"] = pd.to_datetime(srg_df["timestamp"])
     except ValueError:
         # SRG strings carry mixed UTC offsets (+01:00 / +02:00 across DST boundary);
         # utc=True normalises them before converting to local time.
-        _ts = pd.to_datetime(srg_df["timestamp"], utc=True)
-    if _ts.dt.tz is not None:
-        _ts = _ts.dt.tz_convert(timezone).dt.tz_localize(None)
-    srg_df["timestamp"] = _ts
+        srg_df["timestamp"] = pd.to_datetime(srg_df["timestamp"], utc=True)
+    srg_df = _strip_tz(srg_df, timezone)
     om_df  = om_df.copy()
     om_df["timestamp"]  = pd.to_datetime(om_df["timestamp"])
 
