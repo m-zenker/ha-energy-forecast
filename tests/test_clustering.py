@@ -277,8 +277,13 @@ def test_daily_features_no_occupancy_defaults_zero():
 
 # ── find_optimal_k ────────────────────────────────────────────────────────────
 
-def _make_energy_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFrame:
-    """Synthetic energy data with `n_regimes` distinct 24h profiles repeated over `n_days`."""
+def _make_energy_df(n_days: int = 50, n_regimes: int = 3) -> pd.DataFrame:
+    """Synthetic energy data with `n_regimes` distinct 24h profiles repeated over `n_days`.
+
+    Small Gaussian noise (σ=0.05) is added per data point so each day is a unique
+    point in 24D space, preventing KMeans ConvergenceWarnings when K > n_regimes.
+    """
+    rng = np.random.default_rng(42)
     rows = []
     dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
     for i, dt in enumerate(dates):
@@ -289,11 +294,12 @@ def _make_energy_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFrame:
                 val = 3.0
             elif regime == 2 and 18 <= h <= 20:
                 val = 4.5
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": val})
+            noise = rng.normal(0, 0.05)
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": max(0.0, val + noise)})
     return pd.DataFrame(rows)
 
 
-def _make_aligned_weather_df(n_days: int = 30, n_regimes: int = 3) -> pd.DataFrame:
+def _make_aligned_weather_df(n_days: int = 50, n_regimes: int = 3) -> pd.DataFrame:
     """Hourly weather correlated with energy regimes so RegimePredictor has signal."""
     # Each regime gets a distinct temperature band so OOB accuracy is high
     temp_map = {0: 5.0, 1: 15.0, 2: 25.0}
@@ -329,7 +335,8 @@ def test_find_optimal_k_selects_best():
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_elbow_prefers_higher_k():
     """5-regime synthetic data: elbow should select K >= 3, not K=2."""
-    n_days, n_regimes = 40, 5
+    n_days, n_regimes = 50, 5
+    rng = np.random.default_rng(42)
     rows = []
     dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
     # 5 clearly distinct profiles: flat, morning, evening, midday, night
@@ -343,7 +350,8 @@ def test_find_optimal_k_elbow_prefers_higher_k():
     for i, dt in enumerate(dates):
         p = profiles[i % n_regimes]
         for h in range(24):
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": p[h]})
+            noise = rng.normal(0, 0.05)
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": max(0.0, p[h] + noise)})
     energy_df = pd.DataFrame(rows)
     weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=n_regimes)
     daily_features = _prepare_daily_regime_features(weather_df)
@@ -391,6 +399,46 @@ def test_find_optimal_k_weighted():
     k = find_optimal_k(energy_df, daily_features, sample_weight=weights, k_range=(2, 4))
 
     assert 2 <= k <= 4
+
+
+# ── Stage 3: test coverage additions ─────────────────────────────────────────
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_single_cluster_collapse():
+    """When all profiles are nearly identical, homogeneous bail-out returns k_lo.
+
+    This exercises the Stage 1 #66 guard: inertia range < 1e-6 → k_lo.
+    """
+    n_days = 30
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+    rows = [
+        {"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0}
+        for dt in dates for h in range(24)
+    ]
+    energy_df = pd.DataFrame(rows)
+    weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=1)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
+    assert k == 2, f"Homogeneous data should fall back to k_lo=2, got K={k}"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_pkl_corruption_recovery(tmp_path):
+    """A corrupted clusterer.pkl must not crash the model; _clusterer becomes None."""
+    import pickle
+    from energy_forecast.model import EnergyForecastModel
+
+    # Write a corrupted clusterer.pkl
+    clusterer_path = tmp_path / "clusterer.pkl"
+    clusterer_path.write_bytes(b"not-valid-pickle-data")
+
+    # _load() should silently fall back to None
+    m = EnergyForecastModel(tmp_path)
+    # The model dir exists but has no valid model; EnergyForecastModel._load() is called in __init__
+    assert m._clusterer is None, (
+        "Corrupt clusterer.pkl should result in _clusterer=None, not an exception"
+    )
 
 
 # ── Stage 1 algorithmic correctness tests ────────────────────────────────────

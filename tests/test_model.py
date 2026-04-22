@@ -4103,3 +4103,62 @@ class TestEWMAGapReset:
         assert any("EWMA" in r.message for r in caplog.records), (
             "Expected EWMA gap warning not found in logs"
         )
+
+
+# ── Stage 3: Test coverage additions ─────────────────────────────────────────
+
+class TestTrainEdgeCases:
+    """#77 — train() must handle degenerate inputs gracefully."""
+
+    def _make_weather(self, ts):
+        return pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [10.0] * len(ts),
+            "precipitation_mm":     [0.0] * len(ts),
+            "sunshine_min":         [30.0] * len(ts),
+            "wind_kmh":             [10.0] * len(ts),
+            "cloud_cover_pct":      [50.0] * len(ts),
+            "direct_radiation_wm2": [100.0] * len(ts),
+        })
+
+    def test_train_empty_dataframe(self, tmp_path, caplog):
+        """train() with an empty energy_df logs a warning and does not raise."""
+        import logging
+        energy = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns]"), "gross_kwh": pd.Series(dtype=float)})
+        ts = pd.date_range("2024-01-01", periods=10, freq="1h")
+        weather = self._make_weather(ts)
+        m = EnergyForecastModel(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        # Model should not be trained (train() returned early)
+        assert m.model is None or not m.feature_cols, (
+            "Model should not be trained on empty energy_df"
+        )
+
+    def test_train_below_min_rows(self, tmp_path, caplog):
+        """train() with fewer than MIN_TRAINING_ROWS clean rows logs warning and returns."""
+        import logging
+        from energy_forecast.model import MIN_TRAINING_ROWS
+        n = MIN_TRAINING_ROWS - 1
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = self._make_weather(ts)
+        m = EnergyForecastModel(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        assert any("skipping" in r.message.lower() or "need" in r.message for r in caplog.records), (
+            "Expected 'skipping' warning for below-MIN_TRAINING_ROWS input"
+        )
+
+    def test_train_constant_values(self, tmp_path):
+        """train() with all gross_kwh=1.0 must not raise."""
+        n = 200
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+        weather = self._make_weather(ts)
+        m = EnergyForecastModel(tmp_path)
+        # Should not raise even if LightGBM complains about constant target
+        try:
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+        except Exception as exc:
+            pytest.fail(f"train() raised on constant values: {exc}")
