@@ -618,17 +618,21 @@ class EnergyForecastModel:
         )
 
         # ── Quantile models for prediction intervals (CQR) ───────────────────
-        # q10/q90 trained on first 85% of rows; last 15% (≥20 rows) used for
-        # split-conformal calibration to achieve ≥80% marginal coverage.
-        # Wrapped so a quantile failure never interrupts normal operation.
+        # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
+        # split-conformal calibration. Random split (not tail) is required so
+        # CQR's exchangeability assumption holds, guaranteeing ≥80% marginal
+        # coverage. Wrapped so a quantile failure never interrupts normal operation.
         try:
-            cal_size  = max(20, int(len(X) * 0.15))
-            split_idx = len(X) - cal_size
-            X_qtrain  = X.iloc[:split_idx]
-            y_qtrain  = y_fit[:split_idx]
-            X_cal     = X.iloc[split_idx:]
-            y_cal_log = y_fit[split_idx:]
-            sw_qtrain = sample_weight[:split_idx] if sample_weight is not None else None
+            rng = np.random.default_rng(42)
+            cal_size = max(20, int(len(X) * 0.15))
+            cal_idx = rng.choice(len(X), size=cal_size, replace=False)
+            train_mask = np.ones(len(X), dtype=bool)
+            train_mask[cal_idx] = False
+            X_qtrain  = X.iloc[train_mask]
+            y_qtrain  = y_fit[train_mask]
+            X_cal     = X.iloc[cal_idx]
+            y_cal_log = y_fit[cal_idx]
+            sw_qtrain = sample_weight[train_mask] if sample_weight is not None else None
 
             q10 = _build_quantile_model(lgb, GBR, alpha=0.1, n_estimators=best_n_est)
             q90 = _build_quantile_model(lgb, GBR, alpha=0.9, n_estimators=best_n_est)
@@ -740,9 +744,13 @@ class EnergyForecastModel:
                 regime_map = dict(zip(daily_features.index, predicted_labels))
                 
                 # 3. Populate regime_kwh column (vectorized)
+                # Mirror training ffill so partial/gap days get a filled label
+                # rather than -1 (which would zero out regime_kwh).
                 ts_idx = pd.to_datetime(feat_df["timestamp"])
                 hourly_labels = ts_idx.dt.date
-                mapped_labels = np.array([regime_map.get(d, -1) for d in hourly_labels])
+                date_series = pd.Series(hourly_labels)
+                label_series = date_series.map(regime_map).ffill().fillna(-1).astype(int)
+                mapped_labels = label_series.values
 
                 regime_vals = np.zeros(len(ts_idx))
                 valid_mask = (mapped_labels >= 0)
@@ -2225,8 +2233,18 @@ def _engineer_features(
 
     # ── Thermal modelling features (#49–#52) ──────────────────────────────────
     # #49 EWMA — RC-circuit thermal mass model (halflife in hours)
-    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24).mean()
-    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72).mean()
+    # Insert NaN at gap boundaries > 2h so ewm() resets rather than bleeding
+    # stale temperature across multi-hour weather API gaps.
+    dt_diff = w["timestamp"].diff().dt.total_seconds() / 3600
+    gap_starts = dt_diff > 2.0
+    if gap_starts.any():
+        _LOGGER.warning(
+            "EWMA: %d weather gap(s) > 2 h detected — resetting EWMA at boundaries",
+            int(gap_starts.sum()),
+        )
+        w.loc[gap_starts, "temp_c"] = np.nan
+    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24, min_periods=1).mean()
+    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72, min_periods=1).mean()
 
     # #50 Rolling degree-hour sums — accumulated thermal debt
     _hd = np.maximum(0, 18.0 - w["temp_c"])

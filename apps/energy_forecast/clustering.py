@@ -20,6 +20,7 @@ _LOGGER = logging.getLogger("energy_forecast")
 try:
     from sklearn.cluster import KMeans
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import TimeSeriesSplit, cross_val_score
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -137,14 +138,25 @@ class RegimePredictor:
 
             train_acc = self.model.score(X, y)
             oob_acc = self.model.oob_score_
-            _LOGGER.info(
-                "Regime Predictor trained — train acc: %.2f, OOB acc: %.2f (n=%d, k=%d)",
-                train_acc, oob_acc, len(X), len(y.unique()),
+
+            # TimeSeriesSplit CV measures forward-generalization (OOB alone
+            # uses bootstrap which ignores temporal ordering).
+            n_splits = min(3, max(2, len(X) // 30))
+            tscv = TimeSeriesSplit(n_splits=n_splits)
+            clf_proto = RandomForestClassifier(
+                n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3
             )
-            if oob_acc < 0.5:
+            tscv_scores = cross_val_score(clf_proto, X, y, cv=tscv, scoring="accuracy")
+            _LOGGER.info(
+                "Regime Predictor trained — train acc: %.2f, OOB=%.2f, "
+                "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d)",
+                train_acc, oob_acc, tscv_scores.mean(), tscv_scores.std(),
+                len(X), len(y.unique()),
+            )
+            if tscv_scores.mean() < 0.5:
                 _LOGGER.warning(
-                    "Regime Predictor OOB accuracy %.2f is near chance — regime signal may be "
-                    "unreliable. More training history needed.", oob_acc
+                    "Regime Predictor TimeSeriesCV accuracy %.2f is near chance — regime signal "
+                    "may be unreliable. More training history needed.", tscv_scores.mean()
                 )
             
         except Exception as e:
@@ -223,9 +235,16 @@ def find_optimal_k(
         if not raw_inertias:
             return k_lo
 
-        # Normalize inertias to 0-1 range
+        # Normalize inertias to 0-1 range; bail out if data is homogeneous
+        # (range < 1e-6 means all K values look identical — elbow is arbitrary)
         min_i, max_i = min(raw_inertias.values()), max(raw_inertias.values())
-        inertias = {k: (i - min_i) / (max_i - min_i + 1e-9) for k, i in raw_inertias.items()}
+        if max_i - min_i < 1e-6:
+            _LOGGER.warning(
+                "Auto-K: inertia range %.2e — data too homogeneous, falling back to K=%d",
+                max_i - min_i, k_lo,
+            )
+            return k_lo
+        inertias = {k: (i - min_i) / (max_i - min_i) for k, i in raw_inertias.items()}
         
         # Smooth inertias slightly (rolling average)
         sorted_k = sorted(inertias.keys())

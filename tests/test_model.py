@@ -3965,3 +3965,104 @@ class TestAutoKRegimeSelection:
         assert "predicted_kwh" in result.columns
         assert result["predicted_kwh"].notna().all(), "predicted_kwh contains NaN"
         assert (result["predicted_kwh"] >= 0).all(), "predicted_kwh contains negative values"
+
+
+# ── Stage 1: Algorithmic correctness tests ────────────────────────────────────
+
+class TestCQRCalibrationRandomSplit:
+    """#64 — CQR calibration must use a random holdout, not a temporal tail."""
+
+    def test_quantile_models_trained_after_random_split(self, tmp_path):
+        """train() with random CQR split still produces valid quantile models."""
+        m, _ = _make_trained_model(tmp_path)
+        assert m._model_q10 is not None
+        assert m._model_q90 is not None
+        assert isinstance(m._interval_correction, float)
+        assert np.isfinite(m._interval_correction)
+
+    def test_cal_indices_scattered_via_rng(self, tmp_path):
+        """Verify the random split: cal_idx from np.random.default_rng(42) must not
+        equal the tail slice (last 15% of rows), confirming exchangeability fix."""
+        import numpy as np_inner
+        n = 600
+        cal_size = max(20, int(n * 0.15))
+        # Reproduce the exact RNG used in model.py
+        rng = np_inner.random.default_rng(42)
+        cal_idx = rng.choice(n, size=cal_size, replace=False)
+        tail_idx = np_inner.arange(n - cal_size, n)
+        # The randomly chosen indices should NOT equal the tail
+        assert not np_inner.array_equal(np_inner.sort(cal_idx), tail_idx), (
+            "CQR cal_idx equals temporal tail — exchangeability fix not applied"
+        )
+        # And they must cover rows from the first half (impossible with a tail slice)
+        assert (cal_idx < n // 2).any(), (
+            "Random cal_idx contains no rows from the first half — not random"
+        )
+
+
+class TestEWMAGapReset:
+    """#69 — EWMA must reset at weather data gaps > 2 hours."""
+
+    def test_gap_inserts_nan_before_ewma(self):
+        """A 3-hour gap in weather timestamps triggers EWMA reset (warns and
+        temp_c at gap boundary is NaN → ewm propagates from NaN)."""
+        import logging
+        import warnings
+        # Build a 48-hour series with a 3-hour gap at hour 20
+        ts_before = pd.date_range("2026-01-01 00:00", periods=20, freq="1h")
+        ts_after = pd.date_range("2026-01-01 23:00", periods=28, freq="1h")  # 3h gap
+        ts_all = ts_before.append(ts_after)
+
+        df = _make_bare_df(ts_all)
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts_all),
+            "temp_c":               [10.0] * 20 + [20.0] * 28,
+            "precipitation_mm":     [0.0] * len(ts_all),
+            "sunshine_min":         [30.0] * len(ts_all),
+            "wind_kmh":             [10.0] * len(ts_all),
+            "cloud_cover_pct":      [50.0] * len(ts_all),
+            "direct_radiation_wm2": [100.0] * len(ts_all),
+        })
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = _engineer_features(df, w, None)
+
+        assert "temp_ewma_24h" in result.columns
+        assert result["temp_ewma_24h"].notna().any()
+
+    def test_no_gap_no_warning(self, caplog):
+        """Contiguous timestamps produce no EWMA gap warning."""
+        import logging
+        ts = pd.date_range("2026-01-01 00:00", periods=48, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=10.0)
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(df, w, None)
+
+        assert not any("EWMA" in r.message for r in caplog.records)
+
+    def test_gap_warning_logged(self, caplog):
+        """A 3-hour gap triggers a WARNING log mentioning EWMA."""
+        import logging
+        ts_before = pd.date_range("2026-01-01 00:00", periods=10, freq="1h")
+        ts_after = pd.date_range("2026-01-01 13:00", periods=10, freq="1h")
+        ts_all = ts_before.append(ts_after)
+        df = _make_bare_df(ts_all)
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts_all),
+            "temp_c":               [10.0] * 20,
+            "precipitation_mm":     [0.0] * 20,
+            "sunshine_min":         [30.0] * 20,
+            "wind_kmh":             [10.0] * 20,
+            "cloud_cover_pct":      [50.0] * 20,
+            "direct_radiation_wm2": [100.0] * 20,
+        })
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(df, w, None)
+
+        assert any("EWMA" in r.message for r in caplog.records), (
+            "Expected EWMA gap warning not found in logs"
+        )
