@@ -381,7 +381,7 @@ energy_forecast:
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
 | `enable_regimes` | No | `false` | Enable [Daily Regime Clustering](#daily-regime-clustering-optional). Groups historical 24h profiles and predicts the regime for tomorrow. Requires `scikit-learn`. |
-| `regime_count` | No | `5` | Number of distinct daily patterns to identify (e.g. Workday, Weekend, High-Heating). Typical range: 3–7. |
+| `regime_count` | No | `5` | Number of distinct daily patterns to identify (e.g. Workday, Weekend, High-Heating). Typical range: 3–7. Set to `0` to enable Auto-K (selects K ∈ [2, 8] via inertia elbow; experimental). |
 | `baseline_mode` | No | `false` | When `true`, subtracts all `sub_energy_sensors` from the training target so the model learns the household baseline without controllable-appliance noise. Mirrors the same subtraction at prediction time. See [Baseline / Passive mode](#baseline--passive-mode). |
 | `baseline_included_sensors` | No | `[]` | When `baseline_mode: true`, sensors listed here are **kept** in the training target (not subtracted). Use to include heating/DHW sub-sensors in the baseline model while still removing schedulable appliances (dishwasher, washer) for clean scenario deltas. Sensors absent from this list are subtracted as before. |
 | `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (area-weighted setpoint − current temp, in °C·h). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
@@ -572,6 +572,33 @@ The trained model and metadata are saved as pickle files in `apps/energy_forecas
 
 ---
 
+## Operational Characteristics
+
+### Cold-start timeline
+
+All forecast sensors show `unavailable` until at least **100 rows** of hourly energy history have been collected. The full feature set (lag features at 24 h / 48 h / 168 h / 336 h, rolling stats) activates progressively — expect roughly **3 weeks** (~500 rows) before lag features are fully active and predictions stabilise.
+
+### Retraining cadence
+
+The model retrains automatically **once a week** on a fixed timer. Retraining runs in a background thread; predictions continue to use the last-good model throughout. There is no sensor freeze or gap during retraining.
+
+To trigger an immediate retrain without restarting AppDaemon, fire the HA event:
+
+```
+event: RELOAD_ENERGY_MODEL
+```
+
+### CSV cache
+
+`energy_history.csv` grows at roughly **50 KB/month**. It is automatically compacted (sorted, deduplicated) on each weekly retrain. To force a full re-fetch from the HA database, delete the file — the next retrain will rebuild it from scratch.
+
+### Fallback chain
+
+- **Weather API failure**: if the Open-Meteo request fails, the previous forecast is reused until the next successful fetch.
+- **Corrupt model pickle**: if the SHA-256 sidecar check fails at startup, a warning is logged and a cold-start retrain is triggered automatically.
+
+---
+
 ## Backfilling history
 
 If you have existing Home Assistant data you want to import before the first training run, use the included backfill tool. It reads directly from the HA SQLite database (no REST API, no token required) and can import up to one year of hourly data.
@@ -715,6 +742,19 @@ Add the following to `apps.yaml` (requires `scikit-learn`):
 3.  **Feature Integration**: For the 48-hour forecast, the system predicts the regime for "Today" and "Tomorrow" and passes the expected 24-hour profile as a strong hint (`regime_kwh`) to the main forecast model.
 
 **Dependency Note:** This feature requires `scikit-learn`. If the package is missing or the feature is disabled, the system falls back gracefully to standard hourly forecasting without any characteristically different behaviour.
+
+### Auto-K (automatic cluster count)
+
+Set `regime_count: 0` to let the system pick the number of regimes automatically:
+
+```yaml
+  enable_regimes: true
+  regime_count: 0   # auto-select K ∈ [2, 8] via inertia elbow (experimental)
+```
+
+**How it works:** The system fits K-Means at each K from 2 to 8 and picks the K where the marginal inertia drop is steepest (the "elbow"). The RegimePredictor OOB accuracy is logged as an informational metric but does not influence the selection. Falls back to K=2 when fewer than 14 days of history are available.
+
+**When to use it:** Homes with an irregular or evolving routine benefit from Auto-K — the system discovers the right number of patterns rather than over- or under-clustering. For stable, well-understood routines, a fixed `regime_count` is still preferable as it gives you direct control.
 
 ---
 

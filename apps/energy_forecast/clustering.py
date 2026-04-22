@@ -39,7 +39,8 @@ class DailyProfileClusterer:
 
         Args:
             df: DataFrame with 'timestamp' and 'gross_kwh'.
-            sample_weight: Optional Series of daily weights indexed by date.
+            sample_weight: Accepted but ignored — KMeans runs unweighted to avoid
+                exponential decay distorting cluster geometry. Kept for API compatibility.
 
         Returns:
             A Series of cluster labels indexed by date, or None if failed.
@@ -52,7 +53,7 @@ class DailyProfileClusterer:
             daily = df.copy()
             daily["date"] = daily["timestamp"].dt.date
             daily["hour"] = daily["timestamp"].dt.hour
-            
+
             # Filter days with too much missing data
             daily_counts = daily.groupby("date")["gross_kwh"].count()
             valid_days = daily_counts[daily_counts >= 18].index
@@ -63,32 +64,15 @@ class DailyProfileClusterer:
             pivoted = daily[daily["date"].isin(valid_days)].pivot(
                 index="date", columns="hour", values="gross_kwh"
             )
-            
+
             # Interpolate to fill missing hours (up to 6 per day)
             pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1, limit=6).ffill(axis=1).bfill(axis=1)
-            
-            # Prepare sample weights for valid days
-            fit_kwargs = {}
-            if sample_weight is not None:
-                # Align weights to pivoted index; fill missing with the mean weight so
-                # unmatched days get a neutral contribution rather than zero weight.
-                # A zero-weight day causes sample_weight.sum()==0 → KMeans NaN divide.
-                mean_w = sample_weight.mean() if len(sample_weight) > 0 else 1.0
-                w = sample_weight.reindex(pivoted.index).fillna(mean_w).values
-                # Final safety guard: if all weights are zero or NaN, drop them entirely
-                if not np.isfinite(w).all() or w.sum() == 0:
-                    _LOGGER.warning(
-                        "Regime Clustering: sample_weight is invalid (all-zero or NaN) — "
-                        "falling back to uniform weights."
-                    )
-                else:
-                    fit_kwargs["sample_weight"] = w
 
-            # 2. Fit KMeans
+            # 2. Fit KMeans (unweighted — exponential weights distort cluster geometry)
             # Use raw values to capture both shape and magnitude (e.g. high-heating vs low-heating)
             n = min(self.n_clusters, len(pivoted))
             km = KMeans(n_clusters=n, random_state=42, n_init=10)
-            labels = km.fit_predict(pivoted, **fit_kwargs)
+            labels = km.fit_predict(pivoted)
             
             self.centroids = km.cluster_centers_
             self.is_fitted = True
@@ -218,13 +202,6 @@ def find_optimal_k(
         )
         pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1).ffill(axis=1).bfill(axis=1)
 
-        fit_kwargs: dict = {}
-        if sample_weight is not None:
-            mean_w = sample_weight.mean() if len(sample_weight) > 0 else 1.0
-            w = sample_weight.reindex(pivoted.index).fillna(mean_w).values
-            if np.isfinite(w).all() and w.sum() > 0:
-                fit_kwargs["sample_weight"] = w
-
         k_lo, k_hi = k_range
         k_max = min(k_hi, len(pivoted))
         k_values = list(range(k_lo, k_max + 1))
@@ -233,12 +210,12 @@ def find_optimal_k(
         if len(k_values) == 1:
             return k_values[0]
 
-        # First pass: collect inertias for all K
+        # First pass: collect inertias for all K (unweighted — weights distort geometry)
         raw_inertias: dict[int, float] = {}
         for k in k_values:
             try:
                 km = KMeans(n_clusters=k, random_state=42, n_init=10)
-                km.fit(pivoted, **fit_kwargs)
+                km.fit(pivoted)
                 raw_inertias[k] = float(km.inertia_)
             except Exception as e:
                 _LOGGER.debug("Auto-K: K=%d fit failed: %s", k, e)
@@ -269,42 +246,24 @@ def find_optimal_k(
                 best_d2 = d2
             candidates.append((k_cur, d2))
             
-        # Select candidates within 10% of best_d2
+        # Select candidates within 10% of best_d2; take the first (lowest K) on ties
         best_candidates = [k for k, d2 in candidates if d2 >= best_d2 * 0.9]
-        
-        # Tie-break using OOB score
-        if len(best_candidates) > 1:
-            best_oob = -1.0
-            selected_k = best_candidates[0]
-            for k in best_candidates:
-                try:
-                    km_test = KMeans(n_clusters=k, random_state=42, n_init=10)
-                    labels = km_test.fit_predict(pivoted, **fit_kwargs)
-                    predictor = RegimePredictor()
-                    predictor.fit(daily_features, pd.Series(labels, index=pivoted.index), sample_weight=sample_weight)
-                    oob = predictor.model.oob_score_ if predictor.is_fitted else -1.0
-                    if oob > best_oob:
-                        best_oob = oob
-                        selected_k = k
-                except Exception:
-                    continue
-        else:
-            selected_k = best_candidates[0]
+        selected_k = best_candidates[0]
 
-        # Second pass (informational): log OOB for selected K
+        # Informational pass: log OOB for selected K (does not affect selection)
         try:
             km_sel = KMeans(n_clusters=selected_k, random_state=42, n_init=10)
-            labels_arr = km_sel.fit_predict(pivoted, **fit_kwargs)
+            labels_arr = km_sel.fit_predict(pivoted)
             labels_series = pd.Series(labels_arr, index=pivoted.index)
             predictor = RegimePredictor()
             predictor.fit(daily_features, labels_series, sample_weight=sample_weight)
             oob = predictor.model.oob_score_ if predictor.is_fitted else float("nan")
             _LOGGER.info(
-                "Auto-K selected K=%d (inertia=%.1f, predictor OOB=%.2f).",
-                selected_k, inertias[selected_k], oob,
+                "Auto-K: inertia elbow selected K=%d. RegimePredictor OOB=%.2f (informational only).",
+                selected_k, oob,
             )
         except Exception:
-            _LOGGER.info("Auto-K selected K=%d (inertia=%.1f).", selected_k, inertias[selected_k])
+            _LOGGER.info("Auto-K: inertia elbow selected K=%d.", selected_k)
 
         return selected_k
 

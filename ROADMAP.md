@@ -128,21 +128,6 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
-### #62 — Adaptive Regime Selection (Auto-K)
-
-**Signal:** Instead of a fixed `regime_count`, automatically find the optimal number of clusters ($K$) that maximizes the balance between clustering quality (Silhouette Score) and weather-based predictability.
-
-**Proposed changes:**
-- Iterate $K \in [2, 8]$ during the clustering stage.
-- Calculate `silhouette_score` for each $K$ via `sklearn.metrics`.
-- Run internal cross-validation on `RegimePredictor` to measure predictability.
-- Select $K$ that maximizes $\text{Silhouette} \times \text{Accuracy}$.
-- Activate when `regime_count: 0`.
-
-**Effort:** ~2 h. **Impact:** MEDIUM — zero-config optimization.
-
----
-
 ### Deferred
 
 | # | Item | Reason |
@@ -158,11 +143,28 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
-| 62 | Adaptive Regime Selection (Auto-K) | medium | 2 h | backlog |
 | 10 | School holidays | medium | 4 h | long-term |
-| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | done (partial — personal IDs replaced) |
+| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
+| 64 | CQR calibration: use random split (not temporal tail) for valid coverage guarantee | HIGH/accuracy | ~3 h | backlog |
+| 65 | RegimePredictor: replace OOB with TimeSeriesSplit CV to prevent temporal overfitting | HIGH/accuracy | ~2 h | backlog |
+| 66 | Inertia normalization: bail out if range < 1e-6 (homogeneous data guard) | HIGH/robustness | ~1 h | backlog |
+| 67 | Train/predict regime mismatch: use consistent ffill for missing-day labels in both paths | MEDIUM/correctness | ~1 h | backlog |
+| 68 | Timezone normalization: extract `_normalize_timestamps()` utility (deduplication) | MEDIUM/maintainability | ~2 h | backlog |
+| 69 | EWMA temperature: detect and reset on weather data gaps > 2h | MEDIUM/robustness | ~2 h | backlog |
+| 70 | Physics feature scaling: document empirical basis for `0.01` infiltration multiplier and `10.0` defrost Gaussian width; consider learnable interaction terms | MEDIUM/explainability | ~3 h | backlog |
+| 71 | Sub-sensor signature quality: incorporate CoV into quality rating (not just cycle count) | MEDIUM/accuracy | ~1 h | backlog |
+| 72 | Scenario service: add input validation on schedule dict in `_get_scenario_cb()` | MEDIUM/robustness | ~1 h | backlog |
+| 73 | MQTT discovery: source version string from `__version__` instead of hardcoded string | LOW/maintainability | <1 h | backlog |
+| 74 | Tests: fix 19 KMeans ConvergenceWarnings in clustering tests (synthetic data too degenerate) | MEDIUM/test quality | ~1 h | backlog |
+| 75 | Tests: add pickle corruption recovery tests (clusterer.pkl has no SHA256 sidecar) | HIGH/test coverage | ~2 h | backlog |
+| 76 | Tests: add K=1 fallback test (single-cluster natural collapse) | HIGH/test coverage | ~1 h | backlog |
+| 77 | Tests: add `train()` edge cases — empty DataFrame, constant values, <100 rows boundary | HIGH/test coverage | ~2 h | backlog |
+| 78 | Tests: add network failure scenarios (HA unavailable during retrain, weather timeout) | HIGH/test coverage | ~2 h | backlog |
+| 79 | Tests: use timezone-aware fixtures to avoid UTC vs UTC+1 test environment traps | MEDIUM/test quality | ~1 h | backlog |
+| 80 | Docs: expand `find_optimal_k()` docstring — explain inertia elbow choice vs silhouette, fallback logic | LOW/maintainability | ~1 h | backlog |
+| 81 | Docs: expand `_calibrate_tau()` and `_project_indoor_temps()` inline docs (RC-ODE basis, stale-sensor fallback) | LOW/maintainability | ~1 h | backlog |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
@@ -244,3 +246,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 61 | Daily Regime Clustering (`regime_kwh`) | v0.11.0 |
 | 63 | Fix RegimePredictor overfitting (OOB score + constraints + occupancy features) | v0.11.0-alpha-8 |
 | 59 | Relaxed τ calibration — quality-scored windows replace hard daytime/solar filters | v0.11.0-alpha-9 |
+| 62 | Adaptive Regime Selection (Auto-K) — inertia elbow, K ∈ [2, 8], `regime_count: 0` | v0.11.0-alpha-10 |

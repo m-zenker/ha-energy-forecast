@@ -3930,3 +3930,38 @@ class TestAutoKRegimeSelection:
             regime_count=3,
         )
         assert m._regime_count == 3
+
+    def test_train_and_predict_end_to_end(self, tmp_path):
+        """train(enable_regimes=True) + predict() returns a 48-row non-NaN DataFrame."""
+        pytest.importorskip("sklearn")
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        energy_df, weather_df = self._make_regime_train_data(n=400)
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df, weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=0,
+        )
+        assert m._clusterer is not None and m._clusterer.is_fitted
+        assert m._regime_model is not None and m._regime_model.is_fitted
+
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast_df = pd.DataFrame({
+            "timestamp": future_ts,
+            "temp_c": [10.0] * 48,
+            "precipitation_mm": [0.0] * 48,
+            "sunshine_min": [30.0] * 48,
+            "wind_kmh": [10.0] * 48,
+            "cloud_cover_pct": [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        })
+        result = m.predict(forecast_df, live_temp=10.0)
+        assert len(result) == 48, f"Expected 48 rows, got {len(result)}"
+        assert "predicted_kwh" in result.columns
+        assert result["predicted_kwh"].notna().all(), "predicted_kwh contains NaN"
+        assert (result["predicted_kwh"] >= 0).all(), "predicted_kwh contains negative values"

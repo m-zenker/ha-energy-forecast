@@ -25,11 +25,11 @@ views:
             layout: horizontal
             name: Heute
           - type: custom:mushroom-entity-card
-            entity: sensor.ha_energy_forecast_energy_forecast_today_low_10th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_today_low
             name: Min
             layout: horizontal
           - type: custom:mushroom-entity-card
-            entity: sensor.ha_energy_forecast_energy_forecast_today_high_90th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_today_high
             name: Max
             layout: horizontal
           - type: custom:mushroom-entity-card
@@ -40,12 +40,12 @@ views:
           - type: custom:mushroom-entity-card
             icon_type: icon
             layout: horizontal
-            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_low_10th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_low
             name: Min
           - type: custom:mushroom-entity-card
             icon_type: icon
             layout: horizontal
-            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_high_90th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_tomorrow_high
             name: Max
           - type: custom:mushroom-entity-card
             icon_type: icon
@@ -55,11 +55,11 @@ views:
           - type: custom:mushroom-entity-card
             icon_type: icon
             layout: horizontal
-            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_low_10th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_low
             name: 3h Min
           - type: custom:mushroom-entity-card
             layout: horizontal
-            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_high_90th_pct
+            entity: sensor.ha_energy_forecast_energy_forecast_next_3h_high
             name: 3h Max
             icon_type: icon
         title: Energy Forecast
