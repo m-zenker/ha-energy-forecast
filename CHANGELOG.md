@@ -8,6 +8,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0-alpha-15] — 2026-04-22
+
+### Fixed
+- `apps/energy_forecast/model.py` — Auto-K scoring bias fixed: `find_optimal_k()` replaced the TimeSeriesSplit (TSCV) mean with out-of-bag (OOB) accuracy as the `RegimePredictor` quality gate in the tie-breaking step (when multiple K values have elbow scores within 10% of the best). Root cause: TSCV underestimated regime predictor quality by evaluating on forward-time-sliced folds (weather patterns drift season-to-season), while OOB draws from the full temporal range and better reflects the predictor's ability to generalize across the household's full operating envelope. New tie-breaking logic: fit `RegimePredictor` at each tied K, select the K with highest OOB accuracy. TSCV logging retained for observability but no longer influences selection. No config changes required (#82).
+
 ## [0.11.0-alpha-14] — 2026-04-22
 
 ### Fixed
