@@ -182,15 +182,22 @@ def find_optimal_k(
 ) -> int:
     """Return K ∈ k_range selected by the inertia elbow (second derivative).
 
-    Fits KMeans at each K, computes within-cluster inertia, then picks the K
-    where the marginal inertia drop accelerates most — the "knee" of the elbow
-    curve. Unlike silhouette, this metric is unbiased toward small K and
-    naturally selects K=4–6 for real energy profiles.
+    Algorithm
+    ---------
+    1. Fit KMeans at each K in k_range; record within-cluster inertia.
+    2. Normalize inertias to [0, 1] by (i - min) / (max - min).
+       Bail-out: if max - min < 1e-6 (all K values nearly identical, data is
+       homogeneous), return k_range[0] immediately with a WARNING.
+    3. Apply 3-point smoothing (rolling average on interior points) to reduce
+       noise before computing the discrete second derivative.
+    4. Compute d²inertia/dK² at each interior K. Gather all K whose d2 is
+       within 10 % of the global max — the "tolerance band". Among those
+       candidates, prefer the lowest K (parsimony tie-breaker).
+    5. After selecting K, fit a RegimePredictor and log OOB *and* TimeSeriesCV
+       accuracy as INFO — purely informational; no selection gate on OOB.
 
-    After selecting K, fits a RegimePredictor and logs OOB accuracy as INFO
-    (informational only — no gating on OOB).
-
-    Falls back to k_range[0] on insufficient data or sklearn unavailability.
+    Falls back to k_range[0] on insufficient data (< 14 valid days) or if
+    scikit-learn is unavailable.
     """
     if not SKLEARN_AVAILABLE or energy_df.empty:
         return k_range[0]

@@ -443,3 +443,59 @@ class TestFetchForecastV2:
         # Verify geo cache is populated
         assert (47.2, 7.5) in weather._srg_geo_id
         assert weather._srg_geo_id[(47.2, 7.5)] == geo_id
+
+
+# ── Stage 3: network failure scenarios (#78) ──────────────────────────────────
+
+class TestFetchOpenMeteoNetworkErrors:
+    """#78 — fetch_open_meteo must return empty DataFrame on all network/parse errors."""
+
+    def test_http_404_returns_empty(self):
+        """404 response → requests raises HTTPError (subclass of RequestException) → empty df."""
+        import requests as req_mod
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = req_mod.HTTPError("404")
+        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
+
+    def test_http_500_returns_empty(self):
+        """500 response → HTTPError → empty df."""
+        import requests as req_mod
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = req_mod.HTTPError("500")
+        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
+
+    def test_connection_timeout_returns_empty(self):
+        """requests.Timeout → empty df (Timeout is a subclass of RequestException)."""
+        import requests as req_mod
+        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.Timeout("timed out")):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
+
+    def test_connection_error_returns_empty(self):
+        """requests.ConnectionError → empty df."""
+        import requests as req_mod
+        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.ConnectionError("no route")):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
+
+    def test_malformed_json_returns_empty(self):
+        """Valid HTTP but invalid JSON (raises ValueError/KeyError) → empty df."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("not json")
+        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
+
+    def test_missing_hourly_key_returns_empty(self):
+        """JSON without 'hourly' key → KeyError → empty df."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"metadata": "no hourly key"}
+        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+        assert df.empty
