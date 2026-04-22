@@ -29,7 +29,8 @@ from typing import Any
 import hassapi as hass
 
 from . import ha_data, weather
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
+from . import __version__
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME, strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
@@ -464,7 +465,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.11.0-alpha-13",
+                "sw_version": __version__,
             },
         }
         if device_class is not None:
@@ -496,7 +497,7 @@ class EnergyForecast(hass.Hass):
                 "identifiers": ["ha_energy_forecast"],
                 "name": "HA Energy Forecast",
                 "model": "AppDaemon App",
-                "sw_version": "0.11.0-alpha-13",
+                "sw_version": __version__,
             },
         }
         if device_class is not None:
@@ -751,6 +752,27 @@ class EnergyForecast(hass.Hass):
                 _LOGGER.warning("get_scenario: 'schedule' must be a dict, got %s", type(schedule).__name__)
                 return
 
+            # Validate keys and time values; silently drop invalid entries
+            valid_prefixes = (
+                set(self._ml_model._signatures.keys())
+                | set((self._cfg or {}).get("sub_energy_sensors", {}).keys())
+            )
+            cleaned: dict = {}
+            for key, val in schedule.items():
+                if valid_prefixes and key not in valid_prefixes:
+                    _LOGGER.warning("get_scenario: unknown prefix '%s' in schedule — ignored", key)
+                    continue
+                if val is not None and val != "off":
+                    try:
+                        datetime.strptime(str(val), "%H:%M")
+                    except ValueError:
+                        _LOGGER.warning(
+                            "get_scenario: invalid time '%s' for prefix '%s' — ignored", val, key
+                        )
+                        continue
+                cleaned[key] = val
+            schedule = cleaned
+
             result_df = self._ml_model.predict_scenario(
                 self._cached_forecast_df,
                 self._cached_live_temp,
@@ -790,7 +812,7 @@ class EnergyForecast(hass.Hass):
         import pandas as pd
         import numpy as np
 
-        now_dt      = pd.Timestamp.now(tz=self._timezone).replace(tzinfo=None)
+        now_dt      = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         today_np    = np.datetime64(now_dt.normalize())
         tomorrow_np = today_np + np.timedelta64(1, "D")
         after_np    = tomorrow_np + np.timedelta64(1, "D")
@@ -1802,7 +1824,7 @@ class EnergyForecast(hass.Hass):
         import numpy as np
         import pandas as pd
 
-        now_dt      = pd.Timestamp.now(tz=self._timezone).replace(tzinfo=None)
+        now_dt      = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         now_np      = np.datetime64(now_dt.floor("h"))
         today_np    = np.datetime64(now_dt.normalize())
         tomorrow_np = today_np + np.timedelta64(1, "D")
@@ -1957,15 +1979,8 @@ class EnergyForecast(hass.Hass):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
-    """Convert timestamp column to naive local time in the given timezone."""
-    import pandas as pd
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"])
-        if ts.dt.tz is not None:
-            ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
-        df = df.copy()
-        df["timestamp"] = ts
-    return df
+    """Convert timestamp column to naive local time. Delegates to const.strip_tz."""
+    return _strip_tz_util(df, timezone)
 
 
 def _empty_weather_df() -> Any:

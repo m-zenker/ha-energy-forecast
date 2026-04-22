@@ -1,6 +1,7 @@
 """Constants for the Energy Forecast app."""
 
 from pathlib import Path
+from typing import Any
 
 # Data Validation
 MAX_HOURLY_KWH = 50.0  # Filters out meter resets or spikes
@@ -36,3 +37,19 @@ SENSOR_BLEND_HOURS = 6
 # Thermal Projection (indoor temperature RC-ODE forward simulation)
 DEFAULT_TAU = 12.0        # hours — used when τ has not been calibrated yet
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
+
+
+def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
+    """Convert the 'timestamp' column of a DataFrame to naive local time.
+
+    tz-aware timestamps are converted to *timezone* first, then the tzinfo is
+    dropped. Naive timestamps pass through unchanged.
+    """
+    import pandas as pd
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"])
+        if ts.dt.tz is not None:
+            ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+        df = df.copy()
+        df["timestamp"] = ts
+    return df

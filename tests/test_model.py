@@ -2496,6 +2496,43 @@ class TestApplianceSignatures:
         assert "dw" in sigs
         assert sigs["dw"]["quality"] == "good"
 
+    def test_quality_demoted_by_high_cov(self):
+        """15+ cycles but high energy variability (CoV > 0.5) → quality='fair', not 'good'."""
+        # Create cycles with very different total energies (high CoV)
+        ts_list, kwh_list = [], []
+        t = pd.Timestamp("2024-01-01")
+        rng = np.random.default_rng(7)
+        for i in range(20):
+            # Energy varies wildly: alternating 0.2 kWh and 5.0 kWh cycles
+            cycle_energy = 0.2 if i % 2 == 0 else 5.0
+            ts_list.append(t)
+            kwh_list.append(cycle_energy)
+            ts_list.append(t + pd.Timedelta(hours=1))
+            kwh_list.append(0.0)
+            t += pd.Timedelta(hours=8)
+        # Tail padding
+        for h in range(4):
+            ts_list.append(t + pd.Timedelta(hours=h))
+            kwh_list.append(0.0)
+        df = pd.DataFrame({"timestamp": ts_list, "kwh": kwh_list})
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        sig = sigs["dw"]
+        assert "energy_cov" in sig, "energy_cov should be in signature dict"
+        # If CoV > 0.5 and cycle count >= 15, quality should be demoted to 'fair'
+        if sig["n_cycles"] >= 15 and sig["energy_cov"] > 0.5:
+            assert sig["quality"] == "fair", (
+                f"Expected quality='fair' with CoV={sig['energy_cov']:.2f}, got '{sig['quality']}'"
+            )
+
+    def test_energy_cov_in_signature(self):
+        """energy_cov key is always present in the signature dict."""
+        df = _make_cycle_df([1.0, 0.5], n_cycles=5, period_hours=10)
+        sigs = _learn_appliance_signatures({"dw": df})
+        assert "dw" in sigs
+        assert "energy_cov" in sigs["dw"]
+        assert isinstance(sigs["dw"]["energy_cov"], float)
+
     def test_hour_of_day_distribution_present(self):
         """hour_of_day_distribution is a dict mapping hours (int) to counts (int)."""
         # All cycles start at 08:00 UTC

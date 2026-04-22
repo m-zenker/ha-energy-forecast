@@ -1879,11 +1879,15 @@ def _learn_appliance_signatures(
             (kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400
         )
         last_cycle_ts = str(kwh_series.index[valid_starts[-1]]) if valid_starts else ""
-        quality = (
+        quality_base = (
             "good" if len(windows) >= 15
             else "fair" if len(windows) >= 5
             else "poor"
         )
+        # Demote to "fair" when energy variability is high despite adequate cycle count
+        if energy_cov > 0.5 and quality_base == "good":
+            quality_base = "fair"
+        quality = quality_base
 
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
@@ -1894,6 +1898,7 @@ def _learn_appliance_signatures(
             "n_rejected": n_rejected,
             "idle_threshold": idle_thresh,
             "quality": quality,
+            "energy_cov": float(energy_cov),
             "n_data_days": n_data_days,
             "last_cycle_ts": last_cycle_ts,
             "hour_of_day_distribution": dict(sorted(hour_dist.items())),
