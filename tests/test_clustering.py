@@ -391,3 +391,41 @@ def test_find_optimal_k_weighted():
     k = find_optimal_k(energy_df, daily_features, sample_weight=weights, k_range=(2, 4))
 
     assert 2 <= k <= 4
+
+
+# ── Stage 1 algorithmic correctness tests ────────────────────────────────────
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_homogeneous_fallback():
+    """Homogeneous data (all profiles identical) → inertia range near 0 → returns k_lo."""
+    import logging
+    # All hours identical → KMeans inertia the same for every K → range ≈ 0
+    n_days = 30
+    dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+    rows = [
+        {"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0}
+        for dt in dates for h in range(24)
+    ]
+    energy_df = pd.DataFrame(rows)
+    weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=1)
+    daily_features = _prepare_daily_regime_features(weather_df)
+
+    k = find_optimal_k(energy_df, daily_features, k_range=(2, 5))
+
+    assert k == 2, f"Expected fallback k_lo=2, got {k}"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_regime_predictor_timeseries_cv_logged(caplog):
+    """RegimePredictor.fit() logs TimeSeriesCV accuracy alongside OOB."""
+    import logging
+    # Use enough data for at least 2 CV folds (n_splits = min(3, max(2, n//30)))
+    feats, labels = _make_daily_features(n=60)
+
+    with caplog.at_level(logging.INFO, logger="energy_forecast"):
+        predictor = RegimePredictor()
+        predictor.fit(feats, labels)
+
+    assert any("TimeSeriesCV" in r.message for r in caplog.records), (
+        "Expected 'TimeSeriesCV' in log output"
+    )
