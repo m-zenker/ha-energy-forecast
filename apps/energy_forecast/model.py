@@ -352,7 +352,7 @@ class EnergyForecastModel:
                 )
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
             self._regime_count = _actual_k
-            labels = self._clusterer.fit(energy_df, sample_weight=daily_weights)
+            labels = self._clusterer.fit(energy_df)
 
             if labels is not None and not labels.empty:
                 # ── Train Regime Predictor ──
@@ -380,10 +380,12 @@ class EnergyForecastModel:
                 valid_mask = (mapped_labels >= 0)
                 if valid_mask.any():
                     hours = ts_idx.dt.hour.values
+                    n_clusters = self._clusterer.centroids.shape[0]
+                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
                     regime_rows[valid_mask] = self._clusterer.centroids[
-                        mapped_labels[valid_mask], hours[valid_mask]
+                        safe_labels, hours[valid_mask]
                     ]
-                
+
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
 
         # ── Weather / outdoor / calendar features ───────────────────────────
@@ -746,8 +748,10 @@ class EnergyForecastModel:
                 valid_mask = (mapped_labels >= 0)
                 if valid_mask.any():
                     hours = ts_idx.dt.hour.values
+                    n_clusters = self._clusterer.centroids.shape[0]
+                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
                     regime_vals[valid_mask] = self._clusterer.centroids[
-                        mapped_labels[valid_mask], hours[valid_mask]
+                        safe_labels, hours[valid_mask]
                     ]
                 feat_df["regime_kwh"] = regime_vals
             except Exception as e:

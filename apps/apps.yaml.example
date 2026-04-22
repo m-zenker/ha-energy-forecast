@@ -207,6 +207,7 @@ energy_forecast:
   # Provides the model with a stable physics-informed prior (regime_kwh).
   # enable_regimes: true
   # regime_count: 5        # typical range: 3–7; more regimes = finer patterns but needs more data
+  # regime_count: 0         # auto-select K ∈ [2, 8] via inertia elbow (experimental)
 
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).
