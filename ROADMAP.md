@@ -40,20 +40,6 @@ Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to rea
 
 ## Backlog
 
-### #82 — Fix EV Contamination in Regime Clustering
-
-**Priority:** High — `regime_kwh` is the #1 most important feature but is currently contaminated.
-
-**Problem**: `DailyProfileClusterer.fit()` receives raw `gross_kwh` data. Of 194 valid days in the current history, 29 (15%) have EV charging sessions (any hour > 7 kWh). These form 3 of 5 clusters that encode EV session timing (midday, afternoon, evening peaks), not thermal or behavioral patterns. The meaningful non-EV clusters are simply low/medium/high seasonal totals — all with the same morning-dominant shape.
-
-**Fix**: In `model.py`'s `train()`, an EV-subtracted DataFrame already exists from the features pipeline. Route this (not the raw `energy_df`) to `DailyProfileClusterer.fit()`. The `EV_CHARGING_THRESHOLD_KWH` constant already defines the boundary.
-
-**Expected outcome**: Clean k=2–3 clusters that represent genuine behavioral/thermal patterns rather than EV timing accidents. Improves the signal quality of the `regime_kwh` feature.
-
-**Effort:** ~2 h. **Impact:** HIGH.
-
----
-
 ### #83 — Add `predicted_day_total` Feature (Temperature Regression)
 
 **Priority:** Medium — consider after #82.
@@ -156,6 +142,24 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #84 — Legionella / DHW Boost Hour Feature
+
+**Prerequisite:** DHW sub-sensor infrastructure (related to #22).
+
+**Problem**: The weekly legionella DHW protection cycle (heat buffer to ~60 °C, ~1–2 h) creates a predictable spike that the model has no dedicated signal for. Currently relies entirely on `lag_168h` (1-week lag), which takes 2–3 weeks to establish after a schedule change. The schedule was shifted from Tuesday ~23 h to Wednesday ~14 h on 2026-04-22, so the transition period is live now.
+
+Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–48 h), so this is not urgent.
+
+**Design (when implemented)**:
+- New `_compute_likely_legionella_hours()`: detect HOW slots where `dhw_buffer_temp > 58 °C` within a 30-day rolling window
+- New binary feature `is_legionella_hour` (mirrors `likely_ev_hour` pattern)
+- Optional `legionella_schedule_reset_date` config key to prune pre-change data and accelerate transition
+- Falls back gracefully to 0 when `dhw_buffer_sensor` is not configured
+
+**Effort:** ~3 h. **Impact:** LOW-MEDIUM (primarily useful after schedule changes; lag features self-correct within ~3 weeks otherwise).
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -170,8 +174,9 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
-| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **next** |
+| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **done** |
 | 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
+| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | after #22 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
@@ -189,6 +194,8 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
+| v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
 | v0.11.0-alpha-14 | 2026-04-22 | Algorithmic correctness (#64–#69), code quality (#68, #71–#73), test coverage (#74–#78), documentation (#70, #80–#81). 535 tests. |
 | v0.11.0 | 2026-04-17 | Daily Regime Clustering (optional module), K-Means 24h profiles, secondary regime predictor model |
 | v0.10.0 | 2026-04-10 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
@@ -276,3 +283,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 79 | Timezone-aware fixture audit — confirmed existing tests use naive timestamps correctly; no changes needed | v0.11.0-alpha-14 |
 | 80 | `find_optimal_k()` docstring fully documents normalization, bail-out, smoothing, tolerance band, OOB note | v0.11.0-alpha-14 |
 | 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
+| 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
