@@ -341,6 +341,11 @@ class EnergyForecastModel:
         if enable_regimes:
             _actual_k = regime_count
             _prebuilt_daily_features = None
+            ev_day_dates: set = (
+                set(ev_df["timestamp"].dt.date)
+                if ev_df is not None and len(ev_df) > 0
+                else set()
+            )
             if regime_count == 0:
                 # Auto-K: build daily features once and reuse for both selection and predictor
                 _prebuilt_daily_features = _prepare_daily_regime_features(
@@ -349,10 +354,11 @@ class EnergyForecastModel:
                 )
                 _actual_k = clustering.find_optimal_k(
                     energy_df, _prebuilt_daily_features, sample_weight=daily_weights,
+                    ev_day_dates=ev_day_dates,
                 )
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
             self._regime_count = _actual_k
-            labels = self._clusterer.fit(energy_df)
+            labels = self._clusterer.fit(energy_df, ev_day_dates=ev_day_dates)
 
             if labels is not None and not labels.empty:
                 # ── Train Regime Predictor ──

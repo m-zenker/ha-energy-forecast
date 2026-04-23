@@ -40,6 +40,20 @@ Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to rea
 
 ## Backlog
 
+### #83 — Add `predicted_day_total` Feature (Temperature Regression)
+
+**Priority:** Medium — consider after #82.
+
+**Context**: Empirical analysis (2026-04-22) shows non-EV daily totals range 14→40 kWh across seasons, strongly temperature-driven. After #82, clean regime clusters will capture shape. A separate `predicted_day_total` feature from a lightweight regression (`heating_deg_sum_24h`, `temp_ewma_24h`, `is_away`, `people_home` → daily total kWh) would give the main model an explicit scale signal independent of the regime shape.
+
+**Note**: May not add much if the cleaned `regime_kwh` already encodes enough scale information. Evaluate after #82 is live and SHAP importance is re-checked.
+
+**Prerequisite**: #82.
+
+**Effort:** ~3 h. **Impact:** MEDIUM.
+
+---
+
 ### #15 — HVAC / Boiler State: Projected Flow Setpoint
 
 **Priority:** escalate if sub-sensor bouncing persists after 2026-04-20; otherwise long-term.
@@ -128,6 +142,24 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #84 — Legionella / DHW Boost Hour Feature
+
+**Prerequisite:** DHW sub-sensor infrastructure (related to #22).
+
+**Problem**: The weekly legionella DHW protection cycle (heat buffer to ~60 °C, ~1–2 h) creates a predictable spike that the model has no dedicated signal for. Currently relies entirely on `lag_168h` (1-week lag), which takes 2–3 weeks to establish after a schedule change. The schedule was shifted from Tuesday ~23 h to Wednesday ~14 h on 2026-04-22, so the transition period is live now.
+
+Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–48 h), so this is not urgent.
+
+**Design (when implemented)**:
+- New `_compute_likely_legionella_hours()`: detect HOW slots where `dhw_buffer_temp > 58 °C` within a 30-day rolling window
+- New binary feature `is_legionella_hour` (mirrors `likely_ev_hour` pattern)
+- Optional `legionella_schedule_reset_date` config key to prune pre-change data and accelerate transition
+- Falls back gracefully to 0 when `dhw_buffer_sensor` is not configured
+
+**Effort:** ~3 h. **Impact:** LOW-MEDIUM (primarily useful after schedule changes; lag features self-correct within ~3 weeks otherwise).
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -142,6 +174,9 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
+| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **done** |
+| 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
+| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | after #22 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
@@ -159,6 +194,8 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
+| v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
 | v0.11.0-alpha-14 | 2026-04-22 | Algorithmic correctness (#64–#69), code quality (#68, #71–#73), test coverage (#74–#78), documentation (#70, #80–#81). 535 tests. |
 | v0.11.0 | 2026-04-17 | Daily Regime Clustering (optional module), K-Means 24h profiles, secondary regime predictor model |
 | v0.10.0 | 2026-04-10 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
@@ -246,3 +283,4 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 79 | Timezone-aware fixture audit — confirmed existing tests use naive timestamps correctly; no changes needed | v0.11.0-alpha-14 |
 | 80 | `find_optimal_k()` docstring fully documents normalization, bail-out, smoothing, tolerance band, OOB note | v0.11.0-alpha-14 |
 | 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
+| 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
