@@ -35,13 +35,23 @@ class DailyProfileClusterer:
         self.centroids: np.ndarray | None = None
         self.is_fitted = False
 
-    def fit(self, df: pd.DataFrame, sample_weight: pd.Series | None = None) -> pd.Series | None:
+    def fit(
+        self,
+        df: pd.DataFrame,
+        sample_weight: pd.Series | None = None,
+        ev_day_dates: "set | None" = None,
+    ) -> pd.Series | None:
         """Find clusters in hourly energy data.
 
         Args:
             df: DataFrame with 'timestamp' and 'gross_kwh'.
             sample_weight: Accepted but ignored — KMeans runs unweighted to avoid
                 exponential decay distorting cluster geometry. Kept for API compatibility.
+            ev_day_dates: Optional set of dates (datetime.date) that contain EV charging
+                sessions. These days are excluded from centroid fitting so that the
+                evening-peaked EV residual shape does not distort thermal/behavioural
+                clusters. EV days are still assigned to their nearest centroid afterward
+                so that every day gets a valid regime label.
 
         Returns:
             A Series of cluster labels indexed by date, or None if failed.
@@ -69,18 +79,38 @@ class DailyProfileClusterer:
             # Interpolate to fill missing hours (up to 6 per day)
             pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1, limit=6).ffill(axis=1).bfill(axis=1)
 
-            # 2. Fit KMeans (unweighted — exponential weights distort cluster geometry)
-            # Use raw values to capture both shape and magnitude (e.g. high-heating vs low-heating)
-            n = min(self.n_clusters, len(pivoted))
+            # 2. Determine which days to fit on (exclude EV days from centroid learning)
+            ev_set = ev_day_dates or set()
+            fit_index = [d for d in pivoted.index if d not in ev_set]
+            ev_excluded = len(pivoted) - len(fit_index)
+
+            if ev_excluded > 0 and len(fit_index) < 14:
+                _LOGGER.info(
+                    "Clustering: only %d non-EV days (< 14); including all %d days for fitting.",
+                    len(fit_index), len(pivoted),
+                )
+                fit_index = list(pivoted.index)
+                ev_excluded = 0
+
+            if ev_excluded > 0:
+                _LOGGER.info("Clustering: excluding %d EV days from centroid fitting.", ev_excluded)
+
+            piv_fit = pivoted.loc[fit_index]
+
+            # 3. Fit KMeans on non-EV days only (unweighted — exponential weights distort geometry)
+            n = min(self.n_clusters, len(piv_fit))
             km = KMeans(n_clusters=n, random_state=42, n_init=10)
-            labels = km.fit_predict(pivoted)
-            
+            km.fit(piv_fit)
+
             self.centroids = km.cluster_centers_
             self.is_fitted = True
-            
-            _LOGGER.info(f"Regime Clustering: Identified {n} profiles from {len(pivoted)} days.")
-            return pd.Series(labels, index=pivoted.index)
-            
+
+            # 4. Assign ALL valid days (including EV days) to their nearest centroid
+            all_labels = km.predict(pivoted)
+
+            _LOGGER.info(f"Regime Clustering: Identified {n} profiles from {len(piv_fit)} days.")
+            return pd.Series(all_labels, index=pivoted.index)
+
         except Exception as e:
             _LOGGER.error(f"Regime Clustering failed: {e}")
             return None
@@ -182,6 +212,7 @@ def find_optimal_k(
     daily_features: pd.DataFrame,
     sample_weight: "pd.Series | None" = None,
     k_range: tuple = (2, 8),
+    ev_day_dates: "set | None" = None,
 ) -> int:
     """Return K ∈ k_range selected by the inertia elbow (second derivative).
 
@@ -218,6 +249,18 @@ def find_optimal_k(
                 len(valid_days), k_range[0],
             )
             return k_range[0]
+
+        # Exclude EV days from inertia computation so EV session timing does not
+        # inflate the apparent number of meaningful clusters.
+        if ev_day_dates:
+            fit_days = [d for d in valid_days if d not in ev_day_dates]
+            if len(fit_days) >= 14:
+                valid_days = fit_days
+            else:
+                _LOGGER.info(
+                    "Auto-K: only %d non-EV days (< 14); including all days for K selection.",
+                    len(fit_days),
+                )
 
         pivoted = daily[daily["date"].isin(valid_days)].pivot(
             index="date", columns="hour", values="gross_kwh"

@@ -464,6 +464,129 @@ def test_find_optimal_k_homogeneous_fallback():
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_excludes_ev_days_from_centroids():
+    """EV days must not influence centroid shape; they still receive a label."""
+    import datetime
+
+    # 20 normal days with a morning peak at hour 7
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    rows = []
+    for dt in dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
+                         "gross_kwh": 2.0 if h == 7 else 0.3})
+
+    # 3 "EV days" with a distinctive large evening spike at hour 20
+    ev_dates = pd.date_range("2024-01-21", periods=3, freq="D")
+    ev_day_set = {d.date() for d in ev_dates}
+    for dt in ev_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
+                         "gross_kwh": 8.0 if h == 20 else 0.3})
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, ev_day_dates=ev_day_set)
+
+    # All 23 days must get a label
+    assert labels is not None
+    assert len(labels) == 23
+
+    # EV days must be assigned (label is not NaN)
+    for d in ev_day_set:
+        assert d in labels.index
+        assert labels[d] >= 0
+
+    # Centroids must NOT have a large evening spike — EV shape excluded from fitting
+    assert clusterer.centroids is not None
+    max_h20 = clusterer.centroids[:, 20].max()
+    assert max_h20 < 2.0, f"Evening centroid h20={max_h20:.2f} suggests EV days leaked into fitting"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_ev_fallback_too_few_non_ev_days():
+    """Falls back to fitting on all days when fewer than 14 non-EV days remain."""
+    import datetime
+
+    # 16 total days; mark all but 10 as EV → only 10 non-EV (< 14 threshold)
+    dates = pd.date_range("2024-01-01", periods=16, freq="D")
+    rows = []
+    for dt in dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 0.5})
+
+    ev_day_set = {d.date() for d in dates[6:]}  # 10 EV days, 6 non-EV
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, ev_day_dates=ev_day_set)
+
+    # Should not fail and should return labels for all 16 days
+    assert labels is not None
+    assert len(labels) == 16
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_excludes_ev_days():
+    """find_optimal_k with ev_day_dates matches result of simply removing those days."""
+    import datetime
+
+    # 30 normal days (two clear groups: low/high consumption)
+    dates_normal = pd.date_range("2024-01-01", periods=30, freq="D")
+    rows = []
+    for i, dt in enumerate(dates_normal):
+        level = 0.5 if i % 2 == 0 else 2.0
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": level})
+
+    # 5 outlier "EV days" with extreme evening spike
+    ev_dates = pd.date_range("2024-02-01", periods=5, freq="D")
+    ev_day_set = {d.date() for d in ev_dates}
+    for dt in ev_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
+                         "gross_kwh": 15.0 if 18 <= h <= 22 else 0.3})
+
+    df_all = pd.DataFrame(rows)
+    df_no_ev = pd.DataFrame([r for r in rows if r["timestamp"].date() not in ev_day_set])
+
+    feats_all, _ = _make_daily_features(n=35)
+    feats_no_ev, _ = _make_daily_features(n=30)
+
+    k_with_exclusion = find_optimal_k(df_all, feats_all, k_range=(2, 5), ev_day_dates=ev_day_set)
+    k_without_ev = find_optimal_k(df_no_ev, feats_no_ev, k_range=(2, 5))
+
+    assert k_with_exclusion == k_without_ev, (
+        f"K selection should match when EV days excluded: got {k_with_exclusion} vs {k_without_ev}"
+    )
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_no_ev_dates_unchanged():
+    """ev_day_dates=None and ev_day_dates=set() both match the default behaviour."""
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    rows = []
+    for i, dt in enumerate(dates):
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
+                         "gross_kwh": 1.0 if h == 8 else 0.3})
+    df = pd.DataFrame(rows)
+
+    clusterer_default = DailyProfileClusterer(n_clusters=2)
+    labels_default = clusterer_default.fit(df)
+
+    clusterer_none = DailyProfileClusterer(n_clusters=2)
+    labels_none = clusterer_none.fit(df, ev_day_dates=None)
+
+    clusterer_empty = DailyProfileClusterer(n_clusters=2)
+    labels_empty = clusterer_empty.fit(df, ev_day_dates=set())
+
+    assert labels_default is not None
+    np.testing.assert_array_equal(labels_default.values, labels_none.values)
+    np.testing.assert_array_equal(labels_default.values, labels_empty.values)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_regime_predictor_timeseries_cv_logged(caplog):
     """RegimePredictor.fit() logs TimeSeriesCV accuracy alongside OOB."""
     import logging

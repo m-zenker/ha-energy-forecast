@@ -40,6 +40,34 @@ Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to rea
 
 ## Backlog
 
+### #82 — Fix EV Contamination in Regime Clustering
+
+**Priority:** High — `regime_kwh` is the #1 most important feature but is currently contaminated.
+
+**Problem**: `DailyProfileClusterer.fit()` receives raw `gross_kwh` data. Of 194 valid days in the current history, 29 (15%) have EV charging sessions (any hour > 7 kWh). These form 3 of 5 clusters that encode EV session timing (midday, afternoon, evening peaks), not thermal or behavioral patterns. The meaningful non-EV clusters are simply low/medium/high seasonal totals — all with the same morning-dominant shape.
+
+**Fix**: In `model.py`'s `train()`, an EV-subtracted DataFrame already exists from the features pipeline. Route this (not the raw `energy_df`) to `DailyProfileClusterer.fit()`. The `EV_CHARGING_THRESHOLD_KWH` constant already defines the boundary.
+
+**Expected outcome**: Clean k=2–3 clusters that represent genuine behavioral/thermal patterns rather than EV timing accidents. Improves the signal quality of the `regime_kwh` feature.
+
+**Effort:** ~2 h. **Impact:** HIGH.
+
+---
+
+### #83 — Add `predicted_day_total` Feature (Temperature Regression)
+
+**Priority:** Medium — consider after #82.
+
+**Context**: Empirical analysis (2026-04-22) shows non-EV daily totals range 14→40 kWh across seasons, strongly temperature-driven. After #82, clean regime clusters will capture shape. A separate `predicted_day_total` feature from a lightweight regression (`heating_deg_sum_24h`, `temp_ewma_24h`, `is_away`, `people_home` → daily total kWh) would give the main model an explicit scale signal independent of the regime shape.
+
+**Note**: May not add much if the cleaned `regime_kwh` already encodes enough scale information. Evaluate after #82 is live and SHAP importance is re-checked.
+
+**Prerequisite**: #82.
+
+**Effort:** ~3 h. **Impact:** MEDIUM.
+
+---
+
 ### #15 — HVAC / Boiler State: Projected Flow Setpoint
 
 **Priority:** escalate if sub-sensor bouncing persists after 2026-04-20; otherwise long-term.
@@ -142,6 +170,8 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
+| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **next** |
+| 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
