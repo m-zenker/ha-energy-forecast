@@ -8,6 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0-alpha-16] — 2026-04-23
+
+### Fixed
+- `apps/energy_forecast/clustering.py`, `apps/energy_forecast/model.py` — EV days are now excluded from `DailyProfileClusterer.fit()` centroid calculation. Previously, `fit()` received raw `gross_kwh` data; of 194 valid history days, 29 (15%) had EV charging sessions (any hour > 7 kWh), causing 3 of 5 clusters to encode EV session timing (midday/afternoon/evening peaks) rather than genuine thermal or behavioral patterns. Fix: `model.train()` now passes the EV-subtracted DataFrame to `DailyProfileClusterer.fit()`, reusing the existing `ev_subtracted_df` that was already computed for the features pipeline. The `EV_CHARGING_THRESHOLD_KWH` constant defines the exclusion boundary. Expected outcome: cleaner k=2–3 clusters representing seasonal scale and shape variation, improving the signal quality of `regime_kwh` (#1 feature by SHAP importance). Closes #82.
+
+### Tests
+- `tests/test_clustering.py` — Added 4 new tests verifying EV day exclusion in `find_optimal_k()`, `DailyProfileClusterer.fit()` with EV-subtracted data, and that EV days do not appear in centroid fitting. 539 tests total (up from 535).
+
 ## [0.11.0-alpha-15] — 2026-04-22
 
 ### Fixed
