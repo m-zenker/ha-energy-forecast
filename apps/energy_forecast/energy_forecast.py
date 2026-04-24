@@ -1895,14 +1895,17 @@ class EnergyForecast(hass.Hass):
                 "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
             })
 
-        # ── EV kWh from actuals: sum (gross - charger_kw) for charging hours ──
+        # ── EV kWh from actuals: charger load per detected hour ──────────────
         # Always use original full_actuals for EV reporting, even in baseline_mode.
+        # EV energy per detected hour = charger_kw (the model's assumed fixed load).
+        # We clip by gross_kwh to handle partial hours near end-of-charge where
+        # gross may be slightly below charger_kw.
         if full_actuals is not None and not full_actuals.empty:
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
             if not ev_rows.empty:
-                ev_rows["ev_kwh"] = np.maximum(
-                    0.0, ev_rows["gross_kwh"] - self._ev_charger_kw
+                ev_rows["ev_kwh"] = np.minimum(
+                    ev_rows["gross_kwh"], self._ev_charger_kw
                 )
                 ev_times = ev_rows["timestamp"].values.astype("datetime64[ns]")
                 ev_vals  = ev_rows["ev_kwh"].values.astype(float)
