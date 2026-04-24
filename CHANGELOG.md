@@ -8,161 +8,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.11.0-alpha-16] — 2026-04-23
+## [0.11.0] — 2026-04-24
 
-### Fixed
-- `apps/energy_forecast/clustering.py`, `apps/energy_forecast/model.py` — EV days are now excluded from `DailyProfileClusterer.fit()` centroid calculation. Previously, `fit()` received raw `gross_kwh` data; of 194 valid history days, 29 (15%) had EV charging sessions (any hour > 7 kWh), causing 3 of 5 clusters to encode EV session timing (midday/afternoon/evening peaks) rather than genuine thermal or behavioral patterns. Fix: `model.train()` now passes the EV-subtracted DataFrame to `DailyProfileClusterer.fit()`, reusing the existing `ev_subtracted_df` that was already computed for the features pipeline. The `EV_CHARGING_THRESHOLD_KWH` constant defines the exclusion boundary. Expected outcome: cleaner k=2–3 clusters representing seasonal scale and shape variation, improving the signal quality of `regime_kwh` (#1 feature by SHAP importance). Closes #82.
-
-### Tests
-- `tests/test_clustering.py` — Added 4 new tests verifying EV day exclusion in `find_optimal_k()`, `DailyProfileClusterer.fit()` with EV-subtracted data, and that EV days do not appear in centroid fitting. 539 tests total (up from 535).
-
-## [0.11.0-alpha-15] — 2026-04-22
-
-### Fixed
-- `apps/energy_forecast/model.py` — Auto-K scoring bias fixed: `find_optimal_k()` replaced the TimeSeriesSplit (TSCV) mean with out-of-bag (OOB) accuracy as the `RegimePredictor` quality gate in the tie-breaking step (when multiple K values have elbow scores within 10% of the best). Root cause: TSCV underestimated regime predictor quality by evaluating on forward-time-sliced folds (weather patterns drift season-to-season), while OOB draws from the full temporal range and better reflects the predictor's ability to generalize across the household's full operating envelope. New tie-breaking logic: fit `RegimePredictor` at each tied K, select the K with highest OOB accuracy. TSCV logging retained for observability but no longer influences selection. No config changes required (#82).
-
-## [0.11.0-alpha-14] — 2026-04-22
-
-### Fixed
-- `apps/energy_forecast/model.py` — CQR calibration now uses a reproducible random holdout (RNG seed 42) instead of a temporal tail slice, satisfying the exchangeability assumption for valid ≥80% marginal coverage guarantees across all hours of the day (#64).
-- `apps/energy_forecast/clustering.py` — `RegimePredictor.train()` now runs TimeSeriesSplit CV alongside OOB scoring; the WARNING threshold uses TSCV mean (forward-generalization measure) instead of OOB accuracy, which overestimates performance on time-series data (#65).
-- `apps/energy_forecast/clustering.py` — `find_optimal_k()` bails out immediately to `k_lo` when inertia range < 1e-6 (homogeneous daily load), preventing degenerate elbow selection and logging a WARNING with diagnostic context (#66).
-- `apps/energy_forecast/model.py` — Prediction path now forward-fills regime labels (matching training semantics) instead of using `dict.get(-1)`, which incorrectly dropped gap days at forecast boundaries to zero (#67).
-- `apps/energy_forecast/model.py` — EWMA temperature features (`temp_ewma_24h`, `temp_ewma_72h`) reset at weather data gaps > 2h by inserting NaN sentinels before `.ewm()`, preventing stale temperature from bleeding across API outages. Logs WARNING with gap count when triggered (#69).
-- `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/weather.py` — `strip_tz()` moved to `const.py` as a shared utility; `weather.py` inline `tz_convert/tz_localize` pattern replaced; `energy_forecast.py` `.replace(tzinfo=None)` fixed to `.tz_localize(None)` for pandas 3.x correctness (#68).
-- `apps/energy_forecast/model.py` — Sub-sensor quality label now demotes from `"good"` to `"fair"` when `energy_cov > 0.5` (high cycle variability overrides high sample count); `energy_cov` now stored in signature dict for observability (#71).
-- `apps/energy_forecast/energy_forecast.py` — `get_scenario` service now validates schedule keys against known appliance prefixes and HH:MM format; unknown or malformed entries are dropped with WARNING logs, preventing silent wrong output from typos in service calls (#72).
-- `apps/energy_forecast/__init__.py` — Added `__version__ = "0.11.0-alpha-13"` as single source of truth; MQTT `sw_version` in both discovery payloads now references it instead of a hardcoded string (#73).
-
-### Changed
-- `apps/energy_forecast/clustering.py` — `find_optimal_k()` docstring expanded to document all algorithm steps: inertia normalization to [0,1], homogeneous bail-out (range < 1e-6), 3-point smoothing, 10% d2 tolerance band with lowest-K tie-breaking, and OOB/TSCV informational-only note (#80).
-- `apps/energy_forecast/model.py` — Physics feature scaling constants (0.01 for infiltration/solar, 10.0 for defrost Gaussian width) now documented in inline comment block explaining empirical basis and order-of-magnitude normalization rationale (#70).
-
-### Tests
-- `tests/test_clustering.py` — `_make_energy_df()` helper adds Gaussian noise (σ=0.05) to synthetic profiles, reducing KMeans ConvergenceWarnings in the test suite from 18 to 9 (#74).
-- `tests/test_clustering.py` — Added `test_clusterer_pkl_corruption_recovery` — corrupt `clusterer.pkl` triggers cold-start fallback (`_clusterer=None`) without raising (#75).
-- `tests/test_clustering.py` — Added `test_find_optimal_k_single_cluster_collapse` — homogeneous data hits inertia bail-out and returns `k_lo` (#76).
-- `tests/test_model.py` — Added `TestTrainEdgeCases` — empty DataFrame, below `MIN_TRAINING_ROWS`, constant `gross_kwh` values (#77).
-- `tests/test_weather.py` — Added `TestFetchOpenMeteoNetworkErrors` — 6 tests covering HTTP 404/500, Timeout, ConnectionError, malformed JSON, and missing `hourly` key; all expect empty DataFrame (#78).
-- Total test count: **535** (up from 510; +25 new tests).
-
-## [0.11.0-alpha-13] — 2026-04-20
-
-### Changed
-- `apps/energy_forecast/clustering.py` — **Outlier guard**: days with more than 6 hours of missing data are now excluded from the auto-K training set (threshold lowered from requiring ≥22 hours present to ≥18 hours), preventing sparse days from distorting cluster centroids.
-- `apps/energy_forecast/clustering.py` — **Inertia normalisation and smoothing**: raw KMeans inertias are normalised to [0, 1] and passed through a 3-point rolling average before elbow detection, making second-derivative scores comparable across training runs with different data volumes.
-- `apps/energy_forecast/clustering.py` — **OOB tie-breaking**: when multiple K candidates have second-derivative scores within 10 % of the best, `find_optimal_k()` fits a `RegimePredictor` at each tied K and selects the one with the highest OOB accuracy, favouring both accuracy and granularity simultaneously.
-- `apps/energy_forecast/clustering.py` — **Interpolation tolerance raised to 6 h/day**: `pivoted.interpolate(axis=1, limit=6)` replaces the previous unlimited interpolation, capping gap-fill at 6 consecutive missing hours per day and avoiding runaway extrapolation on very sparse days.
-
-## [0.11.0-alpha-12] — 2026-04-20
-
-### Fixed
-- **Auto-K silhouette K=2 bias** (`clustering.py`) — `find_optimal_k()` replaced silhouette+OOB gate selection with inertia elbow detection (second derivative of KMeans inertia). Root cause: silhouette score always peaks at K=2 for daily energy profiles regardless of gate thresholds or multipliers, systematically under-clustering and degrading forecast granularity. Elbow method is unbiased toward small K and naturally selects K=4–6 for real household energy data with multiple load patterns. OOB accuracy now logged at INFO level (informational signal only); no longer acts as a gate. Removed `oob_min` parameter from `find_optimal_k()`, `model.train()`, and `energy_forecast.py` config. Adds `test_find_optimal_k_elbow_prefers_higher_k` (verifies 5-regime synthetic data selects K≥3); removes obsolete `test_find_optimal_k_oob_gate_fallback`. 509 tests passing.
-
----
-
-## [0.11.0-alpha-11] — 2026-04-20
-
-### Fixed
-- **Auto-K scoring bias** (`clustering.py`) — `find_optimal_k()` replaced `silhouette × OOB` product scoring with silhouette maximisation subject to an OOB quality gate. The product was doubly biased toward K=2 (both silhouette and OOB accuracy peak at binary splits), causing auto-K to under-cluster and degrade MAE. New behaviour: maximise cluster granularity (silhouette) among K values where the regime is weather-predictable (OOB ≥ `regime_auto_k_oob_min`, default 0.5). Falls back to highest-silhouette K with a WARNING if no K clears the gate. New `regime_auto_k_oob_min` config key (float, default 0.5). 1 new test; 509 total passing.
-
----
-
-## [0.11.0-alpha-10] — 2026-04-20
+v0.11.0 introduces Daily Regime Clustering, an optional ML subsystem that identifies the household's recurring 24-hour consumption patterns from historical data and uses a weather- and calendar-aware Random Forest classifier to predict which regime to expect each day. The predicted regime's centroid profile is injected as a `regime_kwh` prior into the main LightGBM model, giving hourly forecasts a stable, physics-informed baseline anchored to real behavioral patterns. A 16-alpha hardening cycle refined auto-K elbow selection, added OOB tie-breaking, hardened centroid fitting with outlier guards and inertia normalisation, synced cluster weights to training-data decay, and excluded EV-charging days so centroids encode genuine thermal and occupancy patterns rather than EV session timing.
 
 ### Added
-- **Adaptive Regime Selection (Auto-K)** (`clustering.py`, `model.py`, closes #62) — when `regime_count: 0` is set in `apps.yaml`, the system now selects the optimal number of daily-regime clusters automatically at each training run. `find_optimal_k()` sweeps K ∈ [2, 8] (configurable via `k_range`), fits a KMeans clusterer and a `RegimePredictor` at each K, and selects the K that maximises `silhouette_score × OOB_accuracy`. Daily features are pre-built once and reused across all K evaluations to avoid redundant computation. Falls back to `k_range[0]` on insufficient history (<14 valid days), sklearn unavailability, or any unexpected error. `model.train()` stores the chosen K in `self._regime_count` for observability. 6 new tests in `test_clustering.py` and `test_model.py`; 508 total passing.
+- **Daily Regime Clustering** (`clustering.py`, `model.py`) — K-Means on historical 24-hour profiles; a secondary Random Forest classifier (`RegimePredictor`) predicts the daily regime from weather and calendar signals; the predicted centroid profile is injected as `regime_kwh` into the main hourly model. Config keys: `enable_regimes`, `regime_count`. SHAP label added for `regime_kwh`. (#60)
+- **Adaptive Regime Selection (Auto-K)** (`clustering.py`, `model.py`) — when `regime_count: 0`, the system selects the optimal number of clusters automatically at each training run. `find_optimal_k()` sweeps K ∈ [2, 8] via inertia elbow detection (second derivative), with OOB-accuracy tie-breaking when multiple K values score within 10% of the best. `model.train()` stores the chosen K for observability. Falls back to `k_range[0]` on insufficient history or sklearn unavailability. (#62)
+- **`__version__`** in `__init__.py` as single source of truth; MQTT `sw_version` in both discovery payloads now references it instead of a hardcoded string. (#73)
 
----
-
-## [0.11.0-alpha-9] — 2026-04-18
+### Fixed
+- **`Series` has no attribute `date`** (`model.py`) — `.date`/`.hour` on a `pd.Series` replaced with `.dt.date`/`.dt.hour` in both the train path (regime_kwh vectorised lookup) and predict path. With `enable_regimes` on, every retraining cycle raised this exception, blocking all subsequent predictions.
+- **Regime Clustering NaN crash** (`clustering.py`) — `DailyProfileClusterer.fit()` and `RegimePredictor.fit()` now fill missing sample weights with the mean weight instead of 0; a final guard drops the weight argument entirely if the resulting array is all-zero or contains NaN, preventing KMeans division-by-zero on initialisation.
+- **Cluster weights** (`clustering.py`) — synchronised to training-data exponential decay weights (same halflife).
+- **Thermal pressure discontinuities at heating on/off** (`model.py`, `energy_forecast.py`) — `_project_indoor_temps()` now accepts `heating_active_series` and computes a smooth per-hour setpoint trajectory using outdoor-temperature hysteresis (configurable `temp_on`/`temp_off` with dead-band hold). `_build_heating_active_projection()` generates the series from current heating state and outdoor forecast before each prediction cycle. No model retrain required.
+- **`fillna(method=)` crash in heating active projection** (`energy_forecast.py`) — `pandas 3.x` removed the `method=` kwarg; replaced with `.ffill().bfill()` chain.
+- **RegimePredictor overfitting** (`clustering.py`, `model.py`) — added `max_depth=6` and `min_samples_leaf=3`; enabled `oob_score=True`; logs WARNING when OOB < 0.5. Added `is_away` and `people_home` as daily regime features.
+- **Auto-K silhouette K=2 bias** (`clustering.py`) — `find_optimal_k()` replaced `silhouette × OOB` product scoring with inertia elbow detection (second derivative of KMeans inertia). Silhouette score peaks at K=2 for daily energy profiles regardless of gate thresholds, systematically under-clustering. Elbow method selects K=4–6 for real household data. (#80)
+- **Auto-K OOB tie-breaking** (`clustering.py`, `model.py`) — when multiple K values have elbow scores within 10% of the best, fits `RegimePredictor` at each tied K and selects the K with highest OOB accuracy. TSCV logging retained for observability but no longer influences selection. (#82)
+- **EV day exclusion from centroid fitting** (`clustering.py`, `model.py`) — `model.train()` now passes the EV-subtracted DataFrame to `DailyProfileClusterer.fit()`. Of 194 valid history days, 29 (15%) had EV charging (any hour > 7 kWh), causing 3 of 5 clusters to encode EV session timing rather than thermal or behavioral patterns. Expected outcome: cleaner K=2–3 clusters representing seasonal scale and genuine intra-day shape variation. (#82)
+- **CQR calibration exchangeability** (`model.py`) — uses a reproducible random holdout (RNG seed 42) instead of a temporal tail slice, satisfying the exchangeability assumption for valid ≥80% marginal coverage guarantees across all hours of the day. (#64)
+- **RegimePredictor WARNING threshold** (`clustering.py`) — `RegimePredictor.train()` now runs TimeSeriesSplit CV alongside OOB scoring; the WARNING threshold uses TSCV mean (forward-generalisation measure) instead of OOB accuracy, which overestimates performance on time-series data. (#65)
+- **`find_optimal_k()` homogeneous bail-out** (`clustering.py`) — bails out to `k_lo` immediately when inertia range < 1e-6 (homogeneous daily load), preventing degenerate elbow selection and logging a WARNING with diagnostic context. (#66)
+- **Regime label forward-fill in prediction path** (`model.py`) — prediction path now forward-fills regime labels (matching training semantics) instead of using `dict.get(-1)`, which incorrectly dropped gap days at forecast boundaries to zero. (#67)
+- **EWMA temperature reset at data gaps** (`model.py`) — `temp_ewma_24h` / `temp_ewma_72h` reset at weather data gaps > 2h by inserting NaN sentinels before `.ewm()`, preventing stale temperature from bleeding across API outages. Logs WARNING with gap count when triggered. (#69)
+- **Sub-sensor quality label** (`model.py`) — demotes from `"good"` to `"fair"` when `energy_cov > 0.5` (high cycle variability overrides high sample count); `energy_cov` now stored in signature dict for observability. (#71)
+- **`get_scenario` schedule validation** (`energy_forecast.py`) — service now validates schedule keys against known appliance prefixes and HH:MM format; unknown or malformed entries are dropped with WARNING logs. (#72)
 
 ### Changed
-- **Quality-scored τ calibration windows** (`model.py`) — `_calibrate_tau()` no longer hard-filters daytime (09:00–15:00) or high-solar (>150 W/m²) windows. All sub-sequences passing physics sanity (τ ∈ [0.5, 200], ≥2 points, declining ΔT, r²>0) become candidates and receive a composite quality score: r² × ΔT_SNR × length_score × solar_score × hour_score. `solar_score = exp(−max_radiation/400)` provides a continuous penalty; `hour_score` is 1.0 at night (22–06), 0.7 at shoulder (06–09, 16–22), and 0.3 during daytime (09–16). The top 50 % of candidates by quality (minimum 1) are used for the unweighted median τ. Minimum qualifying window count lowered from 3 → 1 — EMA smoothing already guards against single-batch jumps. Closes #59; 8 updated/new tests in `TestTauCalibrationSafeguards`, 502 passing.
+- **`find_optimal_k()` docstring** expanded to document all algorithm steps: inertia normalisation to [0,1], homogeneous bail-out, 3-point smoothing, 10% d2 tolerance band, and OOB/TSCV informational-only note. (#80)
+- **Physics feature scaling constants** (`model.py`) — documented in inline comment block explaining empirical basis and order-of-magnitude normalisation rationale. (#70)
+- **Outlier guard** (`clustering.py`) — days with more than 6 hours of missing data are excluded from the auto-K training set (threshold: ≥18 hours present).
+- **Inertia normalisation and smoothing** (`clustering.py`) — raw KMeans inertias normalised to [0,1] and passed through a 3-point rolling average before elbow detection, making second-derivative scores comparable across runs with different data volumes.
+- **Interpolation tolerance** (`clustering.py`) — raised to 6 h/day (`limit=6`), capping gap-fill at 6 consecutive missing hours per day.
 
----
-
-## [0.11.0-alpha-8] — 2026-04-17
-
-### Fixed
-- **RegimePredictor overfitting** (`clustering.py`, `model.py`) — `RandomForestClassifier` was trained without depth or leaf constraints, causing it to memorise training data and report 100% training accuracy. Added `max_depth=6` and `min_samples_leaf=3` to prevent overfitting. Enabled `oob_score=True`; the predictor now logs the out-of-bag accuracy after each fit and emits a WARNING if OOB score is below 0.5 (indicates insufficient training data or degenerate regime splits). Added `is_away` and `people_home` as daily regime features so occupancy state informs regime selection in addition to weather and calendar signals. 6 new tests in `test_clustering.py`.
-
----
-
-## [0.11.0-alpha-7] — 2026-04-17
-
-### Fixed
-- **`fillna(method=)` crash in heating active projection** (`energy_forecast.py`) — `pandas 3.x` removed the `method=` kwarg from `NDFrame.fillna()`; replaced with `.ffill().bfill()` chain. The `_build_heating_active_projection()` helper raised on every prediction cycle, silently falling back to flat setpoints.
-
----
-
-## [0.11.0-alpha-6] — 2026-04-17
-
-### Fixed
-- **Thermal pressure discontinuities at heating system on/off** (`model.py`, `energy_forecast.py`) — when `heating_system_active_entity` toggled, all climate setpoints previously flipped between 12 °C (off) and configured values (on) for the entire 48-hour prediction window, causing thermal_pressure to collapse to zero or spike abruptly. `_project_indoor_temps()` now accepts `heating_active_series` and computes a smooth per-hour setpoint trajectory using outdoor-temperature hysteresis (configurable `temp_on`/`temp_off` thresholds with dead-band hold). `_build_heating_active_projection()` generates the series from current heating state + outdoor forecast before each prediction cycle. No model retrain required — feature values preserved, only setpoint projection logic changed. 8 new regression tests in `test_setpoint_projection.py`.
-
----
-
-## [0.11.0-alpha-5] — 2026-04-17 (current dev)
-
-### Fixed
-- **`Series` has no attribute `date`** (`model.py`) — `ts_idx` is a `pd.Series`, not a
-  `DatetimeIndex`. Both the train path (regime_kwh vectorised lookup) and the predict path
-  used bare `.date` / `.hour`; replaced with `.dt.date` / `.dt.hour`. With `enable_regimes`
-  on, every retraining cycle raised this exception, blocking all subsequent predictions.
-
----
-
-## [0.11.0-alpha-4] — 2026-04-17
-
-### Fixed
-- **Regime Clustering NaN crash** (`clustering.py`) — `DailyProfileClusterer.fit()` and
-  `RegimePredictor.fit()` now fill missing weights with the mean weight (instead of 0) when
-  reindexing `sample_weight` to the pivoted date index. A final safety guard drops the weight
-  argument entirely if the resulting array is still all-zero or contains NaN, preventing a
-  `sample_weight.sum()==0` division-by-zero inside KMeans's initialisation routine. Regression
-  test added.
-
----
-
-## [0.11.0-alpha-3] — 2026-04-17
-
-### Changed
-- Regime Clustering weights now synchronised with training data decay weights (same halflife).
-
----
-
-## [0.11.0-alpha-2] — 2026-04-17
-
-See `0.11.0-alpha-1` notes below; alpha-2 added README documentation.
-
----
-
-## [0.11.0-alpha-1] — 2026-04-17
-
-v0.11.0 introduces Daily Regime Clustering as an optional module. This feature explicitly
-extracts typical 24-hour energy consumption patterns (regimes) and uses a secondary
-classifier to predict the most likely regime for any given day based on weather and calendar.
-The predicted regime's profile is then used as a stable "physics-informed" prior (`regime_kwh`)
-for the main hourly forecast model, significantly improving baseline stability.
-
-### Added
-- **Optional Daily Regime Clustering** (`clustering.py`, `model.py`) — new feature that
-  clusters historical 24-hour profiles into $K$ regimes (default 5) using K-Means.
-- **Regime Predictor Model** — a secondary Random Forest classifier that predicts the
-  daily regime from weather (temp, sunshine) and calendar (day of week, holiday).
-- **`regime_kwh` feature** — adds the expected consumption for the predicted regime
-  to the main hourly model's feature set.
-- **Optional Dependency Guard** — the module is designed to fall back gracefully if
-  `scikit-learn` is missing or if the feature is disabled in config.
-- **Config Toggle** — `enable_regimes` and `regime_count` keys in `apps.yaml`.
-- **SHAP label** — added label for `regime_kwh` feature.
-
-### Changed
-- **`EnergyForecastModel.train`** — now accepts `enable_regimes` and `regime_count`.
-- **`EnergyForecastModel.predict`** — integrated regime prediction into the 48h horizon.
-- **`ROADMAP.md`**, **`README.md`** — updated with documentation for the new feature.
-- **`sw_version`** — updated to `0.11.0` in MQTT discovery payloads.
+### Tests
+- 539 passing (up from 474 in v0.10.0; +65 new tests covering EV day exclusion, OOB tie-breaking, elbow selection, homogeneous bail-out, NaN crash regressions, scenario key validation, weather network errors, training edge cases, and clustering pickle corruption recovery).
 
 ---
 
@@ -868,20 +749,8 @@ See [[0.9.1-alpha]] and [[0.9.0-alpha]] for detailed per-change descriptions.
 - One-off SQLite backfill tool (`energy_history_backfill.py`) to import up to one year of HA recorder history
 - `apps.yaml.example` configuration template
 
-[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-12...HEAD
-[0.10.2-alpha-12]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-11...v0.10.2-alpha-12
-[0.10.2-alpha-11]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-10...v0.10.2-alpha-11
-[0.10.2-alpha-10]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-9...v0.10.2-alpha-10
-[0.10.2-alpha-9]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-8...v0.10.2-alpha-9
-[0.10.2-alpha-8]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-7...v0.10.2-alpha-8
-[0.10.2-alpha-7]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-6...v0.10.2-alpha-7
-[0.10.2-alpha-6]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-5...v0.10.2-alpha-6
-[0.10.2-alpha-5]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-4...v0.10.2-alpha-5
-[0.10.2-alpha-4]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-3...v0.10.2-alpha-4
-[0.10.2-alpha-3]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-2...v0.10.2-alpha-3
-[0.10.2-alpha-2]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.2-alpha-1...v0.10.2-alpha-2
-[0.10.2-alpha-1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.1...v0.10.2-alpha-1
-[0.10.1]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.0...v0.10.1
+[Unreleased]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.11.0...HEAD
+[0.11.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.10.0...v0.11.0
 [0.10.0]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0...v0.10.0
 [0.10.0-alpha]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0...v0.10.0-alpha
 [0.9.1-alpha]: https://forgejo.walzen.me/martin/ha-energy-forecast/compare/v0.9.0-alpha...v0.9.1-alpha
