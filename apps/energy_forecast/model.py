@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pandas as pd
 
+from . import clustering
 from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
@@ -110,6 +111,8 @@ _FEATURES_BASE = [
     "is_away",
     # Occupancy
     "people_home",
+    # Daily regime profile (optional module)
+    "regime_kwh",
     # Stage 2: Intent-driven features
     "thermal_pressure",
     "thermal_pressure_max",
@@ -217,6 +220,12 @@ class EnergyForecastModel:
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
 
+        # Daily Regime Clustering (optional)
+        self._enable_regimes: bool = False
+        self._regime_count: int = 5
+        self._clusterer: clustering.DailyProfileClusterer | None = None
+        self._regime_model: clustering.RegimePredictor | None = None
+
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
         self._model_archive_count: int = model_archive_count
@@ -242,6 +251,8 @@ class EnergyForecastModel:
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
+        enable_regimes: bool = False,
+        regime_count: int = 5,
     ) -> None:
         """Train/retrain the model on historical data."""
         import pandas as pd
@@ -311,12 +322,85 @@ class EnergyForecastModel:
         likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
         self._likely_ev_hours = likely_ev_hours
 
+        # ── Sample weighting for decay (Stage 1.5) ──────────────────────────
+        # Calculate hourly weights for all rows in energy_df
+        hourly_weights = None
+        daily_weights = None
+        if weight_halflife_days > 0:
+            end_ts = energy_df["timestamp"].max()
+            days_ago = (end_ts - energy_df["timestamp"]).dt.total_seconds() / 86400
+            h_weights = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
+            hourly_weights = pd.Series(h_weights, index=energy_df["timestamp"])
+            daily_weights = hourly_weights.groupby(energy_df["timestamp"].dt.date).mean()
+
+        # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
+        self._enable_regimes = enable_regimes
+        self._regime_count = regime_count
+        regime_kwh_series = None
+
+        if enable_regimes:
+            _actual_k = regime_count
+            _prebuilt_daily_features = None
+            ev_day_dates: set = (
+                set(ev_df["timestamp"].dt.date)
+                if ev_df is not None and len(ev_df) > 0
+                else set()
+            )
+            if regime_count == 0:
+                # Auto-K: build daily features once and reuse for both selection and predictor
+                _prebuilt_daily_features = _prepare_daily_regime_features(
+                    weather_df, country=country, canton=canton,
+                    away_df=away_df, presence_df=presence_df,
+                )
+                _actual_k = clustering.find_optimal_k(
+                    energy_df, _prebuilt_daily_features, sample_weight=daily_weights,
+                    ev_day_dates=ev_day_dates,
+                )
+            self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
+            self._regime_count = _actual_k
+            labels = self._clusterer.fit(energy_df, ev_day_dates=ev_day_dates)
+
+            if labels is not None and not labels.empty:
+                # ── Train Regime Predictor ──
+                daily_features = (
+                    _prebuilt_daily_features
+                    if _prebuilt_daily_features is not None
+                    else _prepare_daily_regime_features(
+                        weather_df, country=country, canton=canton,
+                        away_df=away_df, presence_df=presence_df,
+                    )
+                )
+
+                self._regime_model = clustering.RegimePredictor()
+                self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
+                
+                # 3. Create hourly regime_kwh_series (vectorized)
+                # Map daily labels to hourly timestamps
+                ts_idx = pd.to_datetime(df["timestamp"])
+                hourly_labels = ts_idx.dt.date
+                # Reindex labels to all dates in df, ffill any gaps
+                mapped_labels = labels.reindex(hourly_labels).ffill().fillna(-1).astype(int).values
+
+                # Use centroids matrix to lookup values for each hour
+                regime_rows = np.zeros(len(ts_idx))
+                valid_mask = (mapped_labels >= 0)
+                if valid_mask.any():
+                    hours = ts_idx.dt.hour.values
+                    n_clusters = self._clusterer.centroids.shape[0]
+                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
+                    regime_rows[valid_mask] = self._clusterer.centroids[
+                        safe_labels, hours[valid_mask]
+                    ]
+
+                regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
+
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
                                 dhw_df=dhw_df, tau_hours=self._tau_hours,
-                                room_areas=room_areas)
+                                room_areas=room_areas,
+                                regime_kwh_series=regime_kwh_series)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -389,12 +473,11 @@ class EnergyForecastModel:
         y = df["gross_kwh"].to_numpy(dtype=float)
         y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
 
-        # ── Exponential sample weighting ────────────────────────────────────
+        # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
-        if weight_halflife_days > 0:
-            end_ts = df["timestamp"].max()
-            days_ago = (end_ts - df["timestamp"]).dt.total_seconds() / 86400
-            sample_weight = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
+        if hourly_weights is not None:
+            # Map hourly weights to the (potentially subsetted) training df
+            sample_weight = hourly_weights.reindex(df["timestamp"]).fillna(0).values
 
         # ── TimeSeriesSplit cross-validation for MAE reporting ───────────────
         # Also used to determine optimal n_estimators via LightGBM early stopping.
@@ -541,17 +624,21 @@ class EnergyForecastModel:
         )
 
         # ── Quantile models for prediction intervals (CQR) ───────────────────
-        # q10/q90 trained on first 85% of rows; last 15% (≥20 rows) used for
-        # split-conformal calibration to achieve ≥80% marginal coverage.
-        # Wrapped so a quantile failure never interrupts normal operation.
+        # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
+        # split-conformal calibration. Random split (not tail) is required so
+        # CQR's exchangeability assumption holds, guaranteeing ≥80% marginal
+        # coverage. Wrapped so a quantile failure never interrupts normal operation.
         try:
-            cal_size  = max(20, int(len(X) * 0.15))
-            split_idx = len(X) - cal_size
-            X_qtrain  = X.iloc[:split_idx]
-            y_qtrain  = y_fit[:split_idx]
-            X_cal     = X.iloc[split_idx:]
-            y_cal_log = y_fit[split_idx:]
-            sw_qtrain = sample_weight[:split_idx] if sample_weight is not None else None
+            rng = np.random.default_rng(42)
+            cal_size = max(20, int(len(X) * 0.15))
+            cal_idx = rng.choice(len(X), size=cal_size, replace=False)
+            train_mask = np.ones(len(X), dtype=bool)
+            train_mask[cal_idx] = False
+            X_qtrain  = X.iloc[train_mask]
+            y_qtrain  = y_fit[train_mask]
+            X_cal     = X.iloc[cal_idx]
+            y_cal_log = y_fit[cal_idx]
+            sw_qtrain = sample_weight[train_mask] if sample_weight is not None else None
 
             q10 = _build_quantile_model(lgb, GBR, alpha=0.1, n_estimators=best_n_est)
             q90 = _build_quantile_model(lgb, GBR, alpha=0.9, n_estimators=best_n_est)
@@ -584,6 +671,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -621,12 +711,68 @@ class EnergyForecastModel:
                 future_hours,
                 outdoor_temp_series,
                 tau_hours=self._tau_hours,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
             )
 
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
                                      climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
                                      tau_hours=self._tau_hours, room_areas=room_areas)
+
+        # ── Daily Regime Profile Prediction ──────────────────────────────────
+        if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
+            try:
+                # 1. Prepare daily features for Today and Tomorrow
+                # Convert hourly away/occupancy series → DataFrames for regime predictor
+                _away_df_r = None
+                if away_series is not None and not away_series.empty:
+                    _away_df_r = (
+                        away_series.rename("is_away")
+                        .reset_index()
+                        .rename(columns={"index": "timestamp"})
+                    )
+                _presence_df_r = None
+                if people_home_series is not None and not people_home_series.empty:
+                    _presence_df_r = (
+                        people_home_series.rename("people_home")
+                        .reset_index()
+                        .rename(columns={"index": "timestamp"})
+                    )
+                daily_features = _prepare_daily_regime_features(
+                    forecast_df, country=self._country, canton=self._canton,
+                    away_df=_away_df_r, presence_df=_presence_df_r,
+                )
+                
+                # 2. Predict regime IDs
+                predicted_labels = self._regime_model.predict(daily_features)
+                regime_map = dict(zip(daily_features.index, predicted_labels))
+                
+                # 3. Populate regime_kwh column (vectorized)
+                # Mirror training ffill so partial/gap days get a filled label
+                # rather than -1 (which would zero out regime_kwh).
+                ts_idx = pd.to_datetime(feat_df["timestamp"])
+                hourly_labels = ts_idx.dt.date
+                date_series = pd.Series(hourly_labels)
+                label_series = date_series.map(regime_map).ffill().fillna(-1).astype(int)
+                mapped_labels = label_series.values
+
+                regime_vals = np.zeros(len(ts_idx))
+                valid_mask = (mapped_labels >= 0)
+                if valid_mask.any():
+                    hours = ts_idx.dt.hour.values
+                    n_clusters = self._clusterer.centroids.shape[0]
+                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
+                    regime_vals[valid_mask] = self._clusterer.centroids[
+                        safe_labels, hours[valid_mask]
+                    ]
+                feat_df["regime_kwh"] = regime_vals
+            except Exception as e:
+                _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
+                feat_df["regime_kwh"] = 0.0
+        else:
+            feat_df["regime_kwh"] = 0.0
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -685,6 +831,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import pandas as pd
@@ -695,7 +844,8 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
+            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
         )
         preds = self.model.predict(X)
         if self._log_transform:
@@ -714,6 +864,9 @@ class EnergyForecastModel:
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
         room_areas: "dict[str, float] | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -728,7 +881,8 @@ class EnergyForecastModel:
 
         future_hours, X = self._prepare_prediction_X(
             forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas
+            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
+            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
         )
         low  = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -755,6 +909,9 @@ class EnergyForecastModel:
         people_home_series: "pd.Series | None" = None,
         climate_recent: "dict[str, pd.DataFrame] | None" = None,
         dhw_recent: "pd.DataFrame | None" = None,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> "pd.DataFrame":
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
@@ -774,6 +931,9 @@ class EnergyForecastModel:
             people_home_series=people_home_series,
             climate_recent=climate_recent,
             dhw_recent=dhw_recent,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
         return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 
@@ -789,6 +949,9 @@ class EnergyForecastModel:
         dhw_recent: "pd.DataFrame | None" = None,
         room_areas: "dict[str, float] | None" = None,
         n: int = 5,
+        heating_active_series: "pd.Series | None" = None,
+        setpoint_on: "float | None" = None,
+        setpoint_off: "float | None" = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
 
@@ -812,6 +975,9 @@ class EnergyForecastModel:
             climate_recent=climate_recent,
             dhw_recent=dhw_recent,
             room_areas=room_areas,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -864,6 +1030,8 @@ class EnergyForecastModel:
                 self._model_q10_path,
                 self._model_q90_path,
                 self._interval_correction_path,
+                self._model_dir / "clusterer.pkl",
+                self._model_dir / "regime_model.pkl",
             ]
             for src in _artifacts:
                 if src.exists():
@@ -910,6 +1078,14 @@ class EnergyForecastModel:
             pickle.dump(self.model, fh)
         _write_hash(self._model_path)
 
+        # Save regime components if present
+        if self._clusterer:
+            with open(self._model_dir / "clusterer.pkl", "wb") as fh:
+                pickle.dump(self._clusterer, fh)
+        if self._regime_model:
+            with open(self._model_dir / "regime_model.pkl", "wb") as fh:
+                pickle.dump(self._regime_model, fh)
+
         meta = {
             "feature_cols":              self.feature_cols,
             "last_trained":              self.last_trained,
@@ -923,6 +1099,8 @@ class EnergyForecastModel:
             "likely_ev_hours":           self._likely_ev_hours,
             "sub_sensor_prefixes":       self._sub_sensor_prefixes,
             "tau_hours":                 self._tau_hours,
+            "enable_regimes":            self._enable_regimes,
+            "regime_count":              self._regime_count,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1030,14 +1208,25 @@ class EnergyForecastModel:
     ) -> "float | None":
         """Estimate building thermal time constant τ (hours) from passive-cooling windows.
 
-        Fits log-linear OLS on `ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ` for each
-        window where the heating system was confirmed off for ≥ 2 consecutive hours.
-        Returns median τ across valid windows, or None if fewer than 3 windows qualify.
+        Fits log-linear OLS on ``ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ`` for each
+        contiguous sub-sequence where indoor is warmer than outdoor and cooling.
+
+        Windows are scored rather than hard-filtered.  Each candidate receives a
+        composite quality score (0–1):
+
+        * ``r²``       — goodness of OLS log-linear fit (primary signal quality indicator;
+                         candidates with r² ≤ 0 are dropped as physics failures)
+        * ``ΔT score`` — initial indoor−outdoor gap normalised to 5 °C (SNR proxy)
+        * ``n score``  — length bonus, capped at 6 points
+        * ``solar``    — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
+        * ``hour``     — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.3 daytime
+
+        The top 50 % of candidates by quality (minimum 1) are used to compute the
+        median τ, which is then EMA-smoothed against the stored value.
         """
         import pandas as pd
         import numpy as np
 
-        # Average indoor temperature across all climate entities
         indoor_parts = []
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
@@ -1051,13 +1240,10 @@ class EnergyForecastModel:
 
         T_indoor_series = pd.concat(indoor_parts, axis=1).mean(axis=1)
 
-        # Outdoor temperature + radiation from weather_df
         outdoor = weather_df[["timestamp", "temp_c"]].copy()
         outdoor["timestamp"] = pd.to_datetime(outdoor["timestamp"]).dt.floor("1h")
         T_outdoor_series = outdoor.set_index("timestamp")["temp_c"]
 
-        # Solar radiation — used to mask windows contaminated by solar gain.
-        # Gracefully absent in legacy weather_df without this column.
         has_radiation = "direct_radiation_wm2" in weather_df.columns
         if has_radiation:
             rad = weather_df[["timestamp", "direct_radiation_wm2"]].copy()
@@ -1066,7 +1252,6 @@ class EnergyForecastModel:
         else:
             rad_series = None
 
-        # Heating active status (treat any value > 0.5 as "on")
         active = heating_active_df[["timestamp", "heating_active"]].copy()
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
@@ -1086,35 +1271,19 @@ class EnergyForecastModel:
         if combined.empty:
             return None
 
-        # Label contiguous off-blocks
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
-        tau_estimates: list[float] = []
+        candidates: list[tuple[float, float]] = []  # (tau, quality)
+
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
-
-            # §4 safeguard: exclude windows touching daytime hours (09:00–15:00).
-            # Heating behaviour and solar gain during these hours corrupt the
-            # passive-cooling signal even when the heating system is nominally off.
-            if group.index.hour.isin(range(9, 16)).any():
-                continue
-
-            # §4 safeguard: reject windows where solar radiation exceeded 150 W/m².
-            if "direct_radiation_wm2" in group.columns:
-                if group["direct_radiation_wm2"].max() > 150:
-                    continue
 
             group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
 
-            # Scan ALL maximal contiguous sub-sequences where indoor is both
-            # warmer than outdoor (delta > 0) and cooling (diff < 0).
-            # Prefix-only trimming missed evening cooling windows when heating
-            # turns off in the morning — solar gain invalidates the early hours
-            # but the valuable signal is in the tail (no sun, outdoor temp sinking).
             valid = delta > 0
             declining = np.concatenate([[False], np.diff(delta) < 0])
             mask = valid & declining
@@ -1129,34 +1298,84 @@ class EnergyForecastModel:
             for s, e in zip(starts, ends):
                 if e - s < 2:
                     continue
+
                 d = delta[s:e]
                 t = np.arange(len(d), dtype=float)
-                slope, _ = np.polyfit(t, np.log(d), 1)
-                if slope >= 0:  # safety net for noisy data
+                log_d = np.log(d)
+                slope, intercept = np.polyfit(t, log_d, 1)
+
+                if slope >= 0:
                     continue
                 tau = -1.0 / slope
-                if 0.5 <= tau <= 200:  # physics sanity guard
-                    tau_estimates.append(tau)
+                if not (0.5 <= tau <= 200.0):
+                    continue
 
-        if len(tau_estimates) < 3:
-            _LOGGER.info(
-                "τ calibration: only %d valid passive-cooling windows found (need ≥3) — skipping.",
-                len(tau_estimates),
-            )
+                # R² of the log-linear fit — windows where the fit explains no
+                # variance (flat decay profile, noisy sensor) are discarded.
+                y_hat = slope * t + intercept
+                ss_res = float(np.sum((log_d - y_hat) ** 2))
+                ss_tot = float(np.sum((log_d - log_d.mean()) ** 2))
+                r2 = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 1e-9 else 0.0
+                if r2 <= 0.0:
+                    continue
+
+                # ΔT SNR: normalised to 5 °C ceiling (larger gap = cleaner signal)
+                delta_t_score = min(d[0] / 5.0, 1.0)
+
+                # Length bonus — capped at 6 points
+                n_score = min(len(d) / 6.0, 1.0)
+
+                # Continuous solar penalty — no hard threshold
+                if "direct_radiation_wm2" in group.columns:
+                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e].max())
+                else:
+                    sub_max_rad = 0.0
+                solar_score = float(np.exp(-sub_max_rad / 400.0))
+
+                # Hour-of-day penalty applied at sub-sequence level
+                sub_hours = np.asarray(group.index[s:e].hour)
+                hour_scores = np.where(
+                    (sub_hours >= 9) & (sub_hours < 16),
+                    0.3,
+                    np.where(
+                        ((sub_hours >= 6) & (sub_hours < 9))
+                        | ((sub_hours >= 16) & (sub_hours < 22)),
+                        0.7,
+                        1.0,
+                    ),
+                )
+                hour_score = float(hour_scores.min())
+
+                quality = r2 * delta_t_score * n_score * solar_score * hour_score
+                candidates.append((tau, quality))
+
+        if not candidates:
+            _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
+
+        # Use top 50 % by quality (minimum 1 window)
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        n_select = max(1, len(candidates) // 2)
+        selected = candidates[:n_select]
+        tau_estimates = [c[0] for c in selected]
+
+        _LOGGER.debug(
+            "τ calibration: %d candidates, using top %d "
+            "(quality %.2f–%.2f, τ range %.1f–%.1f h)",
+            len(candidates), n_select,
+            selected[-1][1], selected[0][1],
+            min(tau_estimates), max(tau_estimates),
+        )
 
         tau_median = float(np.median(tau_estimates))
 
-        # §4 safeguard: EMA smoothing — if the new estimate differs from the
-        # stored τ by more than 50%, blend rather than replace outright.
-        # Prevents a single anomalous training batch from causing a large jump.
         old_tau = self._tau_hours
         if old_tau is not None and old_tau > 0:
             change_frac = abs(tau_median - old_tau) / old_tau
             if change_frac > 0.5:
                 tau_result = 0.8 * old_tau + 0.2 * tau_median
                 _LOGGER.info(
-                    "τ EMA blend: %.1f h → %.1f h (raw new estimate %.1f h, Δ=%.0f%%)",
+                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
                     old_tau, tau_result, tau_median, change_frac * 100,
                 )
             else:
@@ -1165,8 +1384,8 @@ class EnergyForecastModel:
             tau_result = tau_median
 
         _LOGGER.info(
-            "Building τ estimated at %.1f h from %d passive-cooling windows.",
-            tau_result, len(tau_estimates),
+            "Building τ estimated at %.1f h from %d passive-cooling windows (%d candidates scored).",
+            tau_result, len(tau_estimates), len(candidates),
         )
         return tau_result
 
@@ -1206,11 +1425,91 @@ class EnergyForecastModel:
                     self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
                     self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
                     self._tau_hours            = meta.get("tau_hours",             None)
+                    self._enable_regimes       = meta.get("enable_regimes",        False)
+                    self._regime_count         = meta.get("regime_count",          5)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
+        # Load regime models if they exist
+        c_path = self._model_dir / "clusterer.pkl"
+        if c_path.exists():
+            try:
+                with open(c_path, "rb") as fh:
+                    self._clusterer = pickle.load(fh)
+            except Exception:
+                self._clusterer = None
+        r_path = self._model_dir / "regime_model.pkl"
+        if r_path.exists():
+            try:
+                with open(r_path, "rb") as fh:
+                    self._regime_model = pickle.load(fh)
+            except Exception:
+                self._regime_model = None
+
         self._load_quantile_models()
         self._load_signatures()
+
+
+def _prepare_daily_regime_features(
+    weather_df: pd.DataFrame,
+    country: str = "CH",
+    canton: str | None = None,
+    away_df: "pd.DataFrame | None" = None,      # cols: timestamp, is_away
+    presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home
+) -> pd.DataFrame:
+    """Aggregate hourly weather into daily features for regime prediction."""
+    import pandas as pd
+
+    # 1. Aggregate daily weather features
+    w_daily = weather_df.copy()
+    w_daily["date"] = pd.to_datetime(w_daily["timestamp"]).dt.date
+    w_daily = w_daily.groupby("date").agg({
+        "temp_c": ["mean", "min", "max"],
+        "sunshine_min": "sum",
+        "precipitation_mm": "sum"
+    })
+    w_daily.columns = ["temp_mean", "temp_min", "temp_max", "sun_total", "precip_total"]
+
+    # 2. Add calendar features
+    cal_df = pd.DataFrame(index=w_daily.index)
+    cal_dates = pd.to_datetime(cal_df.index)
+    cal_df["day_of_week"] = cal_dates.dayofweek
+
+    # Reuse holiday logic
+    try:
+        import holidays as hd
+        years = cal_dates.year.unique().tolist()
+        ch_hols = hd.country_holidays(country, years=years)
+        # Add cantonal holidays if provided
+        if canton and country.upper() == "CH":
+            try:
+                ch_hols = hd.country_holidays(country, prov=canton, years=years)
+            except Exception:
+                pass
+        cal_df["is_holiday"] = pd.Series(cal_df.index).map(lambda d: 1 if d in ch_hols else 0).values
+    except Exception:
+        cal_df["is_holiday"] = 0
+
+    # 3. Occupancy features
+    # is_away: 1 if any hour of the day was marked away
+    if away_df is not None and not away_df.empty and "is_away" in away_df.columns:
+        a = away_df.copy()
+        a["date"] = pd.to_datetime(a["timestamp"]).dt.date
+        daily_away = a.groupby("date")["is_away"].max()
+        cal_df["is_away"] = daily_away.reindex(cal_df.index).fillna(0).astype(int)
+    else:
+        cal_df["is_away"] = 0
+
+    # people_home: mean occupied count across the day
+    if presence_df is not None and not presence_df.empty and "people_home" in presence_df.columns:
+        p = presence_df.copy()
+        p["date"] = pd.to_datetime(p["timestamp"]).dt.date
+        daily_pres = p.groupby("date")["people_home"].mean()
+        cal_df["people_home"] = daily_pres.reindex(cal_df.index).fillna(0)
+    else:
+        cal_df["people_home"] = 0
+
+    return pd.concat([w_daily, cal_df], axis=1).dropna()
 
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
@@ -1586,11 +1885,15 @@ def _learn_appliance_signatures(
             (kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400
         )
         last_cycle_ts = str(kwh_series.index[valid_starts[-1]]) if valid_starts else ""
-        quality = (
+        quality_base = (
             "good" if len(windows) >= 15
             else "fair" if len(windows) >= 5
             else "poor"
         )
+        # Demote to "fair" when energy variability is high despite adequate cycle count
+        if energy_cov > 0.5 and quality_base == "good":
+            quality_base = "fair"
+        quality = quality_base
 
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
@@ -1601,6 +1904,7 @@ def _learn_appliance_signatures(
             "n_rejected": n_rejected,
             "idle_threshold": idle_thresh,
             "quality": quality,
+            "energy_cov": float(energy_cov),
             "n_data_days": n_data_days,
             "last_cycle_ts": last_cycle_ts,
             "hour_of_day_distribution": dict(sorted(hour_dist.items())),
@@ -1797,6 +2101,9 @@ def _project_indoor_temps(
     future_timestamps: "pd.DatetimeIndex",
     outdoor_temp_series: "pd.Series",
     tau_hours: float | None = None,
+    heating_active_series: "pd.Series | None" = None,
+    setpoint_on: "float | None" = None,
+    setpoint_off: "float | None" = None,
 ) -> "dict[str, pd.Series]":
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
@@ -1845,10 +2152,20 @@ def _project_indoor_temps(
 
         # Build a projected climate DataFrame matching what _engineer_features expects
         setpoint_val = float(latest["setpoint"])
+        if (
+            heating_active_series is not None
+            and setpoint_on is not None
+            and setpoint_off is not None
+        ):
+            ha_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values
+            setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
+        else:
+            setpoint_arr = np.full(len(future_timestamps), setpoint_val)
+
         projected_df = pd.DataFrame({
             "timestamp": future_timestamps,
             "current_temp": t_in_arr,
-            "setpoint": setpoint_val,  # constant — we have no future setpoint schedule
+            "setpoint": setpoint_arr,
         })
         result[eid] = projected_df
 
@@ -1870,6 +2187,7 @@ def _engineer_features(
     dhw_df: pd.DataFrame | None = None,
     tau_hours: float | None = None,
     room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
+    regime_kwh_series: "pd.Series | None" = None,  # hourly regime profile
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -1926,8 +2244,18 @@ def _engineer_features(
 
     # ── Thermal modelling features (#49–#52) ──────────────────────────────────
     # #49 EWMA — RC-circuit thermal mass model (halflife in hours)
-    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24).mean()
-    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72).mean()
+    # Insert NaN at gap boundaries > 2h so ewm() resets rather than bleeding
+    # stale temperature across multi-hour weather API gaps.
+    dt_diff = w["timestamp"].diff().dt.total_seconds() / 3600
+    gap_starts = dt_diff > 2.0
+    if gap_starts.any():
+        _LOGGER.warning(
+            "EWMA: %d weather gap(s) > 2 h detected — resetting EWMA at boundaries",
+            int(gap_starts.sum()),
+        )
+        w.loc[gap_starts, "temp_c"] = np.nan
+    w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24, min_periods=1).mean()
+    w["temp_ewma_72h"] = w["temp_c"].ewm(halflife=72, min_periods=1).mean()
 
     # #50 Rolling degree-hour sums — accumulated thermal debt
     _hd = np.maximum(0, 18.0 - w["temp_c"])
@@ -2101,10 +2429,24 @@ def _engineer_features(
     cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
     df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
 
+    # ── §3: Physics feature scaling rationale ─────────────────────────────────
+    # Constants below are empirical, chosen to keep each feature in a ~0–5 range
+    # so LightGBM split-gain is not dominated by one feature's raw magnitude:
+    #
+    #   0.01 (solar gain, infiltration): wind_kmh × thermal_pressure can reach
+    #     ~500 raw (e.g. 50 km/h × 10 °C delta); 0.01 rescales to ~5. Solar gain
+    #     similarly reaches ~500 Wm⁻² × peak cosine; 0.01 maps to ~5 kWh equiv.
+    #
+    #   10.0 (defrost Gaussian σ²): width ≈ ±3σ = ±√30 ≈ ±5.5 °C from the 2 °C
+    #     peak. This covers the observed icing range of −3 °C to +7 °C at ≥ 5 %
+    #     of peak intensity. Empirical: wider (σ²=20) loses the 0 °C/5 °C split;
+    #     narrower (σ²=4) misses high-humidity defrost above 5 °C.
+    #
+    # Both 0.01 and 10.0 are candidates for learnable interaction terms if a
+    # dedicated physics-calibration pipeline is added (see ROADMAP).
     # ── §3: Solar-compensated pressure (#56) ─────────────────────────────────
     # Primary signal: subtract passive solar gain from thermal pressure.
     # High impact on reducing over-forecast on sunny winter days.
-    # Scaled by 0.01 to keep feature range comparable to raw pressure.
     df["thermal_pressure_net"] = np.maximum(0.0, df["thermal_pressure"] - 0.01 * df["weighted_solar_gain"])
 
     # ── §3: Wind-driven infiltration (#57) ───────────────────────────────────
@@ -2113,10 +2455,25 @@ def _engineer_features(
     df["infiltration_pressure"] = 0.01 * df["wind_kmh"] * df["thermal_pressure"]
 
     # ── §3: Humidity-aware defrost proxy (#58) ───────────────────────────────
-    # Peaks at 2°C, falls off rapidly above 7°C and below -3°C.
-    # Scaled by relative humidity.
+    # Peaks at 2°C; Gaussian σ²=10 covers observed icing range −3°C to +7°C.
+    # Scaled by relative humidity (dimensionless, 0–1).
     defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0)**2) / 10.0)
     df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
+
+    # ── Daily Regime Profile (optional) ──────────────────────────────────────
+    if regime_kwh_series is not None:
+        # Merge hourly profile by timestamp
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(
+            regime_kwh_series.to_frame("regime_kwh"),
+            left_on="_ts_floor",
+            right_index=True,
+            how="left"
+        )
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["regime_kwh"] = df["regime_kwh"].fillna(0.0)
+    else:
+        df["regime_kwh"] = 0.0
 
     return df
 

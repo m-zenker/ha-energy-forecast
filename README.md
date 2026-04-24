@@ -5,11 +5,20 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.10.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-474%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.11.0--alpha--8-blue)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-498%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
-Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a machine-learning model trained on *your own* historical grid-import data and local weather. Forecasts are published as native Home Assistant sensor entities and update every hour. The model retrains weekly to adapt to seasonal patterns and changes in your household.
+Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
+
+> **Status:** v0.11.0 is in alpha — core forecasting is stable; Daily Regime Clustering is experimental.
+
+**What you get:**
+- Trains entirely on *your* historical grid-import data — no generic model, no cloud dependency
+- 48-hour hourly forecast updated every hour, with calibrated prediction intervals
+- Anticipates heat-pump and DHW cycles from thermal pressure, outdoor temperature, and physics features
+- Scenario "what-if" API: ask what happens if you run the dishwasher at 22:00
 
 ---
 
@@ -25,7 +34,7 @@ The left card shows today/tomorrow forecasts with prediction-interval min/max an
 |---|---|
 | ![What drives today's forecast](assets/dashboard_shap_narrative.png) | ![MAE and anomaly detection](assets/dashboard_mae_anomaly.png) |
 
-Left: SHAP narrative card explaining the top drivers of today's forecast. Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
+Left: SHAP narrative card explaining the top drivers of today's forecast (e.g. "Mainly driven by: daily regime pattern; yesterday's same-hour consumption"). Right: rolling MAE sensors (model-reported, 30-day, 7-day) alongside the unusual consumption binary sensor.
 
 Dashboard YAML is in `dashboard/`.
 
@@ -46,11 +55,13 @@ Dashboard YAML is in `dashboard/`.
 - [EV charging detection](#ev-charging-detection)
 - [Solar PV + battery](#solar-pv--battery)
 - [Sub-energy sensors](#sub-energy-sensors)
+- [Daily Regime Clustering](#daily-regime-clustering-optional)
 - [Vacation / Away mode](#vacation--away-mode)
 - [Occupancy / Presence](#occupancy--presence)
 - [Baseline / Passive mode](#baseline--passive-mode)
 - [Thermal & DHW modeling](#thermal--dhw-modeling)
 - [MQTT Discovery](#mqtt-discovery-optional)
+- [Dashboard Setup](#dashboard-setup)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Licence](#licence)
@@ -61,8 +72,14 @@ Dashboard YAML is in `dashboard/`.
 
 These four steps get forecasts running. Skip MQTT Discovery, sub-sensors, and backfill for now — link to each is in the relevant section.
 
+**Before you start:**
+1. Find your `energy_sensor` entity ID: go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for a sensor whose state increases continuously (never resets daily). Note the full entity ID.
+2. Note your home's latitude and longitude in decimal degrees (e.g. from Google Maps).
+
 **1. Install AppDaemon and configure dependencies.**
 In HA go to **Settings → Add-ons → Add-on Store**, install **AppDaemon**, then paste the dependency block from [Requirements → AppDaemon add-on configuration](#appdaemon-add-on-configuration) into the add-on's Configuration tab and save.
+
+> **Timing:** the first AppDaemon restart takes **5–10 minutes** while LightGBM compiles on some platforms. Subsequent restarts take ~30 seconds (wheel is cached). On **Raspberry Pi (armv7)**, omit the `lightgbm` `init_commands` line if compilation fails — the app falls back to scikit-learn automatically.
 
 **2. Copy the app files** into your AppDaemon apps directory:
 ```
@@ -87,30 +104,45 @@ Open the file and fill in `energy_sensor`, `latitude`, and `longitude`. This fil
 ```
 HA Energy Forecast ready.
 ```
-Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and forecasts will begin publishing. If you have fewer than 48 hours of history, see [Backfilling history](#backfilling-history).
+Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and forecasts will begin publishing.
+
+**Next steps:**
+1. **Import dashboard cards** — YAML files are in `dashboard/`. See [Dashboard Setup](#dashboard-setup) for required custom cards.
+2. **Run backfill if you have < 48 hours of history** — see [Backfilling history](#backfilling-history). New installs without backfill will not produce a forecast until 48 hours of data accumulate.
+3. **Wait 48 hours for the first stable forecast.** Accuracy improves significantly over 2–4 weeks as lag features activate and the model learns your household's weekly rhythm.
 
 ---
 
 ## Features
 
+### Stage 1 — Core Forecasting
 - **48-hour hourly forecast** — trained on your own consumption history, not generic averages
-- **Works on any hardware** — including armv7 Raspberry Pi (LightGBM with automatic scikit-learn fallback when no C compiler is available)
-- **High-resolution local weather** — SRG-SSR forecast (Switzerland) with automatic Open-Meteo fallback, so a forecast is always available
-- **EV charging detection** — EV sessions are identified and subtracted from the training signal so they don't distort household baseline forecasts; detected kWh are published as separate sensors
-- **Solar PV + battery support** — four optional config keys correct the training target from grid-import-only to true household consumption (`grid_import − grid_export + solar_production − battery_charge + battery_discharge`); any subset of sensors can be configured independently
-- **Appliance-level context** — optional sub-energy sensors (heat pump, dishwasher, etc.) give the model lag features per appliance
-- **Local outdoor temperature blending** — if you have an outdoor sensor, its live reading is blended with the weather forecast for the first few hours
+- **LightGBM with scikit-learn GBR fallback** — works on any hardware including armv7 Raspberry Pi (automatic fallback when no C compiler is available)
+- **SHAP feature importance** — `shap_top_features` attribute and `shap_narrative` text on `sensor.energy_forecast_today` explain which inputs drove today's forecast
+- **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from the day-ahead prediction
+- **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world accuracy with calibrated 80% prediction intervals
+- **High-resolution local weather** — SRG-SSR forecast (Switzerland) with automatic Open-Meteo fallback
+- **EV charging detection** — EV sessions subtracted from the training signal; detected kWh published as separate sensors
+- **Solar PV + battery support** — four optional sensors correct the training target to true household consumption
 - **Exponential sample weighting** — recent data influences the model more than old data
-- **Self-healing** — graceful fallbacks at every external dependency (weather API, HA history, ML packages)
-- **MQTT Discovery** (optional) — registers all sensors in the HA entity registry so you can assign them to areas, add labels, and rename them in the UI
-- **Vacation / away mode** — `is_away` binary flag teaches the model your lower holiday consumption so predictions stay accurate while you travel
-- **Occupancy detection** — optional person-count feature improves accuracy during home/away transitions and captures household rhythm shifts
-- **Anomaly detection** — `binary_sensor.energy_forecast_unusual_consumption` fires when actual usage deviates by more than σ from recent patterns
-- **SHAP feature importance** — `shap_top_features` attribute on `sensor.energy_forecast_today` shows which inputs drove today's forecast
-- **Live rolling MAE** — `sensor.energy_forecast_mae_7d` and `mae_30d` track real-world forecast accuracy so you can see the model improving over time
-- **Passive / Baseline mode** — optional `baseline_mode` flag strips controllable sub-sensor loads from the training target, giving the model a cleaner household baseline signal and making scenario deltas more meaningful
-- **Thermal & DHW intent modeling** — optional climate entity setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
-- **Scenario / What-If API** — ask "what would my consumption look like if I run the dishwasher at 22:00?" without changing the live forecast; results fire an event and optionally publish dedicated HA sensors
+- **Self-healing** — graceful fallbacks at every external dependency
+
+### Stage 2 — Thermal & Occupancy
+- **Thermal & DHW intent modeling** — climate setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
+- **Physics feature pack** — `infiltration_pressure` (wind × thermal gradient), `defrost_risk` (humidity-scaled heat-pump defrost proxy), `thermal_pressure_net` (pressure minus passive solar gain)
+- **Thermal setpoint projection** — outdoor-temperature hysteresis projects heating on/off transitions across the full 48-hour window, eliminating step discontinuities in `thermal_pressure`
+- **Occupancy detection** — optional `people_home` person-count feature improves accuracy during home/away transitions
+- **Vacation / away mode** — `is_away` flag teaches the model lower holiday consumption
+
+### Stage 3 — Appliance Learning
+- **Appliance-level context** — optional `sub_energy_sensors` give the model lag, activity, and run-count features per appliance
+- **ML appliance signatures** — learned per-appliance 4-hour energy profiles, used by the scenario API
+- **Passive / Baseline mode** — strips controllable sub-sensor loads from the training target for cleaner baseline accuracy and meaningful scenario deltas
+
+### Stage 4 — Scenario API & Regime Clustering
+- **Scenario / What-If API** — ask "what if I run the dishwasher at 22:00?" without changing the live forecast; results fire an HA event and optionally publish dedicated sensors
+- **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns (e.g. Workday, Weekend, High-Heating) and predicts the most likely regime for tomorrow; provides the model with a stable `regime_kwh` prior
+- **MQTT Discovery** (optional) — registers all sensors in the HA entity registry for area assignment, labels, and UI renaming
 
 ---
 
@@ -123,21 +155,25 @@ Call the `energy_forecast/get_scenario` AppDaemon service to overlay appliance r
 service: appdaemon/energy_forecast_get_scenario
 data:
   schedule:
-    sub_dishwasher: "22:30"
-    sub_washing_machine: "off"   # "off" or null to skip
-  publish: true                  # optional: write result to HA sensors
+    sub_dishwasher: "22:30"        # key = entity ID suffix from sub_energy_sensors
+    sub_washing_machine: "off"     # "off" or null to exclude from scenario
+  publish: true                    # optional: write result to HA sensors
 ```
+
+Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after the last `.`, e.g. `sub_dishwasher` from `sensor.dishwasher_energy_kwh`. Alternatively, pass the full entity ID. Unknown keys are silently skipped.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
 {
   "forecast": [
-    {"timestamp": "2024-06-01T00:00:00", "predicted_kwh": 0.42, "delta_kwh": 0.0},
-    {"timestamp": "2024-06-01T01:00:00", "predicted_kwh": 0.38, "delta_kwh": 0.0},
+    {"timestamp": "2024-06-01T00:00:00+02:00", "predicted_kwh": 0.42, "delta_kwh": 0.0},
+    {"timestamp": "2024-06-01T01:00:00+02:00", "predicted_kwh": 0.38, "delta_kwh": 0.0},
     "..."
   ]
 }
 ```
+
+`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances relative to the baseline forecast — positive values mean higher consumption than baseline.
 
 **Published sensors** (when `publish: true`):
 
@@ -195,7 +231,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 | `numpy` ≥ 1.24.0 | |
 | `requests` ≥ 2.31.0 | |
 | `holidays` ≥ 0.46 | Swiss public holiday feature |
-| `scikit-learn` ≥ 1.4.0, tested with 1.8.0 | Required — GBR fallback engine |
+| `scikit-learn` ≥ 1.4.0 | Required — GBR fallback engine + Daily Regime Clustering |
 | `lightgbm` ≥ 4.0.0 | Optional — primary engine |
 
 ---
@@ -292,6 +328,10 @@ energy_forecast:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
 
+  # Daily Regime Clustering (optional, requires scikit-learn).
+  # enable_regimes: true
+  # regime_count: 5
+
   # Vacation / away mode (optional).
   # away_mode_entity: input_boolean.vacation_mode
   # away_return_entity: input_datetime.vacation_return
@@ -306,6 +346,13 @@ energy_forecast:
   # Top-N driving features exposed as shap_top_features attribute on
   # sensor.energy_forecast_today. Set to 0 to disable.
   # shap_top_n: 5
+
+  # Thermal setpoint projection — hysteresis thresholds (optional).
+  # Controls when heating is projected on/off across the 48h forecast window.
+  # heating_temp_on:      14.0   # outdoor °C below which heating is projected ON
+  # heating_temp_off:     18.0   # outdoor °C above which heating is projected OFF
+  # heating_setpoint_on:  20.0   # climate setpoint (°C) used when heating is ON
+  # heating_setpoint_off: 12.0   # climate setpoint (°C) used when heating is OFF
 ```
 
 > **Note:** To find your `energy_sensor` entity ID, go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for your grid-import meter — a sensor whose state increases continuously and never resets to zero each day.
@@ -321,7 +368,7 @@ energy_forecast:
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
 | `timezone` | No | `Europe/Zurich` | IANA timezone name |
-| `weight_halflife_days` | No | `90` | Sample weight half-life. Must be `≥ 1` (lower = recent data weighted more heavily). |
+| `weight_halflife_days` | No | `90` | Sample weight half-life in days. Must be `≥ 1`. Typical range: 60–180 (lower = recent data weighted more heavily). |
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
 | `solar_production_sensor` | No | — | Entity ID of a cumulative solar production kWh meter (`total_increasing`). Adds solar generation to the training target. See [Solar PV + battery](#solar-pv--battery). |
@@ -333,6 +380,8 @@ energy_forecast:
 | `holiday_canton` | No | — | Two-letter Swiss canton code (e.g. `ZH`, `BE`, `GE`). Adds cantonal holidays to the `is_public_holiday` feature in addition to federal ones |
 | `adaptive_retrain_threshold` | No | `2.0` | Ratio of live day-ahead MAE to CV MAE that triggers an early retrain. Set to `0` to disable. |
 | `sub_energy_sensors` | No | `[]` | List of cumulative kWh sub-sensor entity IDs (heat pump, dishwasher, etc.) to track as `lag_24h`/`lag_168h` features. Must be `total_increasing` kWh meters. See [Sub-energy sensors](#sub-energy-sensors). |
+| `enable_regimes` | No | `false` | Enable [Daily Regime Clustering](#daily-regime-clustering-optional). Groups historical 24h profiles and predicts the regime for tomorrow. Requires `scikit-learn`. |
+| `regime_count` | No | `5` | Number of distinct daily patterns to identify (e.g. Workday, Weekend, High-Heating). Typical range: 3–7. Set to `0` to enable Auto-K (selects K ∈ [2, 8] via inertia elbow; experimental). |
 | `baseline_mode` | No | `false` | When `true`, subtracts all `sub_energy_sensors` from the training target so the model learns the household baseline without controllable-appliance noise. Mirrors the same subtraction at prediction time. See [Baseline / Passive mode](#baseline--passive-mode). |
 | `baseline_included_sensors` | No | `[]` | When `baseline_mode: true`, sensors listed here are **kept** in the training target (not subtracted). Use to include heating/DHW sub-sensors in the baseline model while still removing schedulable appliances (dishwasher, washer) for clean scenario deltas. Sensors absent from this list are subtracted as before. |
 | `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (area-weighted setpoint − current temp, in °C·h). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
@@ -341,15 +390,30 @@ energy_forecast:
 | `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-cooling windows for τ calibration (log-linear OLS fit on periods where the building decays freely). Enables `thermal_pressure_cop`. Accepts `input_boolean` entities (`"on"`/`"off"` states). |
 | `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
-| `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Silent until ≥ 10 matched hours accumulate. |
+| `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Typical range: 2.5–4.0. Silent until ≥ 10 matched hours accumulate. |
 | `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
 | `presence_sensors` | No | `[]` | List of Home Assistant `person` or `device_tracker` entities used for occupancy counting (`people_home` feature). |
 | `model_archive_count` | No | `3` | Number of previous model snapshots to keep in `models/archive/` for rollback. Set to `0` to disable model versioning. Rollback via HA event `energy_forecast_rollback_model` or dashboard. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
+| `heating_temp_on` | No | `14.0` | Outdoor temperature threshold (°C) below which heating is projected ON across the 48h window. Used by `_build_heating_active_projection()`. Requires `heating_system_active_entity`. |
+| `heating_temp_off` | No | `18.0` | Outdoor temperature threshold (°C) above which heating is projected OFF. Dead-band between `heating_temp_on` and `heating_temp_off` holds the current heating state. |
+| `heating_setpoint_on` | No | `20.0` | Climate setpoint (°C) projected when heating is ON. Used to compute `thermal_pressure` for future hours. |
+| `heating_setpoint_off` | No | `12.0` | Climate setpoint (°C) projected when heating is OFF (e.g. night/summer setback). |
 
-> **Note:** `plz` (Swiss postal code) is silently accepted for backward compatibility but has no effect. The nearest SRG-SSR weather station is resolved from `latitude`/`longitude`. You can remove it from existing configs.
+**`sub_energy_sensors` — dict form with `program_sensor`:**
+
+Each entry in `sub_energy_sensors` may be either a plain entity ID string or a dict with an optional `program_sensor` sub-key:
+
+```yaml
+sub_energy_sensors:
+  - sensor.heat_pump_energy_kwh          # simple string form
+  - entity_id: sensor.dishwasher_energy_kwh
+    program_sensor: sensor.dishwasher_selected_program   # learn per-program energy profiles
+```
+
+The `program_sensor` sub-key enables per-program appliance signatures (requires ≥ 2 recorded cycles per program). Omitting it uses a single aggregate signature for that appliance.
 
 ---
 
@@ -494,6 +558,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
+| Daily Regime | `regime_kwh` — expected hourly profile for the predicted daily regime (e.g. Workday, Weekend, High-Heating); provides a stable physics-informed prior |
 | Away / vacation | `is_away` — binary flag; 1 during periods when `away_mode_entity` is "on"; teaches the model lower vacation-period consumption |
 | Occupancy | `people_home` — integer count of people home (from `presence_sensors`) |
 
@@ -504,6 +569,33 @@ Lag features are dynamically enabled as history grows — short-horizon lags (`l
 ### Model persistence
 
 The trained model and metadata are saved as pickle files in `apps/energy_forecast/models/`. Each file has a SHA-256 sidecar (`.sha256`) for integrity verification. A corrupted or missing sidecar triggers a warning and cold-start retrain.
+
+---
+
+## Operational Characteristics
+
+### Cold-start timeline
+
+All forecast sensors show `unavailable` until at least **100 rows** of hourly energy history have been collected. The full feature set (lag features at 24 h / 48 h / 168 h / 336 h, rolling stats) activates progressively — expect roughly **3 weeks** (~500 rows) before lag features are fully active and predictions stabilise.
+
+### Retraining cadence
+
+The model retrains automatically **once a week** on a fixed timer. Retraining runs in a background thread; predictions continue to use the last-good model throughout. There is no sensor freeze or gap during retraining.
+
+To trigger an immediate retrain without restarting AppDaemon, fire the HA event:
+
+```
+event: RELOAD_ENERGY_MODEL
+```
+
+### CSV cache
+
+`energy_history.csv` grows at roughly **50 KB/month**. It is automatically compacted (sorted, deduplicated) on each weekly retrain. To force a full re-fetch from the HA database, delete the file — the next retrain will rebuild it from scratch.
+
+### Fallback chain
+
+- **Weather API failure**: if the Open-Meteo request fails, the previous forecast is reused until the next successful fetch.
+- **Corrupt model pickle**: if the SHA-256 sidecar check fails at startup, a warning is logged and a cold-start retrain is triggered automatically.
 
 ---
 
@@ -627,6 +719,42 @@ For each sensor the model gains four features:
 **How many sensors?** 3–5 is a practical limit — each sensor adds 2 feature columns and a separate HA history fetch on every retrain and hourly update.
 
 **Backward compatibility:** Omitting `sub_energy_sensors` (or leaving it commented out) produces no behaviour change. Old model files without sub-sensor features load cleanly and continue to work.
+
+---
+
+## Daily Regime Clustering (optional)
+
+Daily Regime Clustering explicitly extracts 24-hour energy consumption patterns (regimes) and uses them as a stable baseline for the hourly model. This is especially useful for homes with distinct routines (e.g., Workday vs. Home Office vs. Weekend).
+
+### Configuration
+
+Add the following to `apps.yaml` (requires `scikit-learn`):
+
+```yaml
+  enable_regimes: true   # default: false
+  regime_count: 5        # default: 5
+```
+
+### How it works
+
+1.  **Clustering**: The system takes your historical 24-hour consumption profiles and groups them into $K$ regimes using K-Means.
+2.  **Regime Predictor**: A secondary classifier is trained to predict which regime a given day belongs to, based on the **weather forecast** and the **calendar**.
+3.  **Feature Integration**: For the 48-hour forecast, the system predicts the regime for "Today" and "Tomorrow" and passes the expected 24-hour profile as a strong hint (`regime_kwh`) to the main forecast model.
+
+**Dependency Note:** This feature requires `scikit-learn`. If the package is missing or the feature is disabled, the system falls back gracefully to standard hourly forecasting without any characteristically different behaviour.
+
+### Auto-K (automatic cluster count)
+
+Set `regime_count: 0` to let the system pick the number of regimes automatically:
+
+```yaml
+  enable_regimes: true
+  regime_count: 0   # auto-select K ∈ [2, 8] via inertia elbow (experimental)
+```
+
+**How it works:** The system fits K-Means at each K from 2 to 8 and picks the K where the marginal inertia drop is steepest (the "elbow"). The RegimePredictor OOB accuracy is logged as an informational metric but does not influence the selection. Falls back to K=2 when fewer than 14 days of history are available.
+
+**When to use it:** Homes with an irregular or evolving routine benefit from Auto-K — the system discovers the right number of patterns rather than over- or under-clustering. For stable, well-understood routines, a fixed `regime_count` is still preferable as it gives you direct control.
 
 ---
 
@@ -772,6 +900,13 @@ The following features activate when the corresponding sensors are configured an
 
 ## MQTT Discovery (optional)
 
+> **Breaking change — entity ID format:** Enabling MQTT Discovery changes all sensor entity IDs:
+> ```
+> OLD (set_state mode):  sensor.energy_forecast_today
+> NEW (MQTT mode):       sensor.ha_energy_forecast_energy_forecast_today
+> ```
+> Update all automations, dashboards, and template sensors before enabling. Switching back to `set_state` mode restores the old IDs but leaves the MQTT entities in the entity registry until you delete them manually.
+
 By default the app publishes all sensors via AppDaemon's `set_state()` API, which writes values to the HA **state machine** only. This means sensors appear in **Developer Tools → States** and can be used in dashboards and automations, but they are **not** registered in the **entity registry** — so you cannot assign them to an area, add labels, or rename them from the HA UI.
 
 Enabling MQTT Discovery registers every sensor as a proper HA entity under a single **HA Energy Forecast** device, unlocking:
@@ -813,7 +948,7 @@ Restart AppDaemon. After a few seconds, the device **HA Energy Forecast** appear
 
 ### What gets registered
 
-All sensors are registered at startup. The 6 prediction-interval sensors (`*_low` / `*_high`) are registered on the **first hourly update after the quantile models finish training** — typically within an hour of the initial retrain.
+All sensors are registered at startup. The 6 prediction-interval sensors (`*_low` / `*_high`) are registered on the **first hourly update after the quantile models finish training** — typically within an hour of the initial retrain. It is normal for these sensors to be absent for the first ~1 hour after startup.
 
 | Sensor group | Count |
 |---|---|
@@ -833,6 +968,22 @@ When AppDaemon starts it publishes `online` to the availability topic. When AppD
 ### Reverting to set_state() mode
 
 Set `mqtt_discovery: false` (or remove the key). The app reverts to writing directly to the HA state machine. Previously registered MQTT entities remain in the entity registry until you delete them manually from **Settings → Devices & Services → MQTT**.
+
+---
+
+## Dashboard Setup
+
+Dashboard YAML files are in the `dashboard/` directory. To import them into Home Assistant:
+
+1. In HA, go to your dashboard → edit mode → **Add card → Manual**.
+2. Paste the contents of the desired YAML file.
+3. Edit any entity IDs marked with `# ← EDIT` to match your installation.
+
+**Required custom cards** (install via HACS → Frontend):
+- [`custom:mushroom-entity-card`](https://github.com/piitaya/lovelace-mushroom) — compact entity tiles
+- [`custom:mini-graph-card`](https://github.com/kalkih/mini-graph-card) — sparkline graphs for MAE and forecast history
+
+> **Note:** `dashboard/dashboard.yaml` contains example personal entity IDs (EV battery, heat pump sensors). Replace these with your own entity IDs before importing.
 
 ---
 
@@ -858,6 +1009,7 @@ Set `mqtt_discovery: false` (or remove the key). The app reverts to writing dire
 
 **`Insufficient history (N h). Skipping.`**
 - Fewer than 48 hours of data are available. The app will retry on the next training cycle. Normal on a new install — history accumulates automatically.
+- **New installs:** run the [backfill tool](#backfilling-history) to import existing HA history before the first training run. Without it, you will not receive a forecast until at least 48 consecutive hours of energy readings have been collected.
 
 **`ML engine: sklearn GBR` instead of LightGBM**
 - LightGBM failed to install (no C compiler on the host, e.g. armv7).
@@ -866,10 +1018,11 @@ Set `mqtt_discovery: false` (or remove the key). The app reverts to writing dire
 
 **Forecast accuracy is poor in the first few weeks**
 - The model needs at least a few weeks of data to learn daily and weekly patterns. Use the backfill tool to give it a head start.
-- Check `sensor.energy_forecast_model_mae` — as a rough guide, MAE below ~15% of your average hourly consumption suggests a well-fitted model (e.g. below 0.3 kWh for a household averaging ~2 kWh/h). Larger homes or those with EV/heat-pump loads will have proportionally higher absolute MAE.
+- Check `sensor.energy_forecast_model_mae` — as a rough guide, MAE below ~15% of your average hourly consumption suggests a well-fitted model. Example: a household averaging 2 kWh/h has a 15% target of 0.3 kWh/h. To compute your baseline: find your daily kWh total (e.g. from `sensor.energy_forecast_today` after a normal day) and divide by 24.
+- If `sensor.energy_forecast_setup_status` is `ok` but MAE is stuck high: check the AppDaemon log for `Retraining failed`, verify your `energy_sensor` returns a numeric state, and check that `energy_history.csv` is growing in size.
 
 **DST fall-back warning in the log**
-- `DST fall-back: N rows share M duplicate naive timestamp(s) after merge` is expected on the last Sunday of October. It is informational — the merge still completes correctly.
+- `DST fall-back: N rows share M duplicate naive timestamp(s) after merge` appears on the last Sunday of October. This is informational — the merge still completes correctly; no action required.
 
 **CSV health check warnings**
 - After the weekly retrain or during history merge, you may see `WARNING` logs mentioning:
@@ -879,7 +1032,9 @@ Set `mqtt_discovery: false` (or remove the key). The app reverts to writing dire
 - These are diagnostic only and do not stop training. Common causes: sensor reset, power failure during DST, manual meter restart. Check the timestamps and decide if correcting the CSV cache is necessary.
 
 **`Could not fetch recent actuals for lag features`**
-- HA history fetch failed. The sensor update proceeds without lag features; the model fills them with training-set medians. No action required.
+- HA history fetch failed. The sensor update proceeds without lag features; the model fills them with training-set medians.
+- Sporadic occurrences (once every few days) are normal — HA sometimes times out on large history fetches. No action required.
+- If this appears every hour: check HA recorder configuration and database size. A very large `home-assistant_v2.db` can cause persistent history fetch timeouts.
 
 ---
 

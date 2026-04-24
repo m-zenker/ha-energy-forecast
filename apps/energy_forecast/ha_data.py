@@ -174,6 +174,7 @@ def fetch_energy_history(
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
     validate_energy_cache(combined, _LOGGER)
 
     # 5. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
@@ -246,6 +247,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     # 4. Merge — fresh HA data wins on timestamp conflicts (for return value)
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
     # 5. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
     # Timestamps already in the cache are not re-written; any HA-wins corrections for

@@ -1,14 +1,15 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.10.0** — 2026-04-17, main. 474 tests.
+Current: **v0.11.0-alpha-14** — 2026-04-22, dev. 535 tests.
 
 ---
 
 ## Current Status
 
-Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to reach full lag-feature activation (~672 rows) around 2026-04-20. MAE has improved from 0.7 → 0.52 kWh/h. No action required unless the bouncing pattern persists after that date.
+Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to reach full lag-feature activation (~672 rows) around 2026-04-20. MAE has improved from 0.7 → 0.52 kWh/h.
 
-**If bouncing persists after 2026-04-20:** escalate to #15 — HVAC/thermostat state as an anticipatory signal.
+**v0.11.0-alpha-1 Update:** Daily Regime Clustering implemented as an optional module.
+ This explicitly extracts 24h consumption patterns and uses a secondary model to predict the expected "regime" for tomorrow, providing a stable physics-informed prior to the main model.
 
 ---
 
@@ -38,6 +39,20 @@ Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to rea
 ---
 
 ## Backlog
+
+### #83 — Add `predicted_day_total` Feature (Temperature Regression)
+
+**Priority:** Medium — consider after #82.
+
+**Context**: Empirical analysis (2026-04-22) shows non-EV daily totals range 14→40 kWh across seasons, strongly temperature-driven. After #82, clean regime clusters will capture shape. A separate `predicted_day_total` feature from a lightweight regression (`heating_deg_sum_24h`, `temp_ewma_24h`, `is_away`, `people_home` → daily total kWh) would give the main model an explicit scale signal independent of the regime shape.
+
+**Note**: May not add much if the cleaned `regime_kwh` already encodes enough scale information. Evaluate after #82 is live and SHAP importance is re-checked.
+
+**Prerequisite**: #82.
+
+**Effort:** ~3 h. **Impact:** MEDIUM.
+
+---
 
 ### #15 — HVAC / Boiler State: Projected Flow Setpoint
 
@@ -86,18 +101,6 @@ night_setback_end: 6
 
 ---
 
-### #59 — Relaxed Thermal Calibration Constraints
-
-**Signal:** The current τ-calibration is conservative to avoid solar/daytime corruption. Relaxing slightly may allow faster calibration in spring/autumn.
-
-**Proposed changes:**
-- Raise max solar radiation mask from 150 → 250 W/m².
-- Allow 2 qualifying windows (down from 3) when historical variance is low.
-
-**Effort:** ~30 min. **Impact:** MEDIUM — faster τ convergence.
-
----
-
 ### #10 — School Holiday Feature
 
 Swiss Schulferien dates are canton-specific but stable year-to-year. During school holidays daytime consumption rises. Implement a static lookup table per canton via `apps.yaml`; add `is_school_holiday` to `_FEATURES_BASE`.
@@ -139,6 +142,24 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #84 — Legionella / DHW Boost Hour Feature
+
+**Prerequisite:** DHW sub-sensor infrastructure (related to #22).
+
+**Problem**: The weekly legionella DHW protection cycle (heat buffer to ~60 °C, ~1–2 h) creates a predictable spike that the model has no dedicated signal for. Currently relies entirely on `lag_168h` (1-week lag), which takes 2–3 weeks to establish after a schedule change. The schedule was shifted from Tuesday ~23 h to Wednesday ~14 h on 2026-04-22, so the transition period is live now.
+
+Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–48 h), so this is not urgent.
+
+**Design (when implemented)**:
+- New `_compute_likely_legionella_hours()`: detect HOW slots where `dhw_buffer_temp > 58 °C` within a 30-day rolling window
+- New binary feature `is_legionella_hour` (mirrors `likely_ev_hour` pattern)
+- Optional `legionella_schedule_reset_date` config key to prune pre-change data and accelerate transition
+- Falls back gracefully to 0 when `dhw_buffer_sensor` is not configured
+
+**Effort:** ~3 h. **Impact:** LOW-MEDIUM (primarily useful after schedule changes; lag features self-correct within ~3 weeks otherwise).
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -153,17 +174,17 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
+| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **done** |
+| 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
+| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | after #22 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
-| 59 | Relaxed τ calibration | medium | 30 min | backlog |
 | 10 | School holidays | medium | 4 h | long-term |
-| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | pre-HACS |
+| 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
-
----
 
 ---
 
@@ -173,7 +194,11 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| v0.10.0 | 2026-04-17 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
+| v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
+| v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
+| v0.11.0-alpha-14 | 2026-04-22 | Algorithmic correctness (#64–#69), code quality (#68, #71–#73), test coverage (#74–#78), documentation (#70, #80–#81). 535 tests. |
+| v0.11.0 | 2026-04-17 | Daily Regime Clustering (optional module), K-Means 24h profiles, secondary regime predictor model |
+| v0.10.0 | 2026-04-10 | Baseline mode (Stages 1–4), thermal/DHW intent, appliance signatures, scenario API, physics features (#55–#58), τ calibration, RC-ODE indoor projection |
 | v0.9.0 | 2026-04-10 | Thermal modelling (#49–#52), occupancy (`people_home`), SHAP narrative, relative MAE sensors, rolling MAE persistence |
 | v0.8.0 | 2026-03-31 | Solar/battery target correction, model versioning + rollback, CSV health checks, temperature bias-fade |
 | v0.7.1 | 2026-03-24 | 404 DELETE fix, MQTT anomaly attrs, dashboard cards (anomaly + SHAP) |
@@ -236,3 +261,26 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 | 57 | Wind-Driven Infiltration Feature (`infiltration_pressure`) | v0.10.0 |
 | 58 | Humidity-Aware Defrost Proxy (`defrost_risk`) | v0.10.0 |
 | 60 | Calibrated default thermal time constant (`DEFAULT_TAU = 12 h`) | v0.10.0 |
+| 61 | Daily Regime Clustering (`regime_kwh`) | v0.11.0 |
+| 63 | Fix RegimePredictor overfitting (OOB score + constraints + occupancy features) | v0.11.0-alpha-8 |
+| 59 | Relaxed τ calibration — quality-scored windows replace hard daytime/solar filters | v0.11.0-alpha-9 |
+| 62 | Adaptive Regime Selection (Auto-K) — inertia elbow, K ∈ [2, 8], `regime_count: 0` | v0.11.0-alpha-10 |
+| 64 | CQR calibration: random holdout split (rng seed 42) for valid exchangeability guarantee | v0.11.0-alpha-14 |
+| 65 | RegimePredictor: TimeSeriesSplit CV logged alongside OOB; warning uses TSCV mean | v0.11.0-alpha-14 |
+| 66 | Inertia normalization: bail out to k_lo when range < 1e-6 (homogeneous data guard) | v0.11.0-alpha-14 |
+| 67 | Regime label ffill in prediction path — matches training semantics for gap days | v0.11.0-alpha-14 |
+| 68 | `strip_tz()` moved to `const.py` as shared utility; weather.py and energy_forecast.py deduped | v0.11.0-alpha-14 |
+| 69 | EWMA temperature resets at weather gaps > 2h via NaN sentinels before `.ewm()` | v0.11.0-alpha-14 |
+| 70 | Physics feature scaling constants (0.01, 10.0) documented with empirical basis | v0.11.0-alpha-14 |
+| 71 | Sub-sensor quality demoted to "fair" when energy_cov > 0.5; CoV stored in signature dict | v0.11.0-alpha-14 |
+| 72 | `get_scenario` validates schedule keys and HH:MM format; drops invalid entries with WARNING | v0.11.0-alpha-14 |
+| 73 | `__version__` in `__init__.py` is single source of truth for MQTT `sw_version` | v0.11.0-alpha-14 |
+| 74 | Gaussian noise in `_make_energy_df()` — KMeans ConvergenceWarnings reduced from 18 → 9 | v0.11.0-alpha-14 |
+| 75 | Pickle corruption recovery test for `clusterer.pkl` | v0.11.0-alpha-14 |
+| 76 | K=1 fallback test — homogeneous data hits inertia bail-out | v0.11.0-alpha-14 |
+| 77 | `train()` edge cases: empty DataFrame, below MIN_TRAINING_ROWS, constant values | v0.11.0-alpha-14 |
+| 78 | Network failure tests for `fetch_open_meteo` (404, 500, Timeout, ConnectionError, bad JSON) | v0.11.0-alpha-14 |
+| 79 | Timezone-aware fixture audit — confirmed existing tests use naive timestamps correctly; no changes needed | v0.11.0-alpha-14 |
+| 80 | `find_optimal_k()` docstring fully documents normalization, bail-out, smoothing, tolerance band, OOB note | v0.11.0-alpha-14 |
+| 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
+| 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |

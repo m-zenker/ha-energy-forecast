@@ -47,8 +47,8 @@ energy_forecast:
   # outdoor_temp_sensor: sensor.outdoor_temperature
   timezone: Europe/Zurich  # ← change if you're outside Switzerland (IANA timezone name)
 
-  # Optional: exponential sample weight half-life in days (default: 90).
-  # Lower = recent data matters more. Set to 0 to disable weighting.
+  # Optional: exponential sample weight half-life in days (default: 90, range: 1–365).
+  # Lower = recent data matters more. Typical range: 60–180. Set to 0 to disable weighting.
   weight_halflife_days: 90
 
   # Optional: ISO 3166-1 alpha-2 country code for public holidays (default: CH).
@@ -68,7 +68,7 @@ energy_forecast:
   # Set higher to retrain less aggressively; 0 disables the feature.
   # adaptive_retrain_threshold: 2.0
 
-  # Optional: anomaly detection threshold (default: 3.0).
+  # Optional: anomaly detection threshold (default: 3.0, typical range: 2.5–4.0).
   # binary_sensor.energy_forecast_unusual_consumption fires when the latest
   # actual consumption deviates more than this many std-deviations from the
   # model's day-ahead prediction. Requires ≥10 matched pairs (cold-start safe).
@@ -100,14 +100,20 @@ energy_forecast:
   # Optional: cumulative kWh sub-sensors whose hourly consumption is tracked
   # as lag_24h / lag_168h features to improve forecast accuracy.
   # Must be total_increasing kWh meters (e.g. heat pump, dishwasher monitor).
-  # Power (W/kW) sensors must first be integrated into a kWh template in HA.
+  # Power (W/kW) sensors must first be integrated into a kWh template in HA:
+  #   Settings → Helpers → Add helper → Riemann sum integral
+  # Practical limit: 3–5 sensors (each adds features + history fetch overhead).
+  #
+  # Simple string form (most common):
   # sub_energy_sensors:
   #   - sensor.heat_pump_energy_kwh
   #   - sensor.dishwasher_energy_kwh
-  # Each item may also be a dict with an optional program_sensor to learn
-  # per-program energy profiles (≥ 2 cycles per program required):
+  #
+  # Dict form with program_sensor (learns per-program energy profiles):
+  # sub_energy_sensors:
+  #   - sensor.heat_pump_energy_kwh           # simple string
   #   - entity_id: sensor.dishwasher_energy_kwh
-  #     program_sensor: sensor.dishwasher_selected_program
+  #     program_sensor: sensor.dishwasher_selected_program  # ≥2 cycles/program required
 
   # Optional: EV charging detection.
   # Hours where gross consumption exceeds ev_charging_threshold_kwh are treated
@@ -125,8 +131,11 @@ energy_forecast:
   #
   # All sensors must be CUMULATIVE kWh entities
   # (device_class: energy, state_class: total_increasing).
-  # If your inverter only exposes instantaneous power (W/kW), create a
-  # Riemann sum integration helper first (HA > Settings > Helpers).
+  # IMPORTANT: if your inverter only exposes instantaneous power (W or kW),
+  # you must create a Riemann sum integration helper in HA first:
+  #   Settings → Helpers → Add helper → Riemann sum integral
+  # Without this, the sensor will not have the correct state_class and the
+  # target correction will not activate.
   #
   # SolarEdge Modbus Multi (entity names are user-defined in the integration):
   # solar_production_sensor:  sensor.solaredge_ac_energy_kwh
@@ -180,9 +189,32 @@ energy_forecast:
   #                               only when the heating system is permitted to run.
   # heating_system_active_entity: binary_sensor.heating_season
 
+  # Optional: thermal setpoint projection thresholds (defaults shown).
+  # Controls how heating on/off is projected across the 48h forecast window
+  # when heating_system_active_entity is configured.
+  #   heating_temp_on:      outdoor °C below which heating is projected ON  (default: 14.0)
+  #   heating_temp_off:     outdoor °C above which heating is projected OFF (default: 18.0)
+  #   heating_setpoint_on:  climate setpoint (°C) used when heating is ON  (default: 20.0)
+  #   heating_setpoint_off: climate setpoint (°C) used when heating is OFF (default: 12.0)
+  # heating_temp_on: 14.0
+  # heating_temp_off: 18.0
+  # heating_setpoint_on: 20.0
+  # heating_setpoint_off: 12.0
+
+  # Optional: Daily Regime Clustering (requires scikit-learn, default: disabled).
+  # Groups historical 24h profiles into K typical patterns (e.g. Workday, Weekend,
+  # High-Heating) and predicts which regime applies to each forecast day.
+  # Provides the model with a stable physics-informed prior (regime_kwh).
+  # enable_regimes: true
+  # regime_count: 5        # typical range: 3–7; more regimes = finer patterns but needs more data
+  # regime_count: 0         # auto-select K ∈ [2, 8] via inertia elbow (experimental)
+
   # ── MQTT Discovery (optional) ─────────────────────────────────────────────
   # Registers all sensors in the HA entity registry (enables area assignment).
   # Requires AppDaemon MQTT plugin in appdaemon.yaml + a running MQTT broker.
+  # NOTE: enabling this changes all sensor entity IDs from
+  #   sensor.energy_forecast_today  →  sensor.ha_energy_forecast_energy_forecast_today
+  # Update automations and dashboards before enabling.
   # mqtt_discovery: false
   # mqtt_namespace: mqtt
   # mqtt_discovery_prefix: homeassistant
