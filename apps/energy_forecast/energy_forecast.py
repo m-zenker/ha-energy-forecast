@@ -1206,7 +1206,7 @@ class EnergyForecast(hass.Hass):
         # Keep-first: only store a prediction for each target hour the first time
         # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
         # Pruned to 30 days so mae_30d sensor has enough history (#41).
-        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._pred_history = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff
@@ -1223,7 +1223,7 @@ class EnergyForecast(hass.Hass):
                 pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
                 recent_actuals["gross_kwh"].astype(float),
             )))
-        actuals_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items()
             if pd.Timestamp(ts) >= actuals_cutoff
@@ -1240,7 +1240,7 @@ class EnergyForecast(hass.Hass):
                 [(ts, kwh) for ts, kwh in self._actuals_history.items()],
                 columns=["timestamp", "gross_kwh"],
             )
-        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        cutoff_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
         pred_hist_7d = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff_7d
@@ -1935,7 +1935,8 @@ class EnergyForecast(hass.Hass):
             return
 
         try:
-            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+            now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+            cutoff = now.floor("1h") - pd.Timedelta(days=30)
 
             # Load and prune prediction history
             for ts_str, kwh in data.get("pred", {}).items():
