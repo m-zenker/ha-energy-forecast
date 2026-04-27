@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-1] — 2026-04-27
+
+### Fixed
+- **MAE rolling window midnight jump** (`energy_forecast.py`) — replaced `pd.Timestamp.now().normalize()` with `floor("1h")` at all four window-cutoff sites. The old code truncated to midnight, causing the 7d/30d MAE sensors to jump by 24 hours at midnight instead of rolling smoothly by 1 hour. Regression test `test_mae_window_rolls_smoothly_at_midnight` added.
+- **EV energy sensor calculation** (`energy_forecast.py`) — corrected from `gross_kwh - charger_kw` (wrong: charger treated as co-load to subtract) to `min(gross_kwh, charger_kw)` (correct: EV draw capped at charger rated capacity, handles partial end-of-charge hours). `sensor.energy_forecast_ev_today` and `sensor.energy_forecast_ev_yesterday` values will differ from prior versions. Tests updated to reflect correct semantics.
+
+### Tests
+- 540 passing (up from 539 in v0.11.0; +1 regression test `test_mae_window_rolls_smoothly_at_midnight`).
+
 ## [0.11.0] — 2026-04-24
 
 v0.11.0 introduces Daily Regime Clustering, an optional ML subsystem that identifies the household's recurring 24-hour consumption patterns from historical data and uses a weather- and calendar-aware Random Forest classifier to predict which regime to expect each day. The predicted regime's centroid profile is injected as a `regime_kwh` prior into the main LightGBM model, giving hourly forecasts a stable, physics-informed baseline anchored to real behavioral patterns. A 16-alpha hardening cycle refined auto-K elbow selection, added OOB tie-breaking, hardened centroid fitting with outlier guards and inertia normalisation, synced cluster weights to training-data decay, and excluded EV-charging days so centroids encode genuine thermal and occupancy patterns rather than EV session timing.
