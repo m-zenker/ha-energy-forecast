@@ -965,7 +965,7 @@ class TestRollingMaeSensors:
         """pred_hist_7d filter must exclude entries older than 7 days."""
         from energy_forecast.energy_forecast import _compute_live_mae
 
-        now = pd.Timestamp.now().normalize()
+        now = pd.Timestamp.now().floor("1h")
         cutoff_7d = now - pd.Timedelta(days=7)
 
         # 24 predictions within 7d window
@@ -988,7 +988,7 @@ class TestRollingMaeSensors:
         """mae_30d must match all pairs within the 30d pred_history."""
         from energy_forecast.energy_forecast import _compute_live_mae
 
-        now = pd.Timestamp.now().normalize()
+        now = pd.Timestamp.now().floor("1h")
         start = now - pd.Timedelta(days=29)
         pred_history = self._make_pred_history(start, 48, kwh=2.0)
         actuals = self._make_actuals_df(start, 48, kwh=3.0)
@@ -997,6 +997,32 @@ class TestRollingMaeSensors:
 
         assert n == 48
         assert abs(mae - 1.0) < 1e-6
+
+    def test_mae_window_rolls_smoothly_at_midnight(self):
+        """MAE window must only drop 1 hour when crossing midnight, not 24 hours."""
+        from energy_forecast.energy_forecast import EnergyForecast, _compute_live_mae
+
+        # Verify that the hourly rolling window logic shifts by exactly 1 hour
+        # when crossing midnight, whereas the old normalize() logic would jump by 24h.
+        
+        # 23:30 on May 20
+        now_before = pd.Timestamp("2024-05-20 23:30")
+        # 00:30 on May 21
+        now_after = pd.Timestamp("2024-05-21 00:30")
+        
+        # Proposed behavior: floor('1h')
+        cutoff_before = now_before.floor("1h") - pd.Timedelta(days=7)
+        cutoff_after = now_after.floor("1h") - pd.Timedelta(days=7)
+        
+        # Crossing midnight (23:30 -> 00:30) shifts the rolling window by exactly 1 hour
+        assert (cutoff_after - cutoff_before) == pd.Timedelta(hours=1)
+        
+        # Legacy behavior: normalize()
+        old_cutoff_before = now_before.normalize() - pd.Timedelta(days=7) # May 13 00:00
+        old_cutoff_after = now_after.normalize() - pd.Timedelta(days=7)   # May 14 00:00
+        
+        # Crossing midnight jumps the window by 24 hours! This is the root cause of the report.
+        assert (old_cutoff_after - old_cutoff_before) == pd.Timedelta(days=1)
 
     # ── publish in set_state mode ──
 
@@ -1334,6 +1360,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app.log = MagicMock()
         app._pred_history = {}
         app._actuals_history = {}
@@ -1374,6 +1401,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app.log = MagicMock()
         app._pred_history = {}
         app._actuals_history = {}
@@ -1410,6 +1438,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app.log = MagicMock()
 
         now = pd.Timestamp.now().normalize()
@@ -1441,6 +1470,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app.log = MagicMock()
         app._pred_history = {}
         app._actuals_history = {}
@@ -1465,6 +1495,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app._pred_history = {}
         app._actuals_history = {}
 
@@ -1488,6 +1519,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app.log = MagicMock()
 
         now = pd.Timestamp.now().normalize()
@@ -1518,6 +1550,7 @@ class TestPredHistoryPersistence:
         monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
 
         app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
         app._pred_history = {}
         app._actuals_history = {}
 
@@ -1603,7 +1636,7 @@ class TestRelativeMAEComputation:
     def test_relative_mae_7d_computed_correctly(self):
         """Verify relative MAE (%) is correctly computed from absolute MAE and actuals mean."""
         # Populate histories: 10 hours of 10 kWh each, MAE should be 5% of mean
-        now = pd.Timestamp.now().normalize()
+        now = pd.Timestamp.now().floor("1h")
         pred_history = {}
         actuals_history = {}
         for i in range(10):
@@ -1613,7 +1646,7 @@ class TestRelativeMAEComputation:
 
         # Compute relative MAE as _update_sensors does
         mae_7d = 0.5  # known absolute MAE
-        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        cutoff_7d = pd.Timestamp.now().floor("1h") - pd.Timedelta(days=7)
         actuals_7d = [v for ts, v in actuals_history.items() if pd.Timestamp(ts) >= cutoff_7d]
         mean_7d = float(np.mean(actuals_7d)) if actuals_7d else float("nan")
         mae_7d_pct = round(mae_7d / mean_7d * 100, 2) if mean_7d > 0 and not math.isnan(mae_7d) else float("nan")
