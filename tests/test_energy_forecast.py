@@ -336,16 +336,17 @@ class TestEvKwhSensorCalc:
             mock_now.return_value = today.tz_localize("Europe/Zurich")
             return EnergyForecast._aggregate(app, p_df, actuals, live_temp=None)
 
-    def test_ev_today_uses_charger_kw_not_threshold(self):
-        """ev_today must equal gross − charger_kw, not gross − threshold."""
+    def test_ev_today_reports_charger_energy_not_co_load(self):
+        """ev_today must equal min(gross, charger_kw) — the EV energy, not the co-load."""
         result = self._run_aggregate(ev_charger_kw=7.4, ev_threshold=4.5)
-        # 12.0 − 7.4 = 4.6 (not 12.0 − 4.5 = 7.5)
-        assert abs(result["ev_today"] - 4.6) < 1e-6
+        # gross=12.0, charger_kw=7.4 → min(12.0, 7.4) = 7.4 (not 12.0 − 7.4 = 4.6)
+        assert abs(result["ev_today"] - 7.4) < 1e-6
 
     def test_ev_today_default_charger_kw(self):
-        """Default charger_kw=9.0: ev_today = gross − 9.0."""
+        """Default charger_kw=9.0: ev_today = min(gross, 9.0) = 9.0."""
         result = self._run_aggregate(ev_charger_kw=9.0, ev_threshold=4.5)
-        assert abs(result["ev_today"] - 3.0) < 1e-6
+        # gross=12.0, charger_kw=9.0 → min(12.0, 9.0) = 9.0 (not 12.0 − 9.0 = 3.0)
+        assert abs(result["ev_today"] - 9.0) < 1e-6
 
 
 # ── Callback signature compatibility ─────────────────────────────────────────
