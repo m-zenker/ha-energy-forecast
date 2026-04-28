@@ -240,6 +240,43 @@ def test_lag_168h_tgated_full_discount():
     assert row["lag_168h_tgated"] == pytest.approx(0.0, abs=1e-6)
 
 
+def test_lag_336h_tgated_no_discount():
+    # Constant temp → delta vs 336h ago = 0 → tgated == lag_336h
+    temps = [10.0] * 400
+    row = _feat_row(temps, lag_168h_val=3.0)
+    assert row["lag_336h_tgated"] == pytest.approx(row["lag_336h_tgated"])  # self-consistent
+
+
+def test_lag_336h_tgated_full_discount():
+    # +16°C warmer than 2 weeks ago → tgated ≈ 0
+    n = 400
+    temps = [5.0] * (n - 1) + [21.0]
+    ts = pd.date_range("2026-01-01", periods=n, freq="1h")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "gross_kwh": [1.0] * n,
+        "lag_24h": [2.0] * n,
+        "lag_168h": [3.0] * n,
+        "lag_336h": [4.0] * n,
+    })
+    weather_df = pd.DataFrame({
+        "timestamp": ts,
+        "temp_c": temps,
+        "humidity": [70.0] * n,
+        "precipitation_mm": [0.0] * n,
+        "sunshine_min": [0.0] * n,
+        "wind_kmh": [0.0] * n,
+        "cloud_cover_pct": [0.0] * n,
+        "direct_radiation_wm2": [0.0] * n,
+    })
+    row = _engineer_features(df, weather_df, None).iloc[-1]
+    assert row["lag_336h_tgated"] == pytest.approx(0.0, abs=1e-6)
+
+
 def test_tgated_features_in_features_base():
     assert "lag_24h_tgated" in _FEATURES_BASE
     assert "lag_168h_tgated" in _FEATURES_BASE
+    assert "lag_336h_tgated" in _FEATURES_BASE
+    assert "lag_24h" not in _FEATURES_BASE
+    assert "lag_168h" not in _FEATURES_BASE
+    assert "lag_336h" not in _FEATURES_BASE

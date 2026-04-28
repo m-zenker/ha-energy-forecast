@@ -101,8 +101,8 @@ _FEATURES_BASE = [
     "temp_lag_24h", "temp_lag_168h",                # #52 temperature lags
     # Autoregressive lags — always safe (see note above)
     "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
-    "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
-    "lag_24h_tgated", "lag_168h_tgated",               # temp-delta gated: suppressed when warmer than lag period
+    "lag_48h", "lag_72h",
+    "lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated",  # temp-delta gated: suppressed when warmer than lag period
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
     # Calendar extras
@@ -2285,6 +2285,7 @@ def _engineer_features(
     # #52 Temperature lags
     w["temp_lag_24h"] = w["temp_c"].shift(24)
     w["temp_lag_168h"] = w["temp_c"].shift(168)
+    w["temp_lag_336h"] = w["temp_c"].shift(336)
 
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
     df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
@@ -2297,7 +2298,7 @@ def _engineer_features(
                 "temp_ewma_24h", "temp_ewma_72h",
                 "heating_deg_sum_24h", "heating_deg_sum_168h",
                 "temp_delta_1h", "temp_delta_24h",
-                "temp_lag_24h", "temp_lag_168h"]:
+                "temp_lag_24h", "temp_lag_168h", "temp_lag_336h"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
@@ -2386,6 +2387,13 @@ def _engineer_features(
         df["lag_168h_tgated"] = df["lag_168h"] * (1.0 - discount_168h)
     else:
         df["lag_168h_tgated"] = df.get("lag_168h", 0.0)
+
+    if "lag_336h" in df.columns and "temp_lag_336h" in df.columns:
+        delta_336h = (df["temp_c"] - df["temp_lag_336h"]).clip(lower=0)
+        discount_336h = (delta_336h / 8.0).clip(upper=1.0)
+        df["lag_336h_tgated"] = df["lag_336h"] * (1.0 - discount_336h)
+    else:
+        df["lag_336h_tgated"] = df.get("lag_336h", 0.0)
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
     # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal
