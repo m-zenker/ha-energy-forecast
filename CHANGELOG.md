@@ -8,6 +8,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-2] — 2026-04-28
+
+### Added
+- **`heating_active` feature** (`model.py`) — binary seasonal flag sourced from `heating_system_active_entity`. When 0 (HP off for the season), the model can learn to suppress HP-related lag features. Defaults to 1 (heating on) when entity not configured. Config key: `heating_system_active_entity`.
+- **`hp_heating_degree`** (`model.py`) — `max(0, 15 − temp_c)`, calibrated HP cut-off; separates mild/warm days from true heating demand more precisely than the standard 18 °C heating degree.
+- **`temp_in_neutral_zone`** (`model.py`) — binary flag: 1 when 15 ≤ temp_c ≤ 22 °C (HP dead-band); signals the "neither heating nor cooling" regime.
+
+### Fixed
+- **Warm-season day-ahead over-prediction** (`model.py`) — day-ahead forecasts were anchoring at the prior heating-season level (~13 kWh/day) for several days after the HP switched off. Root causes and fixes:
+  1. **Temperature-delta gated lags** — `lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated` replace their raw counterparts in `_FEATURES_BASE`. Each is discounted proportionally to how much warmer today is vs the lag period (thresholds: 5 °C/24 h; 8 °C/168 h and 336 h). Raw `lag_24h/168h/336h` removed from `_FEATURES_BASE` and excluded from `active_lag_cols` so the model cannot fall back to unmodified values.
+  2. **`regime_kwh` temperature gating** — regime centroids trained on mostly heating-season data overestimate warm-season consumption. `regime_kwh` is now multiplied by the same 8 °C/168 h discount in both the training path (`_engineer_features`) and the prediction path (`_prepare_prediction_X`).
+  3. **Weather tail for prediction-time gating** — all gating relies on `temp_lag_168h`/`temp_lag_336h`, but the 48 h forecast window cannot supply a 168-row shift; those columns were NaN at prediction time, making every discount NaN and the gated values worse than before. Fix: the last 400 h of real weather is stored in `self._weather_tail` during training (persisted in `meta.pkl`) and prepended to `forecast_df` in `_prepare_prediction_X`, so all temperature-lag shifts resolve to real historical values.
+- **`temp_lag_336h`** added to weather feature computation (needed for `lag_336h_tgated`).
+
+### Tests
+- 554 passing (up from 540 in v0.11.1-alpha-1; +14 covering tgated lag behaviour, `_FEATURES_BASE` membership, and `lag_336h_tgated` discount).
+
 ## [0.11.1-alpha-1] — 2026-04-27
 
 ### Fixed
