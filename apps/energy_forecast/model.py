@@ -90,6 +90,9 @@ _FEATURES_BASE = [
     "humidity",                                      # relative humidity %
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
+    "hp_heating_degree",                             # HP-calibrated cutoff: max(0, 15 − temp_c)
+    "temp_in_neutral_zone",                          # dead-band flag: 1 when 15 ≤ temp_c ≤ 22
+    "heating_active",                                # seasonal on/off from heating_system_active_entity
     "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
     # Thermal modelling features (#49–#52)
     "temp_ewma_24h", "temp_ewma_72h",               # #49 EWMA — RC-circuit thermal mass
@@ -400,7 +403,8 @@ class EnergyForecastModel:
                                 presence_df=presence_df, climate_dfs=climate_dfs,
                                 dhw_df=dhw_df, tau_hours=self._tau_hours,
                                 room_areas=room_areas,
-                                regime_kwh_series=regime_kwh_series)
+                                regime_kwh_series=regime_kwh_series,
+                                heating_active_df=heating_active_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -716,10 +720,20 @@ class EnergyForecastModel:
                 setpoint_off=setpoint_off,
             )
 
+        ha_df_for_features = None
+        if heating_active_series is not None:
+            ha_df_for_features = (
+                heating_active_series
+                .rename_axis("timestamp")
+                .rename("heating_active")
+                .reset_index()
+            )
+
         feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
                                      climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
-                                     tau_hours=self._tau_hours, room_areas=room_areas)
+                                     tau_hours=self._tau_hours, room_areas=room_areas,
+                                     heating_active_df=ha_df_for_features)
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -2188,6 +2202,7 @@ def _engineer_features(
     tau_hours: float | None = None,
     room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: "pd.Series | None" = None,  # hourly regime profile
+    heating_active_df: "pd.DataFrame | None" = None,  # cols: timestamp, heating_active (0/1)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -2296,7 +2311,9 @@ def _engineer_features(
         df["humidity"] = 70.0
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
+    df["hp_heating_degree"] = np.maximum(0, 15.0 - df["temp_c"])  # empirically: HP cutoff ~15°C
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
+    df["temp_in_neutral_zone"] = ((df["temp_c"] >= 15.0) & (df["temp_c"] <= 22.0)).astype(float)
 
     # ── Outdoor sensor merge ─────────────────────────────────────────────────
     if outdoor_df is not None and not outdoor_df.empty:
@@ -2335,6 +2352,21 @@ def _engineer_features(
         df["people_home"] = df["people_home"].fillna(0).astype(int)
     else:
         df["people_home"] = 0
+
+    # ── Heating system active (seasonal on/off) ───────────────────────────────
+    # Binary feature from heating_system_active_entity. When 0, the heat pump is
+    # off for the season, letting trees suppress HP-related lag features.
+    # Default 1 (heating on) when entity is not configured — conservative choice.
+    if heating_active_df is not None and not heating_active_df.empty:
+        h = heating_active_df[["timestamp", "heating_active"]].copy()
+        h["timestamp"] = pd.to_datetime(h["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(h, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_ha"))
+        df.drop(columns=["timestamp_ha", "_ts_floor"], errors="ignore", inplace=True)
+        df["heating_active"] = df["heating_active"].fillna(1).astype(int)
+    else:
+        df["heating_active"] = 1
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
     # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal

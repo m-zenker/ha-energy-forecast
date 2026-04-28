@@ -716,6 +716,69 @@ class TestTemperatureLagFeatures:
         assert abs(float(result["temp_lag_168h"].iloc[168]) - 10.0) < 1e-9
 
 
+class TestWarmWeatherBiasFeatures:
+    """hp_heating_degree, temp_in_neutral_zone, and heating_active features."""
+
+    def test_new_features_in_features_base(self):
+        assert "hp_heating_degree"    in _FEATURES_BASE
+        assert "temp_in_neutral_zone" in _FEATURES_BASE
+        assert "heating_active"       in _FEATURES_BASE
+
+    def test_hp_heating_degree_matches_15c_threshold(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        temps = [0.0, 10.0, 15.0, 20.0]
+        w = _make_weather_df(ts)
+        w["temp_c"] = temps
+        result = _engineer_features(df, w, None)
+        expected = [15.0, 5.0, 0.0, 0.0]
+        for i, exp in enumerate(expected):
+            assert abs(float(result["hp_heating_degree"].iloc[i]) - exp) < 1e-9
+
+    def test_temp_in_neutral_zone_boundaries(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=5, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        w["temp_c"] = [10.0, 15.0, 20.0, 22.0, 25.0]
+        result = _engineer_features(df, w, None)
+        assert float(result["temp_in_neutral_zone"].iloc[0]) == 0.0  # 10°C: below zone
+        assert float(result["temp_in_neutral_zone"].iloc[1]) == 1.0  # 15°C: lower bound
+        assert float(result["temp_in_neutral_zone"].iloc[2]) == 1.0  # 20°C: inside
+        assert float(result["temp_in_neutral_zone"].iloc[3]) == 1.0  # 22°C: upper bound
+        assert float(result["temp_in_neutral_zone"].iloc[4]) == 0.0  # 25°C: above zone
+
+    def test_heating_active_uses_provided_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [1, 1, 0, 0]})
+        result = _engineer_features(df, w, None, heating_active_df=ha_df)
+        assert list(result["heating_active"]) == [1, 1, 0, 0]
+
+    def test_heating_active_defaults_to_1_when_not_provided(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)
+        assert (result["heating_active"] == 1).all()
+
+    def test_heating_active_fills_missing_timestamps_with_1(self):
+        """Timestamps not covered by heating_active_df fill with 1 (heating on)."""
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        # Only provide two of the four timestamps
+        ha_df = pd.DataFrame({
+            "timestamp": ts[:2],
+            "heating_active": [0, 0],
+        })
+        result = _engineer_features(df, w, None, heating_active_df=ha_df)
+        assert result["heating_active"].iloc[0] == 0
+        assert result["heating_active"].iloc[1] == 0
+        assert result["heating_active"].iloc[2] == 1  # filled with default
+        assert result["heating_active"].iloc[3] == 1
+
+
 class TestThermalFeaturesIntegration:
     """Integration test: all 8 thermal features activate during training."""
 
