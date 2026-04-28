@@ -102,6 +102,7 @@ _FEATURES_BASE = [
     # Autoregressive lags — always safe (see note above)
     "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
     "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
+    "lag_24h_tgated", "lag_168h_tgated",               # temp-delta gated: suppressed when warmer than lag period
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
     # Calendar extras
@@ -2367,6 +2368,24 @@ def _engineer_features(
         df["heating_active"] = df["heating_active"].fillna(1).astype(int)
     else:
         df["heating_active"] = 1
+
+    # ── Temperature-delta gated lags ─────────────────────────────────────
+    # Suppress lag features proportionally when today is warmer than the lag
+    # period — prevents stale HP-consumption lags from anchoring predictions
+    # during warm-season transitions.  Self-heals once the season stabilises
+    # (delta → 0, lags fully restored).
+    if "lag_24h" in df.columns and "temp_delta_24h" in df.columns:
+        discount_24h = (df["temp_delta_24h"].clip(lower=0) / 5.0).clip(upper=1.0)
+        df["lag_24h_tgated"] = df["lag_24h"] * (1.0 - discount_24h)
+    else:
+        df["lag_24h_tgated"] = df.get("lag_24h", 0.0)
+
+    if "lag_168h" in df.columns and "temp_lag_168h" in df.columns:
+        delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
+        discount_168h = (delta_168h / 8.0).clip(upper=1.0)
+        df["lag_168h_tgated"] = df["lag_168h"] * (1.0 - discount_168h)
+    else:
+        df["lag_168h_tgated"] = df.get("lag_168h", 0.0)
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
     # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal
