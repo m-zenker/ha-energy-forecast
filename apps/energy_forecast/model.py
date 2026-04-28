@@ -792,6 +792,13 @@ class EnergyForecastModel:
         else:
             feat_df["regime_kwh"] = 0.0
 
+        # Temperature-gate regime_kwh — same 8°C/168h discount as tgated lags.
+        # Centroids are trained on mostly heating-season data; suppress them
+        # during warm-season transitions so they don't anchor predictions high.
+        if "temp_c" in feat_df.columns and "temp_lag_168h" in feat_df.columns:
+            _delta = (feat_df["temp_c"] - feat_df["temp_lag_168h"]).clip(lower=0)
+            feat_df["regime_kwh"] *= (1.0 - (_delta / 8.0).clip(upper=1.0))
+
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
         # Merge by timestamp; fill unmatched rows with 0 (default: not away).
@@ -2536,6 +2543,12 @@ def _engineer_features(
         df["regime_kwh"] = df["regime_kwh"].fillna(0.0)
     else:
         df["regime_kwh"] = 0.0
+
+    # Suppress regime_kwh when warmer than last week — centroids trained on
+    # heating-season data overestimate during warm-season transitions.
+    if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
+        delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
+        df["regime_kwh"] *= (1.0 - (delta_168h / 8.0).clip(upper=1.0))
 
     return df
 
