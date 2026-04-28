@@ -410,8 +410,11 @@ class EnergyForecastModel:
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
         # only the lags that were actually computed for this training run.
+        # Lags for 24/168/336h are computed (needed for tgated gating) but
+        # excluded here — the model sees only the temperature-gated versions.
+        _GATED_LAG_HOURS = frozenset({24, 168, 336})
         all_lag_cols = {f"lag_{l}h" for l in LAG_HOURS}
-        active_lag_cols = [f"lag_{l}h" for l in active_lags]
+        active_lag_cols = [f"lag_{l}h" for l in active_lags if l not in _GATED_LAG_HOURS]
 
         # Sub-sensor lag columns: lag_24h always; lag_168h only with enough history
         sub_sensor_cols: list[str] = []
