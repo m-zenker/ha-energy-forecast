@@ -230,6 +230,11 @@ class EnergyForecastModel:
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
 
+        # Recent weather tail — last 400h stored at training time so that
+        # temp_lag_168h / temp_lag_336h are computable at prediction time
+        # (the 48h forecast window alone cannot supply a 168-row shift).
+        self._weather_tail: "pd.DataFrame | None" = None
+
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
         self._model_archive_count: int = model_archive_count
@@ -397,6 +402,11 @@ class EnergyForecastModel:
                     ]
 
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
+
+        # ── Store recent weather tail for prediction-time lag gating ────────
+        self._weather_tail = (
+            weather_df.sort_values("timestamp").tail(400).reset_index(drop=True).copy()
+        )
 
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
@@ -733,7 +743,18 @@ class EnergyForecastModel:
                 .reset_index()
             )
 
-        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
+        # Extend the 48h forecast with recent historical weather so that
+        # shift(168) and shift(336) in _engineer_features produce real values
+        # instead of NaN — enabling the temperature-delta gating to fire.
+        if self._weather_tail is not None and not self._weather_tail.empty:
+            import pandas as _pd
+            _extended = _pd.concat(
+                [self._weather_tail, forecast_df], ignore_index=True
+            ).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        else:
+            _extended = forecast_df
+
+        feat_df = _engineer_features(future_df, _extended, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
                                      climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
                                      tau_hours=self._tau_hours, room_areas=room_areas,
@@ -1126,6 +1147,7 @@ class EnergyForecastModel:
             "tau_hours":                 self._tau_hours,
             "enable_regimes":            self._enable_regimes,
             "regime_count":              self._regime_count,
+            "weather_tail":              self._weather_tail,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1452,6 +1474,7 @@ class EnergyForecastModel:
                     self._tau_hours            = meta.get("tau_hours",             None)
                     self._enable_regimes       = meta.get("enable_regimes",        False)
                     self._regime_count         = meta.get("regime_count",          5)
+                    self._weather_tail         = meta.get("weather_tail",          None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
