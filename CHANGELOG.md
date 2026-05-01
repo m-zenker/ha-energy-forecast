@@ -8,6 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-3] — 2026-05-02
+
+### Fixed
+- **Retraining crash when weather archive fetch fails** (`energy_forecast.py`) — `_empty_weather_df()` returned object-dtype columns (pandas default for empty DataFrames); after a left merge in `_engineer_features`, `df["temp_c"]` remained object dtype with all-NaN, causing `np.exp()` to crash with `"float has no attribute exp"`. Two-part fix: (1) cap `end_date` to `today − 5 days` so the Open-Meteo archive API (5-day lag) never gets a 400 for recent dates, preventing the fallback in the first place; (2) `_empty_weather_df()` now uses explicit `dtype=float` Series so merges always produce float64 columns even when all values are NaN.
+
+### Tests
+- 555 passing (up from 554 in v0.11.1-alpha-2; +1 regression test `test_defrost_risk_with_empty_weather_df` in `test_physics_features.py`).
+
 ## [0.11.1-alpha-2] — 2026-04-28
 
 ### Added
