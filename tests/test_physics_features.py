@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import pytest
 from apps.energy_forecast.model import _engineer_features, EnergyForecastModel, _FEATURES_BASE
+from apps.energy_forecast.energy_forecast import _empty_weather_df
 
 
 def _make_constant_weather(ts, temp_c=10.0):
@@ -46,6 +47,18 @@ def test_defrost_risk_calculation():
     weather_df["humidity"] = 50.0
     feat_df_50 = _engineer_features(df, weather_df, None)
     assert feat_df_50.iloc[0]["defrost_risk"] == pytest.approx(0.5, abs=0.01)
+
+def test_defrost_risk_with_empty_weather_df():
+    # Regression: _empty_weather_df() used to return object-dtype columns, causing
+    # np.exp() to crash with "float has no attribute exp" when weather fetch fails.
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2026-04-15 12:00"]),
+        "gross_kwh": [1.0],
+    })
+    feat_df = _engineer_features(df, _empty_weather_df(), None)
+    assert "defrost_risk" in feat_df.columns
+    assert feat_df["defrost_risk"].isna().all()
+
 
 def test_solar_compensation():
     df = pd.DataFrame({

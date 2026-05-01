@@ -22,7 +22,7 @@ import logging
 import math
 import os
 import threading
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -970,7 +970,7 @@ class EnergyForecast(hass.Hass):
             )
 
         start_date = baseline_df["timestamp"].min().date()
-        end_date   = baseline_df["timestamp"].max().date()
+        end_date   = min(baseline_df["timestamp"].max().date(), date.today() - timedelta(days=5))
 
         try:
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date, timezone=self._timezone)
@@ -1989,12 +1989,16 @@ def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
 
 def _empty_weather_df() -> Any:
     import pandas as pd
-    return pd.DataFrame(
-        columns=[
-            "timestamp", "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
-            "cloud_cover_pct", "direct_radiation_wm2",
-        ]
-    )
+    return pd.DataFrame({
+        "timestamp":            pd.Series(dtype="datetime64[ns]"),
+        "temp_c":               pd.Series(dtype=float),
+        "precipitation_mm":     pd.Series(dtype=float),
+        "sunshine_min":         pd.Series(dtype=float),
+        "wind_kmh":             pd.Series(dtype=float),
+        "cloud_cover_pct":      pd.Series(dtype=float),
+        "direct_radiation_wm2": pd.Series(dtype=float),
+        "humidity":             pd.Series(dtype=float),
+    })
 
 
 def _apply_target_correction(
