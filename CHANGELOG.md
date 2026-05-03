@@ -8,6 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-4] — 2026-05-03
+
+### Fixed
+- **EWMA gap warning log pollution** (`model.py`) — the late March DST spring-forward gap in Open-Meteo archive data triggered a WARNING once per `_engineer_features` call (3× per hourly update cycle). Since the gap is expected, correctly handled, and not actionable, a single gap now logs at DEBUG level instead of WARNING. Multiple gaps (≥ 2) retain WARNING level to flag genuine weather API problems.
+
+### Tests
+- 556 passing (up from 555 in v0.11.1-alpha-3; +1 split `test_single_gap_logged_at_debug` and `test_multiple_gaps_logged_at_warning` covering the new behaviour, replacing `test_gap_warning_logged`).
+
 ## [0.11.1-alpha-3] — 2026-05-02
 
 ### Fixed
