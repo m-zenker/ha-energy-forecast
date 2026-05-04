@@ -8,13 +8,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.11.1-alpha-5] — 2026-05-04
-
-### Fixed
-- `apps/energy_forecast/weather.py` — crash when weather history API returns an empty DataFrame due to network errors or missing archive data. `_convert_legacy_to_weather_archive_format()` now checks for empty input and returns an empty structure with correct dtypes, preventing downstream object-dtype failures in EWMA calculations. Includes a DEBUG log when skipping an empty fetch.
-
----
-
 ## [0.11.0] — 2026-04-24
 
 v0.11.0 introduces Daily Regime Clustering, an optional ML subsystem that identifies the household's recurring 24-hour consumption patterns from historical data and uses a weather- and calendar-aware Random Forest classifier to predict which regime to expect each day. The predicted regime's centroid profile is injected as a `regime_kwh` prior into the main LightGBM model, giving hourly forecasts a stable, physics-informed baseline anchored to real behavioral patterns. A 16-alpha hardening cycle refined auto-K elbow selection, added OOB tie-breaking, hardened centroid fitting with outlier guards and inertia normalisation, synced cluster weights to training-data decay, and excluded EV-charging days so centroids encode genuine thermal and occupancy patterns rather than EV session timing.
