@@ -4162,3 +4162,100 @@ class TestTrainEdgeCases:
             m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
         except Exception as exc:
             pytest.fail(f"train() raised on constant values: {exc}")
+
+
+# ── HOD-aware short-lag NaN fill ──────────────────────────────────────────────
+
+def _make_hod_actuals(n_hours: int = 168) -> pd.DataFrame:
+    """Actuals where gross_kwh = hour_of_day + 10.0 (each HOD bucket is uniquely identifiable)."""
+    now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+    start = now_floor - pd.Timedelta(hours=n_hours)
+    ts = pd.date_range(start, periods=n_hours, freq="1h")
+    kwh = np.array([float(t.hour) + 10.0 for t in ts])
+    return pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+
+class TestHodLagFill:
+    """NaN positions in short lag features (lag < 48h) should be filled with the
+    7-day per-hour-of-day mean from recent_actuals, not the flat training median."""
+
+    def test_hod_fill_uses_recent_mean_not_global_median(self, tmp_path):
+        """lag_1h[h=1] must be filled with the HOD mean from recent_actuals, not the
+        training global median (which is ~2.75 for uniform-0.5..5 training data)."""
+        m, forecast = _make_trained_model(tmp_path)
+        if "lag_1h" not in m.feature_cols:
+            pytest.skip("lag_1h not in feature_cols")
+
+        recent_actuals = _make_hod_actuals(168)
+        _, X = m._prepare_prediction_X(forecast, None, recent_actuals)
+
+        # lag_1h[h=1]: logical timestamp = future_ts[1] - 1h = now_floor + 1h - 1h = now_floor
+        # now_floor is NOT in recent_actuals (actuals end at now_floor - 1h) → was NaN
+        now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+        logical_hod = now_floor.hour
+        expected_fill = float(logical_hod) + 10.0  # HOD mean from _make_hod_actuals
+
+        actual_fill = float(X["lag_1h"].iloc[1])
+        # HOD fill must be > 9 (our actuals are 10..33); training median is ~2.75
+        assert actual_fill > 9.0, (
+            f"lag_1h[h=1] expected HOD mean ≥ 10 (got {actual_fill:.4f}); "
+            f"training median used instead?"
+        )
+        assert abs(actual_fill - expected_fill) < 0.5, (
+            f"lag_1h[h=1] expected HOD mean {expected_fill:.2f} (HOD={logical_hod}), "
+            f"got {actual_fill:.4f}"
+        )
+
+    def test_hod_fill_varies_per_nan_position(self, tmp_path):
+        """Each NaN position must get the fill for its own hour-of-day bucket,
+        not the same constant value for all NaN rows."""
+        m, forecast = _make_trained_model(tmp_path)
+        if "lag_1h" not in m.feature_cols:
+            pytest.skip("lag_1h not in feature_cols")
+
+        recent_actuals = _make_hod_actuals(168)
+        _, X = m._prepare_prediction_X(forecast, None, recent_actuals)
+
+        now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+
+        # Check 8 NaN positions h=2..9 — each gets a different HOD bucket
+        fills = []
+        expected = []
+        for h in range(2, 10):
+            logical_ts = now_floor + pd.Timedelta(hours=h - 1)
+            expected_hod = logical_ts.hour
+            expected.append(float(expected_hod) + 10.0)
+            fills.append(float(X["lag_1h"].iloc[h]))
+
+        # Values must vary across positions (not all the same constant)
+        assert len(set(round(v, 3) for v in fills)) > 1, (
+            "lag_1h fill is constant across NaN positions — HOD-aware fill not applied"
+        )
+        # Each value must match its HOD bucket
+        for h_idx, (actual_fill, expected_fill) in enumerate(zip(fills, expected)):
+            assert abs(actual_fill - expected_fill) < 0.5, (
+                f"lag_1h[h={h_idx+2}]: expected HOD mean {expected_fill:.2f}, got {actual_fill:.4f}"
+            )
+
+    def test_hod_fill_sparse_actuals_no_crash(self, tmp_path):
+        """With only 5 rows of actuals (hours 0-4), NaN fill must not raise;
+        unseen HOD buckets fall through to the existing median fill."""
+        m, forecast = _make_trained_model(tmp_path)
+
+        base = pd.Timestamp("2026-03-05 00:00")
+        ts = pd.date_range(base, periods=5, freq="1h")
+        sparse_actuals = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": [1.0, 2.0, 3.0, 4.0, 5.0],
+        })
+
+        _, X = m._prepare_prediction_X(forecast, None, sparse_actuals)
+        assert X is not None
+        assert len(X) == 48
+
+    def test_hod_fill_none_actuals_unchanged(self, tmp_path):
+        """With recent_actuals=None the HOD fill is skipped; predict completes without error."""
+        m, forecast = _make_trained_model(tmp_path)
+        _, X_none = m._prepare_prediction_X(forecast, None, None)
+        assert X_none is not None
+        assert len(X_none) == 48

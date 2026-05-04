@@ -690,6 +690,19 @@ class EnergyForecastModel:
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
         future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
+
+        # 7-day per-hour-of-day mean for smarter short-lag NaN fill.
+        # Shape (24,) indexed by hour 0-23; NaN where hour bucket has no data.
+        _hod_means: "np.ndarray | None" = None
+        if recent_actuals is not None and not recent_actuals.empty:
+            _ra = recent_actuals.tail(168)  # last 7 days (168 h)
+            _hod_series = (
+                _ra.groupby(_ra["timestamp"].dt.hour)["gross_kwh"]
+                .mean()
+                .reindex(range(24))
+            )
+            _hod_means = _hod_series.to_numpy()
+
         future_df = _add_sub_sensor_lags_prediction(future_df, sub_sensors_recent or {})
 
         outdoor_pred_df: pd.DataFrame | None = None
@@ -806,6 +819,25 @@ class EnergyForecastModel:
                 how_fill_lookup[col] = pd.Series(
                     {how: meds.get(col) for how, meds in self._feature_medians_by_how.items()}
                 )
+
+        # HOD-aware fill for short lags (< 48h) before the flat median fallback below.
+        # Remaining NaN (bucket had no actuals) falls through to HOW/global median.
+        if _hod_means is not None:
+            _future_ts = pd.to_datetime(feat_df["timestamp"])
+            for _lag in LAG_HOURS:
+                if _lag >= 48:
+                    continue
+                _col = f"lag_{_lag}h"
+                if _col not in feat_df.columns:
+                    continue
+                _nan_mask = feat_df[_col].isna()
+                if not _nan_mask.any():
+                    continue
+                _logical_hod = (_future_ts[_nan_mask] - pd.Timedelta(hours=_lag)).dt.hour
+                _fill_vals = _hod_means[_logical_hod.to_numpy()]
+                _valid = ~np.isnan(_fill_vals)
+                _idx = _nan_mask[_nan_mask].index[_valid]
+                feat_df.loc[_idx, _col] = _fill_vals[_valid]
 
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
