@@ -2330,9 +2330,12 @@ def _engineer_features(
     dt_diff = w["timestamp"].diff().dt.total_seconds() / 3600
     gap_starts = dt_diff > 2.0
     if gap_starts.any():
-        _LOGGER.warning(
+        n_gaps = int(gap_starts.sum())
+        # 1 gap is the expected DST spring-forward hole — debug only.
+        # Multiple gaps indicate weather API problems — keep as WARNING.
+        (_LOGGER.warning if n_gaps > 1 else _LOGGER.debug)(
             "EWMA: %d weather gap(s) > 2 h detected — resetting EWMA at boundaries",
-            int(gap_starts.sum()),
+            n_gaps,
         )
         w.loc[gap_starts, "temp_c"] = np.nan
     w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24, min_periods=1).mean()

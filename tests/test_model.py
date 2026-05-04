@@ -4143,8 +4143,8 @@ class TestEWMAGapReset:
 
         assert not any("EWMA" in r.message for r in caplog.records)
 
-    def test_gap_warning_logged(self, caplog):
-        """A 3-hour gap triggers a WARNING log mentioning EWMA."""
+    def test_single_gap_logged_at_debug(self, caplog):
+        """A single gap (expected DST case) logs at DEBUG, not WARNING."""
         import logging
         ts_before = pd.date_range("2026-01-01 00:00", periods=10, freq="1h")
         ts_after = pd.date_range("2026-01-01 13:00", periods=10, freq="1h")
@@ -4160,11 +4160,40 @@ class TestEWMAGapReset:
             "direct_radiation_wm2": [100.0] * 20,
         })
 
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
+            _engineer_features(df, w, None)
+
+        ewma_records = [r for r in caplog.records if "EWMA" in r.message]
+        assert ewma_records, "Expected EWMA gap log not found"
+        assert all(r.levelno == logging.DEBUG for r in ewma_records), (
+            "Single gap should log at DEBUG, not WARNING"
+        )
+
+    def test_multiple_gaps_logged_at_warning(self, caplog):
+        """Multiple gaps (unexpected weather API holes) log at WARNING."""
+        import logging
+        ts1 = pd.date_range("2026-01-01 00:00", periods=5, freq="1h")
+        ts2 = pd.date_range("2026-01-01 08:00", periods=5, freq="1h")
+        ts3 = pd.date_range("2026-01-01 16:00", periods=5, freq="1h")
+        ts_all = ts1.append(ts2).append(ts3)
+        df = _make_bare_df(ts_all)
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts_all),
+            "temp_c":               [10.0] * 15,
+            "precipitation_mm":     [0.0] * 15,
+            "sunshine_min":         [30.0] * 15,
+            "wind_kmh":             [10.0] * 15,
+            "cloud_cover_pct":      [50.0] * 15,
+            "direct_radiation_wm2": [100.0] * 15,
+        })
+
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _engineer_features(df, w, None)
 
-        assert any("EWMA" in r.message for r in caplog.records), (
-            "Expected EWMA gap warning not found in logs"
+        ewma_records = [r for r in caplog.records if "EWMA" in r.message]
+        assert ewma_records, "Expected EWMA gap warning not found"
+        assert any(r.levelno == logging.WARNING for r in ewma_records), (
+            "Multiple gaps should log at WARNING"
         )
 
 
