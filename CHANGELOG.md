@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-5] — 2026-05-04
+
+### Fixed
+- **Flat short-lag NaN fill** (`model.py`) — `lag_1h`..`lag_24h` NaN positions (hours where no real historical lookup exists within the 48 h forecast) were previously filled with flat training medians, producing a constant feature value for most of the forecast. These positions are now filled with the 7-day per-hour-of-day mean computed from `recent_actuals` at prediction time, giving each forecast row a time-of-day-aware fill value grounded in recent consumption patterns. No retraining required.
+
+### Tests
+- 560 passing (up from 556 in v0.11.1-alpha-4; +4 in `TestHodLagFill` covering correct HOD bucket selection, per-row variation, sparse actuals, and None-actuals fallback).
+
+---
+
 ## [0.11.1-alpha-4] — 2026-05-03
 
 ### Fixed
