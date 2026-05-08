@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1-alpha-6] — 2026-05-08
+
+### Fixed
+- **τ calibration sub-sequence scanning** (`model.py`) — the 12-hour cap in `_calibrate_tau()` was applied at the heating-off block level (`group = group.iloc[:12]`), causing the scanner to miss nighttime cooling windows when an off-block started in daytime (extended mild-weather off-periods of 24–48 h). The cap is now applied per sub-sequence (`e_cap = min(e, s + 12)`) so the full block is searched but each OLS fit remains limited to ≤12 h (preserving the ambient-drift guard). A `DEBUG` log for the number of heating-off blocks is also added. First post-fix retrain: candidates doubled (9 → 18); raw τ improved from ~1.9 h to 5.5 h (more physically realistic).
+
+### Tests
+- 562 passing (up from 560; +2 covering sub-sequence extraction from extended off-blocks and 12 h per-sub-sequence cap).
+
+---
+
 ## [0.11.1-alpha-5] — 2026-05-04
 
 ### Fixed
