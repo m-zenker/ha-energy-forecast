@@ -1355,11 +1355,12 @@ class EnergyForecastModel:
 
         candidates: list[tuple[float, float]] = []  # (tau, quality)
 
+        n_blocks = combined[combined["off"] == 1]["block"].nunique()
+        _LOGGER.debug("τ calibration: %d heating-off blocks found in combined data", n_blocks)
+
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
-
-            group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
 
@@ -1375,10 +1376,14 @@ class EnergyForecastModel:
             ends   = np.where(edges == -1)[0]
 
             for s, e in zip(starts, ends):
-                if e - s < 2:
+                # Cap each sub-sequence at 12h to avoid ambient drift in the OLS fit.
+                # The cap is applied here (not at the block level) so that nighttime
+                # cooling windows in extended off-periods (>12h) are still reachable.
+                e_cap = min(e, s + 12)
+                if e_cap - s < 2:
                     continue
 
-                d = delta[s:e]
+                d = delta[s:e_cap]
                 t = np.arange(len(d), dtype=float)
                 log_d = np.log(d)
                 slope, intercept = np.polyfit(t, log_d, 1)
@@ -1406,13 +1411,13 @@ class EnergyForecastModel:
 
                 # Continuous solar penalty — no hard threshold
                 if "direct_radiation_wm2" in group.columns:
-                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e].max())
+                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e_cap].max())
                 else:
                     sub_max_rad = 0.0
                 solar_score = float(np.exp(-sub_max_rad / 400.0))
 
                 # Hour-of-day penalty applied at sub-sequence level
-                sub_hours = np.asarray(group.index[s:e].hour)
+                sub_hours = np.asarray(group.index[s:e_cap].hour)
                 hour_scores = np.where(
                     (sub_hours >= 9) & (sub_hours < 16),
                     0.3,

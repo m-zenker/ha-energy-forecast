@@ -3327,6 +3327,109 @@ class TestCalibrateTau:
             f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
         )
 
+    def test_tau_extended_off_block_finds_nighttime_windows(self, tmp_path):
+        """Nighttime cooling windows beyond hour 12 of a long off-block are now found.
+
+        Regression test for the bug where the block-level 12h cap caused the
+        entire nighttime portion of a daytime-start off-block to be discarded.
+
+        Scenario: 48-hour heating-off block starting at 08:00.
+          Hours  0-11 (08:00–19:00): daytime, indoor rising due to solar gain → no decline.
+          Hours 12-23 (20:00–07:00): nighttime, indoor cooling → valid declining delta.
+          Hours 24-35 (08:00–19:00): daytime again, rising.
+          Hours 36-47 (20:00–07:00): second nighttime, cooling.
+
+        Old behaviour (block cap at 12h): only hours 0-11 are analysed (all
+        rising) → 0 candidates → returns None.
+        New behaviour (cap at sub-sequence level): hours 12-23 and 36-47 are
+        searched → nighttime sub-sequences found → τ estimated.
+        """
+        TRUE_TAU = 6.0
+        T_out = 5.0
+
+        n = 48
+        # Start at 08:00 so daytime hours come first in the block.
+        ts = pd.date_range("2024-06-10 08:00", periods=n, freq="1h")
+
+        T_indoor = np.empty(n)
+        for j in range(n):
+            hour_in_block = j % 24
+            if 0 <= hour_in_block < 12:
+                # Daytime: indoor rises from 18 to 22 °C (solar gain).
+                T_indoor[j] = 18.0 + hour_in_block * (4.0 / 11)
+            else:
+                # Nighttime: passive cooling from 22 °C toward T_out.
+                night_j = hour_in_block - 12
+                T_indoor[j] = T_out + (22.0 - T_out) * np.exp(-night_j / TRUE_TAU)
+
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": T_indoor,
+            "setpoint":     T_indoor + 1.0,
+        })}
+        heating_df = pd.DataFrame({
+            "timestamp":      ts,
+            "heating_active": np.zeros(n),  # heating off for the entire 48h block
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [T_out] * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [100.0] * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, (
+            "Nighttime cooling sub-sequences (hours 12-23 and 36-47) should yield "
+            "a τ estimate even though the block starts in daytime."
+        )
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.25, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
+    def test_tau_sub_sequence_cap_at_12h(self, tmp_path):
+        """A declining sequence longer than 12h is capped at 12h for the OLS fit.
+
+        Creates a 25-hour nighttime block with monotonic cooling (true τ = 8h).
+        The sub-sequence spans hours 1-25 (length 24), but the cap limits the
+        OLS regression to 12 points.  The estimate should still be within 20%
+        of the true τ and the function must not raise.
+        """
+        TRUE_TAU = 8.0
+        T_out = 5.0
+        T0 = 22.0
+        n = 25
+        ts = pd.date_range("2024-01-15 22:00", periods=n, freq="1h")  # all nighttime
+
+        T_indoor = np.array([T_out + (T0 - T_out) * np.exp(-j / TRUE_TAU) for j in range(n)])
+
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": T_indoor,
+            "setpoint":     T_indoor + 1.0,
+        })}
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": np.zeros(n)})
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [T_out] * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [100.0] * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, "25-hour declining block should produce a τ estimate"
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
     def test_thermal_pressure_scaled(self, tmp_path):
         """thermal_pressure is the area-weighted °C delta (no τ-division since v0.10.3)."""
         n = 10
