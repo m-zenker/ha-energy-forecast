@@ -3993,6 +3993,48 @@ class TestTauCalibrationSafeguards:
         # Top 50% should favour the good τ≈10 windows; result should not be near 50
         assert result < 30.0
 
+    def test_selectivity_switches_to_top25pct_above_threshold(self, tmp_path, monkeypatch):
+        """At ≥ _TAU_SELECTIVITY_THRESHOLD candidates, top-25% is used instead of top-50%.
+
+        Fixture: 8 candidates total — 2 nighttime (high quality, τ≈10) + 6 daytime
+        (low quality, τ≈50).  Threshold patched to 4 so the fixture crosses it.
+        Top-25% selects the 2 nighttime windows → result ≈ 10.
+        Old top-50% would select 4 windows (2 good + 2 noisy) → median much higher.
+        """
+        import pandas as pd
+
+        model = _make_tau_model(tmp_path)
+        monkeypatch.setattr(EnergyForecastModel, "_TAU_SELECTIVITY_THRESHOLD", 4)
+
+        good_dfs, good_heat, good_wx = self._make_night_blocks(
+            tau_true=10.0, n_days=2, start_hour=22
+        )
+        poor_dfs, poor_heat, poor_wx = self._make_night_blocks(
+            tau_true=50.0, n_days=6, start_hour=10  # daytime → hour_score = 0.3
+        )
+
+        climate_dfs = {
+            "climate.room": pd.concat(
+                [list(good_dfs.values())[0], list(poor_dfs.values())[0]]
+            ).sort_values("timestamp").reset_index(drop=True)
+        }
+        heating_df = (
+            pd.concat([good_heat, poor_heat])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        weather_df = (
+            pd.concat([good_wx, poor_wx])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        # top-25% of 8 = 2 nighttime windows → τ ≈ 10
+        # top-50% of 8 = 4 windows (2 good + 2 poor) → median would be >> 20
+        assert result < 20.0
+
     def test_flat_indoor_temp_excluded_by_r2(self, tmp_path):
         """A window where indoor temp doesn't decay (r²≤0) is excluded from candidates."""
         import pandas as pd

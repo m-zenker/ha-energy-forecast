@@ -219,6 +219,8 @@ def ensure_ml_packages() -> tuple[bool, str]:
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
+    _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
+
     def __init__(self, model_dir: Path, model_archive_count: int = 3) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
@@ -1497,20 +1499,20 @@ class EnergyForecastModel:
             _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
 
-        # Use top 50 % by quality (minimum 1 window)
+        # With few candidates use top-50%; with many (≥ threshold) tighten to top-25%
+        # to reduce bias from lower-quality windows in data-rich retrains.
         candidates.sort(key=lambda c: c[1], reverse=True)
-        n_select = max(1, len(candidates) // 2)
+        divisor = 4 if len(candidates) >= self._TAU_SELECTIVITY_THRESHOLD else 2
+        n_select = max(1, len(candidates) // divisor)
         selected = candidates[:n_select]
         tau_estimates = [c[0] for c in selected]
 
         _LOGGER.debug(
-            "τ calibration: %d candidates, using top %d (quality %.2f–%.2f, τ range %.1f–%.1f h)",
-            len(candidates),
-            n_select,
-            selected[-1][1],
-            selected[0][1],
-            min(tau_estimates),
-            max(tau_estimates),
+            "τ calibration: %d candidates, using top %d (%d%%) "
+            "(quality %.2f–%.2f, τ range %.1f–%.1f h)",
+            len(candidates), n_select, 100 // divisor,
+            selected[-1][1], selected[0][1],
+            min(tau_estimates), max(tau_estimates),
         )
 
         tau_median = float(np.median(tau_estimates))
