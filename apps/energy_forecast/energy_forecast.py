@@ -22,7 +22,7 @@ import logging
 import math
 import os
 import threading
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -970,7 +970,7 @@ class EnergyForecast(hass.Hass):
             )
 
         start_date = baseline_df["timestamp"].min().date()
-        end_date   = baseline_df["timestamp"].max().date()
+        end_date   = min(baseline_df["timestamp"].max().date(), date.today() - timedelta(days=5))
 
         try:
             weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date, timezone=self._timezone)
@@ -1206,7 +1206,7 @@ class EnergyForecast(hass.Hass):
         # Keep-first: only store a prediction for each target hour the first time
         # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
         # Pruned to 30 days so mae_30d sensor has enough history (#41).
-        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._pred_history = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff
@@ -1223,7 +1223,7 @@ class EnergyForecast(hass.Hass):
                 pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
                 recent_actuals["gross_kwh"].astype(float),
             )))
-        actuals_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items()
             if pd.Timestamp(ts) >= actuals_cutoff
@@ -1240,7 +1240,7 @@ class EnergyForecast(hass.Hass):
                 [(ts, kwh) for ts, kwh in self._actuals_history.items()],
                 columns=["timestamp", "gross_kwh"],
             )
-        cutoff_7d = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        cutoff_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
         pred_hist_7d = {
             ts: kwh for ts, kwh in self._pred_history.items()
             if pd.Timestamp(ts) >= cutoff_7d
@@ -1895,14 +1895,17 @@ class EnergyForecast(hass.Hass):
                 "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
             })
 
-        # ── EV kWh from actuals: sum (gross - charger_kw) for charging hours ──
+        # ── EV kWh from actuals: charger load per detected hour ──────────────
         # Always use original full_actuals for EV reporting, even in baseline_mode.
+        # EV energy per detected hour = charger_kw (the model's assumed fixed load).
+        # We clip by gross_kwh to handle partial hours near end-of-charge where
+        # gross may be slightly below charger_kw.
         if full_actuals is not None and not full_actuals.empty:
             ev_mask  = full_actuals["gross_kwh"] > self._ev_threshold
             ev_rows  = full_actuals[ev_mask].copy()
             if not ev_rows.empty:
-                ev_rows["ev_kwh"] = np.maximum(
-                    0.0, ev_rows["gross_kwh"] - self._ev_charger_kw
+                ev_rows["ev_kwh"] = np.minimum(
+                    ev_rows["gross_kwh"], self._ev_charger_kw
                 )
                 ev_times = ev_rows["timestamp"].values.astype("datetime64[ns]")
                 ev_vals  = ev_rows["ev_kwh"].values.astype(float)
@@ -1935,7 +1938,8 @@ class EnergyForecast(hass.Hass):
             return
 
         try:
-            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+            now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+            cutoff = now.floor("1h") - pd.Timedelta(days=30)
 
             # Load and prune prediction history
             for ts_str, kwh in data.get("pred", {}).items():
@@ -1985,12 +1989,16 @@ def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
 
 def _empty_weather_df() -> Any:
     import pandas as pd
-    return pd.DataFrame(
-        columns=[
-            "timestamp", "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
-            "cloud_cover_pct", "direct_radiation_wm2",
-        ]
-    )
+    return pd.DataFrame({
+        "timestamp":            pd.Series(dtype="datetime64[ns]"),
+        "temp_c":               pd.Series(dtype=float),
+        "precipitation_mm":     pd.Series(dtype=float),
+        "sunshine_min":         pd.Series(dtype=float),
+        "wind_kmh":             pd.Series(dtype=float),
+        "cloud_cover_pct":      pd.Series(dtype=float),
+        "direct_radiation_wm2": pd.Series(dtype=float),
+        "humidity":             pd.Series(dtype=float),
+    })
 
 
 def _apply_target_correction(

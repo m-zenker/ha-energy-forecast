@@ -90,6 +90,9 @@ _FEATURES_BASE = [
     "humidity",                                      # relative humidity %
     "cloud_cover_pct", "direct_radiation_wm2",
     "heating_degree", "cooling_degree",
+    "hp_heating_degree",                             # HP-calibrated cutoff: max(0, 15 − temp_c)
+    "temp_in_neutral_zone",                          # dead-band flag: 1 when 15 ≤ temp_c ≤ 22
+    "heating_active",                                # seasonal on/off from heating_system_active_entity
     "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
     # Thermal modelling features (#49–#52)
     "temp_ewma_24h", "temp_ewma_72h",               # #49 EWMA — RC-circuit thermal mass
@@ -98,7 +101,8 @@ _FEATURES_BASE = [
     "temp_lag_24h", "temp_lag_168h",                # #52 temperature lags
     # Autoregressive lags — always safe (see note above)
     "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
-    "lag_24h", "lag_48h", "lag_72h", "lag_168h", "lag_336h",
+    "lag_48h", "lag_72h",
+    "lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated",  # temp-delta gated: suppressed when warmer than lag period
     # Rolling activity stats
     "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
     # Calendar extras
@@ -225,6 +229,11 @@ class EnergyForecastModel:
         self._regime_count: int = 5
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
+
+        # Recent weather tail — last 400h stored at training time so that
+        # temp_lag_168h / temp_lag_336h are computable at prediction time
+        # (the 48h forecast window alone cannot supply a 168-row shift).
+        self._weather_tail: "pd.DataFrame | None" = None
 
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
@@ -394,19 +403,28 @@ class EnergyForecastModel:
 
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
 
+        # ── Store recent weather tail for prediction-time lag gating ────────
+        self._weather_tail = (
+            weather_df.sort_values("timestamp").tail(400).reset_index(drop=True).copy()
+        )
+
         # ── Weather / outdoor / calendar features ───────────────────────────
         df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
                                 likely_ev_hours=likely_ev_hours, away_df=away_df,
                                 presence_df=presence_df, climate_dfs=climate_dfs,
                                 dhw_df=dhw_df, tau_hours=self._tau_hours,
                                 room_areas=room_areas,
-                                regime_kwh_series=regime_kwh_series)
+                                regime_kwh_series=regime_kwh_series,
+                                heating_active_df=heating_active_df)
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
         # only the lags that were actually computed for this training run.
+        # Lags for 24/168/336h are computed (needed for tgated gating) but
+        # excluded here — the model sees only the temperature-gated versions.
+        _GATED_LAG_HOURS = frozenset({24, 168, 336})
         all_lag_cols = {f"lag_{l}h" for l in LAG_HOURS}
-        active_lag_cols = [f"lag_{l}h" for l in active_lags]
+        active_lag_cols = [f"lag_{l}h" for l in active_lags if l not in _GATED_LAG_HOURS]
 
         # Sub-sensor lag columns: lag_24h always; lag_168h only with enough history
         sub_sensor_cols: list[str] = []
@@ -690,6 +708,19 @@ class EnergyForecastModel:
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
         future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
+
+        # 7-day per-hour-of-day mean for smarter short-lag NaN fill.
+        # Shape (24,) indexed by hour 0-23; NaN where hour bucket has no data.
+        _hod_means: "np.ndarray | None" = None
+        if recent_actuals is not None and not recent_actuals.empty:
+            _ra = recent_actuals.tail(168)  # last 7 days (168 h)
+            _hod_series = (
+                _ra.groupby(_ra["timestamp"].dt.hour)["gross_kwh"]
+                .mean()
+                .reindex(range(24))
+            )
+            _hod_means = _hod_series.to_numpy()
+
         future_df = _add_sub_sensor_lags_prediction(future_df, sub_sensors_recent or {})
 
         outdoor_pred_df: pd.DataFrame | None = None
@@ -716,10 +747,31 @@ class EnergyForecastModel:
                 setpoint_off=setpoint_off,
             )
 
-        feat_df = _engineer_features(future_df, forecast_df, outdoor_pred_df, canton=self._canton,
+        ha_df_for_features = None
+        if heating_active_series is not None:
+            ha_df_for_features = (
+                heating_active_series
+                .rename_axis("timestamp")
+                .rename("heating_active")
+                .reset_index()
+            )
+
+        # Extend the 48h forecast with recent historical weather so that
+        # shift(168) and shift(336) in _engineer_features produce real values
+        # instead of NaN — enabling the temperature-delta gating to fire.
+        if self._weather_tail is not None and not self._weather_tail.empty:
+            import pandas as _pd
+            _extended = _pd.concat(
+                [self._weather_tail, forecast_df], ignore_index=True
+            ).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        else:
+            _extended = forecast_df
+
+        feat_df = _engineer_features(future_df, _extended, outdoor_pred_df, canton=self._canton,
                                      likely_ev_hours=self._likely_ev_hours,
                                      climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
-                                     tau_hours=self._tau_hours, room_areas=room_areas)
+                                     tau_hours=self._tau_hours, room_areas=room_areas,
+                                     heating_active_df=ha_df_for_features)
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -774,6 +826,13 @@ class EnergyForecastModel:
         else:
             feat_df["regime_kwh"] = 0.0
 
+        # Temperature-gate regime_kwh — same 8°C/168h discount as tgated lags.
+        # Centroids are trained on mostly heating-season data; suppress them
+        # during warm-season transitions so they don't anchor predictions high.
+        if "temp_c" in feat_df.columns and "temp_lag_168h" in feat_df.columns:
+            _delta = (feat_df["temp_c"] - feat_df["temp_lag_168h"]).clip(lower=0)
+            feat_df["regime_kwh"] *= (1.0 - (_delta / 8.0).clip(upper=1.0))
+
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
         # Merge by timestamp; fill unmatched rows with 0 (default: not away).
@@ -806,6 +865,25 @@ class EnergyForecastModel:
                 how_fill_lookup[col] = pd.Series(
                     {how: meds.get(col) for how, meds in self._feature_medians_by_how.items()}
                 )
+
+        # HOD-aware fill for short lags (< 48h) before the flat median fallback below.
+        # Remaining NaN (bucket had no actuals) falls through to HOW/global median.
+        if _hod_means is not None:
+            _future_ts = pd.to_datetime(feat_df["timestamp"])
+            for _lag in LAG_HOURS:
+                if _lag >= 48:
+                    continue
+                _col = f"lag_{_lag}h"
+                if _col not in feat_df.columns:
+                    continue
+                _nan_mask = feat_df[_col].isna()
+                if not _nan_mask.any():
+                    continue
+                _logical_hod = (_future_ts[_nan_mask] - pd.Timedelta(hours=_lag)).dt.hour
+                _fill_vals = _hod_means[_logical_hod.to_numpy()]
+                _valid = ~np.isnan(_fill_vals)
+                _idx = _nan_mask[_nan_mask].index[_valid]
+                feat_df.loc[_idx, _col] = _fill_vals[_valid]
 
         for col in self.feature_cols:
             if col in feat_df.columns and feat_df[col].isna().any():
@@ -1101,6 +1179,7 @@ class EnergyForecastModel:
             "tau_hours":                 self._tau_hours,
             "enable_regimes":            self._enable_regimes,
             "regime_count":              self._regime_count,
+            "weather_tail":              self._weather_tail,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1276,11 +1355,12 @@ class EnergyForecastModel:
 
         candidates: list[tuple[float, float]] = []  # (tau, quality)
 
+        n_blocks = combined[combined["off"] == 1]["block"].nunique()
+        _LOGGER.debug("τ calibration: %d heating-off blocks found in combined data", n_blocks)
+
         for _, group in combined[combined["off"] == 1].groupby("block"):
             if len(group) < 2:
                 continue
-
-            group = group.iloc[:12]  # cap at 12h to avoid ambient drift
 
             delta = group["T_indoor"].values - group["T_outdoor"].values
 
@@ -1296,10 +1376,14 @@ class EnergyForecastModel:
             ends   = np.where(edges == -1)[0]
 
             for s, e in zip(starts, ends):
-                if e - s < 2:
+                # Cap each sub-sequence at 12h to avoid ambient drift in the OLS fit.
+                # The cap is applied here (not at the block level) so that nighttime
+                # cooling windows in extended off-periods (>12h) are still reachable.
+                e_cap = min(e, s + 12)
+                if e_cap - s < 2:
                     continue
 
-                d = delta[s:e]
+                d = delta[s:e_cap]
                 t = np.arange(len(d), dtype=float)
                 log_d = np.log(d)
                 slope, intercept = np.polyfit(t, log_d, 1)
@@ -1327,13 +1411,13 @@ class EnergyForecastModel:
 
                 # Continuous solar penalty — no hard threshold
                 if "direct_radiation_wm2" in group.columns:
-                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e].max())
+                    sub_max_rad = float(group["direct_radiation_wm2"].iloc[s:e_cap].max())
                 else:
                     sub_max_rad = 0.0
                 solar_score = float(np.exp(-sub_max_rad / 400.0))
 
                 # Hour-of-day penalty applied at sub-sequence level
-                sub_hours = np.asarray(group.index[s:e].hour)
+                sub_hours = np.asarray(group.index[s:e_cap].hour)
                 hour_scores = np.where(
                     (sub_hours >= 9) & (sub_hours < 16),
                     0.3,
@@ -1427,6 +1511,7 @@ class EnergyForecastModel:
                     self._tau_hours            = meta.get("tau_hours",             None)
                     self._enable_regimes       = meta.get("enable_regimes",        False)
                     self._regime_count         = meta.get("regime_count",          5)
+                    self._weather_tail         = meta.get("weather_tail",          None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -2188,6 +2273,7 @@ def _engineer_features(
     tau_hours: float | None = None,
     room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: "pd.Series | None" = None,  # hourly regime profile
+    heating_active_df: "pd.DataFrame | None" = None,  # cols: timestamp, heating_active (0/1)
 ) -> pd.DataFrame:
     import pandas as pd
     import numpy as np
@@ -2249,9 +2335,12 @@ def _engineer_features(
     dt_diff = w["timestamp"].diff().dt.total_seconds() / 3600
     gap_starts = dt_diff > 2.0
     if gap_starts.any():
-        _LOGGER.warning(
+        n_gaps = int(gap_starts.sum())
+        # 1 gap is the expected DST spring-forward hole — debug only.
+        # Multiple gaps indicate weather API problems — keep as WARNING.
+        (_LOGGER.warning if n_gaps > 1 else _LOGGER.debug)(
             "EWMA: %d weather gap(s) > 2 h detected — resetting EWMA at boundaries",
-            int(gap_starts.sum()),
+            n_gaps,
         )
         w.loc[gap_starts, "temp_c"] = np.nan
     w["temp_ewma_24h"] = w["temp_c"].ewm(halflife=24, min_periods=1).mean()
@@ -2269,6 +2358,7 @@ def _engineer_features(
     # #52 Temperature lags
     w["temp_lag_24h"] = w["temp_c"].shift(24)
     w["temp_lag_168h"] = w["temp_c"].shift(168)
+    w["temp_lag_336h"] = w["temp_c"].shift(336)
 
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
     df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
@@ -2281,7 +2371,7 @@ def _engineer_features(
                 "temp_ewma_24h", "temp_ewma_72h",
                 "heating_deg_sum_24h", "heating_deg_sum_168h",
                 "temp_delta_1h", "temp_delta_24h",
-                "temp_lag_24h", "temp_lag_168h"]:
+                "temp_lag_24h", "temp_lag_168h", "temp_lag_336h"]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
@@ -2296,7 +2386,9 @@ def _engineer_features(
         df["humidity"] = 70.0
 
     df["heating_degree"] = np.maximum(0, 18.0 - df["temp_c"])
+    df["hp_heating_degree"] = np.maximum(0, 15.0 - df["temp_c"])  # empirically: HP cutoff ~15°C
     df["cooling_degree"] = np.maximum(0, df["temp_c"] - 22.0)
+    df["temp_in_neutral_zone"] = ((df["temp_c"] >= 15.0) & (df["temp_c"] <= 22.0)).astype(float)
 
     # ── Outdoor sensor merge ─────────────────────────────────────────────────
     if outdoor_df is not None and not outdoor_df.empty:
@@ -2335,6 +2427,46 @@ def _engineer_features(
         df["people_home"] = df["people_home"].fillna(0).astype(int)
     else:
         df["people_home"] = 0
+
+    # ── Heating system active (seasonal on/off) ───────────────────────────────
+    # Binary feature from heating_system_active_entity. When 0, the heat pump is
+    # off for the season, letting trees suppress HP-related lag features.
+    # Default 1 (heating on) when entity is not configured — conservative choice.
+    if heating_active_df is not None and not heating_active_df.empty:
+        h = heating_active_df[["timestamp", "heating_active"]].copy()
+        h["timestamp"] = pd.to_datetime(h["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(h, left_on="_ts_floor", right_on="timestamp",
+                      how="left", suffixes=("", "_ha"))
+        df.drop(columns=["timestamp_ha", "_ts_floor"], errors="ignore", inplace=True)
+        df["heating_active"] = df["heating_active"].fillna(1).astype(int)
+    else:
+        df["heating_active"] = 1
+
+    # ── Temperature-delta gated lags ─────────────────────────────────────
+    # Suppress lag features proportionally when today is warmer than the lag
+    # period — prevents stale HP-consumption lags from anchoring predictions
+    # during warm-season transitions.  Self-heals once the season stabilises
+    # (delta → 0, lags fully restored).
+    if "lag_24h" in df.columns and "temp_delta_24h" in df.columns:
+        discount_24h = (df["temp_delta_24h"].clip(lower=0) / 5.0).clip(upper=1.0)
+        df["lag_24h_tgated"] = df["lag_24h"] * (1.0 - discount_24h)
+    else:
+        df["lag_24h_tgated"] = df.get("lag_24h", 0.0)
+
+    if "lag_168h" in df.columns and "temp_lag_168h" in df.columns:
+        delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
+        discount_168h = (delta_168h / 8.0).clip(upper=1.0)
+        df["lag_168h_tgated"] = df["lag_168h"] * (1.0 - discount_168h)
+    else:
+        df["lag_168h_tgated"] = df.get("lag_168h", 0.0)
+
+    if "lag_336h" in df.columns and "temp_lag_336h" in df.columns:
+        delta_336h = (df["temp_c"] - df["temp_lag_336h"]).clip(lower=0)
+        discount_336h = (delta_336h / 8.0).clip(upper=1.0)
+        df["lag_336h_tgated"] = df["lag_336h"] * (1.0 - discount_336h)
+    else:
+        df["lag_336h_tgated"] = df.get("lag_336h", 0.0)
 
     # ── Stage 2: Thermal Pressure (Climate) ──────────────────────────────
     # thermal_pressure      — area-weighted mean deficit (°C·h), primary signal
@@ -2474,6 +2606,12 @@ def _engineer_features(
         df["regime_kwh"] = df["regime_kwh"].fillna(0.0)
     else:
         df["regime_kwh"] = 0.0
+
+    # Suppress regime_kwh when warmer than last week — centroids trained on
+    # heating-season data overestimate during warm-season transitions.
+    if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
+        delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
+        df["regime_kwh"] *= (1.0 - (delta_168h / 8.0).clip(upper=1.0))
 
     return df
 

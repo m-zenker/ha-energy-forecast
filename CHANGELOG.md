@@ -8,6 +8,91 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-05-11
+
+Stable release consolidating six alpha iterations. All fixes harden the warm-season transition and τ thermal-time-constant calibration that landed in v0.11.0.
+
+### Added
+- **`heating_active` feature** (`model.py`) — binary seasonal flag from `heating_system_active_entity`; suppresses HP-related lag features when heating is off. Defaults to 1.
+- **`hp_heating_degree`** (`model.py`) — `max(0, 15 − temp_c)`; separates mild/warm days from true heating demand more precisely than the 18 °C baseline.
+- **`temp_in_neutral_zone`** (`model.py`) — binary flag: 1 when 15 ≤ temp_c ≤ 22 °C (HP dead-band).
+
+### Fixed
+- **τ calibration sub-sequence scanning** (`model.py`) — 12-hour cap now applied per sub-sequence (`e_cap = min(e, s + 12)`) rather than at the block level, so extended mild-weather off-periods (24–48 h) are fully searched. First post-fix retrain: candidates doubled (9 → 18); τ improved from ~1.9 h to 5.5 h.
+- **Flat short-lag NaN fill** (`model.py`) — `lag_1h`..`lag_24h` NaN positions now filled with 7-day per-hour-of-day means from `recent_actuals`, replacing flat training medians.
+- **EWMA gap warning log pollution** (`model.py`) — single DST/archive gap now logs at DEBUG; multiple gaps (≥ 2) retain WARNING.
+- **Retraining crash when weather archive fetch fails** (`energy_forecast.py`) — `_empty_weather_df()` uses explicit `dtype=float`; `end_date` capped to `today − 5 days` to prevent Open-Meteo 400 errors.
+- **Warm-season day-ahead over-prediction** (`model.py`) — temperature-delta gated lags (`lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated`) replace raw lag features; `regime_kwh` gated by same discount; `_weather_tail` persisted in `meta.pkl` so prediction-time lag shifts resolve to real historical temperatures.
+- **MAE rolling window midnight jump** (`energy_forecast.py`) — `pd.Timestamp.now().normalize()` → `.floor("1h")` at all four window-cutoff sites.
+- **EV energy sensor calculation** (`energy_forecast.py`) — corrected to `min(gross_kwh, charger_kw)`.
+
+### Tests
+- 562 passing (up from 539 in v0.11.0; +23 covering all fixes above).
+
+---
+
+## [0.11.1-alpha-6] — 2026-05-08
+
+### Fixed
+- **τ calibration sub-sequence scanning** (`model.py`) — the 12-hour cap in `_calibrate_tau()` was applied at the heating-off block level (`group = group.iloc[:12]`), causing the scanner to miss nighttime cooling windows when an off-block started in daytime (extended mild-weather off-periods of 24–48 h). The cap is now applied per sub-sequence (`e_cap = min(e, s + 12)`) so the full block is searched but each OLS fit remains limited to ≤12 h (preserving the ambient-drift guard). A `DEBUG` log for the number of heating-off blocks is also added. First post-fix retrain: candidates doubled (9 → 18); raw τ improved from ~1.9 h to 5.5 h (more physically realistic).
+
+### Tests
+- 562 passing (up from 560; +2 covering sub-sequence extraction from extended off-blocks and 12 h per-sub-sequence cap).
+
+---
+
+## [0.11.1-alpha-5] — 2026-05-04
+
+### Fixed
+- **Flat short-lag NaN fill** (`model.py`) — `lag_1h`..`lag_24h` NaN positions (hours where no real historical lookup exists within the 48 h forecast) were previously filled with flat training medians, producing a constant feature value for most of the forecast. These positions are now filled with the 7-day per-hour-of-day mean computed from `recent_actuals` at prediction time, giving each forecast row a time-of-day-aware fill value grounded in recent consumption patterns. No retraining required.
+
+### Tests
+- 560 passing (up from 556 in v0.11.1-alpha-4; +4 in `TestHodLagFill` covering correct HOD bucket selection, per-row variation, sparse actuals, and None-actuals fallback).
+
+---
+
+## [0.11.1-alpha-4] — 2026-05-03
+
+### Fixed
+- **EWMA gap warning log pollution** (`model.py`) — the late March DST spring-forward gap in Open-Meteo archive data triggered a WARNING once per `_engineer_features` call (3× per hourly update cycle). Since the gap is expected, correctly handled, and not actionable, a single gap now logs at DEBUG level instead of WARNING. Multiple gaps (≥ 2) retain WARNING level to flag genuine weather API problems.
+
+### Tests
+- 556 passing (up from 555 in v0.11.1-alpha-3; +1 split `test_single_gap_logged_at_debug` and `test_multiple_gaps_logged_at_warning` covering the new behaviour, replacing `test_gap_warning_logged`).
+
+## [0.11.1-alpha-3] — 2026-05-02
+
+### Fixed
+- **Retraining crash when weather archive fetch fails** (`energy_forecast.py`) — `_empty_weather_df()` returned object-dtype columns (pandas default for empty DataFrames); after a left merge in `_engineer_features`, `df["temp_c"]` remained object dtype with all-NaN, causing `np.exp()` to crash with `"float has no attribute exp"`. Two-part fix: (1) cap `end_date` to `today − 5 days` so the Open-Meteo archive API (5-day lag) never gets a 400 for recent dates, preventing the fallback in the first place; (2) `_empty_weather_df()` now uses explicit `dtype=float` Series so merges always produce float64 columns even when all values are NaN.
+
+### Tests
+- 555 passing (up from 554 in v0.11.1-alpha-2; +1 regression test `test_defrost_risk_with_empty_weather_df` in `test_physics_features.py`).
+
+## [0.11.1-alpha-2] — 2026-04-28
+
+### Added
+- **`heating_active` feature** (`model.py`) — binary seasonal flag sourced from `heating_system_active_entity`. When 0 (HP off for the season), the model can learn to suppress HP-related lag features. Defaults to 1 (heating on) when entity not configured. Config key: `heating_system_active_entity`.
+- **`hp_heating_degree`** (`model.py`) — `max(0, 15 − temp_c)`, calibrated HP cut-off; separates mild/warm days from true heating demand more precisely than the standard 18 °C heating degree.
+- **`temp_in_neutral_zone`** (`model.py`) — binary flag: 1 when 15 ≤ temp_c ≤ 22 °C (HP dead-band); signals the "neither heating nor cooling" regime.
+
+### Fixed
+- **Warm-season day-ahead over-prediction** (`model.py`) — day-ahead forecasts were anchoring at the prior heating-season level (~13 kWh/day) for several days after the HP switched off. Root causes and fixes:
+  1. **Temperature-delta gated lags** — `lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated` replace their raw counterparts in `_FEATURES_BASE`. Each is discounted proportionally to how much warmer today is vs the lag period (thresholds: 5 °C/24 h; 8 °C/168 h and 336 h). Raw `lag_24h/168h/336h` removed from `_FEATURES_BASE` and excluded from `active_lag_cols` so the model cannot fall back to unmodified values.
+  2. **`regime_kwh` temperature gating** — regime centroids trained on mostly heating-season data overestimate warm-season consumption. `regime_kwh` is now multiplied by the same 8 °C/168 h discount in both the training path (`_engineer_features`) and the prediction path (`_prepare_prediction_X`).
+  3. **Weather tail for prediction-time gating** — all gating relies on `temp_lag_168h`/`temp_lag_336h`, but the 48 h forecast window cannot supply a 168-row shift; those columns were NaN at prediction time, making every discount NaN and the gated values worse than before. Fix: the last 400 h of real weather is stored in `self._weather_tail` during training (persisted in `meta.pkl`) and prepended to `forecast_df` in `_prepare_prediction_X`, so all temperature-lag shifts resolve to real historical values.
+- **`temp_lag_336h`** added to weather feature computation (needed for `lag_336h_tgated`).
+
+### Tests
+- 554 passing (up from 540 in v0.11.1-alpha-1; +14 covering tgated lag behaviour, `_FEATURES_BASE` membership, and `lag_336h_tgated` discount).
+
+## [0.11.1-alpha-1] — 2026-04-27
+
+### Fixed
+- **MAE rolling window midnight jump** (`energy_forecast.py`) — replaced `pd.Timestamp.now().normalize()` with `floor("1h")` at all four window-cutoff sites. The old code truncated to midnight, causing the 7d/30d MAE sensors to jump by 24 hours at midnight instead of rolling smoothly by 1 hour. Regression test `test_mae_window_rolls_smoothly_at_midnight` added.
+- **EV energy sensor calculation** (`energy_forecast.py`) — corrected from `gross_kwh - charger_kw` (wrong: charger treated as co-load to subtract) to `min(gross_kwh, charger_kw)` (correct: EV draw capped at charger rated capacity, handles partial end-of-charge hours). `sensor.energy_forecast_ev_today` and `sensor.energy_forecast_ev_yesterday` values will differ from prior versions. Tests updated to reflect correct semantics.
+
+### Tests
+- 540 passing (up from 539 in v0.11.0; +1 regression test `test_mae_window_rolls_smoothly_at_midnight`).
+
 ## [0.11.0] — 2026-04-24
 
 v0.11.0 introduces Daily Regime Clustering, an optional ML subsystem that identifies the household's recurring 24-hour consumption patterns from historical data and uses a weather- and calendar-aware Random Forest classifier to predict which regime to expect each day. The predicted regime's centroid profile is injected as a `regime_kwh` prior into the main LightGBM model, giving hourly forecasts a stable, physics-informed baseline anchored to real behavioral patterns. A 16-alpha hardening cycle refined auto-K elbow selection, added OOB tie-breaking, hardened centroid fitting with outlier guards and inertia normalisation, synced cluster weights to training-data decay, and excluded EV-charging days so centroids encode genuine thermal and occupancy patterns rather than EV session timing.

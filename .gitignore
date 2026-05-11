@@ -25,6 +25,9 @@ apps/energy_forecast/energy_history.csv
 temp/
 logs/
 
+# Local analysis data pulled from HA (runtime artifacts, never commit)
+data/
+
 # Claude Code — local only, not for sharing
 CLAUDE.md
 MEMORY.md

@@ -716,6 +716,69 @@ class TestTemperatureLagFeatures:
         assert abs(float(result["temp_lag_168h"].iloc[168]) - 10.0) < 1e-9
 
 
+class TestWarmWeatherBiasFeatures:
+    """hp_heating_degree, temp_in_neutral_zone, and heating_active features."""
+
+    def test_new_features_in_features_base(self):
+        assert "hp_heating_degree"    in _FEATURES_BASE
+        assert "temp_in_neutral_zone" in _FEATURES_BASE
+        assert "heating_active"       in _FEATURES_BASE
+
+    def test_hp_heating_degree_matches_15c_threshold(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        temps = [0.0, 10.0, 15.0, 20.0]
+        w = _make_weather_df(ts)
+        w["temp_c"] = temps
+        result = _engineer_features(df, w, None)
+        expected = [15.0, 5.0, 0.0, 0.0]
+        for i, exp in enumerate(expected):
+            assert abs(float(result["hp_heating_degree"].iloc[i]) - exp) < 1e-9
+
+    def test_temp_in_neutral_zone_boundaries(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=5, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        w["temp_c"] = [10.0, 15.0, 20.0, 22.0, 25.0]
+        result = _engineer_features(df, w, None)
+        assert float(result["temp_in_neutral_zone"].iloc[0]) == 0.0  # 10°C: below zone
+        assert float(result["temp_in_neutral_zone"].iloc[1]) == 1.0  # 15°C: lower bound
+        assert float(result["temp_in_neutral_zone"].iloc[2]) == 1.0  # 20°C: inside
+        assert float(result["temp_in_neutral_zone"].iloc[3]) == 1.0  # 22°C: upper bound
+        assert float(result["temp_in_neutral_zone"].iloc[4]) == 0.0  # 25°C: above zone
+
+    def test_heating_active_uses_provided_df(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [1, 1, 0, 0]})
+        result = _engineer_features(df, w, None, heating_active_df=ha_df)
+        assert list(result["heating_active"]) == [1, 1, 0, 0]
+
+    def test_heating_active_defaults_to_1_when_not_provided(self):
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)
+        assert (result["heating_active"] == 1).all()
+
+    def test_heating_active_fills_missing_timestamps_with_1(self):
+        """Timestamps not covered by heating_active_df fill with 1 (heating on)."""
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        # Only provide two of the four timestamps
+        ha_df = pd.DataFrame({
+            "timestamp": ts[:2],
+            "heating_active": [0, 0],
+        })
+        result = _engineer_features(df, w, None, heating_active_df=ha_df)
+        assert result["heating_active"].iloc[0] == 0
+        assert result["heating_active"].iloc[1] == 0
+        assert result["heating_active"].iloc[2] == 1  # filled with default
+        assert result["heating_active"].iloc[3] == 1
+
+
 class TestThermalFeaturesIntegration:
     """Integration test: all 8 thermal features activate during training."""
 
@@ -3264,6 +3327,109 @@ class TestCalibrateTau:
             f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
         )
 
+    def test_tau_extended_off_block_finds_nighttime_windows(self, tmp_path):
+        """Nighttime cooling windows beyond hour 12 of a long off-block are now found.
+
+        Regression test for the bug where the block-level 12h cap caused the
+        entire nighttime portion of a daytime-start off-block to be discarded.
+
+        Scenario: 48-hour heating-off block starting at 08:00.
+          Hours  0-11 (08:00–19:00): daytime, indoor rising due to solar gain → no decline.
+          Hours 12-23 (20:00–07:00): nighttime, indoor cooling → valid declining delta.
+          Hours 24-35 (08:00–19:00): daytime again, rising.
+          Hours 36-47 (20:00–07:00): second nighttime, cooling.
+
+        Old behaviour (block cap at 12h): only hours 0-11 are analysed (all
+        rising) → 0 candidates → returns None.
+        New behaviour (cap at sub-sequence level): hours 12-23 and 36-47 are
+        searched → nighttime sub-sequences found → τ estimated.
+        """
+        TRUE_TAU = 6.0
+        T_out = 5.0
+
+        n = 48
+        # Start at 08:00 so daytime hours come first in the block.
+        ts = pd.date_range("2024-06-10 08:00", periods=n, freq="1h")
+
+        T_indoor = np.empty(n)
+        for j in range(n):
+            hour_in_block = j % 24
+            if 0 <= hour_in_block < 12:
+                # Daytime: indoor rises from 18 to 22 °C (solar gain).
+                T_indoor[j] = 18.0 + hour_in_block * (4.0 / 11)
+            else:
+                # Nighttime: passive cooling from 22 °C toward T_out.
+                night_j = hour_in_block - 12
+                T_indoor[j] = T_out + (22.0 - T_out) * np.exp(-night_j / TRUE_TAU)
+
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": T_indoor,
+            "setpoint":     T_indoor + 1.0,
+        })}
+        heating_df = pd.DataFrame({
+            "timestamp":      ts,
+            "heating_active": np.zeros(n),  # heating off for the entire 48h block
+        })
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [T_out] * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [100.0] * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, (
+            "Nighttime cooling sub-sequences (hours 12-23 and 36-47) should yield "
+            "a τ estimate even though the block starts in daytime."
+        )
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.25, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
+    def test_tau_sub_sequence_cap_at_12h(self, tmp_path):
+        """A declining sequence longer than 12h is capped at 12h for the OLS fit.
+
+        Creates a 25-hour nighttime block with monotonic cooling (true τ = 8h).
+        The sub-sequence spans hours 1-25 (length 24), but the cap limits the
+        OLS regression to 12 points.  The estimate should still be within 20%
+        of the true τ and the function must not raise.
+        """
+        TRUE_TAU = 8.0
+        T_out = 5.0
+        T0 = 22.0
+        n = 25
+        ts = pd.date_range("2024-01-15 22:00", periods=n, freq="1h")  # all nighttime
+
+        T_indoor = np.array([T_out + (T0 - T_out) * np.exp(-j / TRUE_TAU) for j in range(n)])
+
+        climate_dfs = {"climate.test": pd.DataFrame({
+            "timestamp":    ts,
+            "current_temp": T_indoor,
+            "setpoint":     T_indoor + 1.0,
+        })}
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": np.zeros(n)})
+        weather_df = pd.DataFrame({
+            "timestamp":            ts,
+            "temp_c":               [T_out] * n,
+            "precipitation_mm":     [0.0]   * n,
+            "sunshine_min":         [0.0]   * n,
+            "wind_kmh":             [0.0]   * n,
+            "cloud_cover_pct":      [100.0] * n,
+            "direct_radiation_wm2": [0.0]   * n,
+        })
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None, "25-hour declining block should produce a τ estimate"
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20, (
+            f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
+        )
+
     def test_thermal_pressure_scaled(self, tmp_path):
         """thermal_pressure is the area-weighted °C delta (no τ-division since v0.10.3)."""
         n = 10
@@ -4080,8 +4246,8 @@ class TestEWMAGapReset:
 
         assert not any("EWMA" in r.message for r in caplog.records)
 
-    def test_gap_warning_logged(self, caplog):
-        """A 3-hour gap triggers a WARNING log mentioning EWMA."""
+    def test_single_gap_logged_at_debug(self, caplog):
+        """A single gap (expected DST case) logs at DEBUG, not WARNING."""
         import logging
         ts_before = pd.date_range("2026-01-01 00:00", periods=10, freq="1h")
         ts_after = pd.date_range("2026-01-01 13:00", periods=10, freq="1h")
@@ -4097,11 +4263,40 @@ class TestEWMAGapReset:
             "direct_radiation_wm2": [100.0] * 20,
         })
 
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
+            _engineer_features(df, w, None)
+
+        ewma_records = [r for r in caplog.records if "EWMA" in r.message]
+        assert ewma_records, "Expected EWMA gap log not found"
+        assert all(r.levelno == logging.DEBUG for r in ewma_records), (
+            "Single gap should log at DEBUG, not WARNING"
+        )
+
+    def test_multiple_gaps_logged_at_warning(self, caplog):
+        """Multiple gaps (unexpected weather API holes) log at WARNING."""
+        import logging
+        ts1 = pd.date_range("2026-01-01 00:00", periods=5, freq="1h")
+        ts2 = pd.date_range("2026-01-01 08:00", periods=5, freq="1h")
+        ts3 = pd.date_range("2026-01-01 16:00", periods=5, freq="1h")
+        ts_all = ts1.append(ts2).append(ts3)
+        df = _make_bare_df(ts_all)
+        w = pd.DataFrame({
+            "timestamp":            pd.to_datetime(ts_all),
+            "temp_c":               [10.0] * 15,
+            "precipitation_mm":     [0.0] * 15,
+            "sunshine_min":         [30.0] * 15,
+            "wind_kmh":             [10.0] * 15,
+            "cloud_cover_pct":      [50.0] * 15,
+            "direct_radiation_wm2": [100.0] * 15,
+        })
+
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             _engineer_features(df, w, None)
 
-        assert any("EWMA" in r.message for r in caplog.records), (
-            "Expected EWMA gap warning not found in logs"
+        ewma_records = [r for r in caplog.records if "EWMA" in r.message]
+        assert ewma_records, "Expected EWMA gap warning not found"
+        assert any(r.levelno == logging.WARNING for r in ewma_records), (
+            "Multiple gaps should log at WARNING"
         )
 
 
@@ -4162,3 +4357,100 @@ class TestTrainEdgeCases:
             m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
         except Exception as exc:
             pytest.fail(f"train() raised on constant values: {exc}")
+
+
+# ── HOD-aware short-lag NaN fill ──────────────────────────────────────────────
+
+def _make_hod_actuals(n_hours: int = 168) -> pd.DataFrame:
+    """Actuals where gross_kwh = hour_of_day + 10.0 (each HOD bucket is uniquely identifiable)."""
+    now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+    start = now_floor - pd.Timedelta(hours=n_hours)
+    ts = pd.date_range(start, periods=n_hours, freq="1h")
+    kwh = np.array([float(t.hour) + 10.0 for t in ts])
+    return pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+
+class TestHodLagFill:
+    """NaN positions in short lag features (lag < 48h) should be filled with the
+    7-day per-hour-of-day mean from recent_actuals, not the flat training median."""
+
+    def test_hod_fill_uses_recent_mean_not_global_median(self, tmp_path):
+        """lag_1h[h=1] must be filled with the HOD mean from recent_actuals, not the
+        training global median (which is ~2.75 for uniform-0.5..5 training data)."""
+        m, forecast = _make_trained_model(tmp_path)
+        if "lag_1h" not in m.feature_cols:
+            pytest.skip("lag_1h not in feature_cols")
+
+        recent_actuals = _make_hod_actuals(168)
+        _, X = m._prepare_prediction_X(forecast, None, recent_actuals)
+
+        # lag_1h[h=1]: logical timestamp = future_ts[1] - 1h = now_floor + 1h - 1h = now_floor
+        # now_floor is NOT in recent_actuals (actuals end at now_floor - 1h) → was NaN
+        now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+        logical_hod = now_floor.hour
+        expected_fill = float(logical_hod) + 10.0  # HOD mean from _make_hod_actuals
+
+        actual_fill = float(X["lag_1h"].iloc[1])
+        # HOD fill must be > 9 (our actuals are 10..33); training median is ~2.75
+        assert actual_fill > 9.0, (
+            f"lag_1h[h=1] expected HOD mean ≥ 10 (got {actual_fill:.4f}); "
+            f"training median used instead?"
+        )
+        assert abs(actual_fill - expected_fill) < 0.5, (
+            f"lag_1h[h=1] expected HOD mean {expected_fill:.2f} (HOD={logical_hod}), "
+            f"got {actual_fill:.4f}"
+        )
+
+    def test_hod_fill_varies_per_nan_position(self, tmp_path):
+        """Each NaN position must get the fill for its own hour-of-day bucket,
+        not the same constant value for all NaN rows."""
+        m, forecast = _make_trained_model(tmp_path)
+        if "lag_1h" not in m.feature_cols:
+            pytest.skip("lag_1h not in feature_cols")
+
+        recent_actuals = _make_hod_actuals(168)
+        _, X = m._prepare_prediction_X(forecast, None, recent_actuals)
+
+        now_floor = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None).floor("1h")
+
+        # Check 8 NaN positions h=2..9 — each gets a different HOD bucket
+        fills = []
+        expected = []
+        for h in range(2, 10):
+            logical_ts = now_floor + pd.Timedelta(hours=h - 1)
+            expected_hod = logical_ts.hour
+            expected.append(float(expected_hod) + 10.0)
+            fills.append(float(X["lag_1h"].iloc[h]))
+
+        # Values must vary across positions (not all the same constant)
+        assert len(set(round(v, 3) for v in fills)) > 1, (
+            "lag_1h fill is constant across NaN positions — HOD-aware fill not applied"
+        )
+        # Each value must match its HOD bucket
+        for h_idx, (actual_fill, expected_fill) in enumerate(zip(fills, expected)):
+            assert abs(actual_fill - expected_fill) < 0.5, (
+                f"lag_1h[h={h_idx+2}]: expected HOD mean {expected_fill:.2f}, got {actual_fill:.4f}"
+            )
+
+    def test_hod_fill_sparse_actuals_no_crash(self, tmp_path):
+        """With only 5 rows of actuals (hours 0-4), NaN fill must not raise;
+        unseen HOD buckets fall through to the existing median fill."""
+        m, forecast = _make_trained_model(tmp_path)
+
+        base = pd.Timestamp("2026-03-05 00:00")
+        ts = pd.date_range(base, periods=5, freq="1h")
+        sparse_actuals = pd.DataFrame({
+            "timestamp": ts,
+            "gross_kwh": [1.0, 2.0, 3.0, 4.0, 5.0],
+        })
+
+        _, X = m._prepare_prediction_X(forecast, None, sparse_actuals)
+        assert X is not None
+        assert len(X) == 48
+
+    def test_hod_fill_none_actuals_unchanged(self, tmp_path):
+        """With recent_actuals=None the HOD fill is skipped; predict completes without error."""
+        m, forecast = _make_trained_model(tmp_path)
+        _, X_none = m._prepare_prediction_X(forecast, None, None)
+        assert X_none is not None
+        assert len(X_none) == 48
