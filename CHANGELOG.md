@@ -8,6 +8,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-05-11
+
+Stable release consolidating six alpha iterations. All fixes harden the warm-season transition and τ thermal-time-constant calibration that landed in v0.11.0.
+
+### Added
+- **`heating_active` feature** (`model.py`) — binary seasonal flag from `heating_system_active_entity`; suppresses HP-related lag features when heating is off. Defaults to 1.
+- **`hp_heating_degree`** (`model.py`) — `max(0, 15 − temp_c)`; separates mild/warm days from true heating demand more precisely than the 18 °C baseline.
+- **`temp_in_neutral_zone`** (`model.py`) — binary flag: 1 when 15 ≤ temp_c ≤ 22 °C (HP dead-band).
+
+### Fixed
+- **τ calibration sub-sequence scanning** (`model.py`) — 12-hour cap now applied per sub-sequence (`e_cap = min(e, s + 12)`) rather than at the block level, so extended mild-weather off-periods (24–48 h) are fully searched. First post-fix retrain: candidates doubled (9 → 18); τ improved from ~1.9 h to 5.5 h.
+- **Flat short-lag NaN fill** (`model.py`) — `lag_1h`..`lag_24h` NaN positions now filled with 7-day per-hour-of-day means from `recent_actuals`, replacing flat training medians.
+- **EWMA gap warning log pollution** (`model.py`) — single DST/archive gap now logs at DEBUG; multiple gaps (≥ 2) retain WARNING.
+- **Retraining crash when weather archive fetch fails** (`energy_forecast.py`) — `_empty_weather_df()` uses explicit `dtype=float`; `end_date` capped to `today − 5 days` to prevent Open-Meteo 400 errors.
+- **Warm-season day-ahead over-prediction** (`model.py`) — temperature-delta gated lags (`lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated`) replace raw lag features; `regime_kwh` gated by same discount; `_weather_tail` persisted in `meta.pkl` so prediction-time lag shifts resolve to real historical temperatures.
+- **MAE rolling window midnight jump** (`energy_forecast.py`) — `pd.Timestamp.now().normalize()` → `.floor("1h")` at all four window-cutoff sites.
+- **EV energy sensor calculation** (`energy_forecast.py`) — corrected to `min(gross_kwh, charger_kw)`.
+
+### Tests
+- 562 passing (up from 539 in v0.11.0; +23 covering all fixes above).
+
+---
+
 ## [0.11.1-alpha-6] — 2026-05-08
 
 ### Fixed
