@@ -33,7 +33,7 @@ DETAILS
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import hassapi as hass
@@ -69,6 +69,7 @@ class EnergyHistoryBackfill(hass.Hass):
 
     def _backfill(self) -> None:
         import sqlite3
+
         import pandas as pd
 
         entity_id = self.args["energy_sensor"]
@@ -85,7 +86,7 @@ class EnergyHistoryBackfill(hass.Hass):
         _LOGGER.info("Reading statistics for %s from %s …", entity_id, db_path)
 
         cutoff_ts = (
-            datetime.now(tz=timezone.utc) - timedelta(days=365 * LOOKBACK_YEARS)
+            datetime.now(tz=UTC) - timedelta(days=365 * LOOKBACK_YEARS)
         ).timestamp()
 
         # ── 1. Query the statistics table ─────────────────────────────────────

@@ -1,14 +1,16 @@
 """Tests for the Daily Regime Clustering module."""
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pytest
+
 from apps.energy_forecast.clustering import (
+    SKLEARN_AVAILABLE,
     DailyProfileClusterer,
     RegimePredictor,
     find_optimal_k,
-    SKLEARN_AVAILABLE,
 )
 from apps.energy_forecast.model import _prepare_daily_regime_features
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_fit():
@@ -426,7 +428,6 @@ def test_find_optimal_k_single_cluster_collapse():
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_pkl_corruption_recovery(tmp_path):
     """A corrupted clusterer.pkl must not crash the model; _clusterer becomes None."""
-    import pickle
     from energy_forecast.model import EnergyForecastModel
 
     # Write a corrupted clusterer.pkl
@@ -446,7 +447,6 @@ def test_clusterer_pkl_corruption_recovery(tmp_path):
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_homogeneous_fallback():
     """Homogeneous data (all profiles identical) → inertia range near 0 → returns k_lo."""
-    import logging
     # All hours identical → KMeans inertia the same for every K → range ≈ 0
     n_days = 30
     dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
@@ -466,7 +466,6 @@ def test_find_optimal_k_homogeneous_fallback():
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_fit_excludes_ev_days_from_centroids():
     """EV days must not influence centroid shape; they still receive a label."""
-    import datetime
 
     # 20 normal days with a morning peak at hour 7
     dates = pd.date_range("2024-01-01", periods=20, freq="D")
@@ -506,7 +505,6 @@ def test_clusterer_fit_excludes_ev_days_from_centroids():
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_fit_ev_fallback_too_few_non_ev_days():
     """Falls back to fitting on all days when fewer than 14 non-EV days remain."""
-    import datetime
 
     # 16 total days; mark all but 10 as EV → only 10 non-EV (< 14 threshold)
     dates = pd.date_range("2024-01-01", periods=16, freq="D")
@@ -529,7 +527,6 @@ def test_clusterer_fit_ev_fallback_too_few_non_ev_days():
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_excludes_ev_days():
     """find_optimal_k with ev_day_dates matches result of simply removing those days."""
-    import datetime
 
     # 30 normal days (two clear groups: low/high consumption)
     dates_normal = pd.date_range("2024-01-01", periods=30, freq="D")

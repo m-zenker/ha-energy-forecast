@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import pandas as pd
     import hassapi as hass
+    import pandas as pd
 
 from .const import CACHE_PATH, MAX_HOURLY_KWH
 
@@ -48,7 +48,7 @@ def _check_dst_duplicates(df: pd.DataFrame, logger: logging.Logger) -> None:
         )
 
 
-def validate_energy_cache(df: "pd.DataFrame", logger: logging.Logger) -> None:
+def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
     """Run defensive health checks on the merged energy cache DataFrame.
 
     Logs WARNINGs for detected issues; never raises.  Intended to catch
@@ -132,7 +132,7 @@ def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.
 
 
 def fetch_energy_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path = CACHE_PATH,
     timezone: str = "Europe/Zurich",
@@ -192,7 +192,9 @@ def fetch_energy_history(
 _FETCH_RECENT_TAIL_ROWS = 400   # 336 h max lag + buffer; limits memory use in hourly updates
 
 
-def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CACHE_PATH, timezone: str = "Europe/Zurich") -> pd.DataFrame:
+def fetch_recent_energy(
+    app: hass.Hass, entity_id: str, cache_path: Path = CACHE_PATH, timezone: str = "Europe/Zurich"
+) -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
     Fetches only the last 2 days of HA history (vs. 30 days in
@@ -205,8 +207,9 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     _retrain() continues to call fetch_energy_history() for a full
     30-day resync once a week.
     """
-    import io
     import collections
+    import io
+
     import pandas as pd
 
     # 1. Load only the tail of the cache — enough rows to cover all lag features.
@@ -215,7 +218,7 @@ def fetch_recent_energy(app: "hass.Hass", entity_id: str, cache_path: Path = CAC
     df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
     if cache_path.exists():
         try:
-            with open(cache_path, "r") as fh:
+            with open(cache_path) as fh:
                 header_line = fh.readline()
                 tail_lines = list(collections.deque(fh, maxlen=_FETCH_RECENT_TAIL_ROWS))
             df_cache = pd.read_csv(io.StringIO(header_line + "".join(tail_lines)))
@@ -300,7 +303,7 @@ def split_ev_charging(
     return df, ev_df
 
 
-def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame") -> "pd.DataFrame":
+def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
 
     Fresh HA data wins on kwh conflicts.  For the 'program' column the rule is
@@ -316,12 +319,20 @@ def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame"
     if "program" in df_winner.columns or "program" in df_loser.columns:
         # Re-merge only the program column from both sides.
         # Build a loser index: timestamp → program (non-empty only)
-        loser_prog = df_loser.copy() if "program" in df_loser.columns else pd.DataFrame(columns=["timestamp", "program"])
-        loser_prog = loser_prog[loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        loser_prog = (
+            df_loser.copy() if "program" in df_loser.columns else pd.DataFrame(columns=["timestamp", "program"])
+        )
+        loser_prog = loser_prog[
+            loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")
+        ][["timestamp", "program"]]
         loser_prog = loser_prog.set_index("timestamp")["program"]
 
-        winner_prog = df_winner.copy() if "program" in df_winner.columns else pd.DataFrame(columns=["timestamp", "program"])
-        winner_prog = winner_prog[winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")][["timestamp", "program"]]
+        winner_prog = (
+            df_winner.copy() if "program" in df_winner.columns else pd.DataFrame(columns=["timestamp", "program"])
+        )
+        winner_prog = winner_prog[
+            winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")
+        ][["timestamp", "program"]]
         winner_prog = winner_prog.set_index("timestamp")["program"]
 
         # Winner takes precedence; loser fills gaps
@@ -332,9 +343,9 @@ def _merge_sub_sensor_frames(df_winner: "pd.DataFrame", df_loser: "pd.DataFrame"
 
 
 def _resolve_programs_for_series(
-    timestamps: "pd.Series",
-    prog_df: "pd.DataFrame",
-) -> "pd.Series":
+    timestamps: pd.Series,
+    prog_df: pd.DataFrame,
+) -> pd.Series:
     """Assign a program label to each hourly timestamp using last-value-carry-forward.
 
     Args:
@@ -391,7 +402,7 @@ def _resolve_programs_for_series(
 
 
 def fetch_sub_sensor_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
@@ -458,7 +469,7 @@ def fetch_sub_sensor_history(
 
 
 def fetch_recent_sub_sensor(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
@@ -524,7 +535,7 @@ def fetch_recent_sub_sensor(
 
 
 def fetch_generic_sensor_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     column_name: str = "value",
@@ -570,7 +581,7 @@ def fetch_generic_sensor_history(
 
 
 def fetch_recent_generic_sensor(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     column_name: str = "value",
@@ -616,7 +627,7 @@ def fetch_recent_generic_sensor(
 
 
 def fetch_climate_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
@@ -675,7 +686,7 @@ def fetch_climate_history(
 
 
 def fetch_recent_climate(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     cache_path: Path,
     timezone: str = "Europe/Zurich",
@@ -729,11 +740,11 @@ def fetch_recent_climate(
 
 
 def fetch_boolean_entity_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str | None,
     days: int = 30,
     timezone: str = "Europe/Zurich",
-) -> "pd.DataFrame":
+) -> pd.DataFrame:
     """Return hourly is_away flags from a boolean entity's state history.
 
     Fetches up to *days* of history for *entity_id* (e.g. input_boolean.vacation_mode),
@@ -801,11 +812,11 @@ def fetch_boolean_entity_history(
 
 
 def fetch_presence_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_ids: list[str] | None,
     days: int = 30,
     timezone: str = "Europe/Zurich",
-) -> "pd.DataFrame":
+) -> pd.DataFrame:
     """Return hourly occupancy count from person entity state history.
 
     Fetches up to *days* of history for each entity in *entity_ids* (e.g. person.alice),
@@ -907,11 +918,11 @@ def fetch_presence_history(
 
 
 def fetch_program_sensor_history(
-    app: "hass.Hass",
+    app: hass.Hass,
     entity_id: str,
     days: int = 30,
     timezone: str = "Europe/Zurich",
-) -> "pd.DataFrame":
+) -> pd.DataFrame:
     """Return state-change history for a string program sensor.
 
     Columns: timestamp (naive, local tz), program (str, lowercased).
@@ -953,7 +964,9 @@ def fetch_program_sensor_history(
     )
 
 
-def _fetch_history(app: "hass.Hass", entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False) -> pd.DataFrame:
+def _fetch_history(
+    app: hass.Hass, entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False
+) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
     try:

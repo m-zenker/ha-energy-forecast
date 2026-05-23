@@ -3,15 +3,14 @@
 Covers _project_indoor_temps() with heating_active_series + thermal_pressure
 behaviour in _engineer_features(), plus a predict() smoke test.
 """
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pytest
 
 from apps.energy_forecast.model import (
-    _project_indoor_temps,
     _engineer_features,
+    _project_indoor_temps,
 )
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

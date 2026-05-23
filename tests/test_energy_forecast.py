@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
-
 from energy_forecast.energy_forecast import (
     EnergyForecast,
     _apply_target_correction,
@@ -24,7 +24,6 @@ from energy_forecast.energy_forecast import (
     _compute_live_mae,
     _subtract_sub_sensors,
 )
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -204,7 +203,7 @@ class TestIntervalBlend:
 
 # ── _aggregate ────────────────────────────────────────────────────────────────
 
-def _fake_self_for_aggregate(ev_threshold: float = 4.5, ev_charger_kw: float = 9.0) -> "_FakeSelf":
+def _fake_self_for_aggregate(ev_threshold: float = 4.5, ev_charger_kw: float = 9.0) -> _FakeSelf:
     app = _FakeSelf()
     app._ev_threshold  = ev_threshold
     app._ev_charger_kw = ev_charger_kw
@@ -254,7 +253,6 @@ class TestAggregate:
     def test_tomorrow_uses_predictions_only(self):
         """tomorrow must equal 24 × per-hour prediction for the following calendar day."""
         today = pd.Timestamp.now().normalize()
-        tmrw  = today + pd.Timedelta(days=1)
         preds = _pred_df(today, n=48, kwh=3.0)
         result = self._run(today, today, preds)
         assert abs(result["tomorrow"] - 72.0) < 1e-3   # 24 × 3.0
@@ -314,8 +312,6 @@ class TestEvKwhSensorCalc:
         from energy_forecast.energy_forecast import EnergyForecast
 
         today = pd.Timestamp.now().normalize()
-        tmrw  = today + pd.Timedelta(days=1)
-        now   = today  # start of day — nothing elapsed yet
 
         # Predictions: 48h at 1.0 kWh/h
         ts     = pd.date_range(today, periods=48, freq="1h")
@@ -432,6 +428,7 @@ class TestValidateConfig:
 
     def test_warns_when_threshold_equals_charger_kw(self, caplog):
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=9.0, ev_charger_kw=9.0)
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
@@ -441,6 +438,7 @@ class TestValidateConfig:
 
     def test_warns_when_threshold_exceeds_charger_kw(self, caplog):
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=10.0, ev_charger_kw=9.0)
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
@@ -456,6 +454,7 @@ class TestValidateConfig:
 
     def test_warns_solar_sensor_without_grid_export(self, caplog):
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         fake._solar_sensor = "sensor.solar_production"
@@ -806,7 +805,7 @@ class TestMqttFallback:
 class TestCleanupLegacyStates:
     def test_removes_all_expected_legacy_ids(self):
         fake = _FakeMqttSelf()
-        from energy_forecast.energy_forecast import EnergyForecast, BLOCK_SLOTS
+        from energy_forecast.energy_forecast import BLOCK_SLOTS, EnergyForecast
         EnergyForecast._cleanup_legacy_states(fake)
         removed = set(fake._removed_entities)
         # Core sensors
@@ -947,7 +946,6 @@ class TestRollingMaeSensors:
 
     def test_actuals_history_keep_last_semantics(self):
         """Same-hour key written twice: the newer (later) value must win."""
-        from energy_forecast.energy_forecast import EnergyForecast
 
         # Simulate two rounds of recent_actuals for the same hour
         hour = pd.Timestamp("2026-03-20 10:00")
@@ -972,8 +970,6 @@ class TestRollingMaeSensors:
         # 24 predictions within 7d window
         recent_preds = self._make_pred_history(cutoff_7d + pd.Timedelta(hours=1), 24, kwh=2.0)
         # 24 predictions older than 7d (should be excluded)
-        old_preds = self._make_pred_history(cutoff_7d - pd.Timedelta(days=2), 24, kwh=2.0)
-
         pred_hist_7d = {ts: kwh for ts, kwh in recent_preds.items()}
         # old_preds excluded — not added to pred_hist_7d
 
@@ -1001,7 +997,6 @@ class TestRollingMaeSensors:
 
     def test_mae_window_rolls_smoothly_at_midnight(self):
         """MAE window must only drop 1 hour when crossing midnight, not 24 hours."""
-        from energy_forecast.energy_forecast import EnergyForecast, _compute_live_mae
 
         # Verify that the hourly rolling window logic shifts by exactly 1 hour
         # when crossing midnight, whereas the old normalize() logic would jump by 24h.
@@ -1490,6 +1485,7 @@ class TestPredHistoryPersistence:
     def test_load_corrupt_file_is_silent(self, tmp_path, monkeypatch, caplog):
         """Invalid JSON → no exception, dicts remain empty, warning logged."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         mock_path = tmp_path / "pred_history.json"
@@ -1545,6 +1541,7 @@ class TestPredHistoryPersistence:
     def test_save_handles_oserror_gracefully(self, tmp_path, monkeypatch, caplog):
         """Save failure (OSError) is logged, doesn't raise."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         mock_path = tmp_path / "pred_history.json"

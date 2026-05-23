@@ -16,28 +16,28 @@ Covers:
   - Temperature sensor blending: bias-fade semantics over 6h window preserves forecast trajectory
 """
 from __future__ import annotations
+
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pytest
-
 from energy_forecast.model import (
+    _BRIDGE_CAP,
+    _FEATURES_BASE,
+    LAG_HOURS,
+    EnergyForecastModel,
     _add_holiday_feature,
     _add_lag_and_rolling_prediction,
-    _add_sub_sensor_lags_training,
     _add_sub_sensor_lags_prediction,
-    _BRIDGE_CAP,
+    _add_sub_sensor_lags_training,
     _build_model,
     _build_prediction_temp_df,
     _composite_forecast,
     _compute_likely_ev_hours,
-    _FEATURES_BASE,
     _engineer_features,
     _learn_appliance_signatures,
     _project_indoor_temps,
-    EnergyForecastModel,
-    LAG_HOURS,
 )
 
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
@@ -831,7 +831,8 @@ class TestLogTransform:
 
     def test_backward_compat_old_meta_defaults_to_false(self, tmp_path):
         """meta.pkl without 'log_transform' key must load as False (no crash on old installs)."""
-        import pickle, hashlib
+        import hashlib
+        import pickle
         # Write a meta dict that doesn't contain log_transform
         meta_path = tmp_path / "meta.pkl"
         meta = {
@@ -1091,7 +1092,6 @@ class TestSubSensorFeatures:
         n = 400
         ts = pd.date_range("2024-01-01", periods=n, freq="1h")
         energy  = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * n})
-        weather = self._make_weather(ts)
         # Sub-sensor: deterministic values so we can verify the lag
         sub_kwh = list(range(n))   # 0, 1, 2, ..., n-1
         sub_df  = pd.DataFrame({"timestamp": ts, "kwh": sub_kwh})
@@ -1551,7 +1551,8 @@ class TestHowMedians:
 
     def test_backward_compat_meta_without_how_medians(self, tmp_path):
         """meta.pkl without feature_medians_by_how must load as empty dict (no crash)."""
-        import pickle, hashlib
+        import hashlib
+        import pickle
         meta_path = tmp_path / "meta.pkl"
         meta = {
             "feature_cols":    _FEATURES_BASE,
@@ -2214,7 +2215,6 @@ def _make_cycle_df(
     n_cycles * period_hours.  The cycle occupies the first len(cycle_kwh)
     hours of each period.
     """
-    window_hours = len(cycle_kwh)
     total_hours = n_cycles * period_hours
     ts = pd.date_range(start, periods=total_hours, freq="1h")
     kwh = [0.0] * total_hours
@@ -2564,7 +2564,6 @@ class TestApplianceSignatures:
         # Create cycles with very different total energies (high CoV)
         ts_list, kwh_list = [], []
         t = pd.Timestamp("2024-01-01")
-        rng = np.random.default_rng(7)
         for i in range(20):
             # Energy varies wildly: alternating 0.2 kWh and 5.0 kWh cycles
             cycle_energy = 0.2 if i % 2 == 0 else 5.0
@@ -2599,7 +2598,6 @@ class TestApplianceSignatures:
     def test_hour_of_day_distribution_present(self):
         """hour_of_day_distribution is a dict mapping hours (int) to counts (int)."""
         # All cycles start at 08:00 UTC
-        ts = pd.date_range("2024-01-01 08:00", periods=0, freq="1h")
         ts_list, kwh_list = [], []
         t = pd.Timestamp("2024-01-01 08:00")
         for _ in range(5):
@@ -2731,22 +2729,10 @@ class TestCompositeForecast:
         df = _make_baseline_df(start="2024-06-01 00:00")
         # 4h profile starting at 22:00 → offset=22; window up to 22+4=26, but only 24 rows
         # start=00:00, 46:00 means offset 46, profile=[1,2,1.5,0.5] → clip to [1, 2] (48-46=2)
-        result = _composite_forecast(df, {"sub_dishwasher": "22:00"}, _DUMMY_SIGS)
+        _composite_forecast(df, {"sub_dishwasher": "22:00"}, _DUMMY_SIGS)
         # 22:00 with 00:00 start → offset_h = 22; profile has 4 elements → all 4 fit (22+4=26 < 48)
         # Actually for a 48-row df starting at 00:00, 22:00 = offset 22, 22+4=26 < 48 so no truncation
         # Use start at 00:00 and time "46:00" is invalid; instead test profile going to edge
-        # Re-test with start at 10:00 and time = "08:00" → tomorrow 08:00 → offset=22+24? no
-        # Simplest: make a 48-row df, start at 00:00, use a 4h profile at hour 46:
-        df2 = _make_baseline_df(start="2024-06-01 00:00", n=48)
-        # Manually call _composite_forecast with a signature that starts at hour 46
-        sigs_edge = {
-            "sub_test": {
-                "total_kwh": 5.0,
-                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
-                "peak_hour": 1,
-                "n_cycles": 3,
-            }
-        }
         # 00:00 start, "22:00" today → offset=22, fits fully
         # To get offset=46, need start at 00:00 and appliance at 22:00 next day
         # That would be 46h — can't express as HH:MM directly with the algorithm picking earliest.
@@ -3639,7 +3625,6 @@ class TestAreaWeightedThermalPressure:
 
     def test_uniform_area_fallback(self):
         """Without room_areas, all rooms default to DEFAULT_ROOM_AREA_M2 (equal weight)."""
-        from energy_forecast.const import DEFAULT_ROOM_AREA_M2
         ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
         df = _make_bare_df(ts)
         w  = _make_weather_df(ts)
@@ -3846,7 +3831,7 @@ class TestThermalPressureCop:
 
 # ── Tests: tau calibration safeguards ────────────────────────────────────────
 
-def _make_tau_model(tmp_path) -> "EnergyForecastModel":
+def _make_tau_model(tmp_path) -> EnergyForecastModel:
     return EnergyForecastModel(tmp_path)
 
 
@@ -4037,7 +4022,6 @@ class TestTauCalibrationSafeguards:
     def test_quality_nighttime_higher_than_daytime(self, tmp_path):
         """Nighttime windows score higher quality than equivalent daytime windows."""
         import pandas as pd
-        import numpy as np
 
         model = _make_tau_model(tmp_path)
         tau_true = 10.0
@@ -4209,7 +4193,6 @@ class TestEWMAGapReset:
     def test_gap_inserts_nan_before_ewma(self):
         """A 3-hour gap in weather timestamps triggers EWMA reset (warns and
         temp_c at gap boundary is NaN → ewm propagates from NaN)."""
-        import logging
         import warnings
         # Build a 48-hour series with a 3-hour gap at hour 20
         ts_before = pd.date_range("2026-01-01 00:00", periods=20, freq="1h")
@@ -4333,6 +4316,7 @@ class TestTrainEdgeCases:
     def test_train_below_min_rows(self, tmp_path, caplog):
         """train() with fewer than MIN_TRAINING_ROWS clean rows logs warning and returns."""
         import logging
+
         from energy_forecast.model import MIN_TRAINING_ROWS
         n = MIN_TRAINING_ROWS - 1
         ts = pd.date_range("2024-01-01", periods=n, freq="1h")

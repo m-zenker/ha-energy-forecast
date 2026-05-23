@@ -17,10 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-
 from energy_forecast import ha_data
 from energy_forecast.ha_data import _check_dst_duplicates, _fetch_history, _merge_energy_frames, _merge_frames
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -498,7 +496,8 @@ class TestCheckDstDuplicates:
 
 
 # Module-level logger used directly in DST tests (mirrors ha_data's own logger)
-import logging as _logging
+import logging as _logging  # noqa: E402
+
 _LOGGER = _logging.getLogger("energy_forecast.ha_data")
 
 
@@ -998,8 +997,6 @@ class TestFetchRecentEnergyTailRead:
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
-        # The last timestamp in the result should match the end of the CSV
-        last_expected = timestamps[-1].normalize() + pd.Timedelta(hours=timestamps[-1].hour)
         assert result["timestamp"].max() >= timestamps[600 - _FETCH_RECENT_TAIL_ROWS]
 
     def test_tail_read_merges_new_ha_rows(self, mock_app, tmp_path):

@@ -38,11 +38,12 @@ import logging
 import pickle
 import shutil
 import statistics
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import numpy as np
     import pandas as pd
 
 from . import clustering
@@ -51,7 +52,6 @@ from .const import (
     DEFAULT_ROOM_AREA_M2,
     DEFAULT_TAU,
     HOLDOUT_FRACTION,
-    MAX_HOURLY_KWH,
     MIN_CV_ROWS,
     MIN_TRAINING_ROWS,
     SENSOR_BLEND_HOURS,
@@ -233,7 +233,7 @@ class EnergyForecastModel:
         # Recent weather tail — last 400h stored at training time so that
         # temp_lag_168h / temp_lag_336h are computable at prediction time
         # (the 48h forecast window alone cannot supply a 168-row shift).
-        self._weather_tail: "pd.DataFrame | None" = None
+        self._weather_tail: pd.DataFrame | None = None
 
         # Model versioning — archive dir + how many snapshots to keep
         self._archive_dir: Path = model_dir / "archive"
@@ -253,19 +253,19 @@ class EnergyForecastModel:
         country: str = "CH",
         ev_df: pd.DataFrame | None = None,  # EV charging rows (original gross_kwh)
         sub_sensors_dict: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
-        away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
-        presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+        away_df: pd.DataFrame | None = None,  # cols: timestamp, is_away (0/1)
+        presence_df: pd.DataFrame | None = None,  # cols: timestamp, people_home (int)
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
         dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
-        room_areas: "dict[str, float] | None" = None,  # entity_id → m² for area-weighted thermal pressure
+        room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
         regime_count: int = 5,
     ) -> None:
         """Train/retrain the model on historical data."""
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
@@ -294,7 +294,7 @@ class EnergyForecastModel:
             _LOGGER.info(
                 "Dynamic lag selection: skipping %s (need %d+ rows, have %d). "
                 "These will be added automatically as history grows.",
-                [f"lag_{l}h" for l in skipped_lags],
+                [f"lag_{lag}h" for lag in skipped_lags],
                 max(skipped_lags) + 100,
                 n_rows,
             )
@@ -423,8 +423,8 @@ class EnergyForecastModel:
         # Lags for 24/168/336h are computed (needed for tgated gating) but
         # excluded here — the model sees only the temperature-gated versions.
         _GATED_LAG_HOURS = frozenset({24, 168, 336})
-        all_lag_cols = {f"lag_{l}h" for l in LAG_HOURS}
-        active_lag_cols = [f"lag_{l}h" for l in active_lags if l not in _GATED_LAG_HOURS]
+        all_lag_cols = {f"lag_{lag}h" for lag in LAG_HOURS}
+        active_lag_cols = [f"lag_{lag}h" for lag in active_lags if lag not in _GATED_LAG_HOURS]
 
         # Sub-sensor lag columns: lag_24h always; lag_168h only with enough history
         sub_sensor_cols: list[str] = []
@@ -684,22 +684,22 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None,
         sub_sensors_recent: dict | None = None,
-        away_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
-        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        away_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
+        people_home_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
-        room_areas: "dict[str, float] | None" = None,
-        heating_active_series: "pd.Series | None" = None,
-        setpoint_on: "float | None" = None,
-        setpoint_off: "float | None" = None,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
         Returns (future_hours, X) where future_hours is a naive DatetimeIndex
         and X is the filled DataFrame ready for model.predict().
         """
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None)
         future_hours = pd.date_range(
@@ -711,7 +711,7 @@ class EnergyForecastModel:
 
         # 7-day per-hour-of-day mean for smarter short-lag NaN fill.
         # Shape (24,) indexed by hour 0-23; NaN where hour bucket has no data.
-        _hod_means: "np.ndarray | None" = None
+        _hod_means: np.ndarray | None = None
         if recent_actuals is not None and not recent_actuals.empty:
             _ra = recent_actuals.tail(168)  # last 7 days (168 h)
             _hod_series = (
@@ -858,7 +858,7 @@ class EnergyForecastModel:
 
         # Build per-HOW fill lookups once (for lag/rolling cols with HOW-specific medians).
         # For each such column, map hour_of_week → stored HOW median.
-        how_fill_lookup: dict[str, "pd.Series"] = {}
+        how_fill_lookup: dict[str, pd.Series] = {}
         if self._feature_medians_by_how and "hour_of_week" in feat_df.columns:
             sample_meds = next(iter(self._feature_medians_by_how.values()), {})
             for col in sample_meds:
@@ -904,18 +904,18 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
         sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
-        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
-        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        away_series: pd.Series | None = None,       # 48-value Series indexed by timestamp
+        people_home_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
-        room_areas: "dict[str, float] | None" = None,
-        heating_active_series: "pd.Series | None" = None,
-        setpoint_on: "float | None" = None,
-        setpoint_off: "float | None" = None,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
@@ -937,22 +937,22 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
-        away_series: "pd.Series | None" = None,       # 48-value Series indexed by timestamp
-        people_home_series: "pd.Series | None" = None,  # 48-value Series indexed by timestamp
+        away_series: pd.Series | None = None,       # 48-value Series indexed by timestamp
+        people_home_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
-        room_areas: "dict[str, float] | None" = None,
-        heating_active_series: "pd.Series | None" = None,
-        setpoint_on: "float | None" = None,
-        setpoint_off: "float | None" = None,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
         Returns None when quantile models are not yet trained.  low_kwh and
         high_kwh are guaranteed non-negative and ordered (low ≤ high).
         """
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         if self._model_q10 is None or self._model_q90 is None:
             return None
@@ -978,19 +978,19 @@ class EnergyForecastModel:
 
     def predict_scenario(
         self,
-        forecast_df: "pd.DataFrame",
-        live_temp: "float | None",
-        schedule: "dict[str, str | None]",
-        recent_actuals: "pd.DataFrame | None" = None,
-        sub_sensors_recent: "dict | None" = None,
-        away_series: "pd.Series | None" = None,
-        people_home_series: "pd.Series | None" = None,
-        climate_recent: "dict[str, pd.DataFrame] | None" = None,
-        dhw_recent: "pd.DataFrame | None" = None,
-        heating_active_series: "pd.Series | None" = None,
-        setpoint_on: "float | None" = None,
-        setpoint_off: "float | None" = None,
-    ) -> "pd.DataFrame":
+        forecast_df: pd.DataFrame,
+        live_temp: float | None,
+        schedule: dict[str, str | None],
+        recent_actuals: pd.DataFrame | None = None,
+        sub_sensors_recent: dict | None = None,
+        away_series: pd.Series | None = None,
+        people_home_series: pd.Series | None = None,
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
+    ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
         Runs the baseline predict() then overlays the appliance profiles from
@@ -1017,19 +1017,19 @@ class EnergyForecastModel:
 
     def shap_summary(
         self,
-        forecast_df: "pd.DataFrame",
+        forecast_df: pd.DataFrame,
         live_temp: float | None,
-        recent_actuals: "pd.DataFrame | None" = None,
+        recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
-        away_series: "pd.Series | None" = None,
-        people_home_series: "pd.Series | None" = None,
-        climate_recent: dict[str, "pd.DataFrame"] | None = None,
-        dhw_recent: "pd.DataFrame | None" = None,
-        room_areas: "dict[str, float] | None" = None,
+        away_series: pd.Series | None = None,
+        people_home_series: pd.Series | None = None,
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
+        room_areas: dict[str, float] | None = None,
         n: int = 5,
-        heating_active_series: "pd.Series | None" = None,
-        setpoint_on: "float | None" = None,
-        setpoint_off: "float | None" = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
 
@@ -1099,7 +1099,7 @@ class EnergyForecastModel:
         if not self._model_path.exists():
             return  # nothing to archive on first save
         try:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             snap_dir = self._archive_dir / stamp
             snap_dir.mkdir(parents=True, exist_ok=True)
             _artifacts = [
@@ -1214,7 +1214,7 @@ class EnergyForecastModel:
                 _LOGGER.warning("Could not load quantile model %s: %s", path.name, exc)
         self._load_interval_correction()
 
-    def _calibrate_intervals(self, X_cal: "pd.DataFrame", y_cal_log: "np.ndarray") -> None:
+    def _calibrate_intervals(self, X_cal: pd.DataFrame, y_cal_log: np.ndarray) -> None:
         """Compute CQR correction scalar from the calibration split and store it.
 
         Conformity score: s_i = max(q10(x_i) − y_i,  y_i − q90(x_i)) in log-space.
@@ -1281,10 +1281,10 @@ class EnergyForecastModel:
 
     def _calibrate_tau(
         self,
-        climate_dfs: "dict[str, pd.DataFrame]",
-        heating_active_df: "pd.DataFrame",  # cols: timestamp, heating_active (0/1)
-        weather_df: "pd.DataFrame",          # cols: timestamp, temp_c
-    ) -> "float | None":
+        climate_dfs: dict[str, pd.DataFrame],
+        heating_active_df: pd.DataFrame,  # cols: timestamp, heating_active (0/1)
+        weather_df: pd.DataFrame,          # cols: timestamp, temp_c
+    ) -> float | None:
         """Estimate building thermal time constant τ (hours) from passive-cooling windows.
 
         Fits log-linear OLS on ``ln(T_indoor − T_outdoor) = ln(ΔT₀) − t/τ`` for each
@@ -1303,8 +1303,8 @@ class EnergyForecastModel:
         The top 50 % of candidates by quality (minimum 1) are used to compute the
         median τ, which is then EMA-smoothed against the stored value.
         """
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         indoor_parts = []
         for eid, c_df in climate_dfs.items():
@@ -1335,7 +1335,7 @@ class EnergyForecastModel:
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
 
-        combined_data: dict[str, "pd.Series"] = {
+        combined_data: dict[str, pd.Series] = {
             "T_indoor":       T_indoor_series,
             "T_outdoor":      T_outdoor_series,
             "heating_active": active_series,
@@ -1539,8 +1539,8 @@ def _prepare_daily_regime_features(
     weather_df: pd.DataFrame,
     country: str = "CH",
     canton: str | None = None,
-    away_df: "pd.DataFrame | None" = None,      # cols: timestamp, is_away
-    presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home
+    away_df: pd.DataFrame | None = None,      # cols: timestamp, is_away
+    presence_df: pd.DataFrame | None = None,  # cols: timestamp, people_home
 ) -> pd.DataFrame:
     """Aggregate hourly weather into daily features for regime prediction."""
     import pandas as pd
@@ -1636,8 +1636,8 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
     If recent_actuals is missing or sparse, falls back to NaN (the model
     will fill those with stored training medians).
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     if recent_actuals is None or recent_actuals.empty:
         for lag in LAG_HOURS:
@@ -1819,7 +1819,7 @@ def _learn_appliance_signatures(
         arr = np.array(padded)
         return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
 
-    def _resolve_program(cycle_ts: "pd.Timestamp", prog_df: "pd.DataFrame") -> "str | None":
+    def _resolve_program(cycle_ts: pd.Timestamp, prog_df: pd.DataFrame) -> str | None:
         """Last-value-carry-forward lookup of program at cycle start."""
         earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
         return str(earlier.iloc[-1]["program"]) if not earlier.empty else None
@@ -2005,10 +2005,10 @@ def _learn_appliance_signatures(
 
 
 def _composite_forecast(
-    baseline_df: "pd.DataFrame",
-    schedule: "dict[str, str | dict | None]",
+    baseline_df: pd.DataFrame,
+    schedule: dict[str, str | dict | None],
     signatures: dict,
-) -> "pd.DataFrame":
+) -> pd.DataFrame:
     """Overlay appliance run profiles onto a baseline forecast.
 
     Args:
@@ -2030,8 +2030,8 @@ def _composite_forecast(
         the scheduled appliances; it is 0 when schedule is empty or a prefix has no
         matching signature.
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     result = baseline_df.copy()
     result["delta_kwh"] = 0.0
@@ -2122,7 +2122,6 @@ def _add_sub_sensor_lags_prediction(
     Falls back to NaN/0 when actuals don't reach far enough back.
     """
     import pandas as pd
-    import numpy as np
 
     for prefix, sub_df in sub_sensors_recent.items():
         if sub_df is None or sub_df.empty:
@@ -2182,14 +2181,14 @@ def _add_sub_sensor_lags_prediction(
 # ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
 
 def _project_indoor_temps(
-    climate_recent: "dict[str, pd.DataFrame]",
-    future_timestamps: "pd.DatetimeIndex",
-    outdoor_temp_series: "pd.Series",
+    climate_recent: dict[str, pd.DataFrame],
+    future_timestamps: pd.DatetimeIndex,
+    outdoor_temp_series: pd.Series,
     tau_hours: float | None = None,
-    heating_active_series: "pd.Series | None" = None,
-    setpoint_on: "float | None" = None,
-    setpoint_off: "float | None" = None,
-) -> "dict[str, pd.Series]":
+    heating_active_series: pd.Series | None = None,
+    setpoint_on: float | None = None,
+    setpoint_off: float | None = None,
+) -> dict[str, pd.Series]:
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
@@ -2203,8 +2202,8 @@ def _project_indoor_temps(
     ``_engineer_features()`` so that prediction-time thermal pressure reflects
     projected — rather than stale — indoor temperatures.
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     tau = tau_hours if (tau_hours and tau_hours > 0) else DEFAULT_TAU
     now = future_timestamps[0]  # first step ≈ current hour (naive)
@@ -2266,17 +2265,17 @@ def _engineer_features(
     canton: str | None = None,
     country: str = "CH",
     likely_ev_hours: set | None = None,
-    away_df: "pd.DataFrame | None" = None,  # cols: timestamp, is_away (0/1)
-    presence_df: "pd.DataFrame | None" = None,  # cols: timestamp, people_home (int)
+    away_df: pd.DataFrame | None = None,  # cols: timestamp, is_away (0/1)
+    presence_df: pd.DataFrame | None = None,  # cols: timestamp, people_home (int)
     climate_dfs: dict[str, pd.DataFrame] | None = None,
     dhw_df: pd.DataFrame | None = None,
     tau_hours: float | None = None,
-    room_areas: "dict[str, float] | None" = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
-    regime_kwh_series: "pd.Series | None" = None,  # hourly regime profile
-    heating_active_df: "pd.DataFrame | None" = None,  # cols: timestamp, heating_active (0/1)
+    room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
+    regime_kwh_series: pd.Series | None = None,  # hourly regime profile
+    heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
 ) -> pd.DataFrame:
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])  # stays naive
@@ -2473,7 +2472,7 @@ def _engineer_features(
     # thermal_pressure_max  — largest per-room deficit (cold outlier room)
     # thermal_pressure_std  — spread across rooms (imbalance signal)
     if climate_dfs:
-        delta_series: dict[str, "pd.Series"] = {}  # entity_id → per-timestamp delta Series
+        delta_series: dict[str, pd.Series] = {}  # entity_id → per-timestamp delta Series
         ts_index = None
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
@@ -2641,7 +2640,7 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
     try:
         import holidays as hd  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
-        import pandas as pd
+        import pandas as pd  # noqa: F401
 
         # Extend by ±1 year so dates near year boundaries (e.g. Dec 31)
         # can see the next/previous holiday across the year boundary.

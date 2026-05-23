@@ -24,13 +24,16 @@ import os
 import threading
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import hassapi as hass
 
-from . import ha_data, weather
-from . import __version__
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME, strip_tz as _strip_tz_util
+if TYPE_CHECKING:
+    import pandas as pd
+
+from . import __version__, ha_data, weather
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
+from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
@@ -630,7 +633,9 @@ class EnergyForecast(hass.Hass):
             None,
         )
         # Forecast totals
-        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+        for key, label in [
+            ("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")
+        ]:
             attrs_topic = (
                 f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_today/attributes"
                 if key == "today" else None
@@ -795,7 +800,7 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("get_scenario failed: %s", exc)
 
-    def _publish_scenario_forecast(self, result_df: "pd.DataFrame") -> None:
+    def _publish_scenario_forecast(self, result_df: pd.DataFrame) -> None:
         """Publish scenario forecast sensors to HA (called when publish=True).
 
         Writes the following HA sensor entities (all in kWh):
@@ -809,8 +814,9 @@ class EnergyForecast(hass.Hass):
         Values are rounded to 3 decimal places; NaN/Inf are coerced to 0.
         """
         import math as _math
-        import pandas as pd
+
         import numpy as np
+        import pandas as pd
 
         now_dt      = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         today_np    = np.datetime64(now_dt.normalize())
@@ -847,9 +853,13 @@ class EnergyForecast(hass.Hass):
         scenario_tomorrow = _sum(p_vals, tomorrow_np, after_np)
         delta_today       = _sum(d_vals, today_np, tomorrow_np)
 
-        _safe_set_scenario("sensor.energy_forecast_scenario_today",    scenario_today,    "Energy Forecast Scenario Today")
-        _safe_set_scenario("sensor.energy_forecast_scenario_tomorrow",  scenario_tomorrow, "Energy Forecast Scenario Tomorrow")
-        _safe_set_scenario("sensor.energy_forecast_scenario_delta_today", delta_today,     "Energy Forecast Scenario Delta Today")
+        _safe_set_scenario("sensor.energy_forecast_scenario_today", scenario_today, "Energy Forecast Scenario Today")
+        _safe_set_scenario(
+            "sensor.energy_forecast_scenario_tomorrow", scenario_tomorrow, "Energy Forecast Scenario Tomorrow"
+        )
+        _safe_set_scenario(
+            "sensor.energy_forecast_scenario_delta_today", delta_today, "Energy Forecast Scenario Delta Today"
+        )
 
         for h in range(0, 24, 3):
             slot      = f"{h:02d}_{h + 3:02d}"
@@ -877,7 +887,9 @@ class EnergyForecast(hass.Hass):
     def _retrain(self) -> None:
         import pandas as pd
         _LOGGER.info("Starting model retraining…")
-        energy_df = ha_data.fetch_energy_history(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
+        energy_df = ha_data.fetch_energy_history(
+            self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone
+        )
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             _LOGGER.warning("Insufficient history (%d h). Skipping.", len(energy_df))
@@ -973,7 +985,9 @@ class EnergyForecast(hass.Hass):
         end_date   = min(baseline_df["timestamp"].max().date(), date.today() - timedelta(days=5))
 
         try:
-            weather_df = weather.fetch_historical_weather(self._lat, self._lon, start_date, end_date, timezone=self._timezone)
+            weather_df = weather.fetch_historical_weather(
+                self._lat, self._lon, start_date, end_date, timezone=self._timezone
+            )
             weather_df = _strip_tz(weather_df, self._timezone)
         except (OSError, KeyError, ValueError) as exc:
             _LOGGER.warning(
@@ -1059,8 +1073,8 @@ class EnergyForecast(hass.Hass):
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 
     def _update_sensors(self) -> None:
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         # ── Fetch weather forecast ────────────────────────────────────────────
         forecast_df = weather.fetch_forecast(
@@ -1077,7 +1091,9 @@ class EnergyForecast(hass.Hass):
         # Uses the lightweight fetch (last 2 days only) to stay well within
         # AppDaemon's 10s callback limit. Full 30-day resync happens in _retrain().
         try:
-            full_actuals = ha_data.fetch_recent_energy(self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone)
+            full_actuals = ha_data.fetch_recent_energy(
+                self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone
+            )
             full_actuals = _strip_tz(full_actuals, self._timezone)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
@@ -1314,7 +1330,7 @@ class EnergyForecast(hass.Hass):
             return None
 
     @staticmethod
-    def _parse_room_areas(raw: Any) -> "dict[str, float]":
+    def _parse_room_areas(raw: Any) -> dict[str, float]:
         """Validate and coerce ``climate_room_areas`` from apps.yaml.
 
         Expects a dict ``{entity_id: float}``. Non-numeric values are silently
@@ -1405,8 +1421,8 @@ class EnergyForecast(hass.Hass):
     def _build_heating_active_projection(
         self,
         forecast_df: Any,
-        climate_recent: "dict[str, Any]",
-    ) -> "tuple[Any, float, float]":
+        climate_recent: dict[str, Any],
+    ) -> tuple[Any, float, float]:
         """Return (heating_active_series, setpoint_on, setpoint_off) for 48-hour window.
 
         heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
@@ -1414,8 +1430,8 @@ class EnergyForecast(hass.Hass):
         Uses outdoor temp hysteresis to project future heating state.
         Only call when _heating_active_entity is configured.
         """
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
@@ -1575,7 +1591,9 @@ class EnergyForecast(hass.Hass):
             "last_trained": trained_str,
         }
 
-        def safe_set(entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None, icon: str | None = None) -> None:
+        def safe_set(
+            entity_id: str, value: Any, friendly_name: str, extra_attrs: dict | None = None, icon: str | None = None
+        ) -> None:
             try:
                 val = float(value)
                 if math.isnan(val) or math.isinf(val):
@@ -1604,7 +1622,9 @@ class EnergyForecast(hass.Hass):
         # ── Forecast totals ───────────────────────────────────────────────────
         shap_features = data.get("shap_top_features") or {}
         shap_narrative = data.get("shap_narrative") or ""
-        for key, label in [("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
+        for key, label in [
+            ("next_1h", "Next 1h"), ("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")
+        ]:
             extra = None
             if key == "today":
                 extra = {}
@@ -1657,8 +1677,14 @@ class EnergyForecast(hass.Hass):
             low  = data.get(f"{key}_low")
             high = data.get(f"{key}_high")
             if low is not None and high is not None:
-                safe_set(f"sensor.energy_forecast_{key}_low",  low,  f"Energy Forecast {label} Low (10th pct)",  icon="mdi:arrow-down-bold")
-                safe_set(f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)", icon="mdi:arrow-up-bold")
+                safe_set(
+                    f"sensor.energy_forecast_{key}_low", low, f"Energy Forecast {label} Low (10th pct)",
+                    icon="mdi:arrow-down-bold",
+                )
+                safe_set(
+                    f"sensor.energy_forecast_{key}_high", high, f"Energy Forecast {label} High (90th pct)",
+                    icon="mdi:arrow-up-bold",
+                )
 
         # ── Forecast 3-hour blocks ────────────────────────────────────────────
         for day in ("today", "tomorrow"):
@@ -1856,7 +1882,9 @@ class EnergyForecast(hass.Hass):
             )
             # 2. Remove controllable sub-sensors
             if sub_sensors_recent:
-                blended_actuals, _ = _subtract_sub_sensors(blended_actuals, self._subtract_only_dict(sub_sensors_recent))
+                blended_actuals, _ = _subtract_sub_sensors(
+                    blended_actuals, self._subtract_only_dict(sub_sensors_recent)
+                )
 
         today_total, blocks_today = _blend_today_totals(
             p_times, p_vals, blended_actuals, today_np, tomorrow_np, now_np
@@ -1931,7 +1959,7 @@ class EnergyForecast(hass.Hass):
         if not PRED_HISTORY_PATH.exists():
             return  # No saved history yet, start fresh
         try:
-            with open(PRED_HISTORY_PATH, "r") as f:
+            with open(PRED_HISTORY_PATH) as f:
                 data = json.load(f)
         except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
             _LOGGER.warning("Failed to load pred_history: %s", exc)
@@ -1965,7 +1993,6 @@ class EnergyForecast(hass.Hass):
         Writes atomically (to .tmp, then os.replace) to avoid corruption on crash.
         Catches OSError and logs warning — save failure should never break forecast cycle.
         """
-        import pandas as pd
 
         try:
             data = {
@@ -2022,8 +2049,8 @@ def _apply_target_correction(
     The result is clipped to 0 (consumption cannot be negative).
     Returns a copy of df with corrected gross_kwh.
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     df = df.copy()
     ts_index = pd.DatetimeIndex(df["timestamp"])
@@ -2059,8 +2086,8 @@ def _subtract_sub_sensors(
 
     Returns (df_corrected, total_removed_kwh).
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     if not sub_sensors_dict:
         return df.copy(), 0.0
