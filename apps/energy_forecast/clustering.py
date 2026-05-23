@@ -12,8 +12,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -39,7 +39,7 @@ class DailyProfileClusterer:
         self,
         df: pd.DataFrame,
         sample_weight: pd.Series | None = None,
-        ev_day_dates: "set | None" = None,
+        ev_day_dates: set | None = None,
     ) -> pd.Series | None:
         """Find clusters in hourly energy data.
 
@@ -129,7 +129,13 @@ class RegimePredictor:
         self.model: Any = None
         self.is_fitted = False
 
-    def fit(self, daily_features: pd.DataFrame, labels: pd.Series, sample_weight: pd.Series | None = None, verbose: bool = True):
+    def fit(
+        self,
+        daily_features: pd.DataFrame,
+        labels: pd.Series,
+        sample_weight: pd.Series | None = None,
+        verbose: bool = True,
+    ):
         """Train the regime classifier.
 
         Args:
@@ -210,9 +216,9 @@ class RegimePredictor:
 def find_optimal_k(
     energy_df: pd.DataFrame,
     daily_features: pd.DataFrame,
-    sample_weight: "pd.Series | None" = None,
+    sample_weight: pd.Series | None = None,
     k_range: tuple = (2, 8),
-    ev_day_dates: "set | None" = None,
+    ev_day_dates: set | None = None,
 ) -> int:
     """Return K ∈ k_range selected by the inertia elbow (second derivative).
 

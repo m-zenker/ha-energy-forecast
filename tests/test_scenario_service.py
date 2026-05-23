@@ -10,11 +10,9 @@ Covers:
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pandas as pd
-import pytest
-
 
 # ── Minimal stand-in for EnergyForecast ──────────────────────────────────────
 
@@ -45,6 +43,7 @@ class TestGetScenarioCb:
     def test_no_cache_logs_warning(self, caplog):
         """When _cached_forecast_df is None, should log WARNING and return without error."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app(cached_df=None)
@@ -105,6 +104,7 @@ class TestGetScenarioCbErrors:
     def test_predict_scenario_exception_logged(self, caplog):
         """When predict_scenario raises, ERROR must be logged and fire_event not called."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         cached_df = _make_baseline_df()
@@ -124,6 +124,7 @@ class TestGetScenarioCbErrors:
     def test_invalid_schedule_type_logs_warning(self, caplog):
         """Passing schedule as a non-dict should log WARNING and not fire_event."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         cached_df = _make_baseline_df()
@@ -226,6 +227,7 @@ class TestGetScenarioValidation:
     def test_unknown_prefix_ignored(self, caplog):
         """An unknown schedule key logs WARNING and is not forwarded to predict_scenario."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = self._make_app_with_signatures("wm")
@@ -250,6 +252,7 @@ class TestGetScenarioValidation:
     def test_bad_time_format_ignored(self, caplog):
         """A malformed HH:MM string logs WARNING and the key is dropped."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = self._make_app_with_signatures("wm")
@@ -268,6 +271,7 @@ class TestGetScenarioValidation:
     def test_valid_schedule_passes_through(self, caplog):
         """A valid HH:MM entry does NOT trigger any schedule warning."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = self._make_app_with_signatures("wm")
@@ -285,6 +289,7 @@ class TestGetScenarioValidation:
     def test_off_value_passes_through(self, caplog):
         """'off' is a valid value and should not trigger a time-format warning."""
         import logging
+
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = self._make_app_with_signatures("wm")
@@ -304,10 +309,11 @@ class TestMqttSwVersion:
 
     def test_sw_version_matches_init(self):
         """The sw_version hardcoded into MQTT payloads matches energy_forecast.__version__."""
+        import json
+        from unittest.mock import MagicMock
+
         from energy_forecast import __version__
         from energy_forecast.energy_forecast import EnergyForecast
-        from unittest.mock import MagicMock
-        import json
 
         app = MagicMock(spec=EnergyForecast)
         app._timezone = "Europe/Zurich"

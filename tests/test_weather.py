@@ -11,13 +11,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 import pandas as pd
-
 from energy_forecast import weather
 from energy_forecast.weather import _supplement_from_open_meteo
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -130,7 +126,6 @@ class TestFetchOpenMeteo:
         NaN allows the safety-net median fill in _engineer_features to substitute
         a sensible value rather than treating missing data as "perfectly clear sky".
         """
-        import numpy as np
         hourly = {**_base_hourly(3), "sunshine_duration": [0]*3}  # no cloud/radiation
         with patch("requests.get", return_value=_make_response(hourly)):
             df = weather.fetch_open_meteo(47.0, 8.0)
@@ -427,9 +422,9 @@ class TestFetchForecastV2:
                  _make_srg_v2_response(), _om_empty(),
              ]) as mock_get:
             # First call
-            df1 = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+            weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
             # Second call with same lat/lon
-            df2 = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
+            weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
 
         # Verify first call included geolocation lookup
         geo_call = mock_get.call_args_list[0]

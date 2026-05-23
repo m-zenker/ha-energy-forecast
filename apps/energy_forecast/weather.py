@@ -1,10 +1,10 @@
 import logging
 import time
+from datetime import date
 
 import numpy as np
-import requests
 import pandas as pd
-from datetime import datetime, date
+import requests
 
 from .const import strip_tz as _strip_tz
 
@@ -38,7 +38,9 @@ def _parse_sunshine_min(sunshine_seconds: list) -> list:
     return [min(60.0, v) for v in result]
 
 
-def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date: date, timezone: str = "Europe/Zurich") -> pd.DataFrame:
+def fetch_historical_weather(
+    lat: float, lon: float, start_date: date, end_date: date, timezone: str = "Europe/Zurich"
+) -> pd.DataFrame:
     """Fetch hourly historical weather from the Open-Meteo Archive API.
 
     Returns a DataFrame with columns:
@@ -76,7 +78,10 @@ def fetch_historical_weather(lat: float, lon: float, start_date: date, end_date:
     })
 
 
-def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None, timezone: str = "Europe/Zurich") -> pd.DataFrame:
+def fetch_forecast(
+    plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None,
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
     """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback.
 
     When SRG credentials are provided and the fetch succeeds, Open-Meteo is
@@ -132,7 +137,7 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         res.raise_for_status()
         try:
             data = res.json()
-        except ValueError as exc:
+        except ValueError:
             import re as _re
             _title = _re.search(r"<title[^>]*>(.*?)</title>", res.text, _re.I | _re.S)
             title_str = _title.group(1).strip() if _title else res.text[:120].strip()
@@ -163,7 +168,9 @@ def fetch_forecast(plz: str, lat: float, lon: float, client_id: str | None = Non
         return fetch_open_meteo(lat, lon, timezone=timezone)
 
 
-def _supplement_from_open_meteo(srg_df: pd.DataFrame, om_df: pd.DataFrame, timezone: str = "Europe/Zurich") -> pd.DataFrame:
+def _supplement_from_open_meteo(
+    srg_df: pd.DataFrame, om_df: pd.DataFrame, timezone: str = "Europe/Zurich"
+) -> pd.DataFrame:
     """Merge Open-Meteo data into an SRG forecast DataFrame.
 
     Combines two sources into one DataFrame:
