@@ -2031,3 +2031,26 @@ def test_latest_thermal_pressure_net_set_after_predict(trained_model_fixture):
     model = trained_model_fixture
     assert isinstance(model._latest_thermal_pressure_net, float)
     assert model._latest_thermal_pressure_net >= 0.0
+
+
+def test_thermal_pressure_sensor_published():
+    """_publish_thermal_pressure() calls set_state with a float >= 0 and tau_hours attr."""
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    class _AppStub:
+        def __init__(self):
+            self._ml_model = MagicMock()
+            self._ml_model._latest_thermal_pressure_net = 3.7
+            self._ml_model._tau_hours = 18.5
+            self._calls = []
+
+        def set_state(self, eid, **kw):
+            self._calls.append({"entity_id": eid, **kw})
+
+    stub = _AppStub()
+    EnergyForecast._publish_thermal_pressure(stub)
+    assert len(stub._calls) == 1
+    c = stub._calls[0]
+    assert c["entity_id"] == "sensor.energy_forecast_thermal_pressure_net"
+    assert float(c["state"]) >= 0.0
+    assert c["attributes"]["tau_hours"] == 18.5
