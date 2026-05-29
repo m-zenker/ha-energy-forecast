@@ -1025,12 +1025,6 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
         )
-        if "thermal_pressure_net" in X.columns:
-            self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
-        else:
-            # Defensive fallback: thermal_pressure_net is always in _FEATURES_BASE,
-            # so this branch should never execute in practice.
-            self._latest_thermal_pressure_net = 0.0
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:

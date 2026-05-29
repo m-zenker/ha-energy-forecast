@@ -1555,7 +1555,7 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_thermal_pressure_net",
             state=round(float(value), 3),
             attributes={
-                "tau_hours": self._ml_model._tau_hours,
+                "tau_hours": self._ml_model._tau_hours or 0.0,
                 "unit_of_measurement": "°C·m²",
                 "friendly_name": "Thermal Pressure (net)",
             },
