@@ -5,6 +5,7 @@ Covers:
   - _compute_live_mae: correct MAE over matched pairs, nan on no overlap
   - EnergyForecast._retrain_cb / _update_cb: callable from both timer and event contexts
 """
+
 from __future__ import annotations
 
 import math
@@ -24,14 +25,16 @@ from energy_forecast.energy_forecast import (
     _compute_live_mae,
     _subtract_sub_sensors,
 )
+from energy_forecast.model import EnergyForecastModel
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _make_predictions(today: pd.Timestamp, kwh: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
     """48 hourly predictions starting at today midnight, all equal to kwh."""
     ts = pd.date_range(today, periods=48, freq="1h")
     p_times = ts.values.astype("datetime64[ns]")
-    p_vals  = np.full(48, kwh)
+    p_vals = np.full(48, kwh)
     return p_times, p_vals
 
 
@@ -43,69 +46,85 @@ def _make_actuals(start: pd.Timestamp, n: int, kwh: float = 3.0) -> pd.DataFrame
 
 # ── _blend_today_totals ───────────────────────────────────────────────────────
 
-class TestBlendTodayTotals:
 
+class TestBlendTodayTotals:
     def _nts(self, ts: pd.Timestamp) -> np.datetime64:
         return np.datetime64(ts, "ns")
 
     def test_no_actuals_equals_prediction_sum(self):
         """With full_actuals=None the result must equal the prediction sum for today."""
-        today   = pd.Timestamp("2026-03-12 00:00")
-        now     = pd.Timestamp("2026-03-12 00:00")   # start of day — all future
-        tmrw    = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 00:00")  # start of day — all future
+        tmrw = today + pd.Timedelta(days=1)
 
         p_times, p_vals = _make_predictions(today, kwh=2.0)
         total, blocks = _blend_today_totals(
-            p_times, p_vals, None,
-            self._nts(today), self._nts(tmrw), self._nts(now),
+            p_times,
+            p_vals,
+            None,
+            self._nts(today),
+            self._nts(tmrw),
+            self._nts(now),
         )
         # predictions cover [00:00, 48h); only today's 24 hours sum to 24 × 2.0 = 48.0
         assert abs(total - 48.0) < 1e-6
 
     def test_blended_total_uses_actuals_for_elapsed_hours(self):
         """Elapsed-hour actuals (3.0 kWh) replace predictions (1.0 kWh) in today's total."""
-        today   = pd.Timestamp("2026-03-12 00:00")
-        now     = pd.Timestamp("2026-03-12 12:00")   # noon — 12h elapsed
-        tmrw    = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 12:00")  # noon — 12h elapsed
+        tmrw = today + pd.Timedelta(days=1)
 
         p_times, p_vals = _make_predictions(today, kwh=1.0)
         actuals = _make_actuals(today, n=12, kwh=3.0)  # 12 elapsed hours at 3.0
 
         total, _ = _blend_today_totals(
-            p_times, p_vals, actuals,
-            self._nts(today), self._nts(tmrw), self._nts(now),
+            p_times,
+            p_vals,
+            actuals,
+            self._nts(today),
+            self._nts(tmrw),
+            self._nts(now),
         )
         # 12 elapsed hours × 3.0 (actuals) + 12 future hours × 1.0 (predictions) = 48.0
         assert abs(total - (12 * 3.0 + 12 * 1.0)) < 1e-6
 
     def test_fully_elapsed_block_uses_actuals(self):
         """A 3h block entirely in the past must sum actuals, not predictions."""
-        today   = pd.Timestamp("2026-03-12 00:00")
-        now     = pd.Timestamp("2026-03-12 12:00")   # block 00-03 is fully elapsed
-        tmrw    = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 12:00")  # block 00-03 is fully elapsed
+        tmrw = today + pd.Timedelta(days=1)
 
         p_times, p_vals = _make_predictions(today, kwh=1.0)
         actuals = _make_actuals(today, n=12, kwh=5.0)  # 12 elapsed hours at 5.0
 
         _, blocks = _blend_today_totals(
-            p_times, p_vals, actuals,
-            self._nts(today), self._nts(tmrw), self._nts(now),
+            p_times,
+            p_vals,
+            actuals,
+            self._nts(today),
+            self._nts(tmrw),
+            self._nts(now),
         )
         # Block 00_03: 3 actual hours × 5.0 = 15.0
         assert abs(blocks["00_03"] - 15.0) < 1e-6
 
     def test_fully_future_block_uses_predictions(self):
         """A 3h block entirely in the future must sum predictions only."""
-        today   = pd.Timestamp("2026-03-12 00:00")
-        now     = pd.Timestamp("2026-03-12 00:00")   # nothing elapsed yet
-        tmrw    = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 00:00")  # nothing elapsed yet
+        tmrw = today + pd.Timedelta(days=1)
 
         p_times, p_vals = _make_predictions(today, kwh=2.5)
         actuals = _make_actuals(today, n=0, kwh=0.0)  # empty — nothing elapsed
 
         _, blocks = _blend_today_totals(
-            p_times, p_vals, actuals,
-            self._nts(today), self._nts(tmrw), self._nts(now),
+            p_times,
+            p_vals,
+            actuals,
+            self._nts(today),
+            self._nts(tmrw),
+            self._nts(now),
         )
         # Block 21_24: 3 future hours × 2.5 = 7.5
         assert abs(blocks["21_24"] - 7.5) < 1e-6
@@ -113,16 +132,18 @@ class TestBlendTodayTotals:
 
 # ── _compute_live_mae ─────────────────────────────────────────────────────────
 
-class TestComputeLiveMae:
 
+class TestComputeLiveMae:
     def test_matched_pairs_return_correct_mae(self):
         """When predictions and actuals overlap perfectly, MAE equals mean absolute error."""
         ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
-        pred_history = {t: 2.0 for t in ts}   # predicted 2.0 kWh every hour
-        actuals = pd.DataFrame({
-            "timestamp": ts,
-            "gross_kwh": [3.0] * 24,           # actual was 3.0 → error = 1.0 each
-        })
+        pred_history = {t: 2.0 for t in ts}  # predicted 2.0 kWh every hour
+        actuals = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "gross_kwh": [3.0] * 24,  # actual was 3.0 → error = 1.0 each
+            }
+        )
         mae, n = _compute_live_mae(pred_history, actuals)
         assert n == 24
         assert abs(mae - 1.0) < 1e-6
@@ -139,73 +160,84 @@ class TestComputeLiveMae:
 
     def test_partial_overlap_uses_matched_pairs_only(self):
         """Only overlapping timestamps contribute to MAE."""
-        ts_all    = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
-        ts_first  = ts_all[:24]   # predictions cover first 24h
-        ts_second = ts_all[24:]   # actuals cover last 24h — no overlap
+        ts_all = pd.date_range("2026-03-12 00:00", periods=48, freq="1h")
+        ts_first = ts_all[:24]  # predictions cover first 24h
+        ts_second = ts_all[24:]  # actuals cover last 24h — no overlap
 
         pred_history = {t: 1.0 for t in ts_first}
-        actuals = pd.DataFrame({
-            "timestamp": pd.concat([
-                pd.Series(ts_first[:12]),   # 12h overlap
-                pd.Series(ts_second),       # 24h no overlap
-            ]),
-            "gross_kwh": [3.0] * 36,
-        })
+        actuals = pd.DataFrame(
+            {
+                "timestamp": pd.concat(
+                    [
+                        pd.Series(ts_first[:12]),  # 12h overlap
+                        pd.Series(ts_second),  # 24h no overlap
+                    ]
+                ),
+                "gross_kwh": [3.0] * 36,
+            }
+        )
         mae, n = _compute_live_mae(pred_history, actuals)
         assert n == 12
-        assert abs(mae - 2.0) < 1e-6   # |3.0 - 1.0| = 2.0 for each of the 12 matched
+        assert abs(mae - 2.0) < 1e-6  # |3.0 - 1.0| = 2.0 for each of the 12 matched
 
 
 # ── Interval blending (#13) ───────────────────────────────────────────────────
 
-class TestIntervalBlend:
 
+class TestIntervalBlend:
     def _nts(self, ts: pd.Timestamp) -> np.datetime64:
         return np.datetime64(ts, "ns")
 
     def test_low_total_less_than_high_total(self):
         """Blending q10 vals gives today_low < today_high when q10 < q90 for future hours."""
-        today  = pd.Timestamp("2026-03-12 00:00")
-        now    = pd.Timestamp("2026-03-12 00:00")  # nothing elapsed
-        tmrw   = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 00:00")  # nothing elapsed
+        tmrw = today + pd.Timedelta(days=1)
 
         ts = pd.date_range(today, periods=48, freq="1h")
         p_times = ts.values.astype("datetime64[ns]")
 
-        low_vals  = np.full(48, 1.0)   # q10 = 1.0 kWh/h
-        high_vals = np.full(48, 3.0)   # q90 = 3.0 kWh/h
+        low_vals = np.full(48, 1.0)  # q10 = 1.0 kWh/h
+        high_vals = np.full(48, 3.0)  # q90 = 3.0 kWh/h
 
-        today_low,  _ = _blend_today_totals(p_times, low_vals,  None, self._nts(today), self._nts(tmrw), self._nts(now))
+        today_low, _ = _blend_today_totals(p_times, low_vals, None, self._nts(today), self._nts(tmrw), self._nts(now))
         today_high, _ = _blend_today_totals(p_times, high_vals, None, self._nts(today), self._nts(tmrw), self._nts(now))
 
         assert today_low < today_high
 
     def test_fully_elapsed_window_interval_collapses_to_actuals(self):
         """When all hours are elapsed, both low and high equal the actuals sum."""
-        today  = pd.Timestamp("2026-03-12 00:00")
-        now    = pd.Timestamp("2026-03-12 06:00")  # 6h elapsed
-        tmrw   = today + pd.Timedelta(days=1)
+        today = pd.Timestamp("2026-03-12 00:00")
+        now = pd.Timestamp("2026-03-12 06:00")  # 6h elapsed
+        tmrw = today + pd.Timedelta(days=1)
 
-        p_times   = pd.date_range(now, periods=48, freq="1h").values.astype("datetime64[ns]")
-        low_vals  = np.full(48, 1.0)
+        p_times = pd.date_range(now, periods=48, freq="1h").values.astype("datetime64[ns]")
+        low_vals = np.full(48, 1.0)
         high_vals = np.full(48, 5.0)
-        actuals   = pd.DataFrame({
-            "timestamp": pd.date_range(today, periods=6, freq="1h"),
-            "gross_kwh": [2.0] * 6,
-        })
+        actuals = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(today, periods=6, freq="1h"),
+                "gross_kwh": [2.0] * 6,
+            }
+        )
         # Block 00_03 is fully elapsed → both bounds must equal 3×2.0 = 6.0
-        _, blocks_low  = _blend_today_totals(p_times, low_vals,  actuals, self._nts(today), self._nts(tmrw), self._nts(now))
-        _, blocks_high = _blend_today_totals(p_times, high_vals, actuals, self._nts(today), self._nts(tmrw), self._nts(now))
+        _, blocks_low = _blend_today_totals(
+            p_times, low_vals, actuals, self._nts(today), self._nts(tmrw), self._nts(now)
+        )
+        _, blocks_high = _blend_today_totals(
+            p_times, high_vals, actuals, self._nts(today), self._nts(tmrw), self._nts(now)
+        )
 
-        assert abs(blocks_low["00_03"]  - 6.0) < 1e-6
+        assert abs(blocks_low["00_03"] - 6.0) < 1e-6
         assert abs(blocks_high["00_03"] - 6.0) < 1e-6
 
 
 # ── _aggregate ────────────────────────────────────────────────────────────────
 
+
 def _fake_self_for_aggregate(ev_threshold: float = 4.5, ev_charger_kw: float = 9.0) -> _FakeSelf:
     app = _FakeSelf()
-    app._ev_threshold  = ev_threshold
+    app._ev_threshold = ev_threshold
     app._ev_charger_kw = ev_charger_kw
     return app
 
@@ -220,6 +252,7 @@ class TestAggregate:
 
     def _run(self, today, now, predictions, actuals=None, intervals=None):
         from energy_forecast.energy_forecast import EnergyForecast
+
         with patch("pandas.Timestamp.now") as mock_now:
             mock_now.return_value = now
             return EnergyForecast._aggregate(
@@ -229,7 +262,7 @@ class TestAggregate:
     def test_next_1h_sums_only_one_future_hour(self):
         """next_1h must equal exactly 1 × per-hour prediction."""
         today = pd.Timestamp.now().normalize()
-        now   = pd.Timestamp.now().floor("1h")
+        now = pd.Timestamp.now().floor("1h")
         preds = _pred_df(now, n=48, kwh=2.0)
         result = self._run(today, now, preds)
         assert abs(result["next_1h"] - 2.0) < 1e-3
@@ -237,7 +270,7 @@ class TestAggregate:
     def test_next_1h_less_than_next_3h(self):
         """next_1h must be strictly less than next_3h when kWh/h > 0."""
         today = pd.Timestamp.now().normalize()
-        now   = pd.Timestamp.now().floor("1h")
+        now = pd.Timestamp.now().floor("1h")
         preds = _pred_df(now, n=48, kwh=1.5)
         result = self._run(today, now, preds)
         assert result["next_1h"] < result["next_3h"]
@@ -245,7 +278,7 @@ class TestAggregate:
     def test_next_3h_sums_only_three_future_hours(self):
         """next_3h must equal exactly 3 × per-hour prediction, not more."""
         today = pd.Timestamp.now().normalize()
-        now   = pd.Timestamp.now().floor("1h")
+        now = pd.Timestamp.now().floor("1h")
         preds = _pred_df(now, n=48, kwh=2.0)
         result = self._run(today, now, preds)
         assert abs(result["next_3h"] - 6.0) < 1e-3
@@ -255,30 +288,31 @@ class TestAggregate:
         today = pd.Timestamp.now().normalize()
         preds = _pred_df(today, n=48, kwh=3.0)
         result = self._run(today, today, preds)
-        assert abs(result["tomorrow"] - 72.0) < 1e-3   # 24 × 3.0
+        assert abs(result["tomorrow"] - 72.0) < 1e-3  # 24 × 3.0
 
     def test_ev_sensors_zero_when_no_actuals(self):
         """ev_today and ev_yesterday must be 0.0 when full_actuals is None."""
         today = pd.Timestamp.now().normalize()
         preds = _pred_df(today, n=48, kwh=1.0)
         result = self._run(today, today, preds, actuals=None)
-        assert result["ev_today"]     == 0.0
+        assert result["ev_today"] == 0.0
         assert result["ev_yesterday"] == 0.0
 
     def test_interval_keys_present_when_intervals_supplied(self):
         """When intervals DataFrame is provided, *_low/*_high keys appear in result."""
         today = pd.Timestamp.now().normalize()
-        now   = today
+        now = today
         preds = _pred_df(today, n=48, kwh=1.0)
-        ts    = pd.date_range(today, periods=48, freq="1h")
-        ivs   = pd.DataFrame({
-            "timestamp": ts,
-            "low_kwh":   np.full(48, 0.5),
-            "high_kwh":  np.full(48, 2.0),
-        })
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "low_kwh": np.full(48, 0.5),
+                "high_kwh": np.full(48, 2.0),
+            }
+        )
         result = self._run(today, now, preds, intervals=ivs)
-        for key in ("next_3h_low", "next_3h_high", "today_low", "today_high",
-                    "tomorrow_low", "tomorrow_high"):
+        for key in ("next_3h_low", "next_3h_high", "today_low", "today_high", "tomorrow_low", "tomorrow_high"):
             assert key in result, f"missing key: {key}"
 
     def test_interval_keys_absent_when_intervals_is_none(self):
@@ -301,6 +335,7 @@ class TestAggregate:
 
 # ── EV kWh sensor calculation ────────────────────────────────────────────────
 
+
 class TestEvKwhSensorCalc:
     """EV kWh values published to HA sensors use charger_kw, not threshold."""
 
@@ -314,17 +349,19 @@ class TestEvKwhSensorCalc:
         today = pd.Timestamp.now().normalize()
 
         # Predictions: 48h at 1.0 kWh/h
-        ts     = pd.date_range(today, periods=48, freq="1h")
-        p_df   = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
+        ts = pd.date_range(today, periods=48, freq="1h")
+        p_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
 
         # Actuals: one EV-level hour today (gross=12 kWh, clearly above any threshold)
-        actuals = pd.DataFrame({
-            "timestamp": [today + pd.Timedelta(hours=2)],
-            "gross_kwh": [12.0],
-        })
+        actuals = pd.DataFrame(
+            {
+                "timestamp": [today + pd.Timedelta(hours=2)],
+                "gross_kwh": [12.0],
+            }
+        )
 
         app = _FakeSelf()
-        app._ev_threshold  = ev_threshold
+        app._ev_threshold = ev_threshold
         app._ev_charger_kw = ev_charger_kw
 
         with patch("pandas.Timestamp.now") as mock_now:
@@ -347,6 +384,7 @@ class TestEvKwhSensorCalc:
 
 # ── Callback signature compatibility ─────────────────────────────────────────
 
+
 class _FakeSelf:
     """Minimal stand-in for EnergyForecast used in callback / aggregate tests.
 
@@ -354,6 +392,7 @@ class _FakeSelf:
     object.__new__ leaves mock internals uninitialized.  A plain class with
     the attributes touched by the tested methods is sufficient.
     """
+
     def __init__(self):
         self._ml_model = MagicMock()
         self._ml_model.model = None  # prevents _update_sensors execution
@@ -373,50 +412,55 @@ class TestCallbackSignature:
     def test_retrain_cb_timer_style(self):
         """Timer callbacks pass a single positional dict — must not raise TypeError."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._retrain_cb(_FakeSelf(), {})
 
     def test_retrain_cb_event_style(self):
         """listen_event callbacks pass (event_name, data, kwargs) — must not raise TypeError."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._retrain_cb(_FakeSelf(), "RELOAD_ENERGY_MODEL", {}, {})
 
     def test_update_cb_timer_style(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._update_cb(_FakeSelf(), {})
 
     def test_update_cb_event_style(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._update_cb(_FakeSelf(), "some_event", {}, {})
 
 
 # ── Config validation — EV threshold vs charger_kw warning (#20) ─────────────
 
+
 class _FakeValidateSelf:
     """Minimal stand-in for _validate_config with configurable EV params."""
 
     def __init__(self, ev_threshold: float, ev_charger_kw: float):
-        self._lat                        = 47.0
-        self._lon                        = 8.5
-        self._plz                        = ""
-        self._timezone                   = "Europe/Zurich"
-        self._holiday_country            = "CH"
-        self._weight_halflife            = 90.0
-        self._ev_threshold               = ev_threshold
-        self._ev_charger_kw              = ev_charger_kw
-        self._baseline_mode              = False
+        self._lat = 47.0
+        self._lon = 8.5
+        self._plz = ""
+        self._timezone = "Europe/Zurich"
+        self._holiday_country = "CH"
+        self._weight_halflife = 90.0
+        self._ev_threshold = ev_threshold
+        self._ev_charger_kw = ev_charger_kw
+        self._baseline_mode = False
         self._adaptive_retrain_threshold = 2.0
-        self._anomaly_sigma_threshold    = 3.0
-        self._shap_top_n                 = 5
-        self._model_archive_count        = 3
-        self._sub_energy_sensors         = []
-        self._solar_sensor               = None
-        self._grid_export_sensor         = None
-        self._battery_charge_sensor      = None
-        self._battery_discharge_sensor   = None
-        self._mqtt_discovery             = False
-        self._mqtt_namespace             = "mqtt"
-        self._mqtt_discovery_prefix      = "homeassistant"
-        self._warnings: list[str]        = []
+        self._anomaly_sigma_threshold = 3.0
+        self._shap_top_n = 5
+        self._model_archive_count = 3
+        self._sub_energy_sensors = []
+        self._solar_sensor = None
+        self._grid_export_sensor = None
+        self._battery_charge_sensor = None
+        self._battery_discharge_sensor = None
+        self._mqtt_discovery = False
+        self._mqtt_namespace = "mqtt"
+        self._mqtt_discovery_prefix = "homeassistant"
+        self._warnings: list[str] = []
 
     def log(self, msg: str, level: str = "INFO") -> None:
         if level == "WARNING":
@@ -430,24 +474,29 @@ class TestValidateConfig:
         import logging
 
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeValidateSelf(ev_threshold=9.0, ev_charger_kw=9.0)
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._validate_config(fake)
-        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+        assert any(r.levelno == logging.WARNING for r in caplog.records), (
             "Expected WARNING when ev_threshold == ev_charger_kw"
+        )
 
     def test_warns_when_threshold_exceeds_charger_kw(self, caplog):
         import logging
 
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeValidateSelf(ev_threshold=10.0, ev_charger_kw=9.0)
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._validate_config(fake)
-        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+        assert any(r.levelno == logging.WARNING for r in caplog.records), (
             "Expected WARNING when ev_threshold > ev_charger_kw"
+        )
 
     def test_no_warning_when_threshold_below_charger_kw(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         EnergyForecast._validate_config(fake)
         assert not fake._warnings, "No warning expected when ev_threshold < ev_charger_kw"
@@ -456,6 +505,7 @@ class TestValidateConfig:
         import logging
 
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         fake._solar_sensor = "sensor.solar_production"
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
@@ -466,6 +516,7 @@ class TestValidateConfig:
 
     def test_no_warning_solar_sensor_with_grid_export(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
         fake._solar_sensor = "sensor.solar_production"
         fake._grid_export_sensor = "sensor.grid_export"
@@ -477,13 +528,14 @@ class TestValidateConfig:
 
 # ── Setup checker sensor (#17) ────────────────────────────────────────────────
 
+
 class _FakeCheckSetup:
     """Minimal stand-in for _check_setup with controllable set_state and log."""
 
     def __init__(self):
         self._states: dict[str, dict] = {}
-        self._warnings: list[str]     = []
-        self._mqtt_discovery: bool    = False
+        self._warnings: list[str] = []
+        self._mqtt_discovery: bool = False
 
     def set_state(self, entity_id: str, state: str, attributes: dict, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes}
@@ -499,6 +551,7 @@ class TestCheckSetup:
     def test_ok_state_when_all_packages_present(self):
         """When all imports succeed, sensor state must be 'ok'."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeCheckSetup()
         # All packages importable in test environment → state = 'ok'
         EnergyForecast._check_setup(fake)
@@ -509,9 +562,11 @@ class TestCheckSetup:
     def test_missing_packages_state_when_import_fails(self):
         """When an import fails, sensor state must be 'missing_packages'."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeCheckSetup()
         # Patch builtins.__import__ to fail for 'holidays'
         import builtins
+
         real_import = builtins.__import__
 
         def failing_import(name, *args, **kwargs):
@@ -528,6 +583,7 @@ class TestCheckSetup:
 
 
 # ── MQTT Discovery tests ──────────────────────────────────────────────────────
+
 
 class _FakeMqttSelf:
     """Minimal stand-in for EnergyForecast for MQTT-related method tests."""
@@ -558,12 +614,14 @@ class _FakeMqttSelf:
 
     def call_service(self, service: str, **kwargs) -> None:
         if service == "mqtt/publish":
-            self._publishes.append({
-                "topic": kwargs.get("topic", ""),
-                "payload": kwargs.get("payload", ""),
-                "namespace": kwargs.get("namespace", ""),
-                "retain": kwargs.get("retain", False),
-            })
+            self._publishes.append(
+                {
+                    "topic": kwargs.get("topic", ""),
+                    "payload": kwargs.get("payload", ""),
+                    "namespace": kwargs.get("namespace", ""),
+                    "retain": kwargs.get("retain", False),
+                }
+            )
 
     def set_state(self, entity_id: str, state: str = "", attributes: dict | None = None, replace: bool = False) -> None:
         self._states[entity_id] = {"state": state, "attributes": attributes or {}}
@@ -580,34 +638,42 @@ class _FakeMqttSelf:
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_set_sensor(self, unique_id, value)
 
     def _mqtt_set_sensor_raw(self, unique_id: str, value_str: str) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_set_sensor_raw(self, unique_id, value_str)
 
     def _mqtt_publish_discovery(self, *args, **kwargs) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_publish_discovery(self, *args, **kwargs)
 
     def _build_sensor_discovery_payload(self, *args, **kwargs) -> dict:
         from energy_forecast.energy_forecast import EnergyForecast
+
         return EnergyForecast._build_sensor_discovery_payload(self, *args, **kwargs)
 
     def _mqtt_publish_availability(self, payload: str) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_publish_availability(self, payload)
 
     def _mqtt_publish_all_discovery(self) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_publish_all_discovery(self)
 
     def _build_binary_sensor_discovery_payload(self, *args, **kwargs) -> dict:
         from energy_forecast.energy_forecast import EnergyForecast
+
         return EnergyForecast._build_binary_sensor_discovery_payload(self, *args, **kwargs)
 
     def _mqtt_publish_binary_sensor_discovery(self, *args, **kwargs) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._mqtt_publish_binary_sensor_discovery(self, *args, **kwargs)
 
 
@@ -618,8 +684,12 @@ class TestMqttPublishDiscovery:
         """Discovery payload must include a 'device' block with identifiers=['ha_energy_forecast']."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_today", "Today", "kWh",
-            "mdi:lightning-bolt", "energy", "measurement",
+            "energy_forecast_today",
+            "Today",
+            "kWh",
+            "mdi:lightning-bolt",
+            "energy",
+            "measurement",
         )
         assert "device" in payload
         assert payload["device"]["identifiers"] == ["ha_energy_forecast"]
@@ -628,8 +698,12 @@ class TestMqttPublishDiscovery:
         """Config topic must be <prefix>/sensor/<unique_id>/config."""
         fake = _FakeMqttSelf(mqtt_discovery_prefix="myprefix")
         fake._mqtt_publish_discovery(
-            "energy_forecast_today", "Today", "kWh",
-            "mdi:lightning-bolt", "energy", "measurement",
+            "energy_forecast_today",
+            "Today",
+            "kWh",
+            "mdi:lightning-bolt",
+            "energy",
+            "measurement",
         )
         assert len(fake._publishes) == 1
         assert fake._publishes[0]["topic"] == "myprefix/sensor/energy_forecast_today/config"
@@ -638,8 +712,12 @@ class TestMqttPublishDiscovery:
         """kWh sensor must have device_class='energy' and state_class='measurement'."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_today", "Today", "kWh",
-            "mdi:lightning-bolt", "energy", "measurement",
+            "energy_forecast_today",
+            "Today",
+            "kWh",
+            "mdi:lightning-bolt",
+            "energy",
+            "measurement",
         )
         assert payload.get("device_class") == "energy"
         assert payload.get("state_class") == "measurement"
@@ -648,8 +726,12 @@ class TestMqttPublishDiscovery:
         """Setup status sensor must not include device_class or state_class."""
         fake = _FakeMqttSelf()
         payload = fake._build_sensor_discovery_payload(
-            "energy_forecast_setup_status", "Setup Status", "",
-            "mdi:check-circle", None, None,
+            "energy_forecast_setup_status",
+            "Setup Status",
+            "",
+            "mdi:check-circle",
+            None,
+            None,
         )
         assert "device_class" not in payload
         assert "state_class" not in payload
@@ -657,6 +739,7 @@ class TestMqttPublishDiscovery:
     def test_mqtt_publish_failure_logs_warning_and_does_not_raise(self, caplog):
         """If call_service raises, _mqtt_publish_discovery must log WARNING and not re-raise."""
         import logging
+
         fake = _FakeMqttSelf()
 
         def bad_call_service(service, **kwargs):
@@ -665,11 +748,14 @@ class TestMqttPublishDiscovery:
         fake.call_service = bad_call_service
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             fake._mqtt_publish_discovery(
-                "energy_forecast_today", "Today", "kWh",
-                "mdi:lightning-bolt", "energy", "measurement",
+                "energy_forecast_today",
+                "Today",
+                "kWh",
+                "mdi:lightning-bolt",
+                "energy",
+                "measurement",
             )
-        assert any(r.levelno == logging.WARNING for r in caplog.records), \
-            "Expected WARNING on call_service failure"
+        assert any(r.levelno == logging.WARNING for r in caplog.records), "Expected WARNING on call_service failure"
 
 
 class TestMqttSetSensor:
@@ -710,10 +796,10 @@ class TestMqttAvailability:
     def test_terminate_publishes_offline(self):
         """terminate() must publish 'offline' to the availability topic."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeMqttSelf()
         EnergyForecast.terminate(fake)
-        assert any(p["payload"] == "offline" for p in fake._publishes), \
-            "Expected 'offline' payload on terminate()"
+        assert any(p["payload"] == "offline" for p in fake._publishes), "Expected 'offline' payload on terminate()"
 
 
 class TestMqttConditionalIntervals:
@@ -723,32 +809,36 @@ class TestMqttConditionalIntervals:
         """_mqtt_publish_all_discovery() must NOT publish *_low/*_high config topics."""
         fake = _FakeMqttSelf()
         fake._mqtt_publish_all_discovery()
-        low_high_topics = [
-            p["topic"] for p in fake._publishes
-            if "_low" in p["topic"] or "_high" in p["topic"]
-        ]
+        low_high_topics = [p["topic"] for p in fake._publishes if "_low" in p["topic"] or "_high" in p["topic"]]
         assert low_high_topics == [], f"Unexpected interval topics at init: {low_high_topics}"
 
     def test_interval_discovery_fired_on_first_publish_with_data(self):
         """When _publish() receives low/high data for the first time, interval discovery runs
         and _mqtt_intervals_discovered flips to True."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeMqttSelf()
         # Build a minimal aggregated data dict that includes interval values
         data = {
-            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
-            "next_3h_low": 0.8, "next_3h_high": 1.2,
-            "today_low": 4.5, "today_high": 5.5,
-            "tomorrow_low": 5.5, "tomorrow_high": 6.5,
-            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "next_3h_low": 0.8,
+            "next_3h_high": 1.2,
+            "today_low": 4.5,
+            "today_high": 5.5,
+            "tomorrow_low": 5.5,
+            "tomorrow_high": 6.5,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
         }
         EnergyForecast._publish(fake, data)
         assert fake._mqtt_intervals_discovered is True
         low_high_topics = [
-            p["topic"] for p in fake._publishes
-            if "_low/config" in p["topic"] or "_high/config" in p["topic"]
+            p["topic"] for p in fake._publishes if "_low/config" in p["topic"] or "_high/config" in p["topic"]
         ]
         assert len(low_high_topics) == 6, f"Expected 6 interval config topics, got {low_high_topics}"
 
@@ -758,6 +848,7 @@ class TestPublishUnavailable:
 
     def test_next_1h_set_to_unavailable(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeMqttSelf(mqtt_discovery=False)
         EnergyForecast._publish_unavailable(fake)
         assert "sensor.energy_forecast_next_1h" in fake._states
@@ -765,6 +856,7 @@ class TestPublishUnavailable:
 
     def test_all_total_slots_set_unavailable(self):
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeMqttSelf(mqtt_discovery=False)
         EnergyForecast._publish_unavailable(fake)
         for slot in ("next_1h", "next_3h", "today", "tomorrow"):
@@ -780,8 +872,9 @@ class TestMqttPublishAllDiscoveryNext1h:
         fake = _FakeMqttSelf()
         fake._mqtt_publish_all_discovery()
         topics = [p["topic"] for p in fake._publishes]
-        assert any("energy_forecast_next_1h/config" in t for t in topics), \
+        assert any("energy_forecast_next_1h/config" in t for t in topics), (
             f"next_1h discovery topic not found in: {topics}"
+        )
 
 
 class TestMqttFallback:
@@ -790,13 +883,18 @@ class TestMqttFallback:
     def test_safe_set_uses_set_state_not_mqtt(self):
         """With mqtt_discovery=False, _publish() must call set_state and not call_service."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeMqttSelf(mqtt_discovery=False)
         fake.call_service = MagicMock()
         data = {
-            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
-            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "ev_today": 0.0, "ev_yesterday": 0.0,
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
         }
         EnergyForecast._publish(fake, data)
         fake.call_service.assert_not_called()
@@ -806,11 +904,11 @@ class TestCleanupLegacyStates:
     def test_removes_all_expected_legacy_ids(self):
         fake = _FakeMqttSelf()
         from energy_forecast.energy_forecast import BLOCK_SLOTS, EnergyForecast
+
         EnergyForecast._cleanup_legacy_states(fake)
         removed = set(fake._removed_entities)
         # Core sensors
-        for key in ["setup_status", "next_1h", "next_3h", "today", "tomorrow",
-                    "ev_today", "ev_yesterday", "model_mae"]:
+        for key in ["setup_status", "next_1h", "next_3h", "today", "tomorrow", "ev_today", "ev_yesterday", "model_mae"]:
             assert f"sensor.energy_forecast_{key}" in removed
         # Rolling MAE sensors (#41)
         assert "sensor.energy_forecast_mae_7d" in removed
@@ -824,10 +922,13 @@ class TestCleanupLegacyStates:
 
     def test_swallows_remove_entity_exceptions(self):
         fake = _FakeMqttSelf()
+
         def bad_remove(entity_id):
             raise RuntimeError("not found")
+
         fake.remove_entity = bad_remove
         from energy_forecast.energy_forecast import EnergyForecast
+
         # Must not raise
         EnergyForecast._cleanup_legacy_states(fake)
 
@@ -835,10 +936,13 @@ class TestCleanupLegacyStates:
         fake = _FakeMqttSelf()
         fake.entity_exists = lambda entity_id: False
         from energy_forecast.energy_forecast import EnergyForecast
+
         EnergyForecast._cleanup_legacy_states(fake)
         assert fake._removed_entities == []
 
+
 # ── #25 Vacation / Away Flag — _build_away_prediction_series ─────────────────
+
 
 class _FakeAwaySelf:
     """Stand-in for EnergyForecast for _build_away_prediction_series tests."""
@@ -850,7 +954,7 @@ class _FakeAwaySelf:
         away_mode_state: str = "off",
         away_return_state: str | None = None,
     ):
-        self._away_mode_entity   = away_mode_entity
+        self._away_mode_entity = away_mode_entity
         self._away_return_entity = away_return_entity
         self._states: dict[str, str] = {}
         if away_mode_entity:
@@ -876,6 +980,7 @@ class TestBuildAwayPredictionSeries:
     def test_no_entity_returns_all_zeros(self):
         """With no away_mode_entity configured, all 48 values must be 0."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeAwaySelf(away_mode_entity=None)
         result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
         assert len(result) == 48
@@ -884,6 +989,7 @@ class TestBuildAwayPredictionSeries:
     def test_entity_off_returns_all_zeros(self):
         """When away_mode_entity is 'off', all 48 values must be 0."""
         from energy_forecast.energy_forecast import EnergyForecast
+
         fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="off")
         result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
         assert (result == 0).all()
@@ -891,18 +997,20 @@ class TestBuildAwayPredictionSeries:
     def test_entity_on_no_return_entity_returns_all_ones(self):
         """When entity is 'on' and no return entity, all 48 values must be 1."""
         from energy_forecast.energy_forecast import EnergyForecast
-        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="on",
-                             away_return_entity=None)
+
+        fake = _FakeAwaySelf(away_mode_entity="input_boolean.vacation", away_mode_state="on", away_return_entity=None)
         result = EnergyForecast._build_away_prediction_series(fake, self._now_ts())
         assert (result == 1).all()
 
     def test_entity_on_return_in_future_splits_at_return_dt(self):
         """When entity is 'on' and return_dt is 24h ahead, first 24 rows = 1, rest = 0."""
         from energy_forecast.energy_forecast import EnergyForecast
-        now_ts    = pd.Timestamp("2026-04-01 10:00")
+
+        now_ts = pd.Timestamp("2026-04-01 10:00")
         return_dt = now_ts + pd.Timedelta(hours=24)
         fake = _FakeAwaySelf(
-            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_mode_entity="input_boolean.vacation",
+            away_mode_state="on",
             away_return_entity="input_datetime.return",
             away_return_state=str(return_dt),
         )
@@ -914,10 +1022,12 @@ class TestBuildAwayPredictionSeries:
     def test_entity_on_return_dt_in_past_returns_all_ones(self):
         """When entity is 'on' and return_dt is in the past, all 48 values must be 1."""
         from energy_forecast.energy_forecast import EnergyForecast
-        now_ts    = pd.Timestamp("2026-04-01 10:00")
-        return_dt = now_ts - pd.Timedelta(hours=1)   # 1h ago — already past
+
+        now_ts = pd.Timestamp("2026-04-01 10:00")
+        return_dt = now_ts - pd.Timedelta(hours=1)  # 1h ago — already past
         fake = _FakeAwaySelf(
-            away_mode_entity="input_boolean.vacation", away_mode_state="on",
+            away_mode_entity="input_boolean.vacation",
+            away_mode_state="on",
             away_return_entity="input_datetime.return",
             away_return_state=str(return_dt),
         )
@@ -926,6 +1036,7 @@ class TestBuildAwayPredictionSeries:
 
 
 # ── #41 Rolling MAE sensors (mae_7d / mae_30d) ───────────────────────────────
+
 
 class TestRollingMaeSensors:
     """Tests for _actuals_history population, mae_7d/mae_30d computation, publish,
@@ -1000,23 +1111,23 @@ class TestRollingMaeSensors:
 
         # Verify that the hourly rolling window logic shifts by exactly 1 hour
         # when crossing midnight, whereas the old normalize() logic would jump by 24h.
-        
+
         # 23:30 on May 20
         now_before = pd.Timestamp("2024-05-20 23:30")
         # 00:30 on May 21
         now_after = pd.Timestamp("2024-05-21 00:30")
-        
+
         # Proposed behavior: floor('1h')
         cutoff_before = now_before.floor("1h") - pd.Timedelta(days=7)
         cutoff_after = now_after.floor("1h") - pd.Timedelta(days=7)
-        
+
         # Crossing midnight (23:30 -> 00:30) shifts the rolling window by exactly 1 hour
         assert (cutoff_after - cutoff_before) == pd.Timedelta(hours=1)
-        
+
         # Legacy behavior: normalize()
-        old_cutoff_before = now_before.normalize() - pd.Timedelta(days=7) # May 13 00:00
-        old_cutoff_after = now_after.normalize() - pd.Timedelta(days=7)   # May 14 00:00
-        
+        old_cutoff_before = now_before.normalize() - pd.Timedelta(days=7)  # May 13 00:00
+        old_cutoff_after = now_after.normalize() - pd.Timedelta(days=7)  # May 14 00:00
+
         # Crossing midnight jumps the window by 24 hours! This is the root cause of the report.
         assert (old_cutoff_after - old_cutoff_before) == pd.Timedelta(days=1)
 
@@ -1028,12 +1139,18 @@ class TestRollingMaeSensors:
 
         fake = _FakeMqttSelf(mqtt_discovery=False)
         data = {
-            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
-            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "ev_today": 0.0, "ev_yesterday": 0.0,
-            "mae_7d": 0.25, "mae_30d": 0.30,
-            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "mae_7d": 0.25,
+            "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24,
+            "mae_30d_n_pairs": 120,
         }
         EnergyForecast._publish(fake, data)
 
@@ -1052,20 +1169,28 @@ class TestRollingMaeSensors:
 
         fake = _FakeMqttSelf(mqtt_discovery=True)
         data = {
-            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
-            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "ev_today": 0.0, "ev_yesterday": 0.0,
-            "mae_7d": 0.25, "mae_30d": 0.30,
-            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "mae_7d": 0.25,
+            "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24,
+            "mae_30d_n_pairs": 120,
         }
         EnergyForecast._publish(fake, data)
 
         state_topics = [p["topic"] for p in fake._publishes if "/state" in p["topic"]]
-        assert any("energy_forecast_mae_7d" in t for t in state_topics), \
+        assert any("energy_forecast_mae_7d" in t for t in state_topics), (
             f"mae_7d state topic not found in: {state_topics}"
-        assert any("energy_forecast_mae_30d" in t for t in state_topics), \
+        )
+        assert any("energy_forecast_mae_30d" in t for t in state_topics), (
             f"mae_30d state topic not found in: {state_topics}"
+        )
 
     # ── MQTT discovery ──
 
@@ -1074,13 +1199,16 @@ class TestRollingMaeSensors:
         fake = _FakeMqttSelf()
         fake._mqtt_publish_all_discovery()
         config_topics = [p["topic"] for p in fake._publishes if "/config" in p["topic"]]
-        assert any("energy_forecast_mae_7d/config" in t for t in config_topics), \
+        assert any("energy_forecast_mae_7d/config" in t for t in config_topics), (
             f"mae_7d config topic not found in: {config_topics}"
-        assert any("energy_forecast_mae_30d/config" in t for t in config_topics), \
+        )
+        assert any("energy_forecast_mae_30d/config" in t for t in config_topics), (
             f"mae_30d config topic not found in: {config_topics}"
+        )
 
 
 # ── #39 Anomaly detection sensor ──────────────────────────────────────────────
+
 
 class TestAnomalyDetection:
     """Tests for _compute_anomaly and its integration with _publish / discovery."""
@@ -1168,12 +1296,18 @@ class TestAnomalyDetection:
 
     def _base_data(self) -> dict:
         return {
-            "next_1h": 0.5, "next_3h": 1.0, "today": 5.0, "tomorrow": 6.0,
-            "blocks_today": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": {f"{h:02d}_{h+3:02d}": 1.0 for h in range(0, 24, 3)},
-            "ev_today": 0.0, "ev_yesterday": 0.0,
-            "mae_7d": 0.25, "mae_30d": 0.30,
-            "mae_7d_n_pairs": 24, "mae_30d_n_pairs": 120,
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "mae_7d": 0.25,
+            "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24,
+            "mae_30d_n_pairs": 120,
         }
 
     def test_publish_set_state_mode_anomaly_on(self):
@@ -1181,8 +1315,7 @@ class TestAnomalyDetection:
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=False)
-        data = {**self._base_data(), "is_anomaly": True,
-                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        data = {**self._base_data(), "is_anomaly": True, "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
         EnergyForecast._publish(fake, data)
 
         eid = "binary_sensor.energy_forecast_unusual_consumption"
@@ -1195,8 +1328,7 @@ class TestAnomalyDetection:
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=False)
-        data = {**self._base_data(), "is_anomaly": False,
-                "anomaly_residual": 0.1, "anomaly_std": 0.1, "anomaly_n": 20}
+        data = {**self._base_data(), "is_anomaly": False, "anomaly_residual": 0.1, "anomaly_std": 0.1, "anomaly_n": 20}
         EnergyForecast._publish(fake, data)
 
         eid = "binary_sensor.energy_forecast_unusual_consumption"
@@ -1207,23 +1339,19 @@ class TestAnomalyDetection:
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=True)
-        data = {**self._base_data(), "is_anomaly": True,
-                "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
+        data = {**self._base_data(), "is_anomaly": True, "anomaly_residual": 5.0, "anomaly_std": 0.5, "anomaly_n": 20}
         EnergyForecast._publish(fake, data)
 
         state_topics = {p["topic"]: p["payload"] for p in fake._publishes if "/state" in p["topic"]}
-        anomaly_topic = next(
-            (t for t in state_topics if "unusual_consumption" in t), None
-        )
+        anomaly_topic = next((t for t in state_topics if "unusual_consumption" in t), None)
         assert anomaly_topic is not None, f"Anomaly state topic not found in: {list(state_topics)}"
         assert state_topics[anomaly_topic] == "ON"
 
         attr_topics = {p["topic"]: p["payload"] for p in fake._publishes if "/attributes" in p["topic"]}
-        anomaly_attr_topic = next(
-            (t for t in attr_topics if "unusual_consumption" in t), None
-        )
+        anomaly_attr_topic = next((t for t in attr_topics if "unusual_consumption" in t), None)
         assert anomaly_attr_topic is not None, "Anomaly attributes topic not found"
         import json as _json
+
         attrs = _json.loads(attr_topics[anomaly_attr_topic])
         assert "residual_kwh" in attrs
         assert attrs["n_pairs"] == 20
@@ -1236,9 +1364,11 @@ class TestAnomalyDetection:
         anomaly_config_topic = next(
             (t for t in config_publishes if "binary_sensor/energy_forecast_unusual_consumption/config" in t), None
         )
-        assert anomaly_config_topic is not None, \
+        assert anomaly_config_topic is not None, (
             f"anomaly binary sensor config topic not found in: {list(config_publishes)}"
+        )
         import json as _json
+
         cfg = _json.loads(config_publishes[anomaly_config_topic])
         assert "json_attributes_topic" in cfg, "Missing json_attributes_topic in anomaly discovery payload"
 
@@ -1252,6 +1382,7 @@ class TestAnomalyDetection:
 
 
 # ── _apply_target_correction ──────────────────────────────────────────────────
+
 
 def _make_corr_df(timestamps, kwh_values):
     """Helper: build a correction DataFrame with timestamp + kwh columns."""
@@ -1269,58 +1400,65 @@ class TestTargetCorrection:
     def test_solar_only_adds_to_gross_kwh(self):
         df = self._base_df(gross=2.0)
         solar = _make_corr_df(df["timestamp"], [1.0] * 10)
-        result = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
-                                          battery_charge_df=None, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=solar, grid_export_df=None, battery_charge_df=None, battery_discharge_df=None
+        )
         assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
 
     def test_grid_export_subtracts_from_gross_kwh(self):
         df = self._base_df(gross=3.0)
         export = _make_corr_df(df["timestamp"], [1.0] * 10)
-        result = _apply_target_correction(df, solar_df=None, grid_export_df=export,
-                                          battery_charge_df=None, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=None, grid_export_df=export, battery_charge_df=None, battery_discharge_df=None
+        )
         assert result["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
 
     def test_solar_and_export_combined(self):
         df = self._base_df(gross=2.0)
-        solar  = _make_corr_df(df["timestamp"], [3.0] * 10)
+        solar = _make_corr_df(df["timestamp"], [3.0] * 10)
         export = _make_corr_df(df["timestamp"], [1.0] * 10)
-        result = _apply_target_correction(df, solar_df=solar, grid_export_df=export,
-                                          battery_charge_df=None, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=solar, grid_export_df=export, battery_charge_df=None, battery_discharge_df=None
+        )
         # 2 + 3 - 1 = 4
         assert result["gross_kwh"].tolist() == pytest.approx([4.0] * 10)
 
     def test_battery_charge_subtracts(self):
         df = self._base_df(gross=5.0)
         charge = _make_corr_df(df["timestamp"], [2.0] * 10)
-        result = _apply_target_correction(df, solar_df=None, grid_export_df=None,
-                                          battery_charge_df=charge, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=None, grid_export_df=None, battery_charge_df=charge, battery_discharge_df=None
+        )
         assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
 
     def test_battery_discharge_adds(self):
         df = self._base_df(gross=1.0)
         discharge = _make_corr_df(df["timestamp"], [2.0] * 10)
-        result = _apply_target_correction(df, solar_df=None, grid_export_df=None,
-                                          battery_charge_df=None, battery_discharge_df=discharge)
+        result = _apply_target_correction(
+            df, solar_df=None, grid_export_df=None, battery_charge_df=None, battery_discharge_df=discharge
+        )
         assert result["gross_kwh"].tolist() == pytest.approx([3.0] * 10)
 
     def test_full_correction_all_four_sensors(self):
         # grid_import=3, solar=5, export=2, charge=1, discharge=0.5
         # expected: 3 + 5 - 2 - 1 + 0.5 = 5.5
         df = self._base_df(gross=3.0)
-        solar     = _make_corr_df(df["timestamp"], [5.0] * 10)
-        export    = _make_corr_df(df["timestamp"], [2.0] * 10)
-        charge    = _make_corr_df(df["timestamp"], [1.0] * 10)
+        solar = _make_corr_df(df["timestamp"], [5.0] * 10)
+        export = _make_corr_df(df["timestamp"], [2.0] * 10)
+        charge = _make_corr_df(df["timestamp"], [1.0] * 10)
         discharge = _make_corr_df(df["timestamp"], [0.5] * 10)
-        result = _apply_target_correction(df, solar_df=solar, grid_export_df=export,
-                                          battery_charge_df=charge, battery_discharge_df=discharge)
+        result = _apply_target_correction(
+            df, solar_df=solar, grid_export_df=export, battery_charge_df=charge, battery_discharge_df=discharge
+        )
         assert result["gross_kwh"].tolist() == pytest.approx([5.5] * 10)
 
     def test_result_clipped_to_zero(self):
         # gross_kwh=1, export=5 → would be -4 without clip
         df = self._base_df(gross=1.0)
         export = _make_corr_df(df["timestamp"], [5.0] * 10)
-        result = _apply_target_correction(df, solar_df=None, grid_export_df=export,
-                                          battery_charge_df=None, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=None, grid_export_df=export, battery_charge_df=None, battery_discharge_df=None
+        )
         assert (result["gross_kwh"] >= 0).all()
         assert result["gross_kwh"].tolist() == pytest.approx([0.0] * 10)
 
@@ -1329,20 +1467,23 @@ class TestTargetCorrection:
         # correction timestamps are 7 days later — no overlap
         future_ts = df["timestamp"] + pd.Timedelta(days=7)
         solar = _make_corr_df(future_ts, [5.0] * 10)
-        result = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
-                                          battery_charge_df=None, battery_discharge_df=None)
+        result = _apply_target_correction(
+            df, solar_df=solar, grid_export_df=None, battery_charge_df=None, battery_discharge_df=None
+        )
         # unmatched hours get zero delta; gross_kwh unchanged
         assert result["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
 
     def test_original_df_not_mutated(self):
         df = self._base_df(gross=2.0)
         solar = _make_corr_df(df["timestamp"], [1.0] * 10)
-        _ = _apply_target_correction(df, solar_df=solar, grid_export_df=None,
-                                     battery_charge_df=None, battery_discharge_df=None)
+        _ = _apply_target_correction(
+            df, solar_df=solar, grid_export_df=None, battery_charge_df=None, battery_discharge_df=None
+        )
         assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
 
 
 # ── Prediction history persistence ────────────────────────────────────────────
+
 
 class TestPredHistoryPersistence:
     """Tests for _load_pred_history and _save_pred_history methods."""
@@ -1374,6 +1515,7 @@ class TestPredHistoryPersistence:
 
         # Manually save
         import json
+
         data = {
             "pred": {ts.isoformat(): kwh for ts, kwh in pred_data.items()},
             "actuals": {ts.isoformat(): kwh for ts, kwh in actuals_data.items()},
@@ -1408,6 +1550,7 @@ class TestPredHistoryPersistence:
         recent_ts = now - pd.Timedelta(days=5)
 
         import json
+
         data = {
             "pred": {
                 old_ts.isoformat(): 1.0,
@@ -1446,6 +1589,7 @@ class TestPredHistoryPersistence:
 
         # Write file with different value for the same key
         import json
+
         data = {
             "pred": {ts_key.isoformat(): 99.0},  # Should be ignored
             "actuals": {},
@@ -1533,6 +1677,7 @@ class TestPredHistoryPersistence:
 
         # Verify content
         import json
+
         with open(mock_path) as f:
             data = json.load(f)
         assert len(data["pred"]) == 1
@@ -1565,8 +1710,8 @@ class TestPredHistoryPersistence:
 
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
 
-class TestBuildShapNarrative:
 
+class TestBuildShapNarrative:
     def test_empty_dict_returns_empty_string(self):
         """Empty shap_features dict returns empty string."""
         result = _build_shap_narrative({})
@@ -1628,6 +1773,7 @@ class TestBuildShapNarrative:
 
 # ── Relative MAE (#54) ───────────────────────────────────────────────────────────
 
+
 class TestRelativeMAEComputation:
     """Integration tests for relative MAE computation in _update_sensors."""
 
@@ -1666,11 +1812,16 @@ class TestRelativeMAEComputation:
         """Relative MAE is NaN when absolute MAE is NaN (cold start)."""
         mean_consumption = 10.0
         mae_abs = float("nan")
-        mae_pct = round(mae_abs / mean_consumption * 100, 2) if mean_consumption > 0 and not math.isnan(mae_abs) else float("nan")
+        mae_pct = (
+            round(mae_abs / mean_consumption * 100, 2)
+            if mean_consumption > 0 and not math.isnan(mae_abs)
+            else float("nan")
+        )
         assert math.isnan(mae_pct)
 
 
 # ── Fix: _update_cb must not skip under lock (concurrency fix) ────────────────
+
 
 class TestUpdateCbNoLock:
     """_update_cb must run _update_sensors even when _lock is held (retrain in progress)."""
@@ -1707,8 +1858,8 @@ class TestUpdateCbNoLock:
 
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
 
-class TestSubtractSubSensors:
 
+class TestSubtractSubSensors:
     def test_subtract_single_sensor(self):
         """Subtraction of one sensor at 1.0 kWh/h from 5.0 kWh/h results in 4.0 kWh/h."""
         ts = pd.date_range("2026-03-12 00:00", periods=24, freq="1h")
@@ -1759,7 +1910,9 @@ class TestSubtractSubSensors:
 
     def test_empty_sub_sensors_returns_copy(self):
         """Passing None or empty dict returns an unchanged copy of the input."""
-        df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-03-12 00:00", "2026-03-12 01:00"]), "gross_kwh": [5.0, 5.0]})
+        df = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2026-03-12 00:00", "2026-03-12 01:00"]), "gross_kwh": [5.0, 5.0]}
+        )
         res, removed = _subtract_sub_sensors(df, {})
         assert removed == 0.0
         assert (res["gross_kwh"] == 5.0).all()
@@ -1767,6 +1920,7 @@ class TestSubtractSubSensors:
 
 
 # ── EnergyForecast._subtract_only_dict ───────────────────────────────────────
+
 
 class _FakeSubtractSelf:
     """Minimal stand-in for EnergyForecast with sub-sensor config."""
@@ -1781,7 +1935,6 @@ class _FakeSubtractSelf:
 
 
 class TestSubtractOnlyDict:
-
     def _make_sub_dict(self, *entity_ids: str) -> dict:
         """Build a sub_dict with dummy DataFrames keyed by prefix."""
         fake = _FakeSubtractSelf(list(entity_ids), [])
@@ -1832,3 +1985,49 @@ class TestSubtractOnlyDict:
         # heat_pump not in sub_dict — no crash; dishwasher still present
         assert "sub_dishwasher_energy_kwh" in result
         assert len(result) == 1
+
+
+# ── _latest_thermal_pressure_net ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def trained_model_fixture(tmp_path):
+    """Return an EnergyForecastModel that has been trained and had predict() called."""
+    rng = np.random.default_rng(0)
+    n = 600
+    ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+    energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+    weather = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": rng.uniform(-5, 25, size=n),
+            "precipitation_mm": [0.0] * n,
+            "sunshine_min": [30.0] * n,
+            "wind_kmh": [10.0] * n,
+            "cloud_cover_pct": [50.0] * n,
+            "direct_radiation_wm2": [100.0] * n,
+        }
+    )
+    m = EnergyForecastModel(tmp_path)
+    m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+    future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+    forecast = pd.DataFrame(
+        {
+            "timestamp": future_ts,
+            "temp_c": [10.0] * 48,
+            "precipitation_mm": [0.0] * 48,
+            "sunshine_min": [30.0] * 48,
+            "wind_kmh": [10.0] * 48,
+            "cloud_cover_pct": [50.0] * 48,
+            "direct_radiation_wm2": [100.0] * 48,
+        }
+    )
+    m.predict(forecast, live_temp=10.0)
+    return m
+
+
+def test_latest_thermal_pressure_net_set_after_predict(trained_model_fixture):
+    """After predict(), _latest_thermal_pressure_net is a non-negative float."""
+    model = trained_model_fixture
+    assert isinstance(model._latest_thermal_pressure_net, float)
+    assert model._latest_thermal_pressure_net >= 0.0

@@ -30,6 +30,7 @@ Persistence:
   energy_model.pkl + meta.pkl, each with a SHA-256 sidecar.
   Integrity mismatch → warning + cold-start retrain.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -75,36 +76,61 @@ LAG_HOURS = [1, 2, 6, 12, 24, 48, 72, 168, 336]
 # ── Feature column sets ───────────────────────────────────────────────────────
 _FEATURES_BASE = [
     # Calendar
-    "hour", "day_of_week", "month", "season",
-    "hour_of_week",                                  # 0-167 — replaces is_weekend + hour_block
+    "hour",
+    "day_of_week",
+    "month",
+    "season",
+    "hour_of_week",  # 0-167 — replaces is_weekend + hour_block
     # Cyclical encodings
-    "hour_sin", "hour_cos",
-    "month_sin", "month_cos",
-    "dow_sin", "dow_cos",
-    "how_sin", "how_cos",                            # hour-of-week cyclical
-    "doy_sin", "doy_cos",                            # day-of-year cyclical (seasonal curve)
+    "hour_sin",
+    "hour_cos",
+    "month_sin",
+    "month_cos",
+    "dow_sin",
+    "dow_cos",
+    "how_sin",
+    "how_cos",  # hour-of-week cyclical
+    "doy_sin",
+    "doy_cos",  # day-of-year cyclical (seasonal curve)
     # Horizon
-    "hours_ahead",                                   # 0 at training (actuals), 0-47 at predict
+    "hours_ahead",  # 0 at training (actuals), 0-47 at predict
     # Weather
-    "temp_c", "precipitation_mm", "sunshine_min", "wind_kmh",
-    "humidity",                                      # relative humidity %
-    "cloud_cover_pct", "direct_radiation_wm2",
-    "heating_degree", "cooling_degree",
-    "hp_heating_degree",                             # HP-calibrated cutoff: max(0, 15 − temp_c)
-    "temp_in_neutral_zone",                          # dead-band flag: 1 when 15 ≤ temp_c ≤ 22
-    "heating_active",                                # seasonal on/off from heating_system_active_entity
-    "temp_rolling_3d",                               # thermal mass proxy (rectangular 72h)
+    "temp_c",
+    "precipitation_mm",
+    "sunshine_min",
+    "wind_kmh",
+    "humidity",  # relative humidity %
+    "cloud_cover_pct",
+    "direct_radiation_wm2",
+    "heating_degree",
+    "cooling_degree",
+    "hp_heating_degree",  # HP-calibrated cutoff: max(0, 15 − temp_c)
+    "temp_in_neutral_zone",  # dead-band flag: 1 when 15 ≤ temp_c ≤ 22
+    "heating_active",  # seasonal on/off from heating_system_active_entity
+    "temp_rolling_3d",  # thermal mass proxy (rectangular 72h)
     # Thermal modelling features (#49–#52)
-    "temp_ewma_24h", "temp_ewma_72h",               # #49 EWMA — RC-circuit thermal mass
-    "heating_deg_sum_24h", "heating_deg_sum_168h",  # #50 accumulated heating debt
-    "temp_delta_1h", "temp_delta_24h",              # #51 temperature rate of change
-    "temp_lag_24h", "temp_lag_168h",                # #52 temperature lags
+    "temp_ewma_24h",
+    "temp_ewma_72h",  # #49 EWMA — RC-circuit thermal mass
+    "heating_deg_sum_24h",
+    "heating_deg_sum_168h",  # #50 accumulated heating debt
+    "temp_delta_1h",
+    "temp_delta_24h",  # #51 temperature rate of change
+    "temp_lag_24h",
+    "temp_lag_168h",  # #52 temperature lags
     # Autoregressive lags — always safe (see note above)
-    "lag_1h", "lag_2h", "lag_6h", "lag_12h",    # short-horizon: NaN beyond h=lag at predict time
-    "lag_48h", "lag_72h",
-    "lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated",  # temp-delta gated: suppressed when warmer than lag period
+    "lag_1h",
+    "lag_2h",
+    "lag_6h",
+    "lag_12h",  # short-horizon: NaN beyond h=lag at predict time
+    "lag_48h",
+    "lag_72h",
+    "lag_24h_tgated",
+    "lag_168h_tgated",
+    "lag_336h_tgated",  # temp-delta gated: suppressed when warmer than lag period
     # Rolling activity stats
-    "rolling_mean_24h", "rolling_mean_7d", "rolling_std_24h",
+    "rolling_mean_24h",
+    "rolling_mean_7d",
+    "rolling_std_24h",
     # Calendar extras
     "is_public_holiday",
     "days_to_next_holiday",
@@ -122,9 +148,9 @@ _FEATURES_BASE = [
     "thermal_pressure_max",
     "thermal_pressure_std",
     "thermal_pressure_cop",
-    "thermal_pressure_net",                          # #56 solar-compensated pressure
-    "infiltration_pressure",                         # #57 wind-driven heat loss
-    "defrost_risk",                                  # #58 HP defrost proxy
+    "thermal_pressure_net",  # #56 solar-compensated pressure
+    "infiltration_pressure",  # #57 wind-driven heat loss
+    "defrost_risk",  # #58 HP defrost proxy
     "weighted_solar_gain",
     "dhw_buffer_temp",
     "dhw_pressure",
@@ -155,6 +181,7 @@ def _verify_hash(path: Path) -> bool:
 def _try_import_lgbm() -> Any | None:
     try:
         import lightgbm as lgb  # noqa: PLC0415
+
         return lgb
     except ImportError:
         return None
@@ -163,6 +190,7 @@ def _try_import_lgbm() -> Any | None:
 def _try_import_sklearn_gbr() -> Any | None:
     try:
         from sklearn.ensemble import GradientBoostingRegressor  # noqa: PLC0415
+
         return GradientBoostingRegressor
     except ImportError:
         return None
@@ -171,6 +199,7 @@ def _try_import_sklearn_gbr() -> Any | None:
 def _try_import_mae() -> Any | None:
     try:
         from sklearn.metrics import mean_absolute_error  # noqa: PLC0415
+
         return mean_absolute_error
     except ImportError:
         return None
@@ -193,22 +222,22 @@ class EnergyForecastModel:
     def __init__(self, model_dir: Path, model_archive_count: int = 3) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
-        self._model_path  = model_dir / "energy_model.pkl"
-        self._meta_path   = model_dir / "meta.pkl"
+        self._model_path = model_dir / "energy_model.pkl"
+        self._meta_path = model_dir / "meta.pkl"
 
         self.model = None
-        self.feature_cols: list[str]       = _FEATURES_BASE
-        self.last_trained: datetime        = datetime.min
-        self.last_mae: float | None        = None
-        self.last_cv_mae: float | None     = None   # cross-validated MAE
-        self.engine: str                   = "not trained"
-        self._feature_medians: dict        = {}     # global medians — used to fill NaN at predict time
-        self._feature_medians_by_how: dict = {}     # {how: {col: median}} — finer HOW-specific fill
-        self._log_transform: bool          = False  # log1p target; False = backward compat
-        self._canton: str | None           = None   # cantonal holiday subdivision
-        self._country: str                 = "CH"   # ISO 3166-1 alpha-2 country for holidays
+        self.feature_cols: list[str] = _FEATURES_BASE
+        self.last_trained: datetime = datetime.min
+        self.last_mae: float | None = None
+        self.last_cv_mae: float | None = None  # cross-validated MAE
+        self.engine: str = "not trained"
+        self._feature_medians: dict = {}  # global medians — used to fill NaN at predict time
+        self._feature_medians_by_how: dict = {}  # {how: {col: median}} — finer HOW-specific fill
+        self._log_transform: bool = False  # log1p target; False = backward compat
+        self._canton: str | None = None  # cantonal holiday subdivision
+        self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
-        self._likely_ev_hours: set[int]    = set()
+        self._likely_ev_hours: set[int] = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)
         self._model_q10 = None
         self._model_q90 = None
@@ -223,6 +252,8 @@ class EnergyForecastModel:
         self._sub_sensor_prefixes: list[str] = []
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
+        # Solar-compensated thermal pressure from last predict() call
+        self._latest_thermal_pressure_net: float | None = None
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
@@ -245,8 +276,8 @@ class EnergyForecastModel:
 
     def train(
         self,
-        energy_df: pd.DataFrame,          # naive timestamps, cols: timestamp, gross_kwh
-        weather_df: pd.DataFrame,         # naive timestamps
+        energy_df: pd.DataFrame,  # naive timestamps, cols: timestamp, gross_kwh
+        weather_df: pd.DataFrame,  # naive timestamps
         outdoor_df: pd.DataFrame | None,  # naive timestamps
         weight_halflife_days: float = 90.0,
         canton: str | None = None,
@@ -256,7 +287,7 @@ class EnergyForecastModel:
         away_df: pd.DataFrame | None = None,  # cols: timestamp, is_away (0/1)
         presence_df: pd.DataFrame | None = None,  # cols: timestamp, people_home (int)
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
-        dhw_df: pd.DataFrame | None = None,      # cols: timestamp, buffer_temp
+        dhw_df: pd.DataFrame | None = None,  # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
@@ -271,8 +302,8 @@ class EnergyForecastModel:
         if not ok:
             raise RuntimeError("scikit-learn unavailable — check AppDaemon requirements.txt.")
 
-        lgb    = _try_import_lgbm()
-        GBR    = _try_import_sklearn_gbr()
+        lgb = _try_import_lgbm()
+        GBR = _try_import_sklearn_gbr()
         mae_fn = _try_import_mae()
 
         # ── Dynamic lag selection based on available history ────────────────
@@ -322,7 +353,10 @@ class EnergyForecastModel:
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
-                prefix, sig["n_cycles"], sig["total_kwh"], sig["peak_hour"],
+                prefix,
+                sig["n_cycles"],
+                sig["total_kwh"],
+                sig["peak_hour"],
             )
         if not self._appliance_signatures and sub_sensors_dict:
             _LOGGER.info("Appliance signatures: no signatures learned (insufficient cycles in history)")
@@ -350,19 +384,20 @@ class EnergyForecastModel:
         if enable_regimes:
             _actual_k = regime_count
             _prebuilt_daily_features = None
-            ev_day_dates: set = (
-                set(ev_df["timestamp"].dt.date)
-                if ev_df is not None and len(ev_df) > 0
-                else set()
-            )
+            ev_day_dates: set = set(ev_df["timestamp"].dt.date) if ev_df is not None and len(ev_df) > 0 else set()
             if regime_count == 0:
                 # Auto-K: build daily features once and reuse for both selection and predictor
                 _prebuilt_daily_features = _prepare_daily_regime_features(
-                    weather_df, country=country, canton=canton,
-                    away_df=away_df, presence_df=presence_df,
+                    weather_df,
+                    country=country,
+                    canton=canton,
+                    away_df=away_df,
+                    presence_df=presence_df,
                 )
                 _actual_k = clustering.find_optimal_k(
-                    energy_df, _prebuilt_daily_features, sample_weight=daily_weights,
+                    energy_df,
+                    _prebuilt_daily_features,
+                    sample_weight=daily_weights,
                     ev_day_dates=ev_day_dates,
                 )
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
@@ -375,14 +410,17 @@ class EnergyForecastModel:
                     _prebuilt_daily_features
                     if _prebuilt_daily_features is not None
                     else _prepare_daily_regime_features(
-                        weather_df, country=country, canton=canton,
-                        away_df=away_df, presence_df=presence_df,
+                        weather_df,
+                        country=country,
+                        canton=canton,
+                        away_df=away_df,
+                        presence_df=presence_df,
                     )
                 )
 
                 self._regime_model = clustering.RegimePredictor()
                 self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
-                
+
                 # 3. Create hourly regime_kwh_series (vectorized)
                 # Map daily labels to hourly timestamps
                 ts_idx = pd.to_datetime(df["timestamp"])
@@ -392,30 +430,35 @@ class EnergyForecastModel:
 
                 # Use centroids matrix to lookup values for each hour
                 regime_rows = np.zeros(len(ts_idx))
-                valid_mask = (mapped_labels >= 0)
+                valid_mask = mapped_labels >= 0
                 if valid_mask.any():
                     hours = ts_idx.dt.hour.values
                     n_clusters = self._clusterer.centroids.shape[0]
                     safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_rows[valid_mask] = self._clusterer.centroids[
-                        safe_labels, hours[valid_mask]
-                    ]
+                    regime_rows[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
 
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
 
         # ── Store recent weather tail for prediction-time lag gating ────────
-        self._weather_tail = (
-            weather_df.sort_values("timestamp").tail(400).reset_index(drop=True).copy()
-        )
+        self._weather_tail = weather_df.sort_values("timestamp").tail(400).reset_index(drop=True).copy()
 
         # ── Weather / outdoor / calendar features ───────────────────────────
-        df = _engineer_features(df, weather_df, outdoor_df, canton=canton, country=country,
-                                likely_ev_hours=likely_ev_hours, away_df=away_df,
-                                presence_df=presence_df, climate_dfs=climate_dfs,
-                                dhw_df=dhw_df, tau_hours=self._tau_hours,
-                                room_areas=room_areas,
-                                regime_kwh_series=regime_kwh_series,
-                                heating_active_df=heating_active_df)
+        df = _engineer_features(
+            df,
+            weather_df,
+            outdoor_df,
+            canton=canton,
+            country=country,
+            likely_ev_hours=likely_ev_hours,
+            away_df=away_df,
+            presence_df=presence_df,
+            climate_dfs=climate_dfs,
+            dhw_df=dhw_df,
+            tau_hours=self._tau_hours,
+            room_areas=room_areas,
+            regime_kwh_series=regime_kwh_series,
+            heating_active_df=heating_active_df,
+        )
 
         # ── Build feature list from active lags ─────────────────────────────
         # Replace the static lag columns in _FEATURES_BASE/_WITH_SENSOR with
@@ -439,11 +482,7 @@ class EnergyForecastModel:
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
-        use_sensor = (
-            outdoor_df is not None
-            and not outdoor_df.empty
-            and "outdoor_temp_live" in df.columns
-        )
+        use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns
         feature_cols = sensor_features if use_sensor else base_features
 
         # Sub-sensor lag columns can be sparsely populated during warm-up (e.g. a
@@ -462,9 +501,7 @@ class EnergyForecastModel:
             return
 
         # ── Store medians for NaN-filling at predict time ───────────────────
-        self._feature_medians = {
-            col: float(df[col].median()) for col in feature_cols if col in df.columns
-        }
+        self._feature_medians = {col: float(df[col].median()) for col in feature_cols if col in df.columns}
 
         # Per-hour-of-week medians for lag and rolling columns (#31).
         # These columns vary significantly by HOW (e.g. lag_24h at Monday 08:00
@@ -472,16 +509,16 @@ class EnergyForecastModel:
         # than the global median when recent actuals are sparse.
         # Falls back to global median when a HOW bucket has no data.
         how_cols = [
-            c for c in feature_cols
-            if (c.startswith("lag_") or c.startswith("rolling_") or
-                "_lag_" in c)          # sub-sensor lags: e.g. sub_hp_lag_24h
+            c
+            for c in feature_cols
+            if (
+                c.startswith("lag_") or c.startswith("rolling_") or "_lag_" in c
+            )  # sub-sensor lags: e.g. sub_hp_lag_24h
             and c in df.columns
         ]
         if how_cols and "hour_of_week" in df.columns:
             how_med = (
-                df.groupby("hour_of_week")[how_cols]
-                .median()
-                .to_dict(orient="index")    # {how: {col: median}}
+                df.groupby("hour_of_week")[how_cols].median().to_dict(orient="index")  # {how: {col: median}}
             )
             self._feature_medians_by_how = how_med
         else:
@@ -489,7 +526,7 @@ class EnergyForecastModel:
 
         X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
-        y_fit = np.log1p(y)             # log-transform reduces influence of rare high peaks
+        y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
 
         # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
@@ -501,12 +538,13 @@ class EnergyForecastModel:
         # Also used to determine optimal n_estimators via LightGBM early stopping.
         cv_mae = None
         best_n_est: int | None = None
-        _NUM_LEAVES_SWEEP = [16, 31, 63]   # candidates; only used on last CV fold
+        _NUM_LEAVES_SWEEP = [16, 31, 63]  # candidates; only used on last CV fold
         best_num_leaves: int = 31
         if mae_fn is not None and len(df) >= MIN_CV_ROWS:
             try:
                 from sklearn.model_selection import TimeSeriesSplit  # noqa: PLC0415
-                tscv   = TimeSeriesSplit(n_splits=3)
+
+                tscv = TimeSeriesSplit(n_splits=3)
                 splits = list(tscv.split(X))
                 fold_maes = []
                 for fold_idx, (tr_idx, val_idx) in enumerate(splits):
@@ -524,7 +562,8 @@ class EnergyForecastModel:
                             m_nl = _build_model(lgb, GBR, num_leaves=nl)
                             try:
                                 m_nl.fit(
-                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    X.iloc[tr_idx],
+                                    y_fit[tr_idx],
                                     eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
@@ -534,20 +573,20 @@ class EnergyForecastModel:
                                 )
                             except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                            sweep_maes[nl] = float(
-                                mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx])))
-                            )
+                            sweep_maes[nl] = float(mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx]))))
                         best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
                         _LOGGER.info(
                             "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
                             {nl: round(v, 4) for nl, v in sweep_maes.items()},
-                            best_num_leaves, sweep_maes[best_num_leaves],
+                            best_num_leaves,
+                            sweep_maes[best_num_leaves],
                         )
                         # Refit last fold with the winning num_leaves for consistent n_est
                         m = _build_model(lgb, GBR, num_leaves=best_num_leaves)
                         try:
                             m.fit(
-                                X.iloc[tr_idx], y_fit[tr_idx],
+                                X.iloc[tr_idx],
+                                y_fit[tr_idx],
                                 eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
                                 callbacks=[
                                     lgb.early_stopping(50, verbose=False),
@@ -564,7 +603,8 @@ class EnergyForecastModel:
                         if lgb is not None:
                             try:
                                 m.fit(
-                                    X.iloc[tr_idx], y_fit[tr_idx],
+                                    X.iloc[tr_idx],
+                                    y_fit[tr_idx],
                                     eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
@@ -587,7 +627,9 @@ class EnergyForecastModel:
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(
                     "CV fold MAEs: %s → mean=%.4f ± %.4f",
-                    [round(v, 4) for v in fold_maes], cv_mae, cv_std,
+                    [round(v, 4) for v in fold_maes],
+                    cv_mae,
+                    cv_std,
                 )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 _LOGGER.warning("CV MAE failed: %s", exc)
@@ -623,22 +665,25 @@ class EnergyForecastModel:
             except (ValueError, IndexError):
                 pass
 
-        self.model                 = model
-        self.feature_cols          = feature_cols
-        self.last_trained          = datetime.now()
-        self.last_mae              = cv_mae if cv_mae is not None else holdout_mae
-        self.last_cv_mae           = cv_mae
-        self.engine                = engine_name
-        self._log_transform        = True
-        self._canton               = canton
-        self._country              = country
-        self._sub_sensor_prefixes  = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
+        self.model = model
+        self.feature_cols = feature_cols
+        self.last_trained = datetime.now()
+        self.last_mae = cv_mae if cv_mae is not None else holdout_mae
+        self.last_cv_mae = cv_mae
+        self.engine = engine_name
+        self._log_transform = True
+        self._canton = canton
+        self._country = country
+        self._sub_sensor_prefixes = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
         self._save()
 
         mae_str = f"cv_MAE={cv_mae:.4f}" if cv_mae else (f"holdout_MAE={holdout_mae:.4f}" if holdout_mae else "MAE=n/a")
         _LOGGER.info(
             "Model trained | rows=%d | engine=%s | features=%d | %s",
-            len(df), engine_name, len(feature_cols), mae_str,
+            len(df),
+            engine_name,
+            len(feature_cols),
+            mae_str,
         )
 
         # ── Quantile models for prediction intervals (CQR) ───────────────────
@@ -652,9 +697,9 @@ class EnergyForecastModel:
             cal_idx = rng.choice(len(X), size=cal_size, replace=False)
             train_mask = np.ones(len(X), dtype=bool)
             train_mask[cal_idx] = False
-            X_qtrain  = X.iloc[train_mask]
-            y_qtrain  = y_fit[train_mask]
-            X_cal     = X.iloc[cal_idx]
+            X_qtrain = X.iloc[train_mask]
+            y_qtrain = y_fit[train_mask]
+            X_cal = X.iloc[cal_idx]
             y_cal_log = y_fit[cal_idx]
             sw_qtrain = sample_weight[train_mask] if sample_weight is not None else None
 
@@ -676,7 +721,6 @@ class EnergyForecastModel:
             _LOGGER.warning("Quantile model training failed: %s — prediction intervals unavailable", exc)
             self._model_q10 = None
             self._model_q90 = None
-
 
     def _prepare_prediction_X(
         self,
@@ -702,9 +746,7 @@ class EnergyForecastModel:
         import pandas as pd
 
         now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None)
-        future_hours = pd.date_range(
-            start=now_naive.floor("1h"), periods=48, freq="1h"
-        )
+        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
         future_df = _add_lag_and_rolling_prediction(future_df, recent_actuals)
@@ -714,11 +756,7 @@ class EnergyForecastModel:
         _hod_means: np.ndarray | None = None
         if recent_actuals is not None and not recent_actuals.empty:
             _ra = recent_actuals.tail(168)  # last 7 days (168 h)
-            _hod_series = (
-                _ra.groupby(_ra["timestamp"].dt.hour)["gross_kwh"]
-                .mean()
-                .reindex(range(24))
-            )
+            _hod_series = _ra.groupby(_ra["timestamp"].dt.hour)["gross_kwh"].mean().reindex(range(24))
             _hod_means = _hod_series.to_numpy()
 
         future_df = _add_sub_sensor_lags_prediction(future_df, sub_sensors_recent or {})
@@ -749,29 +787,35 @@ class EnergyForecastModel:
 
         ha_df_for_features = None
         if heating_active_series is not None:
-            ha_df_for_features = (
-                heating_active_series
-                .rename_axis("timestamp")
-                .rename("heating_active")
-                .reset_index()
-            )
+            ha_df_for_features = heating_active_series.rename_axis("timestamp").rename("heating_active").reset_index()
 
         # Extend the 48h forecast with recent historical weather so that
         # shift(168) and shift(336) in _engineer_features produce real values
         # instead of NaN — enabling the temperature-delta gating to fire.
         if self._weather_tail is not None and not self._weather_tail.empty:
             import pandas as _pd
-            _extended = _pd.concat(
-                [self._weather_tail, forecast_df], ignore_index=True
-            ).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+            _extended = (
+                _pd.concat([self._weather_tail, forecast_df], ignore_index=True)
+                .drop_duplicates("timestamp")
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
         else:
             _extended = forecast_df
 
-        feat_df = _engineer_features(future_df, _extended, outdoor_pred_df, canton=self._canton,
-                                     likely_ev_hours=self._likely_ev_hours,
-                                     climate_dfs=climate_dfs_for_features, dhw_df=dhw_recent,
-                                     tau_hours=self._tau_hours, room_areas=room_areas,
-                                     heating_active_df=ha_df_for_features)
+        feat_df = _engineer_features(
+            future_df,
+            _extended,
+            outdoor_pred_df,
+            canton=self._canton,
+            likely_ev_hours=self._likely_ev_hours,
+            climate_dfs=climate_dfs_for_features,
+            dhw_df=dhw_recent,
+            tau_hours=self._tau_hours,
+            room_areas=room_areas,
+            heating_active_df=ha_df_for_features,
+        )
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -780,27 +824,24 @@ class EnergyForecastModel:
                 # Convert hourly away/occupancy series → DataFrames for regime predictor
                 _away_df_r = None
                 if away_series is not None and not away_series.empty:
-                    _away_df_r = (
-                        away_series.rename("is_away")
-                        .reset_index()
-                        .rename(columns={"index": "timestamp"})
-                    )
+                    _away_df_r = away_series.rename("is_away").reset_index().rename(columns={"index": "timestamp"})
                 _presence_df_r = None
                 if people_home_series is not None and not people_home_series.empty:
                     _presence_df_r = (
-                        people_home_series.rename("people_home")
-                        .reset_index()
-                        .rename(columns={"index": "timestamp"})
+                        people_home_series.rename("people_home").reset_index().rename(columns={"index": "timestamp"})
                     )
                 daily_features = _prepare_daily_regime_features(
-                    forecast_df, country=self._country, canton=self._canton,
-                    away_df=_away_df_r, presence_df=_presence_df_r,
+                    forecast_df,
+                    country=self._country,
+                    canton=self._canton,
+                    away_df=_away_df_r,
+                    presence_df=_presence_df_r,
                 )
-                
+
                 # 2. Predict regime IDs
                 predicted_labels = self._regime_model.predict(daily_features)
                 regime_map = dict(zip(daily_features.index, predicted_labels))
-                
+
                 # 3. Populate regime_kwh column (vectorized)
                 # Mirror training ffill so partial/gap days get a filled label
                 # rather than -1 (which would zero out regime_kwh).
@@ -811,14 +852,12 @@ class EnergyForecastModel:
                 mapped_labels = label_series.values
 
                 regime_vals = np.zeros(len(ts_idx))
-                valid_mask = (mapped_labels >= 0)
+                valid_mask = mapped_labels >= 0
                 if valid_mask.any():
                     hours = ts_idx.dt.hour.values
                     n_clusters = self._clusterer.centroids.shape[0]
                     safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_vals[valid_mask] = self._clusterer.centroids[
-                        safe_labels, hours[valid_mask]
-                    ]
+                    regime_vals[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
                 feat_df["regime_kwh"] = regime_vals
             except Exception as e:
                 _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
@@ -831,7 +870,7 @@ class EnergyForecastModel:
         # during warm-season transitions so they don't anchor predictions high.
         if "temp_c" in feat_df.columns and "temp_lag_168h" in feat_df.columns:
             _delta = (feat_df["temp_c"] - feat_df["temp_lag_168h"]).clip(lower=0)
-            feat_df["regime_kwh"] *= (1.0 - (_delta / 8.0).clip(upper=1.0))
+            feat_df["regime_kwh"] *= 1.0 - (_delta / 8.0).clip(upper=1.0)
 
         # ── Away / vacation flag ─────────────────────────────────────────────
         # away_series is a 48-value Series indexed by naive prediction timestamps.
@@ -900,11 +939,11 @@ class EnergyForecastModel:
 
     def predict(
         self,
-        forecast_df: pd.DataFrame,                    # naive timestamps
+        forecast_df: pd.DataFrame,  # naive timestamps
         live_temp: float | None,
-        recent_actuals: pd.DataFrame | None = None,   # naive timestamps, cols: timestamp, gross_kwh
-        sub_sensors_recent: dict | None = None,       # {prefix: DataFrame[timestamp, kwh]}
-        away_series: pd.Series | None = None,       # 48-value Series indexed by timestamp
+        recent_actuals: pd.DataFrame | None = None,  # naive timestamps, cols: timestamp, gross_kwh
+        sub_sensors_recent: dict | None = None,  # {prefix: DataFrame[timestamp, kwh]}
+        away_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         people_home_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
@@ -921,10 +960,23 @@ class EnergyForecastModel:
             raise RuntimeError("Model not yet trained.")
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
-            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
+            forecast_df,
+            live_temp,
+            recent_actuals,
+            sub_sensors_recent,
+            away_series,
+            people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+            room_areas=room_areas,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
+        if "thermal_pressure_net" in X.columns:
+            self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
+        else:
+            self._latest_thermal_pressure_net = 0.0
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
@@ -937,7 +989,7 @@ class EnergyForecastModel:
         live_temp: float | None,
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
-        away_series: pd.Series | None = None,       # 48-value Series indexed by timestamp
+        away_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         people_home_series: pd.Series | None = None,  # 48-value Series indexed by timestamp
         climate_recent: dict[str, pd.DataFrame] | None = None,
         dhw_recent: pd.DataFrame | None = None,
@@ -958,19 +1010,28 @@ class EnergyForecastModel:
             return None
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series, people_home_series,
-            climate_recent=climate_recent, dhw_recent=dhw_recent, room_areas=room_areas,
-            heating_active_series=heating_active_series, setpoint_on=setpoint_on, setpoint_off=setpoint_off,
+            forecast_df,
+            live_temp,
+            recent_actuals,
+            sub_sensors_recent,
+            away_series,
+            people_home_series,
+            climate_recent=climate_recent,
+            dhw_recent=dhw_recent,
+            room_areas=room_areas,
+            heating_active_series=heating_active_series,
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
         )
-        low  = self._model_q10.predict(X)
+        low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
             correction = self._interval_correction  # 0.0 when uncalibrated
-            low  -= correction
+            low -= correction
             high += correction
-            low  = np.expm1(low)
+            low = np.expm1(low)
             high = np.expm1(high)
-        low  = np.maximum(0, low)
+        low = np.maximum(0, low)
         high = np.maximum(0, high)
         # Enforce ordering in case of quantile crossing
         low, high = np.minimum(low, high), np.maximum(low, high)
@@ -1003,7 +1064,9 @@ class EnergyForecastModel:
             raise RuntimeError("Model not yet trained.")
 
         baseline_df = self.predict(
-            forecast_df, live_temp, recent_actuals,
+            forecast_df,
+            live_temp,
+            recent_actuals,
             sub_sensors_recent=sub_sensors_recent,
             away_series=away_series,
             people_home_series=people_home_series,
@@ -1048,7 +1111,11 @@ class EnergyForecastModel:
             return {}
 
         future_hours, X = self._prepare_prediction_X(
-            forecast_df, live_temp, recent_actuals, sub_sensors_recent, away_series,
+            forecast_df,
+            live_temp,
+            recent_actuals,
+            sub_sensors_recent,
+            away_series,
             people_home_series=people_home_series,
             climate_recent=climate_recent,
             dhw_recent=dhw_recent,
@@ -1060,9 +1127,7 @@ class EnergyForecastModel:
 
         # Filter to today's local date; fall back to all rows if none match
         today = pd.Timestamp.now().normalize()
-        mask = (pd.Series(future_hours) >= today) & (
-            pd.Series(future_hours) < today + pd.Timedelta(days=1)
-        )
+        mask = (pd.Series(future_hours) >= today) & (pd.Series(future_hours) < today + pd.Timedelta(days=1))
         X_slice = X[mask.values] if mask.sum() >= 3 else X
 
         if self.engine == "LightGBM":
@@ -1165,21 +1230,21 @@ class EnergyForecastModel:
                 pickle.dump(self._regime_model, fh)
 
         meta = {
-            "feature_cols":              self.feature_cols,
-            "last_trained":              self.last_trained,
-            "last_mae":                  self.last_mae,
-            "last_cv_mae":               self.last_cv_mae,
-            "engine":                    self.engine,
-            "feature_medians":           self._feature_medians,
-            "feature_medians_by_how":    self._feature_medians_by_how,
-            "log_transform":             self._log_transform,
-            "canton":                    self._canton,
-            "likely_ev_hours":           self._likely_ev_hours,
-            "sub_sensor_prefixes":       self._sub_sensor_prefixes,
-            "tau_hours":                 self._tau_hours,
-            "enable_regimes":            self._enable_regimes,
-            "regime_count":              self._regime_count,
-            "weather_tail":              self._weather_tail,
+            "feature_cols": self.feature_cols,
+            "last_trained": self.last_trained,
+            "last_mae": self.last_mae,
+            "last_cv_mae": self.last_cv_mae,
+            "engine": self.engine,
+            "feature_medians": self._feature_medians,
+            "feature_medians_by_how": self._feature_medians_by_how,
+            "log_transform": self._log_transform,
+            "canton": self._canton,
+            "likely_ev_hours": self._likely_ev_hours,
+            "sub_sensor_prefixes": self._sub_sensor_prefixes,
+            "tau_hours": self._tau_hours,
+            "enable_regimes": self._enable_regimes,
+            "regime_count": self._regime_count,
+            "weather_tail": self._weather_tail,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1203,9 +1268,7 @@ class EnergyForecastModel:
             if not path.exists():
                 continue
             if not _verify_hash(path):
-                _LOGGER.warning(
-                    "Quantile model integrity check failed (%s) — discarding.", path
-                )
+                _LOGGER.warning("Quantile model integrity check failed (%s) — discarding.", path)
                 continue
             try:
                 with open(path, "rb") as fh:
@@ -1231,9 +1294,9 @@ class EnergyForecastModel:
 
         q10_pred = self._model_q10.predict(X_cal)
         q90_pred = self._model_q90.predict(X_cal)
-        scores   = np.maximum(q10_pred - y_cal_log, y_cal_log - q90_pred)
-        level    = min(np.ceil((n + 1) * 0.8) / n, 1.0)
-        q_hat    = float(np.quantile(scores, level))
+        scores = np.maximum(q10_pred - y_cal_log, y_cal_log - q90_pred)
+        level = min(np.ceil((n + 1) * 0.8) / n, 1.0)
+        q_hat = float(np.quantile(scores, level))
         self._interval_correction = q_hat
         _LOGGER.info("CQR correction: q_hat=%.4f (cal_n=%d)", q_hat, n)
 
@@ -1272,9 +1335,7 @@ class EnergyForecastModel:
             # keys back to int so the in-memory representation is consistent.
             for sig in raw.values():
                 if "hour_of_day_distribution" in sig:
-                    sig["hour_of_day_distribution"] = {
-                        int(k): v for k, v in sig["hour_of_day_distribution"].items()
-                    }
+                    sig["hour_of_day_distribution"] = {int(k): v for k, v in sig["hour_of_day_distribution"].items()}
             self._appliance_signatures = raw
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             _LOGGER.warning("Could not load appliance signatures: %s", exc)
@@ -1283,7 +1344,7 @@ class EnergyForecastModel:
         self,
         climate_dfs: dict[str, pd.DataFrame],
         heating_active_df: pd.DataFrame,  # cols: timestamp, heating_active (0/1)
-        weather_df: pd.DataFrame,          # cols: timestamp, temp_c
+        weather_df: pd.DataFrame,  # cols: timestamp, temp_c
     ) -> float | None:
         """Estimate building thermal time constant τ (hours) from passive-cooling windows.
 
@@ -1336,16 +1397,14 @@ class EnergyForecastModel:
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
 
         combined_data: dict[str, pd.Series] = {
-            "T_indoor":       T_indoor_series,
-            "T_outdoor":      T_outdoor_series,
+            "T_indoor": T_indoor_series,
+            "T_outdoor": T_outdoor_series,
             "heating_active": active_series,
         }
         if rad_series is not None:
             combined_data["direct_radiation_wm2"] = rad_series
 
-        combined = pd.DataFrame(combined_data).dropna(
-            subset=["T_indoor", "T_outdoor", "heating_active"]
-        ).sort_index()
+        combined = pd.DataFrame(combined_data).dropna(subset=["T_indoor", "T_outdoor", "heating_active"]).sort_index()
 
         if combined.empty:
             return None
@@ -1373,7 +1432,7 @@ class EnergyForecastModel:
 
             edges = np.diff(mask.astype(int), prepend=0, append=0)
             starts = np.where(edges == 1)[0]
-            ends   = np.where(edges == -1)[0]
+            ends = np.where(edges == -1)[0]
 
             for s, e in zip(starts, ends):
                 # Cap each sub-sequence at 12h to avoid ambient drift in the OLS fit.
@@ -1422,8 +1481,7 @@ class EnergyForecastModel:
                     (sub_hours >= 9) & (sub_hours < 16),
                     0.3,
                     np.where(
-                        ((sub_hours >= 6) & (sub_hours < 9))
-                        | ((sub_hours >= 16) & (sub_hours < 22)),
+                        ((sub_hours >= 6) & (sub_hours < 9)) | ((sub_hours >= 16) & (sub_hours < 22)),
                         0.7,
                         1.0,
                     ),
@@ -1444,11 +1502,13 @@ class EnergyForecastModel:
         tau_estimates = [c[0] for c in selected]
 
         _LOGGER.debug(
-            "τ calibration: %d candidates, using top %d "
-            "(quality %.2f–%.2f, τ range %.1f–%.1f h)",
-            len(candidates), n_select,
-            selected[-1][1], selected[0][1],
-            min(tau_estimates), max(tau_estimates),
+            "τ calibration: %d candidates, using top %d (quality %.2f–%.2f, τ range %.1f–%.1f h)",
+            len(candidates),
+            n_select,
+            selected[-1][1],
+            selected[0][1],
+            min(tau_estimates),
+            max(tau_estimates),
         )
 
         tau_median = float(np.median(tau_estimates))
@@ -1460,7 +1520,10 @@ class EnergyForecastModel:
                 tau_result = 0.8 * old_tau + 0.2 * tau_median
                 _LOGGER.info(
                     "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
-                    old_tau, tau_result, tau_median, change_frac * 100,
+                    old_tau,
+                    tau_result,
+                    tau_median,
+                    change_frac * 100,
                 )
             else:
                 tau_result = tau_median
@@ -1469,7 +1532,9 @@ class EnergyForecastModel:
 
         _LOGGER.info(
             "Building τ estimated at %.1f h from %d passive-cooling windows (%d candidates scored).",
-            tau_result, len(tau_estimates), len(candidates),
+            tau_result,
+            len(tau_estimates),
+            len(candidates),
         )
         return tau_result
 
@@ -1497,21 +1562,21 @@ class EnergyForecastModel:
                 try:
                     with open(self._meta_path, "rb") as fh:
                         meta = pickle.load(fh)
-                    self.feature_cols          = meta.get("feature_cols",          _FEATURES_BASE)
-                    self.last_trained          = meta.get("last_trained",          datetime.min)
-                    self.last_mae              = meta.get("last_mae")
-                    self.last_cv_mae           = meta.get("last_cv_mae")
-                    self.engine                = meta.get("engine",                "unknown")
-                    self._feature_medians      = meta.get("feature_medians",       {})
+                    self.feature_cols = meta.get("feature_cols", _FEATURES_BASE)
+                    self.last_trained = meta.get("last_trained", datetime.min)
+                    self.last_mae = meta.get("last_mae")
+                    self.last_cv_mae = meta.get("last_cv_mae")
+                    self.engine = meta.get("engine", "unknown")
+                    self._feature_medians = meta.get("feature_medians", {})
                     self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
-                    self._log_transform        = meta.get("log_transform",         False)
-                    self._canton               = meta.get("canton",                None)
-                    self._likely_ev_hours      = meta.get("likely_ev_hours",       set())
-                    self._sub_sensor_prefixes  = meta.get("sub_sensor_prefixes",   [])
-                    self._tau_hours            = meta.get("tau_hours",             None)
-                    self._enable_regimes       = meta.get("enable_regimes",        False)
-                    self._regime_count         = meta.get("regime_count",          5)
-                    self._weather_tail         = meta.get("weather_tail",          None)
+                    self._log_transform = meta.get("log_transform", False)
+                    self._canton = meta.get("canton", None)
+                    self._likely_ev_hours = meta.get("likely_ev_hours", set())
+                    self._sub_sensor_prefixes = meta.get("sub_sensor_prefixes", [])
+                    self._tau_hours = meta.get("tau_hours", None)
+                    self._enable_regimes = meta.get("enable_regimes", False)
+                    self._regime_count = meta.get("regime_count", 5)
+                    self._weather_tail = meta.get("weather_tail", None)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -1539,7 +1604,7 @@ def _prepare_daily_regime_features(
     weather_df: pd.DataFrame,
     country: str = "CH",
     canton: str | None = None,
-    away_df: pd.DataFrame | None = None,      # cols: timestamp, is_away
+    away_df: pd.DataFrame | None = None,  # cols: timestamp, is_away
     presence_df: pd.DataFrame | None = None,  # cols: timestamp, people_home
 ) -> pd.DataFrame:
     """Aggregate hourly weather into daily features for regime prediction."""
@@ -1548,11 +1613,9 @@ def _prepare_daily_regime_features(
     # 1. Aggregate daily weather features
     w_daily = weather_df.copy()
     w_daily["date"] = pd.to_datetime(w_daily["timestamp"]).dt.date
-    w_daily = w_daily.groupby("date").agg({
-        "temp_c": ["mean", "min", "max"],
-        "sunshine_min": "sum",
-        "precipitation_mm": "sum"
-    })
+    w_daily = w_daily.groupby("date").agg(
+        {"temp_c": ["mean", "min", "max"], "sunshine_min": "sum", "precipitation_mm": "sum"}
+    )
     w_daily.columns = ["temp_mean", "temp_min", "temp_max", "sun_total", "precip_total"]
 
     # 2. Add calendar features
@@ -1563,6 +1626,7 @@ def _prepare_daily_regime_features(
     # Reuse holiday logic
     try:
         import holidays as hd
+
         years = cal_dates.year.unique().tolist()
         ch_hols = hd.country_holidays(country, years=years)
         # Add cantonal holidays if provided
@@ -1599,6 +1663,7 @@ def _prepare_daily_regime_features(
 
 # ── Lag & rolling feature helpers ─────────────────────────────────────────────
 
+
 def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int]) -> pd.DataFrame:
     """Compute lag and rolling features during training using shift().
 
@@ -1619,9 +1684,9 @@ def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int
         new_cols[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
 
     shifted = df["gross_kwh"].shift(1)
-    new_cols["rolling_mean_24h"] = shifted.rolling(24,    min_periods=12).mean()
-    new_cols["rolling_mean_7d"]  = shifted.rolling(7*24,  min_periods=48).mean()
-    new_cols["rolling_std_24h"]  = shifted.rolling(24,    min_periods=12).std().fillna(0)
+    new_cols["rolling_mean_24h"] = shifted.rolling(24, min_periods=12).mean()
+    new_cols["rolling_mean_7d"] = shifted.rolling(7 * 24, min_periods=48).mean()
+    new_cols["rolling_std_24h"] = shifted.rolling(24, min_periods=12).std().fillna(0)
 
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -1643,16 +1708,12 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
         for lag in LAG_HOURS:
             future_df[f"lag_{lag}h"] = np.nan
         future_df["rolling_mean_24h"] = np.nan
-        future_df["rolling_mean_7d"]  = np.nan
-        future_df["rolling_std_24h"]  = np.nan
+        future_df["rolling_mean_7d"] = np.nan
+        future_df["rolling_std_24h"] = np.nan
         return future_df
 
     # Index actuals by timestamp for O(1) lookup
-    actuals = (
-        recent_actuals
-        .set_index(pd.to_datetime(recent_actuals["timestamp"]))["gross_kwh"]
-        .sort_index()
-    )
+    actuals = recent_actuals.set_index(pd.to_datetime(recent_actuals["timestamp"]))["gross_kwh"].sort_index()
 
     for lag in LAG_HOURS:
         lag_td = pd.Timedelta(hours=lag)
@@ -1667,7 +1728,10 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
                 _LOGGER.warning(
                     "lag_%dh has %d/%d NaN values — recent_actuals doesn't reach "
                     "back %dh; these will be filled with training medians.",
-                    lag, nan_count, len(future_df), lag,
+                    lag,
+                    nan_count,
+                    len(future_df),
+                    lag,
                 )
 
     # ── Rolling stats — sliding window projection ────────────────────────────
@@ -1700,18 +1764,19 @@ def _add_lag_and_rolling_prediction(future_df: pd.DataFrame, recent_actuals: pd.
     # Without it, the window at h=0 would include the fill-value slot itself,
     # causing a mismatch with the training semantics at the boundary.
     extended_shifted = extended.shift(1)
-    rm24 = extended_shifted.rolling(24,  min_periods=12).mean()
+    rm24 = extended_shifted.rolling(24, min_periods=12).mean()
     rm7d = extended_shifted.rolling(168, min_periods=48).mean()
-    rs24 = extended_shifted.rolling(24,  min_periods=12).std().fillna(0)
+    rs24 = extended_shifted.rolling(24, min_periods=12).std().fillna(0)
 
     future_df["rolling_mean_24h"] = rm24.reindex(future_index).values
-    future_df["rolling_mean_7d"]  = rm7d.reindex(future_index).values
-    future_df["rolling_std_24h"]  = rs24.reindex(future_index).values
+    future_df["rolling_mean_7d"] = rm7d.reindex(future_index).values
+    future_df["rolling_std_24h"] = rs24.reindex(future_index).values
 
     return future_df
 
 
 # ── Sub-sensor lag helpers ────────────────────────────────────────────────────
+
 
 def _add_sub_sensor_lags_training(
     df: pd.DataFrame,
@@ -1741,20 +1806,17 @@ def _add_sub_sensor_lags_training(
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
             continue
-        sub_series = (
-            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
-            .sort_index()
-        )
-        kwh_series = pd.Series(
-            pd.to_numeric(sub_series.reindex(ts_idx), errors="coerce").values
-        )
+        sub_series = sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"].sort_index()
+        kwh_series = pd.Series(pd.to_numeric(sub_series.reindex(ts_idx), errors="coerce").values)
         nan_count = int(kwh_series.isna().sum())
         if nan_count > len(kwh_series) * 0.5:
             _LOGGER.warning(
                 "%s reindex introduces %d/%d NaN values during training — "
                 "sub-sensor data may have gaps or misaligned timestamps; "
                 "will be filled with training medians.",
-                prefix, nan_count, len(kwh_series),
+                prefix,
+                nan_count,
+                len(kwh_series),
             )
         new_cols[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
@@ -1834,7 +1896,9 @@ def _learn_appliance_signatures(
                 _LOGGER.warning(
                     "Appliance '%s' (%s) signature has high variability (CoV=%.2f)"
                     " — scenario predictions may be inaccurate.",
-                    prefix, label, cov_max,
+                    prefix,
+                    label,
+                    cov_max,
                 )
 
     result: dict = {}
@@ -1844,11 +1908,7 @@ def _learn_appliance_signatures(
 
         # ── Align to hourly index ──────────────────────────────────────────────
         kwh_series = (
-            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
-            .sort_index()
-            .resample("h")
-            .sum()
-            .astype(float)
+            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"].sort_index().resample("h").sum().astype(float)
         )
         filled = kwh_series.fillna(0.0)
         n = len(filled)
@@ -1872,11 +1932,7 @@ def _learn_appliance_signatures(
         valid_starts: list[int] = []  # parallel to windows; tracks start index in filled
         for pos in start_positions:
             end = pos + 1
-            while (
-                end < n
-                and end - pos < APPLIANCE_MAX_WINDOW_HOURS
-                and filled.iloc[end] > idle_thresh
-            ):
+            while end < n and end - pos < APPLIANCE_MAX_WINDOW_HOURS and filled.iloc[end] > idle_thresh:
                 end += 1
             # Skip if the cycle was still running when history ended (truncated).
             # A cycle that hit the MAX_WINDOW cap is kept — it's complete enough.
@@ -1901,7 +1957,8 @@ def _learn_appliance_signatures(
                 valid_starts = [s for s, keep in zip(valid_starts, keep_mask) if keep]
                 _LOGGER.debug(
                     "Appliance '%s': rejected %d outlier cycle(s) (total kWh > median + 2σ)",
-                    prefix, n_rejected,
+                    prefix,
+                    n_rejected,
                 )
 
         if len(windows) < min_cycles:
@@ -1963,18 +2020,13 @@ def _learn_appliance_signatures(
 
         # ── Hour-of-day distribution ───────────────────────────────────────────
         from collections import Counter as _Counter
+
         hour_dist = _Counter(int(kwh_series.index[pos].hour) for pos in valid_starts)
 
         # ── Signature quality metadata ─────────────────────────────────────────
-        n_data_days = int(
-            (kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400
-        )
+        n_data_days = int((kwh_series.index[-1] - kwh_series.index[0]).total_seconds() / 86400)
         last_cycle_ts = str(kwh_series.index[valid_starts[-1]]) if valid_starts else ""
-        quality_base = (
-            "good" if len(windows) >= 15
-            else "fair" if len(windows) >= 5
-            else "poor"
-        )
+        quality_base = "good" if len(windows) >= 15 else "fair" if len(windows) >= 5 else "poor"
         # Demote to "fair" when energy variability is high despite adequate cycle count
         if energy_cov > 0.5 and quality_base == "good":
             quality_base = "fair"
@@ -2090,7 +2142,8 @@ def _composite_forecast(
             else:
                 _LOGGER.debug(
                     "_composite_forecast: no profile for program '%s' on '%s' — using combined",
-                    program, prefix,
+                    program,
+                    prefix,
                 )
         if profile is None:
             profile = sig["hourly_profile"]
@@ -2128,18 +2181,14 @@ def _add_sub_sensor_lags_prediction(
             for col in (f"{prefix}_lag_24h", f"{prefix}_lag_168h"):
                 future_df[col] = float("nan")
             future_df[f"{prefix}_active_24h"] = 0
-            future_df[f"{prefix}_runs_7d"]    = 0
+            future_df[f"{prefix}_runs_7d"] = 0
             continue
 
-        sub_series = (
-            sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"]
-            .sort_index()
-            .astype(float)
-        )
+        sub_series = sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"].sort_index().astype(float)
         future_ts = pd.DatetimeIndex(pd.to_datetime(future_df["timestamp"]))
 
         for lag, col in [(24, f"{prefix}_lag_24h"), (168, f"{prefix}_lag_168h")]:
-            lag_td    = pd.Timedelta(hours=lag)
+            lag_td = pd.Timedelta(hours=lag)
             lag_times = future_ts - lag_td
             # Normalise index resolution so reindex finds matches regardless of
             # whether the CSV cache was written with ns or us precision (pandas 3.x).
@@ -2150,7 +2199,10 @@ def _add_sub_sensor_lags_prediction(
                 _LOGGER.debug(
                     "%s has %d/%d NaN values — sub-sensor actuals don't reach back %dh; "
                     "will be filled with training medians.",
-                    col, nan_count, len(future_df), lag,
+                    col,
+                    nan_count,
+                    len(future_df),
+                    lag,
                 )
 
         # active_24h: check 24h window before each future hour from recent actuals.
@@ -2168,7 +2220,7 @@ def _add_sub_sensor_lags_prediction(
             filled = sub_series.fillna(0)
             is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
             # Use actuals in the window [last_ts - 168h, last_ts]
-            last_ts    = sub_series.index.max()
+            last_ts = sub_series.index.max()
             window_168 = is_start[is_start.index >= last_ts - pd.Timedelta(hours=168)]
             runs_count = int(window_168.sum())
         else:
@@ -2179,6 +2231,7 @@ def _add_sub_sensor_lags_prediction(
 
 
 # ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
+
 
 def _project_indoor_temps(
     climate_recent: dict[str, pd.DataFrame],
@@ -2236,21 +2289,19 @@ def _project_indoor_temps(
 
         # Build a projected climate DataFrame matching what _engineer_features expects
         setpoint_val = float(latest["setpoint"])
-        if (
-            heating_active_series is not None
-            and setpoint_on is not None
-            and setpoint_off is not None
-        ):
+        if heating_active_series is not None and setpoint_on is not None and setpoint_off is not None:
             ha_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values
             setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
         else:
             setpoint_arr = np.full(len(future_timestamps), setpoint_val)
 
-        projected_df = pd.DataFrame({
-            "timestamp": future_timestamps,
-            "current_temp": t_in_arr,
-            "setpoint": setpoint_arr,
-        })
+        projected_df = pd.DataFrame(
+            {
+                "timestamp": future_timestamps,
+                "current_temp": t_in_arr,
+                "setpoint": setpoint_arr,
+            }
+        )
         result[eid] = projected_df
 
     return result
@@ -2258,10 +2309,11 @@ def _project_indoor_temps(
 
 # ── Core feature engineering ──────────────────────────────────────────────────
 
+
 def _engineer_features(
-    df: pd.DataFrame,                   # naive timestamps
-    weather_df: pd.DataFrame,           # naive timestamps
-    outdoor_df: pd.DataFrame | None,    # naive timestamps
+    df: pd.DataFrame,  # naive timestamps
+    weather_df: pd.DataFrame,  # naive timestamps
+    outdoor_df: pd.DataFrame | None,  # naive timestamps
     canton: str | None = None,
     country: str = "CH",
     likely_ev_hours: set | None = None,
@@ -2281,29 +2333,26 @@ def _engineer_features(
     df["timestamp"] = pd.to_datetime(df["timestamp"])  # stays naive
 
     # ── Calendar features ────────────────────────────────────────────────────
-    df["hour"]         = df["timestamp"].dt.hour
-    df["day_of_week"]  = df["timestamp"].dt.dayofweek
-    df["month"]        = df["timestamp"].dt.month
-    df["season"]       = df["month"].map(
-        {12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1,
-         6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3}
-    )
+    df["hour"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["month"] = df["timestamp"].dt.month
+    df["season"] = df["month"].map({12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3})
     # hour_of_week gives the model a unique slot for every hour in the weekly
     # cycle (0 = Monday 00:00, 167 = Sunday 23:00). Replaces is_weekend + hour_block.
     df["hour_of_week"] = df["day_of_week"] * 24 + df["hour"]
 
     # ── Cyclical encodings ───────────────────────────────────────────────────
-    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"]         / 24)
-    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"]         / 24)
-    df["month_sin"] = np.sin(2 * np.pi * df["month"]        / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"]        / 12)
-    df["dow_sin"]   = np.sin(2 * np.pi * df["day_of_week"]  / 7)
-    df["dow_cos"]   = np.cos(2 * np.pi * df["day_of_week"]  / 7)
-    df["how_sin"]   = np.sin(2 * np.pi * df["hour_of_week"] / 168)
-    df["how_cos"]   = np.cos(2 * np.pi * df["hour_of_week"] / 168)
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+    df["dow_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    df["how_sin"] = np.sin(2 * np.pi * df["hour_of_week"] / 168)
+    df["how_cos"] = np.cos(2 * np.pi * df["hour_of_week"] / 168)
     doy = df["timestamp"].dt.dayofyear
-    df["doy_sin"]   = np.sin(2 * np.pi * doy / 365)
-    df["doy_cos"]   = np.cos(2 * np.pi * doy / 365)
+    df["doy_sin"] = np.sin(2 * np.pi * doy / 365)
+    df["doy_cos"] = np.cos(2 * np.pi * doy / 365)
 
     # ── Horizon feature (0 for training rows — always actuals) ───────────────
     # At predict time _prepare_prediction_X overwrites this with 0..47 so the
@@ -2360,17 +2409,29 @@ def _engineer_features(
     w["temp_lag_336h"] = w["temp_c"].shift(336)
 
     df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-    df = df.merge(w, left_on="_ts_floor", right_on="timestamp",
-                  how="left", suffixes=("", "_w"))
+    df = df.merge(w, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_w"))
     df.drop(columns=["timestamp_w", "_ts_floor"], errors="ignore", inplace=True)
 
-    for col in ["temp_c", "precipitation_mm", "sunshine_min", "wind_kmh", "humidity",
-                "cloud_cover_pct", "direct_radiation_wm2", "temp_rolling_3d",
-                # Thermal modelling features
-                "temp_ewma_24h", "temp_ewma_72h",
-                "heating_deg_sum_24h", "heating_deg_sum_168h",
-                "temp_delta_1h", "temp_delta_24h",
-                "temp_lag_24h", "temp_lag_168h", "temp_lag_336h"]:
+    for col in [
+        "temp_c",
+        "precipitation_mm",
+        "sunshine_min",
+        "wind_kmh",
+        "humidity",
+        "cloud_cover_pct",
+        "direct_radiation_wm2",
+        "temp_rolling_3d",
+        # Thermal modelling features
+        "temp_ewma_24h",
+        "temp_ewma_72h",
+        "heating_deg_sum_24h",
+        "heating_deg_sum_168h",
+        "temp_delta_1h",
+        "temp_delta_24h",
+        "temp_lag_24h",
+        "temp_lag_168h",
+        "temp_lag_336h",
+    ]:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
 
@@ -2394,8 +2455,7 @@ def _engineer_features(
         o = outdoor_df.copy()
         o["timestamp"] = pd.to_datetime(o["timestamp"]).dt.floor("1h")
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(o, left_on="_ts_floor", right_on="timestamp",
-                      how="left", suffixes=("", "_ot"))
+        df = df.merge(o, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_ot"))
         df.drop(columns=["timestamp_ot", "_ts_floor"], errors="ignore", inplace=True)
         df["outdoor_temp_live"] = df["outdoor_temp_live"].fillna(df["temp_c"])
         df["temp_bias"] = df["outdoor_temp_live"] - df["temp_c"]
@@ -2408,8 +2468,7 @@ def _engineer_features(
         a = away_df[["timestamp", "is_away"]].copy()
         a["timestamp"] = pd.to_datetime(a["timestamp"]).dt.floor("1h")
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(a, left_on="_ts_floor", right_on="timestamp",
-                      how="left", suffixes=("", "_aw"))
+        df = df.merge(a, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_aw"))
         df.drop(columns=["timestamp_aw", "_ts_floor"], errors="ignore", inplace=True)
         df["is_away"] = df["is_away"].fillna(0).astype(int)
     else:
@@ -2420,8 +2479,7 @@ def _engineer_features(
         p = presence_df[["timestamp", "people_home"]].copy()
         p["timestamp"] = pd.to_datetime(p["timestamp"]).dt.floor("1h")
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(p, left_on="_ts_floor", right_on="timestamp",
-                      how="left", suffixes=("", "_ph"))
+        df = df.merge(p, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_ph"))
         df.drop(columns=["timestamp_ph", "_ts_floor"], errors="ignore", inplace=True)
         df["people_home"] = df["people_home"].fillna(0).astype(int)
     else:
@@ -2435,8 +2493,7 @@ def _engineer_features(
         h = heating_active_df[["timestamp", "heating_active"]].copy()
         h["timestamp"] = pd.to_datetime(h["timestamp"]).dt.floor("1h")
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(h, left_on="_ts_floor", right_on="timestamp",
-                      how="left", suffixes=("", "_ha"))
+        df = df.merge(h, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_ha"))
         df.drop(columns=["timestamp_ha", "_ts_floor"], errors="ignore", inplace=True)
         df["heating_active"] = df["heating_active"].fillna(1).astype(int)
     else:
@@ -2498,28 +2555,29 @@ def _engineer_features(
 
             # Per-row secondary stats
             max_series = delta_df.max(axis=1)
-            std_series  = delta_df.std(axis=1).fillna(0.0)
+            std_series = delta_df.std(axis=1).fillna(0.0)
 
-            summary = pd.DataFrame({
-                "timestamp":            delta_df.index,
-                "thermal_pressure":     pressure_series.values,
-                "thermal_pressure_max": max_series.values,
-                "thermal_pressure_std": std_series.values,
-            })
+            summary = pd.DataFrame(
+                {
+                    "timestamp": delta_df.index,
+                    "thermal_pressure": pressure_series.values,
+                    "thermal_pressure_max": max_series.values,
+                    "thermal_pressure_std": std_series.values,
+                }
+            )
 
             df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-            df = df.merge(summary, left_on="_ts_floor", right_on="timestamp",
-                          how="left", suffixes=("", "_tp"))
+            df = df.merge(summary, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_tp"))
             df.drop(columns=["timestamp_tp", "_ts_floor"], errors="ignore", inplace=True)
-            df["thermal_pressure"]     = df["thermal_pressure"].fillna(0.0)
+            df["thermal_pressure"] = df["thermal_pressure"].fillna(0.0)
             df["thermal_pressure_max"] = df["thermal_pressure_max"].fillna(0.0)
             df["thermal_pressure_std"] = df["thermal_pressure_std"].fillna(0.0)
         else:
-            df["thermal_pressure"]     = 0.0
+            df["thermal_pressure"] = 0.0
             df["thermal_pressure_max"] = 0.0
             df["thermal_pressure_std"] = 0.0
     else:
-        df["thermal_pressure"]     = 0.0
+        df["thermal_pressure"] = 0.0
         df["thermal_pressure_max"] = 0.0
         df["thermal_pressure_std"] = 0.0
 
@@ -2528,16 +2586,15 @@ def _engineer_features(
         d = dhw_df[["timestamp", "buffer_temp"]].copy()
         d["timestamp"] = pd.to_datetime(d["timestamp"]).dt.floor("1h")
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(d, left_on="_ts_floor", right_on="timestamp",
-                      how="left", suffixes=("", "_dhw"))
+        df = df.merge(d, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_dhw"))
         df.drop(columns=["timestamp_dhw", "_ts_floor"], errors="ignore", inplace=True)
         # Rename merged column to the feature name
         if "buffer_temp" in df.columns:
             df.rename(columns={"buffer_temp": "dhw_buffer_temp"}, inplace=True)
-        
-        df["dhw_buffer_temp"] = df["dhw_buffer_temp"].fillna(50.0) # Assume neutral 50C
+
+        df["dhw_buffer_temp"] = df["dhw_buffer_temp"].fillna(50.0)  # Assume neutral 50C
         # non-linear trigger: higher as temp drops towards 40C floor
-        df["dhw_pressure"] = 1.0 / (np.maximum(0.5, df["dhw_buffer_temp"] - 40.0 + 1.0)**2)
+        df["dhw_pressure"] = 1.0 / (np.maximum(0.5, df["dhw_buffer_temp"] - 40.0 + 1.0) ** 2)
     else:
         df["dhw_buffer_temp"] = 50.0
         df["dhw_pressure"] = 0.0
@@ -2588,19 +2645,14 @@ def _engineer_features(
     # ── §3: Humidity-aware defrost proxy (#58) ───────────────────────────────
     # Peaks at 2°C; Gaussian σ²=10 covers observed icing range −3°C to +7°C.
     # Scaled by relative humidity (dimensionless, 0–1).
-    defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0)**2) / 10.0)
+    defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0) ** 2) / 10.0)
     df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
 
     # ── Daily Regime Profile (optional) ──────────────────────────────────────
     if regime_kwh_series is not None:
         # Merge hourly profile by timestamp
         df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(
-            regime_kwh_series.to_frame("regime_kwh"),
-            left_on="_ts_floor",
-            right_index=True,
-            how="left"
-        )
+        df = df.merge(regime_kwh_series.to_frame("regime_kwh"), left_on="_ts_floor", right_index=True, how="left")
         df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
         df["regime_kwh"] = df["regime_kwh"].fillna(0.0)
     else:
@@ -2610,11 +2662,12 @@ def _engineer_features(
     # heating-season data overestimate during warm-season transitions.
     if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
         delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
-        df["regime_kwh"] *= (1.0 - (delta_168h / 8.0).clip(upper=1.0))
+        df["regime_kwh"] *= 1.0 - (delta_168h / 8.0).clip(upper=1.0)
 
     return df
 
-_BRIDGE_CAP = 3   # days — bridge-day effect beyond this distance is negligible
+
+_BRIDGE_CAP = 3  # days — bridge-day effect beyond this distance is negligible
 
 
 def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: str = "CH") -> pd.DataFrame:
@@ -2652,7 +2705,8 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
             except (NotImplementedError, KeyError):
                 _LOGGER.warning(
                     "Unknown canton/subdivision code %r for country %r — falling back to national holidays.",
-                    canton, country,
+                    canton,
+                    country,
                 )
                 ch_holidays = hd.country_holidays(country, years=years)
         else:
@@ -2667,9 +2721,9 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
             # Vectorised distance computation via ordinals + np.searchsorted.
             # bisect_left semantics: on a holiday, idx points to the holiday → distance 0.
             holiday_ords = np.array([d.toordinal() for d in holiday_dates])
-            date_ords    = np.array([d.toordinal() for d in dates])
+            date_ords = np.array([d.toordinal() for d in dates])
 
-            idx_next  = np.searchsorted(holiday_ords, date_ords, side="left")
+            idx_next = np.searchsorted(holiday_ords, date_ords, side="left")
             safe_next = np.minimum(idx_next, len(holiday_ords) - 1)
             days_next = np.where(
                 idx_next >= len(holiday_ords),
@@ -2678,8 +2732,8 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
             )
             df["days_to_next_holiday"] = np.minimum(_BRIDGE_CAP, days_next).astype(int)
 
-            idx_prev   = np.searchsorted(holiday_ords, date_ords, side="right") - 1
-            safe_prev  = np.maximum(idx_prev, 0)
+            idx_prev = np.searchsorted(holiday_ords, date_ords, side="right") - 1
+            safe_prev = np.maximum(idx_prev, 0)
             days_since = np.where(
                 idx_prev < 0,
                 _BRIDGE_CAP,
@@ -2687,28 +2741,28 @@ def _add_holiday_feature(df: pd.DataFrame, canton: str | None = None, country: s
             )
             df["days_since_last_holiday"] = np.minimum(_BRIDGE_CAP, days_since).astype(int)
         else:
-            df["days_to_next_holiday"]    = _BRIDGE_CAP
+            df["days_to_next_holiday"] = _BRIDGE_CAP
             df["days_since_last_holiday"] = _BRIDGE_CAP
 
     except ImportError:
-        df["is_public_holiday"]       = 0
-        df["days_to_next_holiday"]    = _BRIDGE_CAP
+        df["is_public_holiday"] = 0
+        df["days_to_next_holiday"] = _BRIDGE_CAP
         df["days_since_last_holiday"] = _BRIDGE_CAP
     except (KeyError, ValueError, TypeError, AttributeError, NotImplementedError) as exc:
         _LOGGER.warning("Holiday feature failed: %s — defaulting to 0 / %d", exc, _BRIDGE_CAP)
-        df["is_public_holiday"]       = 0
-        df["days_to_next_holiday"]    = _BRIDGE_CAP
+        df["is_public_holiday"] = 0
+        df["days_to_next_holiday"] = _BRIDGE_CAP
         df["days_since_last_holiday"] = _BRIDGE_CAP
     return df
 
 
-_EV_HOW_MIN_FRACTION = 0.15   # an hour_of_week slot is "likely EV" if it was a
-                               # charging hour in ≥ 15% of its historical occurrences
+_EV_HOW_MIN_FRACTION = 0.15  # an hour_of_week slot is "likely EV" if it was a
+# charging hour in ≥ 15% of its historical occurrences
 
 
 def _compute_likely_ev_hours(
-    baseline_df: Any,           # all training rows (EV hours have kwh already subtracted)
-    ev_df: Any,                 # rows classified as EV charging (original kwh)
+    baseline_df: Any,  # all training rows (EV hours have kwh already subtracted)
+    ev_df: Any,  # rows classified as EV charging (original kwh)
 ) -> set[int]:
     """Return the set of hour_of_week values (0-167) that regularly see EV charging.
 
@@ -2726,31 +2780,28 @@ def _compute_likely_ev_hours(
         return ts.dt.dayofweek * 24 + ts.dt.hour
 
     total_counts = _how(baseline_df).value_counts()
-    ev_counts    = _how(ev_df).value_counts()
+    ev_counts = _how(ev_df).value_counts()
 
     # Align on the same index; missing slots in ev_counts → 0
     fractions = ev_counts.reindex(total_counts.index, fill_value=0) / total_counts
     likely = fractions[fractions >= _EV_HOW_MIN_FRACTION].index.tolist()
     if likely:
         _LOGGER.info(
-            "EV pattern: %d hour_of_week slots flagged as likely charging windows "
-            "(fraction ≥ %.0f%%).",
-            len(likely), _EV_HOW_MIN_FRACTION * 100,
+            "EV pattern: %d hour_of_week slots flagged as likely charging windows (fraction ≥ %.0f%%).",
+            len(likely),
+            _EV_HOW_MIN_FRACTION * 100,
         )
     return set(likely)
 
 
 def _build_prediction_temp_df(
-    future_hours,   # pd.DatetimeIndex — naive
-    forecast_df,    # pd.DataFrame — naive timestamps
+    future_hours,  # pd.DatetimeIndex — naive
+    forecast_df,  # pd.DataFrame — naive timestamps
     live_temp: float,
 ) -> Any:
     import pandas as pd
 
-    fc_indexed = (
-        forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
-        .sort_index()
-    )
+    fc_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"].sort_index()
     blend_range = SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS  # hours over which we fade bias
 
     # Compute bias (sensor offset) relative to forecast at h=0
@@ -2826,4 +2877,3 @@ def _build_model(lgb: Any, GBR: Any, n_estimators: int | None = None, num_leaves
         subsample=0.8,
         random_state=42,
     )
-
