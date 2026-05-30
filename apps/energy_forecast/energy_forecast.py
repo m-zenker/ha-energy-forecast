@@ -1099,13 +1099,18 @@ class EnergyForecast(hass.Hass):
             full_actuals = _strip_tz(full_actuals, self._timezone)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
-            recent_actuals, _ = ha_data.split_ev_charging(
+            recent_actuals, ev_detected = ha_data.split_ev_charging(
                 full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
             )
         except (OSError, ValueError, KeyError) as exc:
             _LOGGER.warning("Could not fetch recent actuals for lag features: %s", exc)
             recent_actuals = None
             full_actuals = None
+            ev_detected = None
+
+        ev_hour_set: set = set()
+        if ev_detected is not None and not ev_detected.empty:
+            ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))
 
         sub_sensors_recent: dict = {}
         for entity_id in self._sub_energy_sensors:
@@ -1240,14 +1245,12 @@ class EnergyForecast(hass.Hass):
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour
         if recent_actuals is not None and not recent_actuals.empty:
-            self._actuals_history.update(
-                dict(
-                    zip(
-                        pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
-                        recent_actuals["gross_kwh"].astype(float),
-                    )
-                )
-            )
+            for _ts, _kwh in zip(
+                pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
+                recent_actuals["gross_kwh"].astype(float),
+            ):
+                if _ts not in ev_hour_set:
+                    self._actuals_history[_ts] = _kwh
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items() if pd.Timestamp(ts) >= actuals_cutoff
@@ -1255,7 +1258,12 @@ class EnergyForecast(hass.Hass):
 
         self._save_pred_history()
 
-        self._maybe_adaptive_retrain(recent_actuals)
+        _actuals_for_retrain = (
+            recent_actuals[~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_hour_set)]
+            if (recent_actuals is not None and not recent_actuals.empty and ev_hour_set)
+            else recent_actuals
+        )
+        self._maybe_adaptive_retrain(_actuals_for_retrain)
 
         # ── Compute rolling MAE sensors (#41) ────────────────────────────────
         actuals_hist_df = None

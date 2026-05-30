@@ -1131,6 +1131,64 @@ class TestRollingMaeSensors:
         # Crossing midnight jumps the window by 24 hours! This is the root cause of the report.
         assert (old_cutoff_after - old_cutoff_before) == pd.Timedelta(days=1)
 
+    # ── EV-hour exclusion from actuals_history ──
+
+    def test_actuals_history_excludes_ev_hours(self):
+        """EV-detected hours must not appear in _actuals_history."""
+        import pandas as pd
+
+        base = pd.Timestamp("2026-03-20 08:00")
+        normal_hours = pd.date_range(base, periods=4, freq="1h")  # 08, 09, 10, 11
+        ev_hours = pd.date_range(base + pd.Timedelta(hours=4), periods=2, freq="1h")  # 12, 13
+
+        # Build ev_hour_set as the production code does
+        ev_hour_set = set(ev_hours)
+
+        actuals_history: dict = {}
+        all_hours = list(normal_hours) + list(ev_hours)
+        for ts in all_hours:
+            if ts not in ev_hour_set:
+                actuals_history[ts] = 2.0
+
+        assert len(actuals_history) == 4
+        for ev_ts in ev_hours:
+            assert ev_ts not in actuals_history
+        for norm_ts in normal_hours:
+            assert norm_ts in actuals_history
+
+    def test_mae_not_inflated_by_ev_hours(self):
+        """MAE computed after excluding EV hours must not exceed MAE when EV hours are included."""
+        from energy_forecast.energy_forecast import _compute_live_mae
+
+        base = pd.Timestamp("2026-03-20 08:00")
+        n_normal = 6
+        normal_ts = pd.date_range(base, periods=n_normal, freq="1h")
+        ev_ts = base + pd.Timedelta(hours=n_normal)
+
+        pred_normal = 1.5
+        actual_normal = 2.0
+        pred_ev = 1.5
+        actual_ev = 12.0  # large EV charging spike
+
+        pred_history = {ts: pred_normal for ts in normal_ts}
+        pred_history[ev_ts] = pred_ev
+
+        # With EV hour included: high MAE
+        actuals_with_ev = pd.DataFrame(
+            {"timestamp": list(normal_ts) + [ev_ts], "gross_kwh": [actual_normal] * n_normal + [actual_ev]}
+        )
+        mae_inflated, n_inflated = _compute_live_mae(pred_history, actuals_with_ev)
+
+        # Without EV hour: lower MAE
+        actuals_no_ev = pd.DataFrame({"timestamp": list(normal_ts), "gross_kwh": [actual_normal] * n_normal})
+        pred_history_no_ev = {ts: pred_normal for ts in normal_ts}
+        mae_clean, n_clean = _compute_live_mae(pred_history_no_ev, actuals_no_ev)
+
+        assert n_inflated == n_normal + 1
+        assert n_clean == n_normal
+        assert mae_clean < mae_inflated
+        assert abs(mae_clean - abs(actual_normal - pred_normal)) < 1e-6
+
     # ── publish in set_state mode ──
 
     def test_publish_mae_sensors_set_state_mode(self):
