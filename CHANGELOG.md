@@ -8,6 +8,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2-alpha-1] — 2026-05-31
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — `sensor.energy_forecast_thermal_pressure_net` published via `set_state` each update cycle with `tau_hours` and `unit_of_measurement=°C·m²` attributes, enabling ha-energy-manager heat pump optimiser to read thermal pressure net directly from HA.
+- `apps/energy_forecast/model.py` — top-25% τ candidate selection when ≥32 windows are available (previously top-50% for all sample sizes), reducing bias from lower-quality windows in data-rich retrains. Below 32 candidates the existing top-50% logic is retained. Log message now shows the selection percentage.
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — EV-charging hours (where `gross_kwh > ev_charging_threshold`) excluded from `_actuals_history` and the adaptive retrain MAE comparison, so EV charging no longer inflates the 7d/30d rolling MAE and does not spuriously trigger adaptive retraining.
+- `apps/energy_forecast/energy_forecast.py` — redundant thermal pressure update removed from `predict_intervals()`; added guard for `tau_hours=None` to prevent `AttributeError`.
+- `apps/energy_forecast/model.py` — `_latest_thermal_pressure_net` now updated inside `predict_intervals()` so it reflects interval-prediction context rather than stale training-time state.
+
+### Changed
+- Ruff linter (target-version py313, line-length 120), pre-commit hooks, pytest-cov, and Forgejo CI workflow added to project.
+- `holidays>=0.46` added to `requirements-dev.txt` — 6 holiday-feature tests that previously failed due to missing package now pass correctly.
+
+### Tests
+- 567 passing (up from 562 in v0.11.1; +5 covering new sensor publication, EV MAE exclusion, and previously-skipped holiday features).
+
+---
+
 ## [0.11.1] — 2026-05-11
 
 Stable release consolidating six alpha iterations. All fixes harden the warm-season transition and τ thermal-time-constant calibration that landed in v0.11.0.
