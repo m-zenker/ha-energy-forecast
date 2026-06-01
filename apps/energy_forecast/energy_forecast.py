@@ -1261,6 +1261,10 @@ class EnergyForecast(hass.Hass):
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
         # Use full_actuals (pre-split, pre-sub-sensor-subtraction) so stored kWh
         # matches the training target (raw gross_kwh on non-EV hours).
+        # NOTE (BUG-7, deferred): ev_hour_set only covers the last 2 days. EV hours
+        # stored in _actuals_history from earlier cycles are not retroactively removed;
+        # they age out at the 30-day cutoff. Startup eviction would fix this faster
+        # but is invasive — deferred until there is evidence of significant MAE inflation.
         if full_actuals is not None and not full_actuals.empty:
             for _ts, _kwh in zip(
                 pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
