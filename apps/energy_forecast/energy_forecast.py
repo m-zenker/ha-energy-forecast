@@ -1245,11 +1245,13 @@ class EnergyForecast(hass.Hass):
                 self._pred_history[ts] = float(row["predicted_kwh"])
 
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
-        # keep-last semantics: fresher actuals overwrite older ones for the same hour
-        if recent_actuals is not None and not recent_actuals.empty:
+        # keep-last semantics: fresher actuals overwrite older ones for the same hour.
+        # Use full_actuals (pre-split, pre-sub-sensor-subtraction) so stored kWh
+        # matches the training target (raw gross_kwh on non-EV hours).
+        if full_actuals is not None and not full_actuals.empty:
             for _ts, _kwh in zip(
-                pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h"),
-                recent_actuals["gross_kwh"].astype(float),
+                pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
+                full_actuals["gross_kwh"].astype(float),
             ):
                 if _ts not in ev_hour_set:
                     self._actuals_history[_ts] = _kwh

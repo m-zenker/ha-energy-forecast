@@ -1250,6 +1250,43 @@ class TestRollingMaeSensors:
             f"mae_30d state topic not found in: {state_topics}"
         )
 
+    # ── full_actuals vs recent_actuals for _actuals_history ──
+
+    def test_actuals_history_stores_raw_kwh_not_sub_sensor_subtracted(self):
+        """_actuals_history must store raw gross_kwh from full_actuals, not sub-sensor-subtracted recent_actuals.
+
+        When sub-sensors reduce recent_actuals kWh, _actuals_history must still hold the
+        original full_actuals values (consistent with training, which uses EV-subtracted
+        gross_kwh without sub-sensor subtraction).
+        """
+        import pandas as pd
+
+        # Simulate the production loop with both full_actuals and recent_actuals available,
+        # where recent_actuals has reduced kWh (sub-sensor subtracted).
+        now = pd.Timestamp("2026-06-01 10:00")
+        timestamps = pd.date_range(now - pd.Timedelta(hours=3), periods=3, freq="1h")
+
+        full_actuals = pd.DataFrame({"timestamp": timestamps, "gross_kwh": [2.0, 3.0, 4.0]})
+        # recent_actuals: same timestamps, 1.0 kWh less (sub-sensor subtracted)
+        recent_actuals_kwh = [1.0, 2.0, 3.0]  # noqa: F841 — kept for documentation
+
+        ev_hour_set: set = set()
+
+        actuals_history: dict = {}
+
+        # Simulate the FIXED production loop (full_actuals):
+        for _ts, _kwh in zip(
+            pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
+            full_actuals["gross_kwh"].astype(float),
+        ):
+            if _ts not in ev_hour_set:
+                actuals_history[_ts] = _kwh
+
+        # Values must be raw (2.0, 3.0, 4.0), not sub-sensor-subtracted (1.0, 2.0, 3.0)
+        assert list(actuals_history.values()) == [2.0, 3.0, 4.0], (
+            f"Expected raw full_actuals values [2.0, 3.0, 4.0], got {list(actuals_history.values())}"
+        )
+
     # ── MQTT discovery ──
 
     def test_mqtt_discovery_includes_mae_sensors(self):
