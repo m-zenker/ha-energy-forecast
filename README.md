@@ -486,7 +486,7 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
 | `sensor.energy_forecast_mae_7d_pct` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. |
 | `sensor.energy_forecast_mae_30d_pct` | Rolling relative MAE over the last 30 days (%). |
-| `sensor.energy_forecast_thermal_pressure_net` | °C·m² | Thermal pressure (heat deficit minus solar gain) for the current hour. Attribute: `tau_hours` (building thermal time constant in hours; `null` when uncalibrated). Consumed by `ha-energy-manager` heat pump optimiser. |
+| `sensor.energy_forecast_thermal_pressure_net` | Thermal pressure (heat deficit minus solar gain) for the current hour. Unit: °C·m². Attribute: `tau_hours` (building thermal time constant in hours; `null` when uncalibrated). Consumed by `ha-energy-manager` heat pump optimiser. |
 
 ### Anomaly detection
 
