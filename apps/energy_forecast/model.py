@@ -221,7 +221,7 @@ class EnergyForecastModel:
 
     _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
 
-    def __init__(self, model_dir: Path, model_archive_count: int = 3) -> None:
+    def __init__(self, model_dir: Path, model_archive_count: int = 3, timezone: str = "Europe/Zurich") -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
         self._model_path = model_dir / "energy_model.pkl"
@@ -238,7 +238,7 @@ class EnergyForecastModel:
         self._log_transform: bool = False  # log1p target; False = backward compat
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
-        self._timezone: str = "Europe/Zurich"  # local timezone for wall-clock "now"
+        self._timezone: str = timezone  # local timezone for wall-clock "now"
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
         self._likely_ev_hours: set[int] = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)

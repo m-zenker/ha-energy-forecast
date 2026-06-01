@@ -44,7 +44,7 @@ from energy_forecast.model import (
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
 
 
-def _make_trained_model(tmp_path, n: int = 600) -> tuple:
+def _make_trained_model(tmp_path, n: int = 600, timezone: str = "Europe/Zurich") -> tuple:
     """Return (model, forecast_df) after a full train() call."""
     rng = np.random.default_rng(0)
     ts = pd.date_range("2024-01-01", periods=n, freq="1h")
@@ -65,7 +65,7 @@ def _make_trained_model(tmp_path, n: int = 600) -> tuple:
             "direct_radiation_wm2": [100.0] * n,
         }
     )
-    m = EnergyForecastModel(tmp_path)
+    m = EnergyForecastModel(tmp_path, timezone=timezone)
     m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
     # Build a minimal forecast_df covering the next 48h
     future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
@@ -1575,8 +1575,7 @@ class TestPreparePredictionXNowNaive:
         from unittest import mock
 
         # Use a trained model so _engineer_features has the weather data it needs.
-        m, _ = _make_trained_model(tmp_path)
-        m._timezone = "Europe/Zurich"
+        m, _ = _make_trained_model(tmp_path, timezone="Europe/Zurich")
 
         # Freeze time to a CEST offset moment: 14:00 local = 12:00 UTC.
         # tz_convert(None) would drop to 12:00; tz_localize(None) keeps 14:00.

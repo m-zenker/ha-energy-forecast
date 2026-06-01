@@ -266,7 +266,9 @@ class EnergyForecast(hass.Hass):
             self._mqtt_publish_availability("online")
 
         model_dir = Path(__file__).parent / "models"
-        self._ml_model = EnergyForecastModel(model_dir, model_archive_count=self._model_archive_count)
+        self._ml_model = EnergyForecastModel(
+            model_dir, model_archive_count=self._model_archive_count, timezone=self._timezone
+        )
         self._lock = threading.Lock()
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
