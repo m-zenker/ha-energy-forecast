@@ -238,6 +238,7 @@ class EnergyForecastModel:
         self._log_transform: bool = False  # log1p target; False = backward compat
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
+        self._timezone: str = "Europe/Zurich"  # local timezone for wall-clock "now"
         # hour_of_week slots (0-167) with ≥ EV_HOW_MIN_FRACTION EV occurrences
         self._likely_ev_hours: set[int] = set()
         # Quantile models for prediction intervals (α=0.1, α=0.9)
@@ -747,7 +748,7 @@ class EnergyForecastModel:
         import numpy as np
         import pandas as pd
 
-        now_naive = pd.Timestamp.now(tz="Europe/Zurich").tz_convert(None)
+        now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
         future_df = pd.DataFrame({"timestamp": future_hours, "gross_kwh": np.nan})
@@ -1508,11 +1509,14 @@ class EnergyForecastModel:
         tau_estimates = [c[0] for c in selected]
 
         _LOGGER.debug(
-            "τ calibration: %d candidates, using top %d (%d%%) "
-            "(quality %.2f–%.2f, τ range %.1f–%.1f h)",
-            len(candidates), n_select, 100 // divisor,
-            selected[-1][1], selected[0][1],
-            min(tau_estimates), max(tau_estimates),
+            "τ calibration: %d candidates, using top %d (%d%%) (quality %.2f–%.2f, τ range %.1f–%.1f h)",
+            len(candidates),
+            n_select,
+            100 // divisor,
+            selected[-1][1],
+            selected[0][1],
+            min(tau_estimates),
+            max(tau_estimates),
         )
 
         tau_median = float(np.median(tau_estimates))
