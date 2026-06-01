@@ -2156,6 +2156,41 @@ class TestModelVersioning:
             m.rollback_model()
         assert any(archive_name in r.message for r in caplog.records)
 
+    def test_country_persisted_through_save_load(self, tmp_path):
+        """_country must survive a save/load cycle."""
+        from energy_forecast.model import EnergyForecastModel
+
+        model = EnergyForecastModel(tmp_path)
+        model._country = "DE"
+        model._save()
+
+        model2 = EnergyForecastModel(tmp_path)
+        model2._load()
+        assert model2._country == "DE", f"Expected 'DE', got {model2._country!r}"
+
+    def test_country_defaults_to_ch_when_absent_from_meta(self, tmp_path):
+        """Old meta without 'country' key must default to 'CH' on load (backward compat)."""
+        import pickle
+
+        from energy_forecast.model import EnergyForecastModel, _write_hash
+
+        model = EnergyForecastModel(tmp_path)
+        model._canton = "ZH"
+        model._country = "CH"
+        model._save()
+
+        # Tamper with meta: remove 'country' to simulate old format
+        with open(model._meta_path, "rb") as fh:
+            meta = pickle.load(fh)
+        meta.pop("country", None)
+        with open(model._meta_path, "wb") as fh:
+            pickle.dump(meta, fh)
+        _write_hash(model._meta_path)
+
+        model2 = EnergyForecastModel(tmp_path)
+        model2._load()
+        assert model2._country == "CH", f"Expected 'CH', got {model2._country!r}"
+
 
 # ── Occupancy feature (people_home) — #21 ──────────────────────────────────────
 

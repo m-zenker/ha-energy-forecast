@@ -1244,6 +1244,7 @@ class EnergyForecastModel:
             "feature_medians_by_how": self._feature_medians_by_how,
             "log_transform": self._log_transform,
             "canton": self._canton,
+            "country": self._country,
             "likely_ev_hours": self._likely_ev_hours,
             "sub_sensor_prefixes": self._sub_sensor_prefixes,
             "tau_hours": self._tau_hours,
@@ -1579,6 +1580,7 @@ class EnergyForecastModel:
                     self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform = meta.get("log_transform", False)
                     self._canton = meta.get("canton", None)
+                    self._country = meta.get("country", "CH")
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())
                     self._sub_sensor_prefixes = meta.get("sub_sensor_prefixes", [])
                     self._tau_hours = meta.get("tau_hours", None)
