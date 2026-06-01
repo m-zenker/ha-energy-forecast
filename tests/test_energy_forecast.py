@@ -2137,6 +2137,7 @@ def test_thermal_pressure_sensor_published():
             self._ml_model = MagicMock()
             self._ml_model._latest_thermal_pressure_net = 3.7
             self._ml_model._tau_hours = 18.5
+            self._mqtt_discovery = False
             self._calls = []
 
         def set_state(self, eid, **kw):
@@ -2149,3 +2150,58 @@ def test_thermal_pressure_sensor_published():
     assert c["entity_id"] == "sensor.energy_forecast_thermal_pressure_net"
     assert float(c["state"]) >= 0.0
     assert c["attributes"]["tau_hours"] == 18.5
+
+
+def test_publish_thermal_pressure_uses_mqtt_in_mqtt_mode():
+    """In MQTT mode, _publish_thermal_pressure must call _mqtt_set_sensor, not set_state."""
+    from unittest import mock
+
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    class _AppStub:
+        def __init__(self):
+            self._ml_model = mock.MagicMock()
+            self._ml_model._latest_thermal_pressure_net = 3.5
+            self._ml_model._tau_hours = 12.0
+            self._mqtt_discovery = True
+
+        def set_state(self, *a, **kw):
+            raise AssertionError("set_state must not be called in MQTT mode")
+
+        def _mqtt_set_sensor(self, unique_id, value):
+            self._mqtt_set_sensor_calls = getattr(self, "_mqtt_set_sensor_calls", [])
+            self._mqtt_set_sensor_calls.append((unique_id, value))
+
+        def _mqtt_publish_sensor_attributes(self, unique_id, attrs):
+            self._attr_calls = getattr(self, "_attr_calls", [])
+            self._attr_calls.append((unique_id, attrs))
+
+    stub = _AppStub()
+    EnergyForecast._publish_thermal_pressure(stub)
+
+    assert hasattr(stub, "_mqtt_set_sensor_calls"), "_mqtt_set_sensor was not called"
+    assert len(stub._mqtt_set_sensor_calls) == 1
+    assert stub._mqtt_set_sensor_calls[0][0] == "energy_forecast_thermal_pressure_net"
+
+
+def test_publish_thermal_pressure_tau_none_not_coerced_to_zero():
+    """tau_hours=None (uncalibrated) must be published as None, not 0.0."""
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    class _AppStub:
+        def __init__(self):
+            self._ml_model = MagicMock()
+            self._ml_model._latest_thermal_pressure_net = 1.0
+            self._ml_model._tau_hours = None
+            self._mqtt_discovery = False
+            self._calls = []
+
+        def set_state(self, eid, **kw):
+            self._calls.append({"entity_id": eid, **kw})
+
+    stub = _AppStub()
+    EnergyForecast._publish_thermal_pressure(stub)
+
+    assert len(stub._calls) == 1, "set_state should have been called once"
+    tau = stub._calls[0]["attributes"]["tau_hours"]
+    assert tau is None, f"tau_hours must be None when uncalibrated, got {tau!r}"

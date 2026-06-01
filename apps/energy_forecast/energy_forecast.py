@@ -708,6 +708,19 @@ class EnergyForecast(hass.Hass):
             "problem",
             json_attributes_topic=_anomaly_attrs_topic,
         )
+        # Thermal pressure (for HP optimiser)
+        _tp_attrs_topic = (
+            f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_thermal_pressure_net/attributes"
+        )
+        self._mqtt_publish_discovery(
+            "energy_forecast_thermal_pressure_net",
+            "Thermal Pressure (net)",
+            "°C·m²",
+            "mdi:thermometer",
+            None,
+            "measurement",
+            json_attributes_topic=_tp_attrs_topic,
+        )
 
     def terminate(self) -> None:
         """AppDaemon lifecycle hook — publish offline availability on shutdown."""
@@ -1547,6 +1560,8 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_today_high",
             "sensor.energy_forecast_tomorrow_low",
             "sensor.energy_forecast_tomorrow_high",
+            # Thermal pressure sensor (now served via MQTT)
+            "sensor.energy_forecast_thermal_pressure_net",
         ]
         # Block sensors
         for day in ("today", "tomorrow"):
@@ -1563,15 +1578,21 @@ class EnergyForecast(hass.Hass):
     def _publish_thermal_pressure(self) -> None:
         """Publish current-hour thermal_pressure_net for the HP optimiser."""
         value = self._ml_model._latest_thermal_pressure_net or 0.0
-        self.set_state(
-            "sensor.energy_forecast_thermal_pressure_net",
-            state=str(round(float(value), 3)),
-            attributes={
-                "tau_hours": self._ml_model._tau_hours or 0.0,
-                "unit_of_measurement": "°C·m²",
-                "friendly_name": "Thermal Pressure (net)",
-            },
-        )
+        tau = self._ml_model._tau_hours  # pass None as-is; consumer distinguishes None vs 0.0
+        attrs = {
+            "tau_hours": tau,
+            "unit_of_measurement": "°C·m²",
+            "friendly_name": "Thermal Pressure (net)",
+        }
+        if self._mqtt_discovery:
+            self._mqtt_set_sensor("energy_forecast_thermal_pressure_net", value)
+            self._mqtt_publish_sensor_attributes("energy_forecast_thermal_pressure_net", attrs)
+        else:
+            self.set_state(
+                "sensor.energy_forecast_thermal_pressure_net",
+                state=str(round(float(value), 3)),
+                attributes=attrs,
+            )
 
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
