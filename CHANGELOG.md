@@ -8,6 +8,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2-alpha-2] — 2026-06-01
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `get_scenario` HA service no longer crashes on every call; corrected `_appliance_signatures` (was `_signatures`) and `self.args` (was `self._cfg`) attribute lookups.
+- `apps/energy_forecast/model.py` — `_prepare_prediction_X` now uses `tz_localize(None)` to strip tzinfo without shifting timestamps (previous `tz_convert(None)` caused a 2 h offset in CEST). `timezone` is now a constructor parameter (default `"Europe/Zurich"`) wired from the app, replacing the hardcoded constant.
+- `apps/energy_forecast/energy_forecast.py` — `_actuals_history` now populates from `full_actuals` (raw pre-EV-split, pre-sub-sensor kWh) instead of `recent_actuals`, so mae_7d / mae_30d reflect true household consumption. EV hours remain excluded via `ev_hour_set`.
+- `apps/energy_forecast/model.py` — `_country` now persisted in model meta so holiday features survive restarts (previously reset to `"CH"` on every AppDaemon restart).
+- `apps/energy_forecast/energy_forecast.py` — `_publish_thermal_pressure()` now respects the `mqtt_discovery` flag; sensor registered via MQTT discovery and added to cleanup list (was creating a ghost entity outside the MQTT device).
+- `apps/energy_forecast/energy_forecast.py` — `tau_hours` attribute now passes `None` as-is when uncalibrated (previously coerced to `0.0`); HP optimiser in ha-energy-manager distinguishes uncalibrated (`None`) from zero-τ (`0.0`).
+- `apps/energy_forecast/model.py` — archive sidecar loop now correctly copies `regime_model.pkl.sha256`; previous `_artifacts[:-1]` slice skipped the last pickle. Fixed to filter `.pkl` files only.
+- `apps/energy_forecast/model.py` — τ calibration debug log now shows actual selection percentage instead of the constant `100 // divisor` (25 or 50).
+
+### Tests
+- 577 passing (up from 569 in v0.11.2-alpha-1; +8 covering get_scenario attribute lookups, timezone handling, _actuals_history source, _country persistence, MQTT discovery flag, tau_hours=None pass-through, archive sidecar filtering, and τ selectivity boundary).
+
+---
+
 ## [0.11.2-alpha-1] — 2026-05-31
 
 ### Added
