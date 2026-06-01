@@ -2191,6 +2191,35 @@ class TestModelVersioning:
         model2._load()
         assert model2._country == "CH", f"Expected 'CH', got {model2._country!r}"
 
+    def test_archive_copies_sidecar_for_regime_model(self, tmp_path):
+        """regime_model.pkl.sha256 must be present in the archive snapshot."""
+        from energy_forecast.model import EnergyForecastModel, _write_hash
+
+        model = EnergyForecastModel(tmp_path)
+        model_dir = model._model_dir
+        archive_dir = model._archive_dir
+
+        # Create fake artifacts using the real filenames (energy_model.pkl triggers archive)
+        pkl_files = [
+            "energy_model.pkl",
+            "meta.pkl",
+            "energy_model_q10.pkl",
+            "energy_model_q90.pkl",
+            "clusterer.pkl",
+            "regime_model.pkl",
+        ]
+        for fname in pkl_files + ["energy_model_interval_correction.json"]:
+            (model_dir / fname).write_bytes(b"fake")
+            if fname.endswith(".pkl"):
+                _write_hash(model_dir / fname)
+
+        model._archive_current()
+
+        archives = list(archive_dir.iterdir())
+        assert len(archives) == 1, "Expected one archive snapshot"
+        snap = archives[0]
+        assert (snap / "regime_model.pkl.sha256").exists(), "regime_model.pkl.sha256 must be in archive but is missing"
+
 
 # ── Occupancy feature (people_home) — #21 ──────────────────────────────────────
 
@@ -4450,6 +4479,71 @@ class TestTauCalibrationSafeguards:
         # Both should be near the true τ since the decay is identical
         assert 5.0 < result_night < 20.0
         assert 5.0 < result_day < 20.0
+
+    def test_tau_calibration_log_shows_actual_percentage(self, tmp_path, monkeypatch, caplog):
+        """Debug log must show round(actual%) not 100//divisor.
+
+        With 9 candidates (threshold patched to 8): divisor=4, n_select=2,
+        actual = round(100*2/9) = 22. Old code: 100//4 = 25.
+        """
+        import logging
+
+        import pandas as pd
+
+        model = _make_tau_model(tmp_path)
+        monkeypatch.setattr(EnergyForecastModel, "_TAU_SELECTIVITY_THRESHOLD", 8)
+
+        # 4 good (nighttime) + 5 poor (daytime) = 9 candidates ≥ threshold 8
+        good_dfs, good_heat, good_wx = self._make_night_blocks(tau_true=10.0, n_days=4, start_hour=22)
+        poor_dfs, poor_heat, poor_wx = self._make_night_blocks(tau_true=50.0, n_days=5, start_hour=10)
+
+        climate_dfs = {
+            "climate.room": pd.concat([list(good_dfs.values())[0], list(poor_dfs.values())[0]])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        }
+        heating_df = pd.concat([good_heat, poor_heat]).sort_values("timestamp").reset_index(drop=True)
+        weather_df = pd.concat([good_wx, poor_wx]).sort_values("timestamp").reset_index(drop=True)
+
+        with caplog.at_level(logging.DEBUG):
+            model._calibrate_tau(climate_dfs, heating_df, weather_df)
+
+        tau_logs = [r.message for r in caplog.records if "candidates, using top" in r.message]
+        assert tau_logs, "Expected a τ calibration DEBUG log entry with 'candidates, using top'"
+        log_msg = tau_logs[0]
+        assert "25%" not in log_msg, f"Old 100//divisor='25%' still in log: {log_msg}"
+        assert "22%" in log_msg, f"Expected '22%' in log: {log_msg}"
+
+    def test_selectivity_boundary_exactly_at_threshold(self, tmp_path, monkeypatch):
+        """At exactly _TAU_SELECTIVITY_THRESHOLD candidates, top-25% (not top-50%) must be used.
+
+        Threshold=4, exactly 4 candidates: 2 good (τ≈10, nighttime) + 2 poor (τ≈50, daytime).
+        top-25% of 4 = 1 window → median ≈ 10.
+        top-50% of 4 = 2 windows → median of 1 good + 1 poor ≈ 30.
+        So result < 30 proves the >= boundary fires (not >).
+        """
+        import pandas as pd
+
+        model = _make_tau_model(tmp_path)
+        monkeypatch.setattr(EnergyForecastModel, "_TAU_SELECTIVITY_THRESHOLD", 4)
+
+        good_dfs, good_heat, good_wx = self._make_night_blocks(tau_true=10.0, n_days=2, start_hour=22)
+        poor_dfs, poor_heat, poor_wx = self._make_night_blocks(tau_true=50.0, n_days=2, start_hour=10)
+
+        climate_dfs = {
+            "climate.room": pd.concat([list(good_dfs.values())[0], list(poor_dfs.values())[0]])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        }
+        heating_df = pd.concat([good_heat, poor_heat]).sort_values("timestamp").reset_index(drop=True)
+        weather_df = pd.concat([good_wx, poor_wx]).sort_values("timestamp").reset_index(drop=True)
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+
+        assert result is not None
+        assert result < 30.0, (
+            f"Expected result close to good τ≈10 (top-25%), got {result:.1f} — 50% branch was used (>= boundary broken)"
+        )
 
 
 # ── Auto-K Regime Selection ───────────────────────────────────────────────────

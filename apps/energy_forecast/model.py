@@ -1185,7 +1185,7 @@ class EnergyForecastModel:
                 if src.exists():
                     shutil.copy2(src, snap_dir / src.name)
             # Copy SHA-256 sidecars for pickle files
-            for src in _artifacts[:-1]:  # skip the .json (no sidecar)
+            for src in [a for a in _artifacts if a.suffix == ".pkl"]:  # only pickles have sidecars
                 sidecar = src.with_suffix(src.suffix + ".sha256")
                 if sidecar.exists():
                     shutil.copy2(sidecar, snap_dir / sidecar.name)
@@ -1513,7 +1513,7 @@ class EnergyForecastModel:
             "τ calibration: %d candidates, using top %d (%d%%) (quality %.2f–%.2f, τ range %.1f–%.1f h)",
             len(candidates),
             n_select,
-            100 // divisor,
+            round(100 * n_select / len(candidates)),
             selected[-1][1],
             selected[0][1],
             min(tau_estimates),
