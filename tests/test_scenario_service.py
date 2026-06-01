@@ -8,6 +8,7 @@ Covers:
   - _get_scenario_cb: invalid schedule type → WARNING logged, fire_event not called
   - _publish_scenario_forecast: set_state call count, entity IDs, value correctness
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -16,18 +17,19 @@ import pandas as pd
 
 # ── Minimal stand-in for EnergyForecast ──────────────────────────────────────
 
+
 def _make_app(cached_df=None):
     """Build a minimal fake EnergyForecast instance for callback testing."""
     app = MagicMock()
-    app._cached_forecast_df    = cached_df
-    app._cached_live_temp      = 12.0
+    app._cached_forecast_df = cached_df
+    app._cached_live_temp = 12.0
     app._cached_recent_actuals = None
-    app._cached_sub_sensors    = None
-    app._cached_away_series    = None
-    app._cached_people_home    = None
+    app._cached_sub_sensors = None
+    app._cached_away_series = None
+    app._cached_people_home = None
     app._cached_climate_recent = None
-    app._cached_dhw_recent     = None
-    app._timezone              = "Europe/Zurich"
+    app._cached_dhw_recent = None
+    app._timezone = "Europe/Zurich"
     return app
 
 
@@ -38,8 +40,8 @@ def _make_baseline_df(start="2024-06-01 10:00", n=48):
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
-class TestGetScenarioCb:
 
+class TestGetScenarioCb:
     def test_no_cache_logs_warning(self, caplog):
         """When _cached_forecast_df is None, should log WARNING and return without error."""
         import logging
@@ -50,8 +52,7 @@ class TestGetScenarioCb:
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(app, "homeassistant", "energy_forecast", "get_scenario", {})
 
-        assert any("before first" in r.message for r in caplog.records), \
-            "Expected a WARNING log when cache is None"
+        assert any("before first" in r.message for r in caplog.records), "Expected a WARNING log when cache is None"
         app.fire_event.assert_not_called()
 
     def test_fires_result_event_with_forecast(self):
@@ -67,7 +68,10 @@ class TestGetScenarioCb:
         app._ml_model.predict_scenario.return_value = scenario_result
 
         EnergyForecast._get_scenario_cb(
-            app, "homeassistant", "energy_forecast", "get_scenario",
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
             {"schedule": {}, "publish": False},
         )
 
@@ -91,7 +95,10 @@ class TestGetScenarioCb:
         app._ml_model.predict_scenario.return_value = scenario_result
 
         EnergyForecast._get_scenario_cb(
-            app, "homeassistant", "energy_forecast", "get_scenario",
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
             {"schedule": {"sub_dw": "14:00"}, "publish": True},
         )
 
@@ -100,7 +107,6 @@ class TestGetScenarioCb:
 
 
 class TestGetScenarioCbErrors:
-
     def test_predict_scenario_exception_logged(self, caplog):
         """When predict_scenario raises, ERROR must be logged and fire_event not called."""
         import logging
@@ -113,12 +119,16 @@ class TestGetScenarioCbErrors:
 
         with caplog.at_level(logging.ERROR, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "homeassistant", "energy_forecast", "get_scenario",
+                app,
+                "homeassistant",
+                "energy_forecast",
+                "get_scenario",
                 {"schedule": {}, "publish": False},
             )
 
-        assert any(r.levelno == logging.ERROR for r in caplog.records), \
+        assert any(r.levelno == logging.ERROR for r in caplog.records), (
             "Expected ERROR log when predict_scenario raises"
+        )
         app.fire_event.assert_not_called()
 
     def test_invalid_schedule_type_logs_warning(self, caplog):
@@ -132,26 +142,31 @@ class TestGetScenarioCbErrors:
 
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "homeassistant", "energy_forecast", "get_scenario",
+                app,
+                "homeassistant",
+                "energy_forecast",
+                "get_scenario",
                 {"schedule": "not-a-dict", "publish": False},
             )
 
-        assert any(r.levelno == logging.WARNING for r in caplog.records), \
+        assert any(r.levelno == logging.WARNING for r in caplog.records), (
             "Expected WARNING log for invalid schedule type"
+        )
         app.fire_event.assert_not_called()
 
 
 class TestPublishScenarioForecast:
-
     def _make_result_df(self, value_kwh: float = 1.0):
         """Build a 48-row result_df anchored to today midnight (naive UTC)."""
         today = pd.Timestamp.now(tz="Europe/Zurich").normalize().tz_localize(None)
         ts = pd.date_range(today, periods=48, freq="1h")
-        return pd.DataFrame({
-            "timestamp": ts,
-            "predicted_kwh": [value_kwh] * 48,
-            "delta_kwh": [0.1] * 48,
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": ts,
+                "predicted_kwh": [value_kwh] * 48,
+                "delta_kwh": [0.1] * 48,
+            }
+        )
 
     def test_set_state_called_correct_count(self):
         """_publish_scenario_forecast should call set_state exactly 11 times."""
@@ -201,7 +216,7 @@ class TestPublishScenarioForecast:
 
         states = {c.args[0]: c.kwargs["state"] for c in app.set_state.call_args_list}
         # 24 hours × 2.0 kWh = 48.0
-        assert states["sensor.energy_forecast_scenario_today"]    == "48.0"
+        assert states["sensor.energy_forecast_scenario_today"] == "48.0"
         assert states["sensor.energy_forecast_scenario_tomorrow"] == "48.0"
         # Each 3-hour block: 3 × 2.0 = 6.0
         assert states["sensor.energy_forecast_scenario_today_00_03"] == "6.0"
@@ -210,19 +225,61 @@ class TestPublishScenarioForecast:
 
 # ── Stage 2: schedule validation and version string ───────────────────────────
 
+
 class TestGetScenarioValidation:
     """#72 — schedule dict key/value validation."""
 
     def _make_app_with_signatures(self, prefix="wm"):
         """App with one known signature prefix and no cfg sub_energy_sensors."""
         from unittest.mock import MagicMock
+
         app = _make_app(cached_df=_make_baseline_df())
         sig_mock = MagicMock()
         sig_mock.__iter__ = MagicMock(return_value=iter([prefix]))
         sig_mock.keys = MagicMock(return_value={prefix})
-        app._ml_model._signatures = {prefix: {}}
-        app._cfg = {}
+        app._ml_model._appliance_signatures = {prefix: {}}
+        app.args = {}
         return app
+
+    def test_get_scenario_uses_correct_attribute_names(self):
+        """get_scenario must read _appliance_signatures and self.args, not _signatures/_cfg."""
+        from unittest import mock
+
+        import pandas as pd
+
+        app = _make_app()
+        app._ml_model = mock.MagicMock()
+        app._ml_model._appliance_signatures = {"dishwasher": {}}
+        # _signatures must NOT exist on the mock — delete to ensure code doesn't touch it
+        del app._ml_model._signatures
+
+        app.args = {"sub_energy_sensors": {"sensor.dishwasher": "dishwasher"}}
+
+        # Patch predict_scenario to return a minimal DataFrame
+        app._ml_model.predict_scenario = mock.MagicMock(
+            return_value=pd.DataFrame({"timestamp": [], "predicted_kwh": [], "delta_kwh": []})
+        )
+        app._cached_forecast_df = mock.MagicMock()
+        app._cached_live_temp = 18.0
+        app._cached_recent_actuals = None
+        app._cached_sub_sensors = {}
+        app._cached_away_series = None
+        app._cached_people_home = None
+        app._cached_climate_recent = None
+        app._cached_dhw_recent = None
+
+        # Should not raise and predict_scenario must have been called
+        # (proves execution got past the valid_prefixes line without AttributeError)
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {"dishwasher": "20:00"}},
+        )
+        app._ml_model.predict_scenario.assert_called_once()
 
     def test_unknown_prefix_ignored(self, caplog):
         """An unknown schedule key logs WARNING and is not forwarded to predict_scenario."""
@@ -235,13 +292,14 @@ class TestGetScenarioValidation:
 
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "ha", "ef", "get_scenario",
+                app,
+                "ha",
+                "ef",
+                "get_scenario",
                 {"schedule": {"unknown_device": "08:00"}, "publish": False},
             )
 
-        assert any("unknown prefix" in r.message for r in caplog.records), (
-            "Expected 'unknown prefix' WARNING"
-        )
+        assert any("unknown prefix" in r.message for r in caplog.records), "Expected 'unknown prefix' WARNING"
         # predict_scenario should be called with cleaned (empty) schedule
         call_kwargs = app._ml_model.predict_scenario.call_args
         passed_schedule = call_kwargs[0][2] if call_kwargs[0] else call_kwargs[1].get("schedule", "NOT CALLED")
@@ -260,13 +318,14 @@ class TestGetScenarioValidation:
 
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "ha", "ef", "get_scenario",
+                app,
+                "ha",
+                "ef",
+                "get_scenario",
                 {"schedule": {"wm": "25:99"}, "publish": False},  # invalid time
             )
 
-        assert any("invalid time" in r.message for r in caplog.records), (
-            "Expected 'invalid time' WARNING"
-        )
+        assert any("invalid time" in r.message for r in caplog.records), "Expected 'invalid time' WARNING"
 
     def test_valid_schedule_passes_through(self, caplog):
         """A valid HH:MM entry does NOT trigger any schedule warning."""
@@ -279,12 +338,14 @@ class TestGetScenarioValidation:
 
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "ha", "ef", "get_scenario",
+                app,
+                "ha",
+                "ef",
+                "get_scenario",
                 {"schedule": {"wm": "08:30"}, "publish": False},
             )
 
-        assert not any("unknown prefix" in r.message or "invalid time" in r.message
-                       for r in caplog.records)
+        assert not any("unknown prefix" in r.message or "invalid time" in r.message for r in caplog.records)
 
     def test_off_value_passes_through(self, caplog):
         """'off' is a valid value and should not trigger a time-format warning."""
@@ -297,7 +358,10 @@ class TestGetScenarioValidation:
 
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._get_scenario_cb(
-                app, "ha", "ef", "get_scenario",
+                app,
+                "ha",
+                "ef",
+                "get_scenario",
                 {"schedule": {"wm": "off"}, "publish": False},
             )
 

@@ -764,8 +764,8 @@ class EnergyForecast(hass.Hass):
                 return
 
             # Validate keys and time values; silently drop invalid entries
-            valid_prefixes = set(self._ml_model._signatures.keys()) | set(
-                (self._cfg or {}).get("sub_energy_sensors", {}).keys()
+            valid_prefixes = set(self._ml_model._appliance_signatures.keys()) | set(
+                (self.args or {}).get("sub_energy_sensors", {}).keys()
             )
             cleaned: dict = {}
             for key, val in schedule.items():
