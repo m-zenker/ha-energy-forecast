@@ -17,7 +17,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - `apps/energy_forecast/energy_forecast.py` — EV-charging hours (where `gross_kwh > ev_charging_threshold`) excluded from `_actuals_history` and the adaptive retrain MAE comparison, so EV charging no longer inflates the 7d/30d rolling MAE and does not spuriously trigger adaptive retraining.
 - `apps/energy_forecast/energy_forecast.py` — redundant thermal pressure update removed from `predict_intervals()`; added guard for `tau_hours=None` to prevent `AttributeError`.
-- `apps/energy_forecast/model.py` — `_latest_thermal_pressure_net` now updated inside `predict_intervals()` so it reflects interval-prediction context rather than stale training-time state.
+- `apps/energy_forecast/model.py` — `_latest_thermal_pressure_net` now updated inside `predict()` so it reflects prediction context rather than stale training-time state.
 
 ### Changed
 - Ruff linter (target-version py313, line-length 120), pre-commit hooks, pytest-cov, and Forgejo CI workflow added to project.
