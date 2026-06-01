@@ -4258,12 +4258,15 @@ class TestTauCalibrationSafeguards:
         t_in_start: float = 22.0,
         t_out: float = 5.0,
         radiation: float = 0.0,
+        day_start: int = 10,
     ) -> tuple:
         """Build climate/heating/weather DataFrames with *n_days* separated night blocks.
 
         Each block: *window_hours* of heating-off at *start_hour*, followed by
         1 heating-on row to close the block.  Start hour defaults to 20:00 so no
         block touches 09:00–15:00 (assuming window_hours ≤ 13).
+        *day_start* sets the first day-of-month (default 10); use different values
+        to create non-overlapping date ranges when combining two fixture sets.
         """
         import pandas as pd
 
@@ -4272,7 +4275,7 @@ class TestTauCalibrationSafeguards:
         heat_list: list = []
 
         for day in range(n_days):
-            base = pd.Timestamp(f"2026-01-{10 + day:02d} {start_hour:02d}:00")
+            base = pd.Timestamp(f"2026-01-{day_start + day:02d} {start_hour:02d}:00")
             t_in = t_in_start
             for j in range(window_hours):
                 ts_list.append(base + pd.Timedelta(hours=j))
@@ -4544,6 +4547,128 @@ class TestTauCalibrationSafeguards:
         assert result < 30.0, (
             f"Expected result close to good τ≈10 (top-25%), got {result:.1f} — 50% branch was used (>= boundary broken)"
         )
+
+    # ── Improvement tests ────────────────────────────────────────────────────
+
+    def test_warm_outdoor_windows_downweighted_vs_cold(self, tmp_path):
+        """outdoor_temp_score penalises warm-weather windows, NOT captured by delta_t_score.
+
+        Both groups have ΔT=10°C (delta_t_score=1.0 for both — so delta_t_score
+        cannot differentiate them).  The cold group (T_out=2°C) should score higher
+        than the warm group (T_out=17°C) because outdoor_temp_score penalises warm
+        outdoor temps (exp(-(17-10)/8)≈0.42 vs 1.0 for cold).
+
+        5 cold-outdoor nighttime windows (T_out=2°C, τ=8h) vs 5 warm-outdoor nighttime
+        windows (T_out=17°C, τ=35h) → result should be closer to 8h than to 35h.
+        """
+        # ΔT = t_in_start - t_out = 10°C for BOTH groups → delta_t_score=1.0 for both.
+        # Same start_hour=22 (nighttime) → identical hour_score → only outdoor_temp_score differs.
+        # Warm group uses day_start=10 so it sorts FIRST in the candidate list; without
+        # outdoor_temp_score, warm windows win by date order → result≈35h → test fails.
+        # After the fix, outdoor_temp_score suppresses warm windows regardless of order.
+        warm_dfs, warm_heat, warm_wx = self._make_night_blocks(
+            tau_true=35.0, n_days=5, start_hour=22, t_out=17.0, t_in_start=27.0, day_start=10
+        )
+        cold_dfs, cold_heat, cold_wx = self._make_night_blocks(
+            tau_true=8.0, n_days=5, start_hour=22, t_out=2.0, t_in_start=12.0, day_start=20
+        )
+
+        climate_dfs = {
+            "climate.room": pd.concat([list(cold_dfs.values())[0], list(warm_dfs.values())[0]])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        }
+        heating_df = pd.concat([cold_heat, warm_heat]).sort_values("timestamp").reset_index(drop=True)
+        weather_df = pd.concat([cold_wx, warm_wx]).sort_values("timestamp").reset_index(drop=True)
+
+        model = _make_tau_model(tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+
+        assert result is not None
+        assert result < 20.0, f"Cold-outdoor (τ≈8h) windows should dominate warm-outdoor (τ≈35h); got τ={result:.1f}h"
+
+    def test_daytime_penalty_suppresses_daytime_when_nighttime_has_moderate_radiation(self, tmp_path):
+        """0.1 hour penalty (not 0.3) is needed when nighttime competes with clear daytime windows.
+
+        5 nighttime windows with moderate radiation (radiation=500 W/m²):
+          solar_score = exp(-500/400) ≈ 0.287
+          quality ≈ r² × outdoor_temp × n × 0.287 × 1.0  ≈ 0.287
+
+        5 daytime windows with zero radiation:
+          quality (0.3 penalty) = r² × outdoor_temp × n × 1.0 × 0.3 = 0.300  → day > night → 40h wins
+          quality (0.1 penalty) = r² × outdoor_temp × n × 1.0 × 0.1 = 0.100  → night > day → 8h wins
+
+        With old 0.3 penalty daytime quality (0.30) beats nighttime quality (0.287), so
+        all 5 daytime windows fill the top-50% → median≈40h.
+        With new 0.1 penalty nighttime quality (0.287) beats daytime (0.10) → top-50%
+        is all 5 nighttime windows → median≈8h.
+        """
+        # Nighttime windows with moderate radiation — quality ≈ 0.287
+        night_dfs, night_heat, night_wx = self._make_night_blocks(
+            tau_true=8.0, n_days=5, start_hour=22, t_out=5.0, radiation=500.0
+        )
+        # Daytime windows, zero radiation — quality (old) 0.3, (new) 0.1
+        day_dfs, day_heat, day_wx = self._make_night_blocks(
+            tau_true=40.0, n_days=5, start_hour=10, t_out=5.0, radiation=0.0
+        )
+
+        climate_dfs = {
+            "climate.room": pd.concat([list(night_dfs.values())[0], list(day_dfs.values())[0]])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        }
+        heating_df = pd.concat([night_heat, day_heat]).sort_values("timestamp").reset_index(drop=True)
+        weather_df = pd.concat([night_wx, day_wx]).sort_values("timestamp").reset_index(drop=True)
+
+        model = _make_tau_model(tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+
+        assert result is not None
+        assert result < 20.0, (
+            f"Nighttime windows (solar_score≈0.287) should outrank daytime (0.1 penalty); got τ={result:.1f}h"
+        )
+
+    def test_spring_bias_guard_preserves_stored_tau(self, tmp_path):
+        """All-daytime + warm-outdoor → stored winter τ is preserved, not overwritten.
+
+        When every candidate is daytime (night_fraction=0) AND outdoor median > 12°C,
+        _calibrate_tau returns the stored _tau_hours instead of the spring estimate.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 25.0  # stored winter τ
+
+        # 5 daytime windows at T_out=18°C → night_frac=0%, outdoor_median=18°C > 12°C
+        bias_dfs, bias_heat, bias_wx = self._make_night_blocks(tau_true=5.0, n_days=5, start_hour=10, t_out=18.0)
+
+        result = model._calibrate_tau(bias_dfs, bias_heat, bias_wx)
+
+        assert result == 25.0, f"Spring-biased calibration should preserve stored τ=25.0h; got {result}"
+
+    def test_spring_bias_guard_not_triggered_without_stored_tau(self, tmp_path):
+        """Guard only fires when a stored τ exists — first-run proceeds normally."""
+        model = _make_tau_model(tmp_path)
+        # _tau_hours is None (fresh model) — guard must not suppress calibration
+
+        bias_dfs, bias_heat, bias_wx = self._make_night_blocks(tau_true=5.0, n_days=5, start_hour=10, t_out=18.0)
+
+        result = model._calibrate_tau(bias_dfs, bias_heat, bias_wx)
+
+        assert result is not None, "First-run calibration should proceed even with spring-biased data"
+
+    def test_spring_bias_guard_not_triggered_with_cold_outdoor(self, tmp_path):
+        """Guard requires warm outdoor (>12°C) — cold outdoor must not suppress calibration."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 25.0
+
+        # 100% daytime windows but T_out=5°C → outdoor_median=5°C < 12°C → guard off
+        cold_day_dfs, cold_day_heat, cold_day_wx = self._make_night_blocks(
+            tau_true=10.0, n_days=5, start_hour=10, t_out=5.0
+        )
+
+        result = model._calibrate_tau(cold_day_dfs, cold_day_heat, cold_day_wx)
+
+        assert result is not None
+        assert result != 25.0, "Cold outdoor should allow τ to update even for daytime windows"
 
 
 # ── Auto-K Regime Selection ───────────────────────────────────────────────────

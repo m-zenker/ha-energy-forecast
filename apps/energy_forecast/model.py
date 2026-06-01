@@ -220,6 +220,8 @@ class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
     _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
+    _SPRING_BIAS_NIGHT_FRAC: float = 0.15  # fraction of nighttime candidates below which guard fires
+    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median above which guard fires
 
     def __init__(self, model_dir: Path, model_archive_count: int = 3, timezone: str = "Europe/Zurich") -> None:
         self._model_dir = model_dir
@@ -1360,12 +1362,17 @@ class EnergyForecastModel:
         Windows are scored rather than hard-filtered.  Each candidate receives a
         composite quality score (0–1):
 
-        * ``r²``       — goodness of OLS log-linear fit (primary signal quality indicator;
-                         candidates with r² ≤ 0 are dropped as physics failures)
-        * ``ΔT score`` — initial indoor−outdoor gap normalised to 5 °C (SNR proxy)
-        * ``n score``  — length bonus, capped at 6 points
-        * ``solar``    — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
-        * ``hour``     — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.3 daytime
+        * ``r²``             — goodness of OLS log-linear fit (primary signal quality indicator;
+                               candidates with r² ≤ 0 are dropped as physics failures)
+        * ``outdoor_temp``   — ``exp(−max(T_out_mean − 10, 0) / 8)``; penalises warm-weather
+                               windows where open-window ventilation shortens apparent τ
+        * ``n score``        — length bonus, capped at 6 points
+        * ``solar``          — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
+        * ``hour``           — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.1 daytime
+
+        A spring-bias guard is applied before selection: if fewer than 15 % of candidates
+        are nighttime AND the heating-off outdoor median exceeds 12 °C, the stored τ is
+        preserved (spring open-window data is not representative of building thermal mass).
 
         The top 50 % of candidates by quality (minimum 1) are used to compute the
         median τ, which is then EMA-smoothed against the stored value.
@@ -1418,7 +1425,7 @@ class EnergyForecastModel:
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
-        candidates: list[tuple[float, float]] = []  # (tau, quality)
+        candidates: list[tuple[float, float, int]] = []  # (tau, quality, hour_start)
 
         n_blocks = combined[combined["off"] == 1]["block"].nunique()
         _LOGGER.debug("τ calibration: %d heating-off blocks found in combined data", n_blocks)
@@ -1468,8 +1475,12 @@ class EnergyForecastModel:
                 if r2 <= 0.0:
                     continue
 
-                # ΔT SNR: normalised to 5 °C ceiling (larger gap = cleaner signal)
-                delta_t_score = min(d[0] / 5.0, 1.0)
+                # Outdoor temperature score: penalises warm-weather windows where open
+                # ventilation dominates (replaces delta_t_score, which had no empirical
+                # correlation with τ accuracy in real-world data).
+                # exp(-(T_out_mean - 10) / 8): score=1.0 at ≤10°C, ≈0.29 at 20°C, ≈0.08 at 30°C.
+                sub_t_outdoor = float(group["T_outdoor"].iloc[s:e_cap].mean())
+                outdoor_temp_score = float(np.exp(-max(sub_t_outdoor - 10.0, 0.0) / 8.0))
 
                 # Length bonus — capped at 6 points
                 n_score = min(len(d) / 6.0, 1.0)
@@ -1481,11 +1492,13 @@ class EnergyForecastModel:
                     sub_max_rad = 0.0
                 solar_score = float(np.exp(-sub_max_rad / 400.0))
 
-                # Hour-of-day penalty applied at sub-sequence level
+                # Hour-of-day penalty applied at sub-sequence level.
+                # Daytime reduced to 0.1 (from 0.3) — empirically, daytime windows
+                # produce τ estimates 5× shorter than nighttime ones due to ventilation.
                 sub_hours = np.asarray(group.index[s:e_cap].hour)
                 hour_scores = np.where(
                     (sub_hours >= 9) & (sub_hours < 16),
-                    0.3,
+                    0.1,
                     np.where(
                         ((sub_hours >= 6) & (sub_hours < 9)) | ((sub_hours >= 16) & (sub_hours < 22)),
                         0.7,
@@ -1493,13 +1506,31 @@ class EnergyForecastModel:
                     ),
                 )
                 hour_score = float(hour_scores.min())
+                hour_start = int(group.index[s].hour)
 
-                quality = r2 * delta_t_score * n_score * solar_score * hour_score
-                candidates.append((tau, quality))
+                quality = r2 * outdoor_temp_score * n_score * solar_score * hour_score
+                candidates.append((tau, quality, hour_start))
 
         if not candidates:
             _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
+
+        # Spring-bias guard: if almost no nighttime candidates exist and outdoor temps
+        # are warm, the estimates are dominated by open-window ventilation rather than
+        # structural thermal mass.  Preserve the stored winter τ in that case.
+        old_tau = self._tau_hours
+        if old_tau is not None and old_tau > 0 and len(candidates) >= 3:
+            night_frac = sum(1 for _, _, h in candidates if h >= 22 or h < 6) / len(candidates)
+            outdoor_median = float(combined[combined["off"] == 1]["T_outdoor"].median())
+            if night_frac < self._SPRING_BIAS_NIGHT_FRAC and outdoor_median > self._SPRING_BIAS_OUTDOOR_TEMP:
+                _LOGGER.info(
+                    "τ calibration skipped — spring/summer bias (%.0f%% nighttime candidates, "
+                    "T_out median=%.1f°C); preserving stored τ=%.1f h.",
+                    night_frac * 100,
+                    outdoor_median,
+                    old_tau,
+                )
+                return old_tau
 
         # With few candidates use top-50%; with many (≥ threshold) tighten to top-25%
         # to reduce bias from lower-quality windows in data-rich retrains.
@@ -1522,7 +1553,6 @@ class EnergyForecastModel:
 
         tau_median = float(np.median(tau_estimates))
 
-        old_tau = self._tau_hours
         if old_tau is not None and old_tau > 0:
             change_frac = abs(tau_median - old_tau) / old_tau
             if change_frac > 0.5:
