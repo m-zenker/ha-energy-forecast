@@ -5,14 +5,14 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.11.1-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-562%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.11.2-blue)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-582%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
 
-> **Status:** v0.11.1 — stable release consolidating τ calibration fixes, lag NaN fill improvements, and EWMA gap handling.
+> **Status:** v0.11.2-alpha-2 on dev. v0.11.1 is the current stable release on main.
 
 **What you get:**
 - Trains entirely on *your* historical grid-import data — no generic model, no cloud dependency
@@ -484,8 +484,9 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | `sensor.energy_forecast_mae_7d` | Rolling mean absolute error over the last 7 days. Attribute `n_pairs` shows how many prediction–actual pairs were used. State is `"0.0"` until enough history accumulates. |
 | `sensor.energy_forecast_mae_30d` | Rolling MAE over the last 30 days (`n_pairs` attribute). Reaches full depth after ~30 days. |
 | `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
-| `sensor.energy_forecast_mae_7d_pct` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. |
-| `sensor.energy_forecast_mae_30d_pct` | Rolling relative MAE over the last 30 days (%). |
+| `sensor.energy_forecast_relative_mae_7d` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. |
+| `sensor.energy_forecast_relative_mae_30d` | Rolling relative MAE over the last 30 days (%). |
+| `sensor.energy_forecast_thermal_pressure_net` | Thermal pressure (heat deficit minus solar gain) for the current hour. Unit: °C·m². Attribute: `tau_hours` (building thermal time constant in hours; `null` when uncalibrated). Consumed by `ha-energy-manager` heat pump optimiser. |
 
 ### Anomaly detection
 
@@ -551,10 +552,11 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Cyclical encodings | sin/cos of hour, day-of-week, month, day-of-year (`doy_sin`/`doy_cos`) |
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
+| Heating system | `hp_heating_degree` (`max(0, 15 − temp_c)` — HP-calibrated heat demand threshold), `temp_in_neutral_zone` (binary: 1 when 15 ≤ temp_c ≤ 22 °C, i.e. HP dead-band), `heating_active` (seasonal binary flag from `heating_system_active_entity`; defaults to 1) |
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
 | Thermal & DHW intent | `thermal_pressure` (area-weighted HVAC setpoint − current temp; °C·h), `thermal_pressure_max` (largest per-room deficit), `thermal_pressure_std` (room temperature spread), `thermal_pressure_cop` (deficit scaled by inverse outdoor COP — electrical urgency), `thermal_pressure_net` (thermal pressure reduced by passive solar gain), `weighted_solar_gain` (direct radiation weighted by south-facing half-cosine window), `dhw_pressure` (buffer heat-loss urgency score); all zero when not configured |
 | Physics | `humidity` (relative humidity %), `infiltration_pressure` (wind speed × thermal gradient — cold-air infiltration proxy), `defrost_risk` (humidity-scaled Gaussian at +2 °C — heat-pump defrost cycle proxy) |
-| Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_24h`, `lag_48h`, `lag_72h`, `lag_168h`, `lag_336h` (daily/weekly) |
+| Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_48h`, `lag_72h` (medium horizon); `lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated` (daily/weekly — temperature-delta gated to prevent over-anchoring to heating-season baselines during warm-season transition) |
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
 | EV probability | `likely_ev_hour` — binary flag per hour-of-week slot where EV sessions were historically ≥ 15% frequent |
@@ -737,7 +739,7 @@ Add the following to `apps.yaml` (requires `scikit-learn`):
 
 ### How it works
 
-1.  **Clustering**: The system takes your historical 24-hour consumption profiles and groups them into $K$ regimes using K-Means.
+1.  **Clustering**: The system takes your historical 24-hour consumption profiles — with EV charging hours removed — and groups them into $K$ regimes using K-Means. Using EV-subtracted data ensures regimes capture genuine household shape patterns (workday rhythm, weekend rhythm, high-heating days) rather than EV session timing.
 2.  **Regime Predictor**: A secondary classifier is trained to predict which regime a given day belongs to, based on the **weather forecast** and the **calendar**.
 3.  **Feature Integration**: For the 48-hour forecast, the system predicts the regime for "Today" and "Tomorrow" and passes the expected 24-hour profile as a strong hint (`regime_kwh`) to the main forecast model.
 
@@ -955,11 +957,12 @@ All sensors are registered at startup. The 6 prediction-interval sensors (`*_low
 | Forecast totals (`next_1h`, `next_3h`, `today`, `tomorrow`) | 4 |
 | 3-hour blocks (today + tomorrow) | 16 |
 | EV actuals (`ev_today`, `ev_yesterday`) | 2 |
-| Model diagnostics (`mae`, `mae_7d`, `mae_30d`) | 3 |
+| Model diagnostics (`mae`, `mae_7d`, `mae_30d`, `relative_mae_7d`, `relative_mae_30d`) | 5 |
 | Setup status | 1 |
 | Anomaly detection (`unusual_consumption`) | 1 |
+| Thermal pressure (`thermal_pressure_net`) | 1 |
 | Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
-| **Total** | **33** |
+| **Total** | **36** |
 
 ### Availability
 

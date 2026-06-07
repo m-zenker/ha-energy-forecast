@@ -1,8 +1,9 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pytest
-from apps.energy_forecast.model import _engineer_features, EnergyForecastModel, _FEATURES_BASE
+
 from apps.energy_forecast.energy_forecast import _empty_weather_df
+from apps.energy_forecast.model import _FEATURES_BASE, EnergyForecastModel, _engineer_features
 
 
 def _make_constant_weather(ts, temp_c=10.0):
