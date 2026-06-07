@@ -1126,6 +1126,10 @@ class EnergyForecast(hass.Hass):
         ev_hour_set: set = set()
         if ev_detected is not None and not ev_detected.empty:
             ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))
+        # Hours immediately before/after EV charging are also contaminated (ramp-up/down).
+        # Excluded from _actuals_history so 7d/30d MAE sensors stay clean.
+        _ev_adjacent: set = {ts + pd.Timedelta(hours=d) for ts in ev_hour_set for d in (-1, 1)}
+        ev_mae_excluded: set = ev_hour_set | _ev_adjacent
 
         sub_sensors_recent: dict = {}
         for entity_id in self._sub_energy_sensors:
@@ -1270,7 +1274,7 @@ class EnergyForecast(hass.Hass):
                 pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
                 full_actuals["gross_kwh"].astype(float),
             ):
-                if _ts not in ev_hour_set:
+                if _ts not in ev_mae_excluded:
                     self._actuals_history[_ts] = _kwh
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
