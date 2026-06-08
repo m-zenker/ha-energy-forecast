@@ -160,6 +160,35 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ---
 
+### #85 — Parallel 15-Minute CSV Cache (Data Collection)
+
+**Goal:** Start recording energy history at 15-minute resolution alongside the existing hourly CSV, so that finer-grained data accumulates in the background for a potential future model upgrade.
+
+**Rationale:** Intra-hour load events (appliance starts, EV plug-in, heat pump defrost spikes) are averaged away at hourly resolution. 15-minute data would sharpen appliance signature learning and EV detection. Collecting it now costs almost nothing; it can never be backfilled later.
+
+**Approach:**
+- Add a `energy_history_15m.csv` cache populated by the existing HA history fetch, resampled to `15T` before writing.
+- Keep the production model on hourly data until at least 6 months of 15-minute history has accumulated.
+- No model changes needed initially — the file just grows in the background.
+
+**Prerequisite:** None.
+
+**Priority:** Low — start early to let data accumulate; no model work required immediately.
+
+---
+
+### #86 — Strip Partial Current Day from Clustering Input
+
+**Context:** `DailyProfileClusterer.fit()` receives the same DataFrame as `train()`. The ≥18 h valid-days filter in `fit()` rejects today's partial day in most cases, but not when a retrain fires late in the day (e.g. 23:xx): today then has 23 complete hours + 1 partial, passes the threshold, and the partial 23:00 column is included in the 24-column KMeans pivot. Because today is the highest-weighted day under exponential decay, the centroid distortion is disproportionate to the 1/24 column fraction.
+
+**Fix:** Before calling `DailyProfileClusterer.fit()` inside `_retrain()`, trim `energy_df` to `timestamp < completed_cutoff` (same guard applied to the fetch functions in `fix/ev-training-contamination`). Alternatively pass `completed_cutoff` as a parameter to `fit()` itself.
+
+**Prerequisite:** `fix/ev-training-contamination` (same `completed_cutoff` pattern).
+
+**Priority:** Low — ≥18 h threshold provides adequate protection in all but the rarest late-day retrain edge case.
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -185,6 +214,8 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
+| 85 | Parallel 15-min CSV cache | future model upgrade path | 2 h | start early / low urgency |
+| 86 | Strip partial day from clustering input | low (≥18 h filter mostly protects) | 30 min | after #ev-training-contamination |
 
 ---
 
