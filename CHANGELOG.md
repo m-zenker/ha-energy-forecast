@@ -8,6 +8,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.3-alpha-2] — 2026-06-08
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — incomplete hours at EV session start are no longer stored in `_actuals_history`; a `completed_cutoff = now_ts.floor("1h")` guard skips any hour `>= completed_cutoff`, eliminating the partial-hour spike (minute-1 data far below the 7 kWh threshold) that caused +0.034 kWh MAE jumps at session boundaries.
+- `apps/energy_forecast/energy_forecast.py` — ramp-down and EV-adjacent hours that were stored in a previous cycle (before the full session was visible to `ev_mae_excluded`) are now retroactively evicted each cycle via `_actuals_history.pop(ts, None)` for every timestamp in `ev_mae_excluded`. Resolves the +0.025 kWh MAE residual spike and self-heals existing contamination on first restart after deploy.
+
+### Tests
+- 585 passing (up from 582 in v0.11.3-alpha-1; +3 covering completed-hour guard and retroactive eviction).
+
+---
+
 ## [0.11.2] — 2026-06-01
 
 Stable release consolidating two alpha iterations. All fixes eliminate silent crashes and correctness bugs introduced during the v0.11.1 alpha cycle (service attribute lookups, timezone handling, actuals source selection, model persistence, MQTT discovery integration, and tau calibration log accuracy).
