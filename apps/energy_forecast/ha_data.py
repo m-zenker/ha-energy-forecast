@@ -3,6 +3,7 @@ History fetching with Local CSV Caching.
 This version stores data in a local file so you don't lose history
 when Home Assistant purges its database.
 """
+
 from __future__ import annotations
 
 import logging
@@ -74,7 +75,8 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
             logger.warning(
                 "Cache health: %d non-monotonic timestamp(s) detected (e.g. %s). "
                 "Cache may have been written out-of-order.",
-                n_bad, example,
+                n_bad,
+                example,
             )
 
         # Check 2: gaps > 2h (strict)
@@ -87,7 +89,8 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
                 "First gap ends at %s. "
                 "DST spring-forward (late March) causes a natural ~2h gap — "
                 "check if expected.",
-                n_gaps, first_gap,
+                n_gaps,
+                first_gap,
             )
 
         # Check 3: out-of-range gross_kwh values
@@ -99,7 +102,9 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
                 logger.warning(
                     "Cache health: %d row(s) with gross_kwh outside (0, %.1f] "
                     "(e.g. %.4f). Spike filter may have missed these.",
-                    n_bad_vals, MAX_HOURLY_KWH, example_val,
+                    n_bad_vals,
+                    MAX_HOURLY_KWH,
+                    example_val,
                 )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.error("validate_energy_cache raised unexpectedly: %s", exc)
@@ -113,8 +118,9 @@ def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: st
     either key column.
     """
     import pandas as pd
+
     result = (
-        pd.concat([df_loser, df_winner])   # winner last → keep="last" selects it
+        pd.concat([df_loser, df_winner])  # winner last → keep="last" selects it
         .drop_duplicates(subset=["timestamp"], keep="last")
         .sort_values("timestamp")
         .dropna(subset=["timestamp", value_col])
@@ -186,10 +192,14 @@ def fetch_energy_history(
     except OSError as e:
         _LOGGER.error(f"Failed to save cache: {e}")
 
-    return combined
+    # Strip the current (still-open) hourly bucket so training never sees a
+    # partial-hour value.  The CSV write above retains it; the correct full-hour
+    # value overwrites it on the next weekly compaction via HA-wins merge.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    return combined[combined["timestamp"] < completed_cutoff]
 
 
-_FETCH_RECENT_TAIL_ROWS = 400   # 336 h max lag + buffer; limits memory use in hourly updates
+_FETCH_RECENT_TAIL_ROWS = 400  # 336 h max lag + buffer; limits memory use in hourly updates
 
 
 def fetch_recent_energy(
@@ -266,7 +276,11 @@ def fetch_recent_energy(
         except OSError as e:
             _LOGGER.error(f"Failed to save cache: {e}")
 
-    return combined
+    # Strip the current (still-open) hourly bucket — same guard as fetch_energy_history.
+    # The CSV append above may write a partial-hour row; it will be superseded by the
+    # next hourly HA fetch (HA-wins merge) and corrected on the next weekly compaction.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    return combined[combined["timestamp"] < completed_cutoff]
 
 
 def split_ev_charging(
@@ -296,9 +310,7 @@ def split_ev_charging(
 
     ev_df = df[ev_mask].copy()
 
-    df.loc[ev_mask, "gross_kwh"] = np.maximum(
-        0.0, df.loc[ev_mask, "gross_kwh"] - charger_kw
-    )
+    df.loc[ev_mask, "gross_kwh"] = np.maximum(0.0, df.loc[ev_mask, "gross_kwh"] - charger_kw)
 
     return df, ev_df
 
@@ -322,17 +334,17 @@ def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) ->
         loser_prog = (
             df_loser.copy() if "program" in df_loser.columns else pd.DataFrame(columns=["timestamp", "program"])
         )
-        loser_prog = loser_prog[
-            loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")
-        ][["timestamp", "program"]]
+        loser_prog = loser_prog[loser_prog["program"].notna() & (loser_prog["program"].astype(str) != "")][
+            ["timestamp", "program"]
+        ]
         loser_prog = loser_prog.set_index("timestamp")["program"]
 
         winner_prog = (
             df_winner.copy() if "program" in df_winner.columns else pd.DataFrame(columns=["timestamp", "program"])
         )
-        winner_prog = winner_prog[
-            winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")
-        ][["timestamp", "program"]]
+        winner_prog = winner_prog[winner_prog["program"].notna() & (winner_prog["program"].astype(str) != "")][
+            ["timestamp", "program"]
+        ]
         winner_prog = winner_prog.set_index("timestamp")["program"]
 
         # Winner takes precedence; loser fills gaps
@@ -386,7 +398,10 @@ def _resolve_programs_for_series(
     # 1 h was insufficient when the sensor fires just into the following hour,
     # e.g. cycle starts at 21:00, program fires at 22:05 → gap is 65 min.
     merged_fwd = pd.merge_asof(
-        left, right, on="timestamp", direction="forward",
+        left,
+        right,
+        on="timestamp",
+        direction="forward",
         tolerance=pd.Timedelta("2h"),
     )
     prog_fwd = merged_fwd["program"].fillna("").astype(str)
@@ -785,9 +800,7 @@ def fetch_boolean_entity_history(
             continue
 
     if not events:
-        _LOGGER.warning(
-            f"No usable history for away entity {entity_id} — is_away will be 0."
-        )
+        _LOGGER.warning(f"No usable history for away entity {entity_id} — is_away will be 0.")
         return pd.DataFrame(columns=["timestamp", "is_away"])
 
     events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True)
@@ -795,7 +808,7 @@ def fetch_boolean_entity_history(
 
     # Hourly grid: span from first to last event
     start = ev_ser.index[0].floor("1h")
-    end   = ev_ser.index[-1].floor("1h")
+    end = ev_ser.index[-1].floor("1h")
     hourly = pd.date_range(start, end, freq="1h", tz=timezone)
 
     # Forward-fill state changes onto the grid; hours before first event default to "off"
@@ -805,10 +818,12 @@ def fetch_boolean_entity_history(
     # Convert to naive local time (strip tz, local time already correct)
     timestamps_naive = hourly.tz_localize(None)
 
-    return pd.DataFrame({
-        "timestamp": timestamps_naive,
-        "is_away": (filled == "on").astype(int).values,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps_naive,
+            "is_away": (filled == "on").astype(int).values,
+        }
+    )
 
 
 def fetch_presence_history(
@@ -843,9 +858,7 @@ def fetch_presence_history(
         try:
             raw = app.get_history(entity_id=entity_id, days=days)
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(
-                f"get_history failed for presence entity {entity_id}: {exc}"
-            )
+            _LOGGER.warning(f"get_history failed for presence entity {entity_id}: {exc}")
             continue
 
         if isinstance(raw, dict):
@@ -867,9 +880,7 @@ def fetch_presence_history(
                 continue
 
         if not events:
-            _LOGGER.warning(
-                f"No usable history for presence entity {entity_id}."
-            )
+            _LOGGER.warning(f"No usable history for presence entity {entity_id}.")
             continue
 
         events_df = pd.DataFrame(events).sort_values("timestamp").reset_index(drop=True)
@@ -887,13 +898,12 @@ def fetch_presence_history(
         all_per_entity[entity_id] = (filled == "home").astype(int)
 
     if not all_per_entity:
-        _LOGGER.warning(
-            f"No usable presence history from {entity_ids} — people_home will be 0."
-        )
+        _LOGGER.warning(f"No usable presence history from {entity_ids} — people_home will be 0.")
         return pd.DataFrame(columns=["timestamp", "people_home"])
 
     # Union all timestamps from all entities using reduce
     from functools import reduce
+
     all_ts = reduce(
         lambda idx1, idx2: idx1.union(idx2),
         [s.index for s in all_per_entity.values()],
@@ -911,10 +921,12 @@ def fetch_presence_history(
     people_count = stacked.sum(axis=1)
     timestamps_naive = all_ts.tz_localize(None)
 
-    return pd.DataFrame({
-        "timestamp": timestamps_naive,
-        "people_home": people_count.astype(int).values,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps_naive,
+            "people_home": people_count.astype(int).values,
+        }
+    )
 
 
 def fetch_program_sensor_history(
@@ -969,6 +981,7 @@ def _fetch_history(
 ) -> pd.DataFrame:
     """Internal helper to call AppDaemon's get_history API."""
     import pandas as pd
+
     try:
         raw = app.get_history(entity_id=entity_id, days=days)
     except Exception as exc:
@@ -1005,4 +1018,3 @@ def _fetch_history(
             continue
 
     return pd.DataFrame(rows)
-    

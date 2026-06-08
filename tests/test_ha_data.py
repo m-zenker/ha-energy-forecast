@@ -10,6 +10,7 @@ _fetch_history is patched throughout so tests run without AppDaemon or a live
 Home Assistant instance.  Timestamps follow Europe/Zurich (UTC+1 in January,
 UTC+2 in summer) — test data uses UTC inputs that map to predictable local hours.
 """
+
 from __future__ import annotations
 
 import logging
@@ -22,31 +23,36 @@ from energy_forecast.ha_data import _check_dst_duplicates, _fetch_history, _merg
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def make_climate_ha_raw(timestamps_utc: list[str], current_temps: list[float], setpoints: list[float]) -> pd.DataFrame:
     """Build a climate-style raw HA history DataFrame with attributes."""
     rows = []
     for ts, ct, sp in zip(timestamps_utc, current_temps, setpoints):
-        rows.append({
-            "timestamp": pd.to_datetime(ts, utc=True).tz_convert("Europe/Zurich"),
-            "current_temperature": ct,
-            "temperature": sp
-        })
+        rows.append(
+            {
+                "timestamp": pd.to_datetime(ts, utc=True).tz_convert("Europe/Zurich"),
+                "current_temperature": ct,
+                "temperature": sp,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 def make_generic_ha_raw(timestamps_utc: list[str], values: list[float]) -> pd.DataFrame:
     """Build a generic absolute sensor raw HA history DataFrame."""
-    return pd.DataFrame({
-        "timestamp": pd.to_datetime(timestamps_utc, utc=True).tz_convert("Europe/Zurich"),
-        "value": values
-    })
+    return pd.DataFrame(
+        {"timestamp": pd.to_datetime(timestamps_utc, utc=True).tz_convert("Europe/Zurich"), "value": values}
+    )
+
 
 def make_energy_df(timestamps: list[str], kwh_values: list[float]) -> pd.DataFrame:
     """Build a naive-timestamp energy DataFrame (as stored in the CSV cache)."""
-    return pd.DataFrame({
-        "timestamp": pd.to_datetime(timestamps),
-        "gross_kwh": kwh_values,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(timestamps),
+            "gross_kwh": kwh_values,
+        }
+    )
 
 
 def make_ha_raw(timestamps_utc: list[str], cumulative_values: list[float]) -> pd.DataFrame:
@@ -58,13 +64,12 @@ def make_ha_raw(timestamps_utc: list[str], cumulative_values: list[float]) -> pd
 
     January dates: UTC+1, so e.g. 08:00 UTC → 09:00 local, 09:00 UTC → 10:00 local.
     """
-    return pd.DataFrame({
-        "timestamp": (
-            pd.to_datetime(timestamps_utc, utc=True)
-            .tz_convert("Europe/Zurich")
-        ),
-        "value": cumulative_values,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": (pd.to_datetime(timestamps_utc, utc=True).tz_convert("Europe/Zurich")),
+            "value": cumulative_values,
+        }
+    )
 
 
 @pytest.fixture
@@ -76,13 +81,13 @@ def mock_app() -> MagicMock:
 
 # ── Stage 2: Climate & Generic ───────────────────────────────────────────────
 
-class TestClimateAndGenericHistory:
 
+class TestClimateAndGenericHistory:
     def test_merge_frames_generic(self):
         """_merge_frames works correctly with any value column."""
         ts = "2024-01-01 10:00"
         winner = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [22.0]})
-        loser  = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [21.0]})
+        loser = pd.DataFrame({"timestamp": [pd.to_datetime(ts)], "val": [21.0]})
         result = _merge_frames(winner, loser, "val")
         assert result.iloc[0]["val"] == 22.0
 
@@ -90,10 +95,7 @@ class TestClimateAndGenericHistory:
     def test_fetch_climate_history_basic(self, mock_fetch, mock_app, tmp_path):
         """fetch_climate_history correctly extracts and resamples attributes."""
         # 10:00 UTC -> 11:00 CET
-        ha_raw = make_climate_ha_raw(
-            ["2024-01-01 10:00", "2024-01-01 10:30"],
-            [20.0, 20.5], [21.0, 21.0]
-        )
+        ha_raw = make_climate_ha_raw(["2024-01-01 10:00", "2024-01-01 10:30"], [20.0, 20.5], [21.0, 21.0])
         mock_fetch.return_value = ha_raw
         cache_file = tmp_path / "climate_test.csv"
 
@@ -154,13 +156,13 @@ class TestClimateAndGenericHistory:
 
 # ── _merge_energy_frames ─────────────────────────────────────────────────────
 
-class TestMergeEnergyFrames:
 
+class TestMergeEnergyFrames:
     def test_winner_takes_conflict(self):
         """When winner and loser share a timestamp, winner's value is kept."""
         ts = "2024-01-01 10:00"
         winner = make_energy_df([ts], [2.0])
-        loser  = make_energy_df([ts], [1.0])
+        loser = make_energy_df([ts], [1.0])
         result = _merge_energy_frames(winner, loser)
         assert len(result) == 1
         assert result.iloc[0]["gross_kwh"] == pytest.approx(2.0)
@@ -168,14 +170,14 @@ class TestMergeEnergyFrames:
     def test_no_conflict_all_rows_kept(self):
         """Non-overlapping timestamps from both frames are all present in output."""
         winner = make_energy_df(["2024-01-01 10:00"], [2.0])
-        loser  = make_energy_df(["2024-01-01 09:00"], [1.0])
+        loser = make_energy_df(["2024-01-01 09:00"], [1.0])
         result = _merge_energy_frames(winner, loser)
         assert len(result) == 2
 
     def test_empty_loser_returns_winner(self):
         """Empty loser: only winner rows appear in output."""
         winner = make_energy_df(["2024-01-01 10:00"], [2.0])
-        loser  = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        loser = pd.DataFrame(columns=["timestamp", "gross_kwh"])
         result = _merge_energy_frames(winner, loser)
         assert len(result) == 1
         assert result.iloc[0]["gross_kwh"] == pytest.approx(2.0)
@@ -183,7 +185,7 @@ class TestMergeEnergyFrames:
     def test_empty_winner_returns_loser(self):
         """Empty winner: only loser rows appear in output."""
         winner = pd.DataFrame(columns=["timestamp", "gross_kwh"])
-        loser  = make_energy_df(["2024-01-01 09:00"], [1.0])
+        loser = make_energy_df(["2024-01-01 09:00"], [1.0])
         result = _merge_energy_frames(winner, loser)
         assert len(result) == 1
         assert result.iloc[0]["gross_kwh"] == pytest.approx(1.0)
@@ -202,7 +204,7 @@ class TestMergeEnergyFrames:
     def test_result_sorted_by_timestamp(self):
         """Output rows are in ascending timestamp order regardless of input order."""
         winner = make_energy_df(["2024-01-01 12:00", "2024-01-01 10:00"], [3.0, 1.0])
-        loser  = make_energy_df(["2024-01-01 11:00"], [2.0])
+        loser = make_energy_df(["2024-01-01 11:00"], [2.0])
         result = _merge_energy_frames(winner, loser)
         assert list(result["gross_kwh"]) == pytest.approx([1.0, 2.0, 3.0])
 
@@ -210,7 +212,7 @@ class TestMergeEnergyFrames:
         """Winner's value is selected for every conflicting timestamp."""
         timestamps = ["2024-01-01 09:00", "2024-01-01 10:00", "2024-01-01 11:00"]
         winner = make_energy_df(timestamps, [10.0, 20.0, 30.0])
-        loser  = make_energy_df(timestamps, [1.0,  2.0,  3.0])
+        loser = make_energy_df(timestamps, [1.0, 2.0, 3.0])
         result = _merge_energy_frames(winner, loser)
         assert len(result) == 3
         assert list(result["gross_kwh"]) == pytest.approx([10.0, 20.0, 30.0])
@@ -224,8 +226,9 @@ class TestMergeEnergyFrames:
         'pandas dtypes must be int, float or bool'.
         """
         import numpy as np
+
         winner = pd.DataFrame(columns=["timestamp", "gross_kwh"])  # object dtype (empty)
-        loser  = make_energy_df(["2024-01-01 09:00", "2024-01-01 10:00"], [0.5, 0.3])
+        loser = make_energy_df(["2024-01-01 09:00", "2024-01-01 10:00"], [0.5, 0.3])
         result = _merge_energy_frames(winner, loser)
         assert result["gross_kwh"].dtype == np.float64
         assert list(result["gross_kwh"]) == pytest.approx([0.5, 0.3])
@@ -233,8 +236,8 @@ class TestMergeEnergyFrames:
 
 # ── fetch_energy_history ──────────────────────────────────────────────────────
 
-class TestFetchEnergyHistory:
 
+class TestFetchEnergyHistory:
     def test_ha_only_no_cache(self, mock_app, tmp_path):
         """No cache file: HA data is processed and returned."""
         cache_path = tmp_path / "energy_history.csv"
@@ -284,9 +287,7 @@ class TestFetchEnergyHistory:
         """Cache rows for timestamps not covered by HA fetch are preserved."""
         cache_path = tmp_path / "energy_history.csv"
         # Cache has a row from 3 days ago
-        make_energy_df(["2023-12-29 10:00", "2024-01-01 10:00"], [0.5, 1.0]).to_csv(
-            cache_path, index=False
-        )
+        make_energy_df(["2023-12-29 10:00", "2024-01-01 10:00"], [0.5, 1.0]).to_csv(cache_path, index=False)
 
         # HA only covers 2024-01-01 — old cache row should survive
         ha_raw = make_ha_raw(
@@ -337,11 +338,36 @@ class TestFetchEnergyHistory:
 
         assert len(result) == 0
 
+    def test_excludes_current_partial_hour(self, mock_app, tmp_path):
+        """fetch_energy_history must not return the current (incomplete) hourly bucket.
+
+        The most recent row in HA data represents a still-open hour — its kWh is only
+        the accumulation so far.  Training on it with full exponential weight biases the
+        model for that hour-of-week.
+        """
+        cache_path = tmp_path / "energy_history.csv"
+        # Use Europe/Zurich (same timezone as production) so current_hour matches
+        # the completed_cutoff computed inside the function.
+        current_hour = pd.Timestamp.now(tz="Europe/Zurich").floor("1h").tz_localize(None)
+        prev_hour = current_hour - pd.Timedelta(hours=1)
+
+        make_energy_df(
+            [prev_hour.isoformat(), current_hour.isoformat()],
+            [1.5, 0.3],
+        ).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
+        assert prev_hour in result_ts, "Previous complete hour must be returned"
+
 
 # ── fetch_recent_energy ───────────────────────────────────────────────────────
 
-class TestFetchRecentEnergy:
 
+class TestFetchRecentEnergy:
     def test_ha_wins_on_conflict(self, mock_app, tmp_path):
         """fetch_recent_energy applies the same merge contract: fresh HA wins."""
         cache_path = tmp_path / "energy_history.csv"
@@ -392,8 +418,27 @@ class TestFetchRecentEnergy:
 
         assert cache_path.exists()
 
+    def test_excludes_current_partial_hour(self, mock_app, tmp_path):
+        """fetch_recent_energy must not return the current (incomplete) hourly bucket."""
+        cache_path = tmp_path / "energy_history.csv"
+        current_hour = pd.Timestamp.now(tz="Europe/Zurich").floor("1h").tz_localize(None)
+        prev_hour = current_hour - pd.Timedelta(hours=1)
+
+        make_energy_df(
+            [prev_hour.isoformat(), current_hour.isoformat()],
+            [1.5, 0.3],
+        ).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
+        assert prev_hour in result_ts, "Previous complete hour must be returned"
+
 
 # ── _check_dst_duplicates ─────────────────────────────────────────────────────
+
 
 class TestCheckDstDuplicates:
     """Fix 5.1 — DST fall-back produces duplicate naive timestamps.
@@ -503,14 +548,16 @@ _LOGGER = _logging.getLogger("energy_forecast.ha_data")
 
 # ── split_ev_charging ─────────────────────────────────────────────────────────
 
-class TestSplitEvCharging:
 
+class TestSplitEvCharging:
     def _make_df(self) -> pd.DataFrame:
         """Four rows: two below threshold (3 kWh), two above (10 kWh)."""
-        return pd.DataFrame({
-            "timestamp": pd.date_range("2026-03-12 00:00", periods=4, freq="1h"),
-            "gross_kwh": [3.0, 3.0, 10.0, 10.0],
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-12 00:00", periods=4, freq="1h"),
+                "gross_kwh": [3.0, 3.0, 10.0, 10.0],
+            }
+        )
 
     def test_custom_charger_kw_subtracted(self):
         """charger_kw=7.4 is subtracted from charging hours, not the default 9.0."""
@@ -532,6 +579,7 @@ class TestSplitEvCharging:
 
 
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
+
 
 class TestFetchSubSensorHistory:
     """Tests for fetch_sub_sensor_history and fetch_recent_sub_sensor.
@@ -559,10 +607,12 @@ class TestFetchSubSensorHistory:
     def test_falls_back_to_cache_when_ha_empty(self, mock_app, tmp_path):
         """When HA returns nothing, the existing cache is returned."""
         cache_path = tmp_path / "sub_heat_pump.csv"
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
-            "kwh": [2.5],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
+                "kwh": [2.5],
+            }
+        ).to_csv(cache_path, index=False)
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.heat_pump_kwh", cache_path)
@@ -573,6 +623,7 @@ class TestFetchSubSensorHistory:
     def test_spike_filter_applied(self, mock_app, tmp_path):
         """Hours with diff >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
         from energy_forecast.const import MAX_HOURLY_KWH
+
         cache_path = tmp_path / "sub_heat_pump.csv"
         # diff = 999 kWh — well above MAX_HOURLY_KWH, should be filtered
         ha_raw = make_ha_raw(
@@ -601,10 +652,12 @@ class TestFetchSubSensorHistory:
     def test_ha_wins_on_conflict(self, mock_app, tmp_path):
         """Fresh HA data overwrites cached value for the same timestamp."""
         cache_path = tmp_path / "sub_heat_pump.csv"
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
-            "kwh": [1.0],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01 10:00"]),
+                "kwh": [1.0],
+            }
+        ).to_csv(cache_path, index=False)
 
         # HA cumulative: diff at local 10:00 = 102.0 - 100.0 = 2.0 kWh
         ha_raw = make_ha_raw(
@@ -645,6 +698,7 @@ class TestFetchSubSensorHistory:
 
 # ── Stage 6 — CSV append-only writes (#19) ────────────────────────────────────
 
+
 class TestCsvAppendOnlyWrites:
     """fetch_recent_energy must only append new timestamps, not rewrite the whole CSV."""
 
@@ -675,7 +729,7 @@ class TestCsvAppendOnlyWrites:
 
         ha_raw = make_ha_raw(
             ["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"],
-            [100.0, 101.5],    # diff at 10:00 local = 1.5 kWh
+            [100.0, 101.5],  # diff at 10:00 local = 1.5 kWh
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
@@ -711,11 +765,7 @@ class TestCsvAppendOnlyWrites:
         """
         cache_path = tmp_path / "energy_history.csv"
         # Write a CSV with mixed formats: one datetime string, one date-only string
-        cache_path.write_text(
-            "timestamp,gross_kwh\n"
-            "2026-03-20 01:00:00,1.2\n"
-            "2026-03-20,0.9\n"
-        )
+        cache_path.write_text("timestamp,gross_kwh\n2026-03-20 01:00:00,1.2\n2026-03-20,0.9\n")
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
@@ -749,7 +799,6 @@ from energy_forecast.ha_data import validate_energy_cache  # noqa: E402
 
 
 class TestValidateEnergyCache:
-
     def test_clean_data_no_warnings(self, caplog):
         """5 rows, 1h apart, valid values → no WARNING logged."""
         ts = pd.date_range("2024-03-15 08:00", periods=5, freq="1h")
@@ -760,9 +809,14 @@ class TestValidateEnergyCache:
 
     def test_non_monotonic_timestamp_warns(self, caplog):
         """A row with an earlier timestamp than its predecessor triggers WARNING."""
-        ts = pd.to_datetime(["2024-03-15 08:00", "2024-03-15 09:00",
-                              "2024-03-15 08:30",  # goes backwards
-                              "2024-03-15 10:00"])
+        ts = pd.to_datetime(
+            [
+                "2024-03-15 08:00",
+                "2024-03-15 09:00",
+                "2024-03-15 08:30",  # goes backwards
+                "2024-03-15 10:00",
+            ]
+        )
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 1.5, 0.8, 2.0]})
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df, _LOGGER)
@@ -797,7 +851,7 @@ class TestValidateEnergyCache:
         """gross_kwh outside (0, MAX_HOURLY_KWH] triggers WARNING."""
         ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
         df_over = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 60.0]})  # 60 > 50
-        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})   # 0 not positive
+        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})  # 0 not positive
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df_over, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
@@ -834,6 +888,7 @@ class TestValidateCacheIntegration:
 
 
 # ── fetch_presence_history ──────────────────────────────────────────────────────
+
 
 class TestFetchPresenceHistory:
     """Tests for fetch_presence_history (occupancy feature #21)."""
@@ -959,6 +1014,7 @@ class TestFetchPresenceHistory:
 
 # ── fetch_recent_energy — tail read (Fix 4) ───────────────────────────────────
 
+
 class TestFetchRecentEnergyTailRead:
     """fetch_recent_energy must read only the last _FETCH_RECENT_TAIL_ROWS rows
     from a large CSV (memory efficiency), while still returning a correct result.
@@ -1007,13 +1063,17 @@ class TestFetchRecentEnergyTailRead:
 
         # HA provides 2 new rows just after the cache window
         cache_end_ts = base + pd.Timedelta(hours=599)
-        ha_raw = pd.DataFrame({
-            "timestamp": pd.to_datetime([
-                cache_end_ts + pd.Timedelta(hours=1),
-                cache_end_ts + pd.Timedelta(hours=2),
-            ]),
-            "value": [100.0, 101.5],
-        })
+        ha_raw = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        cache_end_ts + pd.Timedelta(hours=1),
+                        cache_end_ts + pd.Timedelta(hours=2),
+                    ]
+                ),
+                "value": [100.0, 101.5],
+            }
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
@@ -1024,6 +1084,7 @@ class TestFetchRecentEnergyTailRead:
 
 # ── fetch_program_sensor_history ─────────────────────────────────────────────
 
+
 class TestFetchProgramSensorHistory:
     """Tests for fetch_program_sensor_history (program-type sensor support)."""
 
@@ -1032,10 +1093,12 @@ class TestFetchProgramSensorHistory:
 
     def test_returns_string_states(self, mock_app):
         """Normal states are returned with correct columns and values."""
-        raw = self._make_raw([
-            {"state": "eco",    "last_changed": "2024-01-01T10:00:00+01:00"},
-            {"state": "normal", "last_changed": "2024-01-01T12:00:00+01:00"},
-        ])
+        raw = self._make_raw(
+            [
+                {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
+                {"state": "normal", "last_changed": "2024-01-01T12:00:00+01:00"},
+            ]
+        )
         mock_app.get_history.return_value = raw
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert list(result.columns) == ["timestamp", "program"]
@@ -1045,12 +1108,14 @@ class TestFetchProgramSensorHistory:
 
     def test_drops_unavailable_and_unknown(self, mock_app):
         """'unavailable', 'unknown', and '' are excluded from the result."""
-        raw = self._make_raw([
-            {"state": "unavailable", "last_changed": "2024-01-01T08:00:00+01:00"},
-            {"state": "unknown",     "last_changed": "2024-01-01T09:00:00+01:00"},
-            {"state": "",            "last_changed": "2024-01-01T09:30:00+01:00"},
-            {"state": "eco",         "last_changed": "2024-01-01T10:00:00+01:00"},
-        ])
+        raw = self._make_raw(
+            [
+                {"state": "unavailable", "last_changed": "2024-01-01T08:00:00+01:00"},
+                {"state": "unknown", "last_changed": "2024-01-01T09:00:00+01:00"},
+                {"state": "", "last_changed": "2024-01-01T09:30:00+01:00"},
+                {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        )
         mock_app.get_history.return_value = raw
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert len(result) == 1
@@ -1058,10 +1123,12 @@ class TestFetchProgramSensorHistory:
 
     def test_lowercases_states(self, mock_app):
         """State values are lowercased — 'ECO', 'Eco' → 'eco'."""
-        raw = self._make_raw([
-            {"state": "ECO",    "last_changed": "2024-01-01T10:00:00+01:00"},
-            {"state": "Normal", "last_changed": "2024-01-01T12:00:00+01:00"},
-        ])
+        raw = self._make_raw(
+            [
+                {"state": "ECO", "last_changed": "2024-01-01T10:00:00+01:00"},
+                {"state": "Normal", "last_changed": "2024-01-01T12:00:00+01:00"},
+            ]
+        )
         mock_app.get_history.return_value = raw
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert result.iloc[0]["program"] == "eco"
@@ -1083,19 +1150,23 @@ class TestFetchProgramSensorHistory:
 
     def test_timestamps_are_naive(self, mock_app):
         """Returned timestamps must be naive (no tzinfo)."""
-        raw = self._make_raw([
-            {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
-        ])
+        raw = self._make_raw(
+            [
+                {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        )
         mock_app.get_history.return_value = raw
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert result.iloc[0]["timestamp"].tzinfo is None
 
     def test_sorted_by_timestamp(self, mock_app):
         """Result is sorted ascending by timestamp regardless of input order."""
-        raw = self._make_raw([
-            {"state": "intensive", "last_changed": "2024-01-01T14:00:00+01:00"},
-            {"state": "eco",       "last_changed": "2024-01-01T10:00:00+01:00"},
-        ])
+        raw = self._make_raw(
+            [
+                {"state": "intensive", "last_changed": "2024-01-01T14:00:00+01:00"},
+                {"state": "eco", "last_changed": "2024-01-01T10:00:00+01:00"},
+            ]
+        )
         mock_app.get_history.return_value = raw
         result = ha_data.fetch_program_sensor_history(mock_app, "sensor.dw_program", days=30)
         assert result.iloc[0]["program"] == "eco"
@@ -1104,26 +1175,35 @@ class TestFetchProgramSensorHistory:
 
 # ── _resolve_programs_for_series ──────────────────────────────────────────────
 
+
 class TestResolveProgramsForSeries:
     """Tests for the _resolve_programs_for_series() last-value-carry-forward helper."""
 
     def _make_prog_df(self, rows):
         """Build a program event DataFrame from list of (timestamp_str, label) tuples."""
-        return pd.DataFrame(
-            [{"timestamp": pd.Timestamp(ts), "program": lbl} for ts, lbl in rows]
-        ).sort_values("timestamp").reset_index(drop=True)
+        return (
+            pd.DataFrame([{"timestamp": pd.Timestamp(ts), "program": lbl} for ts, lbl in rows])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
     def test_basic_lvfc(self):
         """Each hourly timestamp gets the last program state before or at that time."""
-        prog_df = self._make_prog_df([
-            ("2024-01-01 09:30", "eco"),
-            ("2024-01-01 11:00", "intensive"),
-        ])
-        timestamps = pd.Series(pd.to_datetime([
-            "2024-01-01 10:00",
-            "2024-01-01 11:00",
-            "2024-01-01 12:00",
-        ]))
+        prog_df = self._make_prog_df(
+            [
+                ("2024-01-01 09:30", "eco"),
+                ("2024-01-01 11:00", "intensive"),
+            ]
+        )
+        timestamps = pd.Series(
+            pd.to_datetime(
+                [
+                    "2024-01-01 10:00",
+                    "2024-01-01 11:00",
+                    "2024-01-01 12:00",
+                ]
+            )
+        )
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert result.tolist() == ["eco", "intensive", "intensive"]
 
@@ -1167,18 +1247,24 @@ class TestResolveProgramsForSeries:
         at 12:05 → hour row stamped 12:00 backward-sees 'no_program' → should
         be corrected to 'eco' by the forward fallback.
         """
-        prog_df = self._make_prog_df([
-            ("2024-01-01 11:30", "no_program"),  # previous cycle ended
-            ("2024-01-01 12:05", "eco"),          # new cycle selected at 12:05
-            ("2024-01-01 16:30", "no_program"),   # cycle finished
-        ])
-        timestamps = pd.Series(pd.to_datetime([
-            "2024-01-01 11:00",
-            "2024-01-01 12:00",   # ← should get "eco", not "no_program"
-            "2024-01-01 13:00",
-            "2024-01-01 14:00",
-            "2024-01-01 17:00",
-        ]))
+        prog_df = self._make_prog_df(
+            [
+                ("2024-01-01 11:30", "no_program"),  # previous cycle ended
+                ("2024-01-01 12:05", "eco"),  # new cycle selected at 12:05
+                ("2024-01-01 16:30", "no_program"),  # cycle finished
+            ]
+        )
+        timestamps = pd.Series(
+            pd.to_datetime(
+                [
+                    "2024-01-01 11:00",
+                    "2024-01-01 12:00",  # ← should get "eco", not "no_program"
+                    "2024-01-01 13:00",
+                    "2024-01-01 14:00",
+                    "2024-01-01 17:00",
+                ]
+            )
+        )
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         # 11:00 precedes the first event (11:30) → no backward match → ""
         assert result.tolist() == ["", "eco", "eco", "eco", "no_program"]
@@ -1189,33 +1275,43 @@ class TestResolveProgramsForSeries:
         If eco is still running at 13:00 and 'intensive' starts at 13:50,
         the 13:00 row must keep 'eco', not be overwritten by 'intensive'.
         """
-        prog_df = self._make_prog_df([
-            ("2024-01-01 12:00", "eco"),
-            ("2024-01-01 13:50", "intensive"),
-        ])
-        timestamps = pd.Series(pd.to_datetime([
-            "2024-01-01 13:00",   # ← 'eco' still running; 'intensive' within 1 h forward
-            "2024-01-01 14:00",
-        ]))
+        prog_df = self._make_prog_df(
+            [
+                ("2024-01-01 12:00", "eco"),
+                ("2024-01-01 13:50", "intensive"),
+            ]
+        )
+        timestamps = pd.Series(
+            pd.to_datetime(
+                [
+                    "2024-01-01 13:00",  # ← 'eco' still running; 'intensive' within 1 h forward
+                    "2024-01-01 14:00",
+                ]
+            )
+        )
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert result.tolist() == ["eco", "intensive"]
 
     def test_forward_fallback_catches_65min_gap(self):
         """Program event 65 min after hour boundary is attributed (was the failing case)."""
-        prog_df = self._make_prog_df([
-            ("2024-01-01 20:30", "no_program"),
-            ("2024-01-01 22:05", "power_wash"),  # 65 min after 21:00
-        ])
+        prog_df = self._make_prog_df(
+            [
+                ("2024-01-01 20:30", "no_program"),
+                ("2024-01-01 22:05", "power_wash"),  # 65 min after 21:00
+            ]
+        )
         timestamps = pd.Series(pd.to_datetime(["2024-01-01 21:00"]))
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert result.tolist() == ["power_wash"]
 
     def test_forward_fallback_not_triggered_beyond_two_hours(self):
         """Program event more than 2 h ahead does not affect backward label."""
-        prog_df = self._make_prog_df([
-            ("2024-01-01 11:30", "no_program"),
-            ("2024-01-01 14:10", "eco"),   # 2 h 10 min after 12:00 → outside tolerance
-        ])
+        prog_df = self._make_prog_df(
+            [
+                ("2024-01-01 11:30", "no_program"),
+                ("2024-01-01 14:10", "eco"),  # 2 h 10 min after 12:00 → outside tolerance
+            ]
+        )
         timestamps = pd.Series(pd.to_datetime(["2024-01-01 12:00"]))
         result = ha_data._resolve_programs_for_series(timestamps, prog_df)
         assert result.tolist() == ["no_program"]
@@ -1231,6 +1327,7 @@ class TestResolveProgramsForSeries:
 
 # ── fetch_sub_sensor_history with program_entity_id ───────────────────────────
 
+
 class TestFetchSubSensorHistoryWithProgram:
     """Tests for fetch_sub_sensor_history / fetch_recent_sub_sensor program integration."""
 
@@ -1239,10 +1336,12 @@ class TestFetchSubSensorHistoryWithProgram:
 
         Returns tz-aware Europe/Zurich timestamps, matching the real _fetch_history output.
         """
-        return pd.DataFrame({
-            "timestamp": pd.to_datetime(iso_times, utc=True).tz_convert("Europe/Zurich"),
-            "value": values,
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(iso_times, utc=True).tz_convert("Europe/Zurich"),
+                "value": values,
+            }
+        )
 
     def _make_prog_raw(self, rows):
         """Build a minimal program-sensor raw list (format expected by fetch_program_sensor_history)."""
@@ -1255,12 +1354,16 @@ class TestFetchSubSensorHistoryWithProgram:
             ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
             [10.0, 11.5],
         )
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T07:00:00+01:00", "eco"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T07:00:00+01:00", "eco"),
+            ]
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_sub_sensor_history(
-                mock_app, "sensor.dw_kwh", cache_path,
+                mock_app,
+                "sensor.dw_kwh",
+                cache_path,
                 program_entity_id="sensor.dw_program",
             )
 
@@ -1278,13 +1381,17 @@ class TestFetchSubSensorHistoryWithProgram:
             [10.0, 11.0, 11.5],
         )
         # Program switches from eco → intensive at 10:00 local
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T08:30:00+01:00", "eco"),
-            ("2024-01-01T10:00:00+01:00", "intensive"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T08:30:00+01:00", "eco"),
+                ("2024-01-01T10:00:00+01:00", "intensive"),
+            ]
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_sub_sensor_history(
-                mock_app, "sensor.dw_kwh", cache_path,
+                mock_app,
+                "sensor.dw_kwh",
+                cache_path,
                 program_entity_id="sensor.dw_program",
             )
 
@@ -1309,21 +1416,27 @@ class TestFetchSubSensorHistoryWithProgram:
         """A cached CSV without a 'program' column is loaded and extended correctly."""
         cache_path = tmp_path / "sub_dw.csv"
         # Old-format cache: no program column
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2024-01-01 08:00"]),
-            "kwh": [0.5],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01 08:00"]),
+                "kwh": [0.5],
+            }
+        ).to_csv(cache_path, index=False)
 
         ha_raw = self._make_ha_raw(
             ["2024-01-01T09:00:00+01:00", "2024-01-01T10:00:00+01:00"],
             [20.0, 21.0],
         )
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T09:30:00+01:00", "cotton"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T09:30:00+01:00", "cotton"),
+            ]
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_sub_sensor_history(
-                mock_app, "sensor.dw_kwh", cache_path,
+                mock_app,
+                "sensor.dw_kwh",
+                cache_path,
                 program_entity_id="sensor.dw_program",
             )
 
@@ -1337,23 +1450,29 @@ class TestFetchSubSensorHistoryWithProgram:
         """Existing non-empty program labels in cache survive a subsequent fetch that doesn't cover them."""
         cache_path = tmp_path / "sub_dw.csv"
         # Cache has a labelled row from > 30 days ago (outside fresh fetch window)
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2023-11-01 10:00"]),
-            "kwh": [1.2],
-            "program": ["eco"],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2023-11-01 10:00"]),
+                "kwh": [1.2],
+                "program": ["eco"],
+            }
+        ).to_csv(cache_path, index=False)
 
         # Fresh HA fetch only covers a recent window — no overlap with cached row
         ha_raw = self._make_ha_raw(
             ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
             [5.0, 6.5],
         )
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T07:00:00+01:00", "intensive"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T07:00:00+01:00", "intensive"),
+            ]
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_sub_sensor_history(
-                mock_app, "sensor.dw_kwh", cache_path,
+                mock_app,
+                "sensor.dw_kwh",
+                cache_path,
                 program_entity_id="sensor.dw_program",
             )
 
@@ -1368,12 +1487,16 @@ class TestFetchSubSensorHistoryWithProgram:
             ["2024-01-01T08:00:00+01:00", "2024-01-01T09:00:00+01:00"],
             [10.0, 10.8],
         )
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T07:30:00+01:00", "quick"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T07:30:00+01:00", "quick"),
+            ]
+        )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_sub_sensor(
-                mock_app, "sensor.dw_kwh", cache_path,
+                mock_app,
+                "sensor.dw_kwh",
+                cache_path,
                 program_entity_id="sensor.dw_program",
             )
 
@@ -1390,20 +1513,26 @@ class TestFetchSubSensorHistoryWithProgram:
         """
         cache_path = tmp_path / "sub_wash.csv"
         # Pre-populate cache with one row
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2024-01-01T10:00:00"]),
-            "kwh": [0.5],
-            "program": ["eco"],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01T10:00:00"]),
+                "kwh": [0.5],
+                "program": ["eco"],
+            }
+        ).to_csv(cache_path, index=False)
 
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-01T07:00:00+01:00", "eco"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-01T07:00:00+01:00", "eco"),
+            ]
+        )
 
         # raw_ha empty → df_new fallback path is exercised
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame(columns=["timestamp", "value"])):
             result = ha_data.fetch_recent_sub_sensor(
-                mock_app, "sensor.wash_kwh", cache_path,
+                mock_app,
+                "sensor.wash_kwh",
+                cache_path,
                 program_entity_id="sensor.wash_program",
             )
 
@@ -1414,19 +1543,25 @@ class TestFetchSubSensorHistoryWithProgram:
         """fetch_sub_sensor_history must not raise when raw HA is empty but
         cache has data and program_entity_id is set (same dtype regression)."""
         cache_path = tmp_path / "sub_dryer.csv"
-        pd.DataFrame({
-            "timestamp": pd.to_datetime(["2024-01-02T10:00:00"]),
-            "kwh": [1.2],
-            "program": ["cotton"],
-        }).to_csv(cache_path, index=False)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-02T10:00:00"]),
+                "kwh": [1.2],
+                "program": ["cotton"],
+            }
+        ).to_csv(cache_path, index=False)
 
-        mock_app.get_history.return_value = self._make_prog_raw([
-            ("2024-01-02T09:00:00+01:00", "cotton"),
-        ])
+        mock_app.get_history.return_value = self._make_prog_raw(
+            [
+                ("2024-01-02T09:00:00+01:00", "cotton"),
+            ]
+        )
 
         with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame(columns=["timestamp", "value"])):
             result = ha_data.fetch_sub_sensor_history(
-                mock_app, "sensor.dryer_kwh", cache_path,
+                mock_app,
+                "sensor.dryer_kwh",
+                cache_path,
                 program_entity_id="sensor.dryer_program",
             )
 
