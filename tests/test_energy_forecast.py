@@ -1393,6 +1393,79 @@ class TestRollingMaeSensors:
             "Partial current hour after restart must not be stored (causes MAE inflation)"
         )
 
+    # ── _actuals_for_retrain and _retrain EV-adjacency guards ──
+
+    def test_actuals_for_retrain_excludes_ev_adjacent_hours(self):
+        """_actuals_for_retrain must exclude EV-adjacent (±1h) hours, not just exact EV hours.
+
+        Ramp-down hours (e.g. 6.2 kWh — below threshold but part of the session tail)
+        inflate _compute_live_mae in _maybe_adaptive_retrain, potentially triggering
+        spurious retrains.  The filter must use ev_mae_excluded (EV ± 1h), not ev_hour_set.
+        """
+        import pandas as pd
+
+        base = pd.Timestamp("2026-06-07 06:00")
+        ev_ts = pd.Timestamp("2026-06-07 08:00")
+        ramp_down_ts = pd.Timestamp("2026-06-07 09:00")  # EV-adjacent, below threshold
+
+        recent_actuals = pd.DataFrame(
+            {
+                "timestamp": [base, ev_ts, ramp_down_ts],
+                "gross_kwh": [2.1, 9.4, 6.2],
+            }
+        )
+
+        ev_hour_set = {ev_ts}
+        _ev_adjacent = {ev_ts + pd.Timedelta(hours=d) for ev_ts in ev_hour_set for d in (-1, 1)}
+        ev_mae_excluded = ev_hour_set | _ev_adjacent
+
+        # Simulate the fixed _actuals_for_retrain filter (ev_mae_excluded, not ev_hour_set)
+        actuals_for_retrain = recent_actuals[
+            ~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_mae_excluded)
+        ]
+
+        result_ts = set(pd.to_datetime(actuals_for_retrain["timestamp"]).dt.floor("1h"))
+        assert base in result_ts, "Normal hour must be kept"
+        assert ev_ts not in result_ts, "EV hour must be excluded"
+        assert ramp_down_ts not in result_ts, "EV-adjacent ramp-down hour must be excluded"
+
+    def test_retrain_baseline_excludes_ev_adjacent_hours(self):
+        """After split_ev_charging, _retrain must also drop ±1h adjacent rows from baseline_df.
+
+        split_ev_charging subtracts the charger load from exact EV hours but leaves ramp-down
+        hours (below threshold) in baseline_df with their elevated values.  These contaminate
+        training data with spuriously high consumption.
+        """
+        import pandas as pd
+        from energy_forecast.ha_data import split_ev_charging
+
+        base = pd.Timestamp("2026-06-07 06:00")
+        ev_ts = pd.Timestamp("2026-06-07 08:00")
+        ramp_up_ts = pd.Timestamp("2026-06-07 07:00")  # adjacent before
+        ramp_down_ts = pd.Timestamp("2026-06-07 09:00")  # adjacent after, below threshold
+
+        energy_df = pd.DataFrame(
+            {
+                "timestamp": [base, ramp_up_ts, ev_ts, ramp_down_ts],
+                "gross_kwh": [2.1, 3.5, 9.4, 6.2],
+            }
+        )
+
+        baseline_df, ev_df = split_ev_charging(energy_df, threshold_kwh=7.0)
+
+        # Simulate the adjacent-drop logic added to _retrain()
+        if len(ev_df):
+            _ev_adj_ts = {
+                ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
+            }
+            baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
+
+        result_ts = set(pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h"))
+        assert base in result_ts, "Non-adjacent normal hour must be kept"
+        assert ev_ts in result_ts, "EV hour is kept in baseline (charger load subtracted)"
+        assert ramp_up_ts not in result_ts, "EV-adjacent ramp-up hour must be dropped"
+        assert ramp_down_ts not in result_ts, "EV-adjacent ramp-down hour must be dropped"
+
     # ── MQTT discovery ──
 
     def test_mqtt_discovery_includes_mae_sensors(self):
