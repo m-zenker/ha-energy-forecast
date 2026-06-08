@@ -19,6 +19,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.11.3-alpha-3] — 2026-06-08
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `fetch_energy_history` and `fetch_recent_energy` now trim the still-open hourly bucket before returning. A `completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)` guard drops the partial row from the returned DataFrame; training on a sub-hour accumulation with full exponential weight introduced a systematic downward bias for that hour-of-week. The partial row is still written to CSV before the trim so that the next weekly compaction can fill it in correctly via HA-wins merge.
+- `apps/energy_forecast/energy_forecast.py` — `_actuals_for_retrain` (passed to `_maybe_adaptive_retrain`) now filters on `ev_mae_excluded` (EV ±1h window) instead of the narrower `ev_hour_set` (exact EV hours only). Ramp-down hours that were previously included inflated `_compute_live_mae` and could trigger spurious adaptive retrains.
+- `apps/energy_forecast/model.py` — `_retrain()` now drops ±1h neighbours of EV-charging hours from `baseline_df` after `split_ev_charging`, matching the exclusion applied in the live MAE path. Affected rows: 1–2 per session (~15% of days); NaN lags introduced by the drop are filled from `meta.pkl` medians.
+
+### Tests
+- 589 passing (up from 585 in v0.11.3-alpha-2; +4 covering partial-hour trim, `_actuals_for_retrain` EV-adjacent exclusion, and `_retrain` baseline neighbour drop).
+
+---
+
 ## [0.11.2] — 2026-06-01
 
 Stable release consolidating two alpha iterations. All fixes eliminate silent crashes and correctness bugs introduced during the v0.11.1 alpha cycle (service attribute lookups, timezone handling, actuals source selection, model persistence, MQTT discovery integration, and tau calibration log accuracy).
