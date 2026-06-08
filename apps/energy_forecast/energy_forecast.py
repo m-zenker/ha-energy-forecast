@@ -925,6 +925,15 @@ class EnergyForecast(hass.Hass):
                 ev_df["gross_kwh"].sum(),
                 sorted(ev_df["timestamp"].dt.date.unique().tolist()),
             )
+            # Drop ±1h adjacent hours (ramp-up/down) — split_ev_charging subtracts the
+            # charger load from exact EV hours but can't cleanly correct adjacent hours
+            # whose elevation comes from a tapering charger.  Dropping 1–2 rows per
+            # session (≈15% of days) has negligible training impact; NaN lags are
+            # filled by feature medians in meta.pkl.
+            _ev_adj_ts: set = {
+                ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
+            }
+            baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
 
         # ── Solar / grid-export / battery target correction ───────────────────
         # Corrects gross_kwh (grid import) to total household consumption.
@@ -1288,8 +1297,8 @@ class EnergyForecast(hass.Hass):
         self._save_pred_history()
 
         _actuals_for_retrain = (
-            recent_actuals[~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_hour_set)]
-            if (recent_actuals is not None and not recent_actuals.empty and ev_hour_set)
+            recent_actuals[~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_mae_excluded)]
+            if (recent_actuals is not None and not recent_actuals.empty and ev_mae_excluded)
             else recent_actuals
         )
         self._maybe_adaptive_retrain(_actuals_for_retrain)
