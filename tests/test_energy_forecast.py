@@ -1287,6 +1287,112 @@ class TestRollingMaeSensors:
             f"Expected raw full_actuals values [2.0, 3.0, 4.0], got {list(actuals_history.values())}"
         )
 
+    # ── Partial-hour and retroactive-eviction guards ──
+
+    def test_incomplete_current_hour_not_stored(self):
+        """The current (not-yet-complete) hourly bucket must not be stored in _actuals_history.
+
+        At cycle time 10:32 the 10:00 bucket contains only ~32 min of data.  Without the
+        completed_cutoff guard it gets stored with a low kWh value, inflating MAE until the
+        next cycle overwrites it.
+        """
+        import pandas as pd
+
+        now_ts = pd.Timestamp("2026-06-07 10:32")
+        completed_cutoff = now_ts.floor("1h")  # 10:00
+
+        timestamps = [
+            pd.Timestamp("2026-06-07 08:00"),
+            pd.Timestamp("2026-06-07 09:00"),
+            pd.Timestamp("2026-06-07 10:00"),  # current hour — only partial data
+        ]
+        gross_kwh = [2.1, 2.3, 0.3]  # 10:00 is below EV threshold, looks "normal"
+
+        ev_mae_excluded: set = set()
+        actuals_history: dict = {}
+
+        for _ts, _kwh in zip(timestamps, gross_kwh):
+            if _ts >= completed_cutoff:  # fix: skip current/future hours
+                continue
+            if _ts not in ev_mae_excluded:
+                actuals_history[_ts] = _kwh
+
+        assert pd.Timestamp("2026-06-07 08:00") in actuals_history
+        assert pd.Timestamp("2026-06-07 09:00") in actuals_history
+        assert pd.Timestamp("2026-06-07 10:00") not in actuals_history, (
+            "Current (incomplete) hour must not be stored in actuals_history"
+        )
+
+    def test_retroactive_eviction_removes_stale_ev_adjacent_actuals(self):
+        """Actuals stored before EV was detected must be evicted when ev_mae_excluded is populated.
+
+        Scenario: at 08:01 the first minute of an EV session (0.002 kWh) is stored for 08:00
+        because it's below the 7 kWh threshold.  At 09:01 the full session is visible and 08:00
+        enters ev_mae_excluded — the retroactive eviction pop must remove the stale entry.
+        """
+        import pandas as pd
+
+        base = pd.Timestamp("2026-06-07 06:00")  # 2h before EV — not adjacent, must be kept
+        ev_ts = pd.Timestamp("2026-06-07 08:00")
+        adjacent_ts = pd.Timestamp("2026-06-07 09:00")  # 1h after EV hour
+
+        # Pre-populate: stale / contaminated values already in actuals_history
+        actuals_history: dict = {
+            base: 2.5,  # clean normal hour (not adjacent)
+            ev_ts: 0.002,  # minute-1 partial — stored before session was detected
+            adjacent_ts: 6.177,  # ramp-down hour stored before adjacent exclusion kicked in
+        }
+
+        ev_hour_set = {ev_ts}
+        _ev_adjacent = {ev_ts + pd.Timedelta(hours=d) for ev_ts in ev_hour_set for d in (-1, 1)}
+        ev_mae_excluded = ev_hour_set | _ev_adjacent
+
+        # Retroactive eviction (fix)
+        for _ts in ev_mae_excluded:
+            actuals_history.pop(_ts, None)
+
+        assert base in actuals_history, "Clean hour must be preserved"
+        assert ev_ts not in actuals_history, "EV hour must be evicted"
+        assert adjacent_ts not in actuals_history, "EV-adjacent hour must be evicted"
+        assert actuals_history[base] == 2.5
+
+    def test_restart_mid_session_partial_hour_not_stored(self):
+        """After a restart mid-EV-session the partial current hour must not be stored.
+
+        Scenario: app restarts at 16:32 during an EV session.  The 16:00 bucket has ~32 min of
+        charging (4.99 kWh), which is below the 7 kWh threshold so ev_hour_set is empty.
+        Without the completed_cutoff guard 16:00 gets stored with 4.99 kWh, inflating MAE.
+        """
+        import pandas as pd
+
+        now_ts = pd.Timestamp("2026-06-07 16:32")
+        completed_cutoff = now_ts.floor("1h")  # 16:00
+
+        timestamps = [
+            pd.Timestamp("2026-06-07 14:00"),
+            pd.Timestamp("2026-06-07 15:00"),
+            pd.Timestamp("2026-06-07 16:00"),  # partial mid-session, below threshold
+        ]
+        gross_kwh = [2.0, 2.1, 4.99]
+
+        ev_mae_excluded: set = set()  # EV not yet detected (partial hour)
+        actuals_history: dict = {}
+
+        for _ts in ev_mae_excluded:  # no-op here; eviction still runs
+            actuals_history.pop(_ts, None)
+
+        for _ts, _kwh in zip(timestamps, gross_kwh):
+            if _ts >= completed_cutoff:
+                continue
+            if _ts not in ev_mae_excluded:
+                actuals_history[_ts] = _kwh
+
+        assert pd.Timestamp("2026-06-07 14:00") in actuals_history
+        assert pd.Timestamp("2026-06-07 15:00") in actuals_history
+        assert pd.Timestamp("2026-06-07 16:00") not in actuals_history, (
+            "Partial current hour after restart must not be stored (causes MAE inflation)"
+        )
+
     # ── MQTT discovery ──
 
     def test_mqtt_discovery_includes_mae_sensors(self):
