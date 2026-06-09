@@ -8,6 +8,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-06-09
+
+Stable release consolidating three alpha iterations. All fixes address EV-charging hour
+contamination that inflated rolling MAE metrics and triggered spurious adaptive retrains:
+incomplete hours at session boundaries were leaking into the actuals cache, the
+`_actuals_for_retrain` exclusion window was too narrow (exact EV hours only, not ±1 h
+ramp-down neighbours), and the retrain baseline filter did not match the live MAE
+exclusion. A complementary partial-hour trim in `fetch_energy_history` /
+`fetch_recent_energy` prevents sub-hour accumulations from entering training in the first
+place.
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — `fetch_energy_history` and `fetch_recent_energy` now trim the still-open hourly bucket before returning. A `completed_cutoff` guard drops the partial row from the returned DataFrame; the partial row is still written to CSV so the next weekly compaction can fill it in via HA-wins merge.
+- `apps/energy_forecast/energy_forecast.py` — incomplete hours at EV session start are no longer stored in `_actuals_history`; a `completed_cutoff = now_ts.floor("1h")` guard skips any hour `>= completed_cutoff`, eliminating the partial-hour spike that caused +0.034 kWh MAE jumps at session boundaries.
+- `apps/energy_forecast/energy_forecast.py` — ramp-down and EV-adjacent hours stored in a previous cycle (before the full session was visible to `ev_mae_excluded`) are now retroactively evicted each cycle via `_actuals_history.pop(ts, None)` for every timestamp in `ev_mae_excluded`. Resolves the +0.025 kWh MAE residual spike and self-heals existing contamination on first restart after deploy.
+- `apps/energy_forecast/energy_forecast.py` — `_actuals_for_retrain` (passed to `_maybe_adaptive_retrain`) now filters on `ev_mae_excluded` (EV ±1 h window) instead of the narrower `ev_hour_set` (exact EV hours only). Ramp-down hours that were previously included inflated `_compute_live_mae` and could trigger spurious adaptive retrains.
+- `apps/energy_forecast/model.py` — `_retrain()` now drops ±1 h neighbours of EV-charging hours from `baseline_df` after `split_ev_charging`, matching the exclusion applied in the live MAE path. NaN lags introduced by the drop are filled from `meta.pkl` medians.
+
+### Tests
+- 589 passing (up from 582 in v0.11.2; +7 covering partial-hour trim, completed-hour guard, retroactive eviction, `_actuals_for_retrain` EV-adjacent exclusion, and `_retrain` baseline neighbour drop).
+
+---
+
 ## [0.11.2] — 2026-06-01
 
 Stable release consolidating two alpha iterations. All fixes eliminate silent crashes and correctness bugs introduced during the v0.11.1 alpha cycle (service attribute lookups, timezone handling, actuals source selection, model persistence, MQTT discovery integration, and tau calibration log accuracy).

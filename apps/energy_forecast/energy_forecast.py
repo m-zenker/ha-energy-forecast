@@ -925,6 +925,15 @@ class EnergyForecast(hass.Hass):
                 ev_df["gross_kwh"].sum(),
                 sorted(ev_df["timestamp"].dt.date.unique().tolist()),
             )
+            # Drop ±1h adjacent hours (ramp-up/down) — split_ev_charging subtracts the
+            # charger load from exact EV hours but can't cleanly correct adjacent hours
+            # whose elevation comes from a tapering charger.  Dropping 1–2 rows per
+            # session (≈15% of days) has negligible training impact; NaN lags are
+            # filled by feature medians in meta.pkl.
+            _ev_adj_ts: set = {
+                ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
+            }
+            baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
 
         # ── Solar / grid-export / battery target correction ───────────────────
         # Corrects gross_kwh (grid import) to total household consumption.
@@ -1126,6 +1135,10 @@ class EnergyForecast(hass.Hass):
         ev_hour_set: set = set()
         if ev_detected is not None and not ev_detected.empty:
             ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))
+        # Hours immediately before/after EV charging are also contaminated (ramp-up/down).
+        # Excluded from _actuals_history so 7d/30d MAE sensors stay clean.
+        _ev_adjacent: set = {ts + pd.Timedelta(hours=d) for ts in ev_hour_set for d in (-1, 1)}
+        ev_mae_excluded: set = ev_hour_set | _ev_adjacent
 
         sub_sensors_recent: dict = {}
         for entity_id in self._sub_energy_sensors:
@@ -1261,16 +1274,20 @@ class EnergyForecast(hass.Hass):
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
         # Use full_actuals (pre-split, pre-sub-sensor-subtraction) so stored kWh
         # matches the training target (raw gross_kwh on non-EV hours).
-        # NOTE (BUG-7, deferred): ev_hour_set only covers the last 2 days. EV hours
-        # stored in _actuals_history from earlier cycles are not retroactively removed;
-        # they age out at the 30-day cutoff. Startup eviction would fix this faster
-        # but is invasive — deferred until there is evidence of significant MAE inflation.
         if full_actuals is not None and not full_actuals.empty:
+            completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
+            # Retroactively evict EV hours + neighbors already in actuals_history.
+            # Handles stale partials stored before the session was fully detected and
+            # ramp-down hours stored before adjacent exclusion kicked in.
+            for _ts in ev_mae_excluded:
+                self._actuals_history.pop(_ts, None)
             for _ts, _kwh in zip(
                 pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
                 full_actuals["gross_kwh"].astype(float),
             ):
-                if _ts not in ev_hour_set:
+                if _ts >= completed_cutoff:  # skip current (partial) hour
+                    continue
+                if _ts not in ev_mae_excluded:
                     self._actuals_history[_ts] = _kwh
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
@@ -1280,8 +1297,8 @@ class EnergyForecast(hass.Hass):
         self._save_pred_history()
 
         _actuals_for_retrain = (
-            recent_actuals[~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_hour_set)]
-            if (recent_actuals is not None and not recent_actuals.empty and ev_hour_set)
+            recent_actuals[~pd.to_datetime(recent_actuals["timestamp"]).dt.floor("1h").isin(ev_mae_excluded)]
+            if (recent_actuals is not None and not recent_actuals.empty and ev_mae_excluded)
             else recent_actuals
         )
         self._maybe_adaptive_retrain(_actuals_for_retrain)

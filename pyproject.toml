@@ -12,6 +12,7 @@ exclude = [
     "*.egg-info",
     "dist",
     "build",
+    "notebooks",
 ]
 
 [tool.ruff.lint]
