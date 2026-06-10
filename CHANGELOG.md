@@ -8,6 +8,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb` no longer crashes for users with appliances configured. It was calling `.keys()` on `sub_energy_sensors`, which is a list; fixed to build valid prefixes via a set comprehension over `_sub_sensor_prefix()`. The `energy_forecast/get_scenario` service now returns results correctly.
+- `apps/energy_forecast/energy_forecast.py` — `shap_summary` today-slice now uses `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` instead of the bare UTC system clock. On container-hosted HA instances (UTC timezone) the "today" window was offset by the local UTC delta, producing a misleading SHAP summary for the current day.
+- `apps/energy_forecast/weather.py` — SRG-SSR token is now cleared (and expiry reset) on a 401 response so the next call triggers a full re-authentication. Previously the stale token was left cached for up to 55 minutes, causing every subsequent call in that window to silently fall back to Open-Meteo.
+- `apps/energy_forecast/weather.py` — `fetch_open_meteo` now returns an empty DataFrame with the full `_WEATHER_COLUMNS` column set on failure instead of a bare columnless DataFrame. On fresh installs with no weather tail, the columnless fallback caused `KeyError: 'timestamp'` in `_engineer_features`; with typed columns the median imputation path applies correctly instead.
+
 ## [0.11.3] — 2026-06-09
 
 Stable release consolidating three alpha iterations. All fixes address EV-charging hour
