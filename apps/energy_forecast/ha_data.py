@@ -370,7 +370,7 @@ def _resolve_programs_for_series(
         preceding program event get an empty string.
 
     The primary strategy is backward LVFC: each row gets the last program state
-    at or before its timestamp.  A forward-lookup fallback (tolerance: 1 h) is
+    at or before its timestamp.  A forward-lookup fallback (tolerance: 2 h) is
     applied when the backward result is empty or the idle sentinel
     ``"no_program"``: this handles the common case where a user starts the
     machine at (say) 12:05, the hourly row is stamped 12:00, and the backward

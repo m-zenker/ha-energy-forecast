@@ -159,13 +159,11 @@ Plumb `room_areas` through `predict_scenario` and `_get_scenario_cb`.
 uses `set_state`, recreating the ghost-entity problem `_cleanup_legacy_states` exists to
 remove in MQTT mode; the cleanup list also doesn't include the scenario entities.
 
-### [ ] L7 — Doc drift
+### [x] L7 — Doc drift
 
-- `_resolve_programs_for_series` docstring says 1 h forward tolerance, code uses 2 h
-  (`ha_data.py:377` vs `ha_data.py:405`).
-- `HOLDOUT_FRACTION = 0.9` is a *training* fraction (acknowledged in the comment, but the
-  name still reads backwards).
-- `_pred_history` comments claim "~24h ahead" (see M5).
+- [x] `_resolve_programs_for_series` docstring updated: 1 h → 2 h (`ha_data.py`).
+- [~] `HOLDOUT_FRACTION` name: existing comment already explains the inversion; name kept for backward compat — won't fix.
+- [ ] `_pred_history` "~24h ahead" comments: deferred to Batch 3 (tied to M5 semantic decision).
 
 ### [ ] L8 — deploy.py nits
 
