@@ -178,8 +178,9 @@ def fetch_forecast(
         return _supplement_from_open_meteo(srg_df, om_df, timezone=timezone)
 
     except (requests.RequestException, KeyError, ValueError) as exc:
-        if isinstance(exc, requests.HTTPError) and getattr(getattr(exc, "response", None), "status_code", None) == 401:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401:
             _srg_token = None  # force re-auth on next call
+            _srg_token_expires_at = 0.0
         _LOGGER.warning("SRG-SSR forecast failed (%s) — falling back to Open-Meteo.", exc)
         return fetch_open_meteo(lat, lon, timezone=timezone)
 
