@@ -119,7 +119,7 @@ or recalibrate the adaptive threshold acknowledging the horizon mismatch.
 
 ## Low severity
 
-### [ ] L1 — `shap_summary` uses the system clock instead of the configured timezone
+### [x] L1 — `shap_summary` uses the system clock instead of the configured timezone
 
 `apps/energy_forecast/model.py:1136` — `pd.Timestamp.now().normalize()` is UTC in the
 container; everywhere else `self._timezone` is used deliberately (documented in

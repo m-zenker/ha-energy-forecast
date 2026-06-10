@@ -1133,7 +1133,7 @@ class EnergyForecastModel:
         )
 
         # Filter to today's local date; fall back to all rows if none match
-        today = pd.Timestamp.now().normalize()
+        today = pd.Timestamp.now(tz=self._timezone).tz_localize(None).normalize()
         mask = (pd.Series(future_hours) >= today) & (pd.Series(future_hours) < today + pd.Timedelta(days=1))
         X_slice = X[mask.values] if mask.sum() >= 3 else X
 

@@ -1890,6 +1890,27 @@ class TestShapSummary:
         result = m.shap_summary(forecast, live_temp=None, n=0)
         assert result == {}
 
+    def test_today_slice_uses_configured_timezone(self, tmp_path, monkeypatch):
+        """shap_summary must call pd.Timestamp.now with self._timezone, not without tz."""
+        # Build the model before installing the spy so that _make_trained_model's
+        # own pd.Timestamp.now() calls don't pollute the call list.
+        m, forecast = _make_trained_model(tmp_path)
+
+        calls = []
+        original_now = pd.Timestamp.now
+
+        def spy_now(*args, **kwargs):
+            calls.append(kwargs.get("tz", "__no_tz__"))
+            return original_now(*args, **kwargs)
+
+        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(spy_now))
+
+        m.shap_summary(forecast, live_temp=5.0, n=3)
+
+        assert "__no_tz__" not in calls, (
+            "shap_summary called pd.Timestamp.now() without a timezone — would use UTC inside the container"
+        )
+
 
 # ── Temperature sensor blending: bias fade ──────────────────────────────────────
 
