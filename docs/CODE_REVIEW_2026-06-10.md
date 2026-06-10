@@ -133,7 +133,7 @@ Same pattern (display-only, harmless): `last_trained` / `hours_since_trained` us
 evaluated on the last 10% it has already seen. It's the `last_mae` fallback when CV is
 skipped (< 500 rows), so new installs report optimistic accuracy.
 
-### [ ] L3 — SRG token not invalidated on auth failure
+### [x] L3 — SRG token not invalidated on auth failure
 
 `apps/energy_forecast/weather.py:96-111` — a revoked/early-expired token causes silent
 Open-Meteo fallback for the rest of the 55-minute cache window. Clear `_srg_token` on any
