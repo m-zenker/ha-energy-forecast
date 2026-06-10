@@ -347,6 +347,42 @@ class TestShortHorizonLags:
             assert "lag_12h" not in rec.message
 
 
+class TestLagFeaturesTemporalTraining:
+    """M1 regression — training lags must be temporal, not positional over gapped frames."""
+
+    def test_gap_produces_nan_lag_not_stale_value(self):
+        """A 24-hour training gap must cause lag_24h to be NaN for rows in the 24h after it."""
+        from energy_forecast.model import _add_lag_and_rolling_training
+
+        ts_before = pd.date_range("2024-01-01", periods=24, freq="1h")  # hours 0-23
+        ts_after = pd.date_range("2024-01-03", periods=24, freq="1h")  # hours 48-71 (gap = 2024-01-02)
+        ts = ts_before.tolist() + ts_after.tolist()
+        kwh = [1.0] * 24 + [2.0] * 24
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+        df = _add_lag_and_rolling_training(energy, [24])
+
+        after_rows = df[df["timestamp"] >= pd.Timestamp("2024-01-03")]
+        assert after_rows["lag_24h"].isna().all(), (
+            "Expected all lag_24h for rows after the gap to be NaN "
+            f"(2024-01-02 not in training data), got: {after_rows['lag_24h'].values}"
+        )
+
+    def test_continuous_data_lag_values_unchanged(self):
+        """Temporal lag fix must not change behavior when training data has no gaps."""
+        from energy_forecast.model import _add_lag_and_rolling_training
+
+        ts = pd.date_range("2024-01-01", periods=100, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": list(range(100))})
+
+        df = _add_lag_and_rolling_training(energy, [24])
+
+        # Row at hour 24: lag_24h should be the value from hour 0 = 0.0
+        first_valid = df["lag_24h"].dropna()
+        assert float(first_valid.iloc[0]) == pytest.approx(0.0)
+        assert float(first_valid.iloc[1]) == pytest.approx(1.0)
+
+
 # ── Bridge-day holiday features ───────────────────────────────────────────────
 
 

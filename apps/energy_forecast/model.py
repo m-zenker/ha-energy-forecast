@@ -1718,15 +1718,33 @@ def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int
     import pandas as pd
 
     df = energy_df.sort_values("timestamp").reset_index(drop=True).copy()
+    ts_index = pd.to_datetime(df["timestamp"])
+
+    if df.empty:
+        # Empty frame — no grid to build; return df with all-NaN feature columns.
+        new_cols: dict = {}
+        for lag in active_lags:
+            new_cols[f"lag_{lag}h"] = pd.Series(dtype=float)
+        new_cols["rolling_mean_24h"] = pd.Series(dtype=float)
+        new_cols["rolling_mean_7d"] = pd.Series(dtype=float)
+        new_cols["rolling_std_24h"] = pd.Series(dtype=float)
+        return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    # Reindex to a continuous hourly grid so shift(N) means "N hours ago" even when
+    # the training frame has holes (zero-import hours dropped, EV adjacent hours
+    # dropped, outages). Without this, shift(24) on row i looks at row i-24 which
+    # may be more than 24 hours earlier when rows are missing.
+    hourly_grid = pd.date_range(ts_index.min(), ts_index.max(), freq="1h")
+    dense_kwh = pd.Series(df["gross_kwh"].values, index=ts_index).reindex(hourly_grid)
 
     new_cols: dict = {}
     for lag in active_lags:
-        new_cols[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
+        new_cols[f"lag_{lag}h"] = dense_kwh.shift(lag).reindex(ts_index).values
 
-    shifted = df["gross_kwh"].shift(1)
-    new_cols["rolling_mean_24h"] = shifted.rolling(24, min_periods=12).mean()
-    new_cols["rolling_mean_7d"] = shifted.rolling(7 * 24, min_periods=48).mean()
-    new_cols["rolling_std_24h"] = shifted.rolling(24, min_periods=12).std().fillna(0)
+    dense_shifted = dense_kwh.shift(1)
+    new_cols["rolling_mean_24h"] = dense_shifted.rolling(24, min_periods=12).mean().reindex(ts_index).values
+    new_cols["rolling_mean_7d"] = dense_shifted.rolling(7 * 24, min_periods=48).mean().reindex(ts_index).values
+    new_cols["rolling_std_24h"] = dense_shifted.rolling(24, min_periods=12).std().fillna(0).reindex(ts_index).values
 
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
