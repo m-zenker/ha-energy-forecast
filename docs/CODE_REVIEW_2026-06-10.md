@@ -34,7 +34,7 @@ test that uses a real list-typed `args["sub_energy_sensors"]`.
 
 ## Medium severity
 
-### [ ] M1 — Training lags are positional, prediction lags are temporal
+### [x] M1 — Training lags are positional, prediction lags are temporal
 
 `apps/energy_forecast/model.py:1707-1731` (training) vs `model.py:1734-1761` (prediction)
 

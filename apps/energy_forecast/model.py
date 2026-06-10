@@ -1859,39 +1859,42 @@ def _add_sub_sensor_lags_training(
 
     n_rows = len(df)
     ts_idx = pd.to_datetime(df["timestamp"])
+    hourly_grid = pd.date_range(ts_idx.min(), ts_idx.max(), freq="1h")
     new_cols: dict = {}
 
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
             continue
         sub_series = sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"].sort_index()
-        kwh_series = pd.Series(pd.to_numeric(sub_series.reindex(ts_idx), errors="coerce").values)
-        nan_count = int(kwh_series.isna().sum())
-        if nan_count > len(kwh_series) * 0.5:
+        # Reindex to dense hourly grid for temporal shift accuracy (same fix as
+        # _add_lag_and_rolling_training — positional shift over gapped ts_idx is wrong).
+        dense_kwh = pd.to_numeric(sub_series.reindex(hourly_grid), errors="coerce")
+        nan_count = int(dense_kwh.reindex(ts_idx).isna().sum())
+        if nan_count > len(ts_idx) * 0.5:
             _LOGGER.warning(
                 "%s reindex introduces %d/%d NaN values during training — "
                 "sub-sensor data may have gaps or misaligned timestamps; "
                 "will be filled with training medians.",
                 prefix,
                 nan_count,
-                len(kwh_series),
+                len(ts_idx),
             )
-        new_cols[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
+        new_cols[f"{prefix}_lag_24h"] = dense_kwh.shift(24).reindex(ts_idx).values
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
-            new_cols[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
+            new_cols[f"{prefix}_lag_168h"] = dense_kwh.shift(168).reindex(ts_idx).values
 
         # active_24h: was the appliance active any time in the past 24h?
         # Use shift(1) so the current-row value is excluded (lag semantics).
-        filled = kwh_series.fillna(0)
+        filled = dense_kwh.fillna(0)
         shifted_kwh = filled.shift(1)
         active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
-        new_cols[f"{prefix}_active_24h"] = active.values
+        new_cols[f"{prefix}_active_24h"] = active.reindex(ts_idx).values
 
         # runs_7d: how many times did the appliance start (0→>0 transition) in
         # the past 168h?  shift(1) applied before rolling to exclude current row.
         is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
         runs = is_start.shift(1).rolling(168, min_periods=1).sum()
-        new_cols[f"{prefix}_runs_7d"] = runs.values
+        new_cols[f"{prefix}_runs_7d"] = runs.reindex(ts_idx).values
 
     if new_cols:
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)

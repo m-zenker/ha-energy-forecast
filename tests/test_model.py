@@ -382,6 +382,22 @@ class TestLagFeaturesTemporalTraining:
         assert float(first_valid.iloc[0]) == pytest.approx(0.0)
         assert float(first_valid.iloc[1]) == pytest.approx(1.0)
 
+    def test_sub_sensor_gap_produces_nan_lag_not_stale_value(self):
+        """Sub-sensor lag_24h must be NaN when the target timestamp is in a training gap."""
+        ts_before = pd.date_range("2024-01-01", periods=24, freq="1h")
+        ts_after = pd.date_range("2024-01-03", periods=24, freq="1h")  # 24h gap on 2024-01-02
+        ts = ts_before.tolist() + ts_after.tolist()
+        kwh = [1.0] * 24 + [2.0] * 24
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
+
+        after_rows = df[df["timestamp"] >= pd.Timestamp("2024-01-03")]
+        assert after_rows["sub_hp_lag_24h"].isna().all(), (
+            f"Expected NaN sub_hp_lag_24h for rows after gap, got: {after_rows['sub_hp_lag_24h'].values}"
+        )
+
 
 # ── Bridge-day holiday features ───────────────────────────────────────────────
 
