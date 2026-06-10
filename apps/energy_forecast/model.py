@@ -661,12 +661,19 @@ class EnergyForecastModel:
                 ", ".join(f"{n}={v:.0f}" for n, v in top),
             )
 
-        # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
+        # ── Hold-out MAE (last 10%) — trained on train-split only for honest estimate ─
+        # The final `model` is still trained on all rows for best accuracy; this
+        # temporary holdout model is only for the MAE fallback used when CV is skipped.
         holdout_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
-                holdout_mae = round(float(mae_fn(y[split:], np.expm1(model.predict(X.iloc[split:])))), 4)
+                ho_model = _build_model(lgb, GBR, n_estimators=best_n_est, num_leaves=best_num_leaves)
+                if sample_weight is not None:
+                    ho_model.fit(X.iloc[:split], y_fit[:split], sample_weight=sample_weight[:split])
+                else:
+                    ho_model.fit(X.iloc[:split], y_fit[:split])
+                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_model.predict(X.iloc[split:])))), 4)
             except (ValueError, IndexError):
                 pass
 

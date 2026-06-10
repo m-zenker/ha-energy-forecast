@@ -127,7 +127,7 @@ container; everywhere else `self._timezone` is used deliberately (documented in
 Same pattern (display-only, harmless): `last_trained` / `hours_since_trained` use
 `datetime.now()`.
 
-### [ ] L2 — Holdout MAE is in-sample
+### [x] L2 — Holdout MAE is in-sample
 
 `apps/energy_forecast/model.py:664-671` — the final model is fit on *all* rows, then
 evaluated on the last 10% it has already seen. It's the `last_mae` fallback when CV is

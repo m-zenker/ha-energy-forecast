@@ -943,6 +943,56 @@ class TestBuildModel:
         assert model.n_estimators == 300
 
 
+# ── Holdout MAE out-of-sample (L2) ───────────────────────────────────────────
+
+
+class TestHoldoutMAE:
+    """L2 regression — holdout MAE must be out-of-sample."""
+
+    def test_holdout_mae_is_out_of_sample(self, tmp_path):
+        """last_mae must come from a model trained on the first 90%, not all data.
+
+        With n < MIN_CV_ROWS (500), CV is skipped and last_mae = holdout_mae.
+        Dataset: first 360 rows gross_kwh=1.0; last 40 rows gross_kwh=500.0.
+
+        Before fix: final model sees all 400 rows → in-sample holdout_mae ≈ 0.
+        After fix:  holdout model sees only first 360 rows (all 1.0) → evaluates
+                    on last 40 rows (all 500.0) → holdout_mae >> 1.0.
+
+        The large jump (500x) is intentional: it overwhelms any temporal
+        extrapolation the model might do, making the in-sample vs out-of-sample
+        distinction unambiguous.
+        """
+        import pandas as pd
+
+        n = 400  # < MIN_CV_ROWS=500 → CV skipped; last_mae = holdout_mae
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        values = [1.0] * 360 + [500.0] * 40
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": values})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": [10.0] * n,
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+                "humidity": [70.0] * n,
+            }
+        )
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+
+        # After the fix: holdout model trained on rows 0-359 (all 1.0),
+        # evaluated on rows 360-399 (all 500.0) → MAE >> 1.0.
+        assert m.last_mae is not None
+        assert m.last_mae > 1.0, (
+            f"Expected out-of-sample holdout_mae > 1.0 "
+            f"(model should not have seen the 500.0 holdout rows), got {m.last_mae}"
+        )
+
+
 # ── Cantonal holidays (#9) ────────────────────────────────────────────────────
 
 
