@@ -20,6 +20,20 @@ _srg_token_expires_at: float = 0.0  # Unix timestamp after which token is invali
 # Caching avoids ~24 redundant geolocation lookups per day (50% quota savings).
 _srg_geo_id: dict[tuple[float, float], str] = {}  # (lat, lon) → geo station ID
 
+# Canonical column list for weather DataFrames.  Used to return a properly-columned
+# empty DataFrame on fetch failure so _engineer_features median-imputation applies
+# instead of raising KeyError on missing columns.
+_WEATHER_COLUMNS = [
+    "timestamp",
+    "temp_c",
+    "precipitation_mm",
+    "sunshine_min",
+    "wind_kmh",
+    "cloud_cover_pct",
+    "direct_radiation_wm2",
+    "humidity",
+]
+
 
 def _parse_sunshine_min(sunshine_seconds: list) -> list:
     """Convert Open-Meteo sunshine_duration (seconds) to minutes, clamped to [0, 60].
@@ -280,4 +294,4 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") ->
             }
         )
     except (requests.RequestException, KeyError, ValueError):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_WEATHER_COLUMNS)

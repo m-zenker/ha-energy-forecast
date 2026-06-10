@@ -88,6 +88,26 @@ class TestFetchOpenMeteo:
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
+    def test_network_error_returns_correct_columns(self):
+        """On failure, returned DataFrame must have all weather columns even if empty."""
+        import requests as req
+
+        with patch("energy_forecast.weather.requests.get", side_effect=req.RequestException("timeout")):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+
+        expected_cols = {
+            "timestamp",
+            "temp_c",
+            "precipitation_mm",
+            "sunshine_min",
+            "wind_kmh",
+            "cloud_cover_pct",
+            "direct_radiation_wm2",
+            "humidity",
+        }
+        assert df.empty
+        assert expected_cols <= set(df.columns), f"Missing columns on failure return: {expected_cols - set(df.columns)}"
+
     def test_url_contains_sunshine_duration(self):
         """The outgoing URL must request sunshine_duration from the API."""
         hourly = {**_base_hourly(2), "sunshine_duration": [0, 0]}

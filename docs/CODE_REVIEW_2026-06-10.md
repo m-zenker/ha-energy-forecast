@@ -139,7 +139,7 @@ skipped (< 500 rows), so new installs report optimistic accuracy.
 Open-Meteo fallback for the rest of the 55-minute cache window. Clear `_srg_token` on any
 401/`RequestException` before falling back.
 
-### [ ] L4 — Total weather failure crashes the hourly update on fresh installs
+### [x] L4 — Total weather failure crashes the hourly update on fresh installs
 
 `fetch_open_meteo` returns a column-less empty DataFrame on failure; with `_weather_tail`
 also None (fresh install / old meta), `_engineer_features` raises `KeyError: 'timestamp'`
