@@ -377,7 +377,7 @@ class TestGetScenarioCbSubSensors:
         # Real list (not MagicMock) — .keys() would raise AttributeError here
         app._sub_energy_sensors = ["sensor.dishwasher_power"]
         # _sub_sensor_prefix must return a real string so the prefix appears in valid_prefixes
-        app._sub_sensor_prefix = lambda eid: f"sub_{eid.split('.', 1)[-1]}"
+        app._sub_sensor_prefix = EnergyForecast._sub_sensor_prefix.__get__(app)
         app._ml_model._appliance_signatures = {}
 
         scenario_result = _make_baseline_df()
@@ -403,7 +403,7 @@ class TestGetScenarioCbSubSensors:
 
         app = _make_app(cached_df=_make_baseline_df())
         app._sub_energy_sensors = ["sensor.dishwasher_power"]
-        app._sub_sensor_prefix = lambda eid: f"sub_{eid.split('.', 1)[-1]}"
+        app._sub_sensor_prefix = EnergyForecast._sub_sensor_prefix.__get__(app)
         app._ml_model._appliance_signatures = {}
 
         scenario_result = _make_baseline_df()
