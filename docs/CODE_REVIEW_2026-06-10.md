@@ -58,7 +58,7 @@ timestamp like the prediction path.
 enter training at all — `_apply_target_correction` only fixes hours that survived the
 `> 0` filter.
 
-### [ ] M2 — The 5 freshest training days get median-imputed weather
+### [x] M2 — The 5 freshest training days get median-imputed weather
 
 `apps/energy_forecast/energy_forecast.py:1014`, `apps/energy_forecast/model.py:2476`
 

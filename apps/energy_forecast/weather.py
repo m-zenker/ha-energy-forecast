@@ -254,10 +254,11 @@ def _supplement_from_open_meteo(
     return combined.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") -> pd.DataFrame:
-    """Forecast (+ 3-day historical tail) using the free Open-Meteo API.
+def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich", past_days: int = 3) -> pd.DataFrame:
+    """Forecast (+ measured historical tail) using the free Open-Meteo API.
 
-    past_days=3 adds ~72 h of measured history before the forecast window.
+    past_days adds measured history before the forecast window; default=3 anchors
+    temp_rolling_3d. Pass past_days=7 from _retrain to cover the 5-day archive lag.
     This anchors the temp_rolling_3d feature in _engineer_features so the
     3-day rolling mean is based on real observations, not forecast values.
     """
@@ -268,7 +269,7 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") ->
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
         ",cloud_cover,direct_radiation,relative_humidity_2m"
-        "&past_days=3"
+        f"&past_days={past_days}"
         f"&timezone={tz_encoded}"
     )
     try:

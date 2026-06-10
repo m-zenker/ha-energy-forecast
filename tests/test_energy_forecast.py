@@ -2363,6 +2363,75 @@ def test_publish_thermal_pressure_uses_mqtt_in_mqtt_mode():
     assert stub._mqtt_set_sensor_calls[0][0] == "energy_forecast_thermal_pressure_net"
 
 
+class TestStitchRecentWeather:
+    """M2: _stitch_recent_weather must extend archive with recent tail, archive wins on overlap."""
+
+    def test_recent_tail_appended_beyond_archive(self):
+        """Rows in recent_df beyond the archive cutoff are added."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=24, freq="1h"),
+                "temp_c": [10.0] * 24,
+            }
+        )
+        recent = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01 12:00", periods=24, freq="1h"),
+                "temp_c": [99.0] * 24,
+            }
+        )
+        cutoff = pd.Timestamp("2024-01-02 12:00")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+
+        assert len(result) > len(archive)
+        overlap_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 12:00")]
+        assert float(overlap_row["temp_c"].iloc[0]) == pytest.approx(10.0)
+
+    def test_future_rows_in_recent_are_excluded(self):
+        """Rows in recent_df after now_local must not be added."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=24, freq="1h"),
+                "temp_c": [10.0] * 24,
+            }
+        )
+        recent = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=24, freq="1h"),
+                "temp_c": [99.0] * 24,
+            }
+        )
+        cutoff = pd.Timestamp("2024-01-02 06:00")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+
+        assert result["timestamp"].max() <= cutoff
+
+    def test_empty_recent_returns_archive_unchanged(self):
+        """Empty recent_df must return archive as-is."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=10, freq="1h"),
+                "temp_c": [10.0] * 10,
+            }
+        )
+        recent = pd.DataFrame(columns=["timestamp", "temp_c"])
+        cutoff = pd.Timestamp("2024-01-02")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+        assert len(result) == len(archive)
+
+
 def test_publish_thermal_pressure_tau_none_not_coerced_to_zero():
     """tau_hours=None (uncalibrated) must be published as None, not 0.0."""
     from energy_forecast.energy_forecast import EnergyForecast

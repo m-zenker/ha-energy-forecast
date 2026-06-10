@@ -122,6 +122,18 @@ class TestFetchOpenMeteo:
             weather.fetch_open_meteo(47.0, 8.0)
         assert "past_days=3" in mock_get.call_args[0][0]
 
+    def test_url_contains_custom_past_days(self):
+        """fetch_open_meteo must honour the past_days parameter in the URL."""
+        with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
+            weather.fetch_open_meteo(47.0, 8.0, past_days=7)
+        assert "past_days=7" in mock_get.call_args[0][0]
+
+    def test_past_days_default_is_3(self):
+        """Default past_days must remain 3 so existing call sites are unaffected."""
+        with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
+            weather.fetch_open_meteo(47.0, 8.0)
+        assert "past_days=3" in mock_get.call_args[0][0]
+
     def test_url_contains_cloud_cover_and_direct_radiation(self):
         with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
             weather.fetch_open_meteo(47.0, 8.0)

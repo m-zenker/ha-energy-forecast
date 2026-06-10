@@ -1027,6 +1027,13 @@ class EnergyForecast(hass.Hass):
             )
             weather_df = _empty_weather_df()
 
+        # Cover the 5-day archive lag: Open-Meteo forecast API with past_days=7
+        # includes measured (not forecast) data for recent hours.
+        recent_weather = weather.fetch_open_meteo(self._lat, self._lon, timezone=self._timezone, past_days=7)
+        recent_weather = _strip_tz(recent_weather, self._timezone)
+        now_local = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        weather_df = _stitch_recent_weather(weather_df, recent_weather, now_local)
+
         away_df = ha_data.fetch_boolean_entity_history(self, self._away_mode_entity, days=30, timezone=self._timezone)
         if not away_df.empty:
             away_df = _strip_tz(away_df, self._timezone)
@@ -2079,6 +2086,25 @@ class EnergyForecast(hass.Hass):
 def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     """Convert timestamp column to naive local time. Delegates to const.strip_tz."""
     return _strip_tz_util(df, timezone)
+
+
+def _stitch_recent_weather(archive_df: Any, recent_df: Any, now_local: Any) -> Any:
+    """Extend archive weather with the measured tail from Open-Meteo, archive wins on overlap.
+
+    Trims recent_df to rows at or before now_local (strips forecast hours).
+    Returns archive_df unchanged when recent_df is empty after trimming.
+    """
+    import pandas as pd
+
+    tail = recent_df[recent_df["timestamp"] <= now_local]
+    if tail.empty:
+        return archive_df
+    return (
+        pd.concat([archive_df, tail])
+        .drop_duplicates(subset="timestamp", keep="first")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
 
 def _empty_weather_df() -> Any:
