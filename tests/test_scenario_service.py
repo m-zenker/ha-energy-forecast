@@ -368,6 +368,61 @@ class TestGetScenarioValidation:
         assert not any("invalid time" in r.message for r in caplog.records)
 
 
+class TestGetScenarioCbSubSensors:
+    def test_list_typed_sub_energy_sensors_does_not_crash(self):
+        """H1: _get_scenario_cb must not call .keys() on the list-typed _sub_energy_sensors."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app(cached_df=_make_baseline_df())
+        # Real list (not MagicMock) — .keys() would raise AttributeError here
+        app._sub_energy_sensors = ["sensor.dishwasher_power"]
+        # _sub_sensor_prefix must return a real string so the prefix appears in valid_prefixes
+        app._sub_sensor_prefix = lambda eid: f"sub_{eid.split('.', 1)[-1]}"
+        app._ml_model._appliance_signatures = {}
+
+        scenario_result = _make_baseline_df()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        # "sub_dishwasher_power" must be accepted (not warned-away) because it
+        # matches the prefix derived from the configured sensor
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {"sub_dishwasher_power": "14:00"}, "publish": False},
+        )
+        app.fire_event.assert_called_once()
+
+    def test_unknown_prefix_warns_and_drops(self, caplog):
+        """An unrecognised schedule key must produce a WARNING and be silently dropped."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app(cached_df=_make_baseline_df())
+        app._sub_energy_sensors = ["sensor.dishwasher_power"]
+        app._sub_sensor_prefix = lambda eid: f"sub_{eid.split('.', 1)[-1]}"
+        app._ml_model._appliance_signatures = {}
+
+        scenario_result = _make_baseline_df()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(
+                app,
+                "homeassistant",
+                "energy_forecast",
+                "get_scenario",
+                {"schedule": {"sub_unknown_appliance": "09:00"}, "publish": False},
+            )
+        assert any("unknown prefix" in r.message for r in caplog.records)
+        # fire_event still called — empty schedule after dropping bad key
+        app.fire_event.assert_called_once()
+
+
 class TestMqttSwVersion:
     """#73 — sw_version in MQTT payloads must equal __version__."""
 
