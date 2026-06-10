@@ -3,6 +3,7 @@
 Covers _project_indoor_temps() with heating_active_series + thermal_pressure
 behaviour in _engineer_features(), plus a predict() smoke test.
 """
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,6 +14,7 @@ from apps.energy_forecast.model import (
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 def _future_ts(n: int = 48) -> pd.DatetimeIndex:
     return pd.date_range("2026-01-15 10:00", periods=n, freq="1h")
@@ -25,11 +27,13 @@ def _outdoor_series(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.Series:
 def _climate_recent(ts: pd.DatetimeIndex, setpoint: float = 21.0, current: float = 19.0) -> dict:
     """One climate entity, observation at ts[0] (fresh)."""
     return {
-        "climate.room": pd.DataFrame({
-            "timestamp":    [ts[0]],
-            "current_temp": [current],
-            "setpoint":     [setpoint],
-        })
+        "climate.room": pd.DataFrame(
+            {
+                "timestamp": [ts[0]],
+                "current_temp": [current],
+                "setpoint": [setpoint],
+            }
+        )
     }
 
 
@@ -39,8 +43,8 @@ def _heating_active_series(ts: pd.DatetimeIndex, states: list[int]) -> pd.Series
 
 # ── _project_indoor_temps: setpoint projection ─────────────────────────────────
 
-class TestSetpointProjection:
 
+class TestSetpointProjection:
     def test_heating_on_uses_setpoint_on(self):
         """All hours ON → entire projected setpoint array == setpoint_on."""
         ts = _future_ts()
@@ -49,7 +53,10 @@ class TestSetpointProjection:
         ha_series = _heating_active_series(ts, [1] * 48)
 
         result = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -65,7 +72,10 @@ class TestSetpointProjection:
         ha_series = _heating_active_series(ts, [0] * 48)
 
         result = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -82,7 +92,10 @@ class TestSetpointProjection:
         ha_series = _heating_active_series(ts, states)
 
         result = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -100,7 +113,10 @@ class TestSetpointProjection:
         ha_series = _heating_active_series(ts, states)
 
         result = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -116,7 +132,10 @@ class TestSetpointProjection:
         cr = _climate_recent(ts, setpoint=19.5)
 
         result = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=None,
             setpoint_on=None,
             setpoint_off=None,
@@ -127,21 +146,23 @@ class TestSetpointProjection:
 
 # ── thermal_pressure via _engineer_features ────────────────────────────────────
 
+
 def _make_weather_df(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.DataFrame:
-    return pd.DataFrame({
-        "timestamp":           ts,
-        "temp_c":              [temp] * len(ts),
-        "precipitation_mm":    [0.0]  * len(ts),
-        "sunshine_min":        [0.0]  * len(ts),
-        "wind_kmh":            [0.0]  * len(ts),
-        "cloud_cover_pct":     [0.0]  * len(ts),
-        "direct_radiation_wm2":[0.0]  * len(ts),
-        "humidity":            [60.0] * len(ts),
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [temp] * len(ts),
+            "precipitation_mm": [0.0] * len(ts),
+            "sunshine_min": [0.0] * len(ts),
+            "wind_kmh": [0.0] * len(ts),
+            "cloud_cover_pct": [0.0] * len(ts),
+            "direct_radiation_wm2": [0.0] * len(ts),
+            "humidity": [60.0] * len(ts),
+        }
+    )
 
 
 class TestThermalPressureWithHysteresis:
-
     def test_pressure_zero_when_off(self):
         """Setpoint 12 °C, T_indoor ~19 °C → setpoint < indoor → thermal_pressure = 0."""
         ts = _future_ts(n=6)
@@ -150,7 +171,10 @@ class TestThermalPressureWithHysteresis:
         ha_series = _heating_active_series(ts, [0] * 6)
 
         climate_dfs = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -170,7 +194,10 @@ class TestThermalPressureWithHysteresis:
         ha_series = _heating_active_series(ts, [1] * 6)
 
         climate_dfs = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -191,7 +218,10 @@ class TestThermalPressureWithHysteresis:
         ha_series = _heating_active_series(ts, states)
 
         climate_dfs = _project_indoor_temps(
-            cr, ts, outdoor, tau_hours=24.0,
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
             heating_active_series=ha_series,
             setpoint_on=21.0,
             setpoint_off=12.0,
@@ -208,6 +238,7 @@ class TestThermalPressureWithHysteresis:
 
 
 # ── Hysteresis projection via _build_heating_active_projection ─────────────────
+
 
 class TestHeatingActiveProjectionHysteresis:
     """Test the outdoor-temp hysteresis logic directly."""
@@ -261,7 +292,7 @@ class TestHeatingActiveProjectionHysteresis:
         # cold → warm → cold → warm
         temps = [10.0] * 4 + [20.0] * 4 + [10.0] * 4 + [20.0] * 4
         states = self._run_hysteresis(temps, initial_state=0)
-        assert all(s == 1 for s in states[0:4])   # cold → ON
-        assert all(s == 0 for s in states[4:8])   # warm → OFF
+        assert all(s == 1 for s in states[0:4])  # cold → ON
+        assert all(s == 0 for s in states[4:8])  # warm → OFF
         assert all(s == 1 for s in states[8:12])  # cold → ON
-        assert all(s == 0 for s in states[12:16]) # warm → OFF
+        assert all(s == 0 for s in states[12:16])  # warm → OFF

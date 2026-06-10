@@ -1,4 +1,5 @@
 """Pytest configuration — makes the AppDaemon apps directory importable."""
+
 import sys
 from pathlib import Path
 from types import ModuleType

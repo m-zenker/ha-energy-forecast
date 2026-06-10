@@ -7,6 +7,7 @@ secondary model to predict tomorrow's regime from weather and calendar.
 Designed as an optional dependency: if scikit-learn is missing, it falls back
 gracefully to a no-op implementation.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,6 +22,7 @@ try:
     from sklearn.cluster import KMeans
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -72,9 +74,7 @@ class DailyProfileClusterer:
                 _LOGGER.info(f"Not enough history for clustering ({len(valid_days)}/14 days).")
                 return None
 
-            pivoted = daily[daily["date"].isin(valid_days)].pivot(
-                index="date", columns="hour", values="gross_kwh"
-            )
+            pivoted = daily[daily["date"].isin(valid_days)].pivot(index="date", columns="hour", values="gross_kwh")
 
             # Interpolate to fill missing hours (up to 6 per day)
             pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1, limit=6).ffill(axis=1).bfill(axis=1)
@@ -87,7 +87,8 @@ class DailyProfileClusterer:
             if ev_excluded > 0 and len(fit_index) < 14:
                 _LOGGER.info(
                     "Clustering: only %d non-EV days (< 14); including all %d days for fitting.",
-                    len(fit_index), len(pivoted),
+                    len(fit_index),
+                    len(pivoted),
                 )
                 fit_index = list(pivoted.index)
                 ev_excluded = 0
@@ -151,7 +152,7 @@ class RegimePredictor:
             common_idx = daily_features.index.intersection(labels.index)
             X = daily_features.loc[common_idx]
             y = labels.loc[common_idx]
-            
+
             fit_kwargs = {}
             if sample_weight is not None:
                 mean_w = sample_weight.mean() if len(sample_weight) > 0 else 1.0
@@ -179,9 +180,7 @@ class RegimePredictor:
             # uses bootstrap which ignores temporal ordering).
             n_splits = min(3, max(2, len(X) // 30))
             tscv = TimeSeriesSplit(n_splits=n_splits)
-            clf_proto = RandomForestClassifier(
-                n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3
-            )
+            clf_proto = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3)
             tscv_scores = cross_val_score(clf_proto, X, y, cv=tscv, scoring="accuracy")
             if verbose:
                 dist = y.value_counts(normalize=True).sort_index()
@@ -189,15 +188,21 @@ class RegimePredictor:
                 _LOGGER.info(
                     "Regime Predictor trained — train acc: %.2f, OOB=%.2f, "
                     "TimeSeriesCV=%.2f±%.2f (n=%d, k=%d) | class dist: %s",
-                    train_acc, oob_acc, tscv_scores.mean(), tscv_scores.std(),
-                    len(X), len(y.unique()), dist_str,
+                    train_acc,
+                    oob_acc,
+                    tscv_scores.mean(),
+                    tscv_scores.std(),
+                    len(X),
+                    len(y.unique()),
+                    dist_str,
                 )
             if tscv_scores.mean() < 0.5:
                 _LOGGER.warning(
                     "Regime Predictor TimeSeriesCV accuracy %.2f is near chance — regime signal "
-                    "may be unreliable. More training history needed.", tscv_scores.mean()
+                    "may be unreliable. More training history needed.",
+                    tscv_scores.mean(),
                 )
-            
+
         except Exception as e:
             _LOGGER.error(f"Regime Predictor training failed: {e}")
 
@@ -252,7 +257,8 @@ def find_optimal_k(
         if len(valid_days) < 14:
             _LOGGER.info(
                 "Auto-K: not enough history (%d/14 days) — using K=%d.",
-                len(valid_days), k_range[0],
+                len(valid_days),
+                k_range[0],
             )
             return k_range[0]
 
@@ -268,9 +274,7 @@ def find_optimal_k(
                     len(fit_days),
                 )
 
-        pivoted = daily[daily["date"].isin(valid_days)].pivot(
-            index="date", columns="hour", values="gross_kwh"
-        )
+        pivoted = daily[daily["date"].isin(valid_days)].pivot(index="date", columns="hour", values="gross_kwh")
         pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1).ffill(axis=1).bfill(axis=1)
 
         k_lo, k_hi = k_range
@@ -300,22 +304,25 @@ def find_optimal_k(
         if max_i - min_i < 1e-6:
             _LOGGER.warning(
                 "Auto-K: inertia range %.2e — data too homogeneous, falling back to K=%d",
-                max_i - min_i, k_lo,
+                max_i - min_i,
+                k_lo,
             )
             return k_lo
         inertias = {k: (i - min_i) / (max_i - min_i) for k, i in raw_inertias.items()}
-        
+
         # Smooth inertias slightly (rolling average)
         sorted_k = sorted(inertias.keys())
         smoothed = {k: inertias[k] for k in sorted_k}
         if len(sorted_k) > 3:
             for i in range(1, len(sorted_k) - 1):
-                smoothed[sorted_k[i]] = (inertias[sorted_k[i-1]] + inertias[sorted_k[i]] + inertias[sorted_k[i+1]]) / 3
+                smoothed[sorted_k[i]] = (
+                    inertias[sorted_k[i - 1]] + inertias[sorted_k[i]] + inertias[sorted_k[i + 1]]
+                ) / 3
 
         # Second pass: compute d2 and track potential K candidates
         candidates = []
         best_d2 = -np.inf
-        
+
         # Compute d2
         for i in range(1, len(sorted_k) - 1):
             k_prev, k_cur, k_next = sorted_k[i - 1], sorted_k[i], sorted_k[i + 1]
@@ -323,7 +330,7 @@ def find_optimal_k(
             if d2 > best_d2:
                 best_d2 = d2
             candidates.append((k_cur, d2))
-            
+
         # Select candidates within 10% of best_d2; take the first (lowest K) on ties
         best_candidates = [k for k, d2 in candidates if d2 >= best_d2 * 0.9]
         selected_k = best_candidates[0]
@@ -338,7 +345,8 @@ def find_optimal_k(
             oob = predictor.model.oob_score_ if predictor.is_fitted else float("nan")
             _LOGGER.info(
                 "Auto-K: inertia elbow selected K=%d. RegimePredictor OOB=%.2f (informational only).",
-                selected_k, oob,
+                selected_k,
+                oob,
             )
         except Exception:
             _LOGGER.info("Auto-K: inertia elbow selected K=%d.", selected_k)
