@@ -12,7 +12,7 @@ Plan EV charging, avoid bill surprises, and know your daily energy use before th
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
 
-> **Status:** v0.11.3-alpha-4 on dev. v0.11.3 is the current stable release on main.
+> **Status:** v0.11.4-alpha-1 on dev. v0.11.3 is the current stable release on main.
 
 **What you get:**
 - Trains entirely on *your* historical grid-import data — no generic model, no cloud dependency
