@@ -2277,6 +2277,101 @@ class TestUpdateCbNoLock:
         assert calls == [], "_update_sensors must NOT be called when model is None"
 
 
+# ── M3 — Adaptive retrain lock ────────────────────────────────────────────────
+
+
+class TestAdaptiveRetrainLock:
+    """M3: _maybe_adaptive_retrain must acquire self._lock before calling _retrain."""
+
+    def _make_fake(self):
+        """Stand-in for EnergyForecast with conditions that trigger adaptive retrain."""
+        import threading
+
+        fake = _FakeSelf()
+        fake._lock = threading.Lock()  # real lock, not mock
+        fake._ml_model.last_cv_mae = 0.5
+        fake._adaptive_retrain_threshold = 2.0
+        fake._pred_history = {}
+        fake._last_adaptive_retrain = pd.Timestamp("2024-01-01")  # > 24 h ago
+        fake._timezone = "Europe/Zurich"
+        return fake
+
+    def test_retrain_skipped_when_lock_held(self):
+        """_retrain must NOT be called when self._lock is already acquired."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        fake._lock.acquire()  # simulate _retrain_cb holding the lock
+
+        retrain_calls = []
+        fake._retrain = lambda: retrain_calls.append(1)
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        assert retrain_calls == [], "_retrain must be skipped when lock is busy"
+        fake._lock.release()
+
+    def test_retrain_fires_when_lock_free(self):
+        """_retrain IS called when the lock is free and MAE exceeds threshold."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        retrain_calls = []
+        fake._retrain = lambda: retrain_calls.append(1)
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        assert retrain_calls == [1], "_retrain must be called when lock is free and threshold exceeded"
+
+    def test_lock_released_after_retrain(self):
+        """self._lock must be released after adaptive retrain, even if _retrain succeeds."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        fake._retrain = lambda: None  # no-op retrain
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        # Lock must be acquirable again (was properly released)
+        acquired = fake._lock.acquire(blocking=False)
+        assert acquired, "Lock must be released after successful adaptive retrain"
+        fake._lock.release()
+
+    def test_lock_released_if_retrain_raises(self):
+        """self._lock must be released even when _retrain raises an exception."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+
+        def boom():
+            raise RuntimeError("training failed")
+
+        fake._retrain = boom
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            # Must not propagate — adaptive path has its own except
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        acquired = fake._lock.acquire(blocking=False)
+        assert acquired, "Lock must be released even when _retrain raises"
+        fake._lock.release()
+
+
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
 
 

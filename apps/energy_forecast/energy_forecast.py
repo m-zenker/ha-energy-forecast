@@ -1538,6 +1538,9 @@ class EnergyForecast(hass.Hass):
         if n_pairs < 24:
             return
         if live_mae > self._adaptive_retrain_threshold * cv_mae:
+            if not self._lock.acquire(blocking=False):
+                _LOGGER.debug("Adaptive retrain deferred — training lock busy (scheduled retrain in progress).")
+                return
             _LOGGER.warning(
                 "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
                 live_mae,
@@ -1545,8 +1548,15 @@ class EnergyForecast(hass.Hass):
                 cv_mae,
                 n_pairs,
             )
-            self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
-            self._retrain()
+            try:
+                self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
+                self._retrain()
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+
+                _LOGGER.error("Adaptive retraining failed: %s\n%s", exc, traceback.format_exc())
+            finally:
+                self._lock.release()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
 

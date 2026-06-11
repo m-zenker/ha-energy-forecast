@@ -70,7 +70,7 @@ This systematically blunts weather sensitivity where it matters most.
 **Fix:** fetch the recent tail from the Open-Meteo forecast API with `past_days`
 (already used at predict time in `fetch_open_meteo`) and stitch it onto the archive data.
 
-### [ ] M3 — Adaptive retrain bypasses the training lock
+### [x] M3 — Adaptive retrain bypasses the training lock
 
 `apps/energy_forecast/energy_forecast.py:1524-1550`
 
