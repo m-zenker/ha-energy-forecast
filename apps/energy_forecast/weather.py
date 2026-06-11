@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import logging
 import time
 from datetime import date
-
-import numpy as np
-import pandas as pd
-import requests
+from typing import TYPE_CHECKING
 
 from .const import strip_tz as _strip_tz
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -65,6 +67,10 @@ def fetch_historical_weather(
     """
     import urllib.parse
 
+    import numpy as np
+    import pandas as pd
+    import requests
+
     tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
@@ -111,6 +117,9 @@ def fetch_forecast(
     and the 3-day historical tail needed to anchor temp_rolling_3d.  SRG
     values for temp_c, precipitation_mm, sunshine_min, wind_kmh are preserved.
     """
+    import pandas as pd
+    import requests
+
     if not client_id or not client_secret:
         return fetch_open_meteo(lat, lon, timezone=timezone)
 
@@ -213,6 +222,8 @@ def _supplement_from_open_meteo(
 
     If om_df is empty (Open-Meteo call failed), returns srg_df unchanged.
     """
+    import pandas as pd
+
     if om_df.empty:
         return srg_df
 
@@ -263,6 +274,10 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich", pa
     3-day rolling mean is based on real observations, not forecast values.
     """
     import urllib.parse
+
+    import numpy as np
+    import pandas as pd
+    import requests
 
     tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (

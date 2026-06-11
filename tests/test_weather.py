@@ -92,7 +92,7 @@ class TestFetchOpenMeteo:
         """On failure, returned DataFrame must have all weather columns even if empty."""
         import requests as req
 
-        with patch("energy_forecast.weather.requests.get", side_effect=req.RequestException("timeout")):
+        with patch("requests.get", side_effect=req.RequestException("timeout")):
             df = weather.fetch_open_meteo(47.0, 8.0)
 
         expected_cols = {
@@ -562,7 +562,7 @@ class TestFetchOpenMeteoNetworkErrors:
 
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = req_mod.HTTPError("404")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -572,7 +572,7 @@ class TestFetchOpenMeteoNetworkErrors:
 
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = req_mod.HTTPError("500")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -580,7 +580,7 @@ class TestFetchOpenMeteoNetworkErrors:
         """requests.Timeout → empty df (Timeout is a subclass of RequestException)."""
         import requests as req_mod
 
-        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.Timeout("timed out")):
+        with patch("requests.get", side_effect=req_mod.Timeout("timed out")):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -588,7 +588,7 @@ class TestFetchOpenMeteoNetworkErrors:
         """requests.ConnectionError → empty df."""
         import requests as req_mod
 
-        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.ConnectionError("no route")):
+        with patch("requests.get", side_effect=req_mod.ConnectionError("no route")):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -597,7 +597,7 @@ class TestFetchOpenMeteoNetworkErrors:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.side_effect = ValueError("not json")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -606,7 +606,7 @@ class TestFetchOpenMeteoNetworkErrors:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"metadata": "no hourly key"}
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
