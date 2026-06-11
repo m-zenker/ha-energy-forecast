@@ -238,8 +238,7 @@ def find_optimal_k(
     4. Compute d²inertia/dK² at each interior K. Gather all K whose d2 is
        within 10 % of the global max — the "tolerance band". Among those
        candidates, prefer the lowest K (parsimony tie-breaker).
-    5. After selecting K, fit a RegimePredictor and log OOB *and* TimeSeriesCV
-       accuracy as INFO — purely informational; no selection gate on OOB.
+    5. Log the selected K.
 
     Falls back to k_range[0] on insufficient data (< 14 valid days) or if
     scikit-learn is unavailable.
