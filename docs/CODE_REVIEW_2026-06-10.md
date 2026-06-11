@@ -87,7 +87,7 @@ predict can see a new model with old feature columns.
 **Fix:** route the adaptive path through the same non-blocking `acquire` pattern;
 optionally assign `(model, feature_cols, medians, …)` as a single tuple/object swap.
 
-### [ ] M4 — "Today" blending is EV-inconsistent outside baseline_mode
+### [x] M4 — "Today" blending is EV-inconsistent outside baseline_mode
 
 `apps/energy_forecast/energy_forecast.py:1945-1957`
 

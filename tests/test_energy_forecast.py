@@ -333,6 +333,70 @@ class TestAggregate:
         assert "21_24" in result["blocks_today"]
 
 
+# ── M4 — EV blending consistency ─────────────────────────────────────────────
+
+
+class TestAggregateEvBlending:
+    """M4: EV sessions must always be stripped from blended_actuals, regardless of baseline_mode."""
+
+    def _run(self, baseline_mode: bool, actuals: Any) -> dict:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        now = pd.Timestamp("2026-06-01 12:00")  # 12 elapsed hours
+        preds = _pred_df(now, n=24, kwh=1.0)  # future: 12:00–35:00, only 12-24 counts for today
+
+        fake = _fake_self_for_aggregate(ev_threshold=4.5, ev_charger_kw=9.0)
+        fake._baseline_mode = baseline_mode
+
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = now
+            return EnergyForecast._aggregate(fake, preds, actuals, live_temp=None)
+
+    def _make_actuals_with_ev(self) -> pd.DataFrame:
+        """12 elapsed actuals; hour 02 is an EV spike (gross=10.0 kWh)."""
+        today = pd.Timestamp("2026-06-01 00:00")
+        ts = pd.date_range(today, periods=12, freq="1h")
+        kwh = [1.0] * 12
+        kwh[2] = 10.0  # EV spike at 02:00 — 10.0 > ev_threshold=4.5
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+    def test_ev_stripped_in_default_mode(self):
+        """In non-baseline_mode, EV co-load (gross - charger_kw) must be used, not raw gross."""
+        actuals = self._make_actuals_with_ev()
+        result = self._run(baseline_mode=False, actuals=actuals)
+
+        # After fix with split_ev_charging(threshold=4.5, charger_kw=9.0):
+        #   hour 02: 10.0 - 9.0 = 1.0 (co-load kept)
+        # Elapsed 00-12: 12 × 1.0 = 12.0 kWh
+        # Future  12-24: 12 × 1.0 = 12.0 kWh
+        # today = 24.0
+        #
+        # Before fix (bug): elapsed includes raw 10.0 for hour 02 → today = 33.0
+        assert result["today"] == pytest.approx(24.0), (
+            f"EV hour should be replaced with co-load (1.0), got today={result['today']} "
+            f"(bug: raw EV gross would give 33.0)"
+        )
+
+    def test_ev_stripped_in_baseline_mode(self):
+        """In baseline_mode, EV stripping must still work (existing behaviour preserved)."""
+        actuals = self._make_actuals_with_ev()
+        result = self._run(baseline_mode=True, actuals=actuals)
+
+        # Same arithmetic as default mode — sub-sensors not passed so no sub-sensor subtraction
+        assert result["today"] == pytest.approx(24.0), f"EV strip must work in baseline_mode too, got {result['today']}"
+
+    def test_no_ev_actuals_unchanged_in_default_mode(self):
+        """When actuals have no EV spikes, blended total is unaffected by the fix."""
+        today = pd.Timestamp("2026-06-01 00:00")
+        ts = pd.date_range(today, periods=12, freq="1h")
+        actuals = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 12})  # all ≤ threshold
+
+        result = self._run(baseline_mode=False, actuals=actuals)
+
+        # Elapsed: 12 × 1.0 = 12; future: 12 × 1.0 = 12 → today = 24.0
+        assert result["today"] == pytest.approx(24.0)
+
+
 # ── EV kWh sensor calculation ────────────────────────────────────────────────
 
 

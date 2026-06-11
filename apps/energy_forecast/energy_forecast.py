@@ -1939,16 +1939,16 @@ class EnergyForecast(hass.Hass):
             }
 
         # For the "today" blended total, use actuals for elapsed hours.
-        # In baseline_mode, actuals must be corrected (EV and sub-sensors removed)
-        # to match the model's baseline predictions.
+        # Training is unconditionally EV-free → predictions are always EV-free baseline.
+        # Strip EV in both modes so elapsed actuals and future predictions share the same
+        # semantic.  Sub-sensors are only stripped in baseline_mode because in non-baseline
+        # mode they are included in training and therefore in predictions too.
         blended_actuals = full_actuals
-        if self._baseline_mode and full_actuals is not None and not full_actuals.empty:
-            # 1. Remove EV sessions
+        if full_actuals is not None and not full_actuals.empty:
             blended_actuals, _ = ha_data.split_ev_charging(
                 full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
             )
-            # 2. Remove controllable sub-sensors
-            if sub_sensors_recent:
+            if self._baseline_mode and sub_sensors_recent:
                 blended_actuals, _ = _subtract_sub_sensors(
                     blended_actuals, self._subtract_only_dict(sub_sensors_recent)
                 )
