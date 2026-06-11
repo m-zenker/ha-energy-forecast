@@ -871,7 +871,7 @@ class EnergyForecast(hass.Hass):
                     "kWh",
                     "mdi:chart-bell-curve-cumulative",
                     "energy",
-                    "total",
+                    "measurement",
                 )
                 self._mqtt_publish_discovery(
                     "energy_forecast_scenario_tomorrow",
@@ -879,7 +879,7 @@ class EnergyForecast(hass.Hass):
                     "kWh",
                     "mdi:chart-bell-curve-cumulative",
                     "energy",
-                    "total",
+                    "measurement",
                 )
                 self._mqtt_publish_discovery(
                     "energy_forecast_scenario_delta_today",
@@ -897,7 +897,7 @@ class EnergyForecast(hass.Hass):
                         "kWh",
                         "mdi:chart-bell-curve-cumulative",
                         "energy",
-                        "total",
+                        "measurement",
                     )
                 self._scenario_mqtt_discovered = True
             self._mqtt_set_sensor("energy_forecast_scenario_today", scenario_today)
