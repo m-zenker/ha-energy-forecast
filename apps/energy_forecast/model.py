@@ -661,12 +661,19 @@ class EnergyForecastModel:
                 ", ".join(f"{n}={v:.0f}" for n, v in top),
             )
 
-        # ── Hold-out MAE (last 10%) as a quick sanity check ─────────────────
+        # ── Hold-out MAE (last 10%) — trained on train-split only for honest estimate ─
+        # The final `model` is still trained on all rows for best accuracy; this
+        # temporary holdout model is only for the MAE fallback used when CV is skipped.
         holdout_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
-                holdout_mae = round(float(mae_fn(y[split:], np.expm1(model.predict(X.iloc[split:])))), 4)
+                ho_model = _build_model(lgb, GBR, n_estimators=best_n_est, num_leaves=best_num_leaves)
+                if sample_weight is not None:
+                    ho_model.fit(X.iloc[:split], y_fit[:split], sample_weight=sample_weight[:split])
+                else:
+                    ho_model.fit(X.iloc[:split], y_fit[:split])
+                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_model.predict(X.iloc[split:])))), 4)
             except (ValueError, IndexError):
                 pass
 
@@ -956,6 +963,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import numpy as np
@@ -964,20 +972,23 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
         if "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
         else:
@@ -1004,6 +1015,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -1016,20 +1028,23 @@ class EnergyForecastModel:
         if self._model_q10 is None or self._model_q90 is None:
             return None
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
@@ -1058,6 +1073,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        room_areas: dict[str, float] | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
@@ -1082,6 +1098,7 @@ class EnergyForecastModel:
             heating_active_series=heating_active_series,
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
+            room_areas=room_areas,
         )
         return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 
@@ -1100,6 +1117,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
 
@@ -1117,23 +1135,26 @@ class EnergyForecastModel:
         if self.model is None or n <= 0:
             return {}
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series=people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
 
         # Filter to today's local date; fall back to all rows if none match
-        today = pd.Timestamp.now().normalize()
+        today = pd.Timestamp.now(tz=self._timezone).tz_localize(None).normalize()
         mask = (pd.Series(future_hours) >= today) & (pd.Series(future_hours) < today + pd.Timedelta(days=1))
         X_slice = X[mask.values] if mask.sum() >= 3 else X
 
@@ -1718,15 +1739,33 @@ def _add_lag_and_rolling_training(energy_df: pd.DataFrame, active_lags: list[int
     import pandas as pd
 
     df = energy_df.sort_values("timestamp").reset_index(drop=True).copy()
+    ts_index = pd.to_datetime(df["timestamp"])
+
+    if df.empty:
+        # Empty frame — no grid to build; return df with all-NaN feature columns.
+        new_cols: dict = {}
+        for lag in active_lags:
+            new_cols[f"lag_{lag}h"] = pd.Series(dtype=float)
+        new_cols["rolling_mean_24h"] = pd.Series(dtype=float)
+        new_cols["rolling_mean_7d"] = pd.Series(dtype=float)
+        new_cols["rolling_std_24h"] = pd.Series(dtype=float)
+        return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    # Reindex to a continuous hourly grid so shift(N) means "N hours ago" even when
+    # the training frame has holes (zero-import hours dropped, EV adjacent hours
+    # dropped, outages). Without this, shift(24) on row i looks at row i-24 which
+    # may be more than 24 hours earlier when rows are missing.
+    hourly_grid = pd.date_range(ts_index.min(), ts_index.max(), freq="1h")
+    dense_kwh = pd.Series(df["gross_kwh"].values, index=ts_index).reindex(hourly_grid)
 
     new_cols: dict = {}
     for lag in active_lags:
-        new_cols[f"lag_{lag}h"] = df["gross_kwh"].shift(lag)
+        new_cols[f"lag_{lag}h"] = dense_kwh.shift(lag).reindex(ts_index).values
 
-    shifted = df["gross_kwh"].shift(1)
-    new_cols["rolling_mean_24h"] = shifted.rolling(24, min_periods=12).mean()
-    new_cols["rolling_mean_7d"] = shifted.rolling(7 * 24, min_periods=48).mean()
-    new_cols["rolling_std_24h"] = shifted.rolling(24, min_periods=12).std().fillna(0)
+    dense_shifted = dense_kwh.shift(1)
+    new_cols["rolling_mean_24h"] = dense_shifted.rolling(24, min_periods=12).mean().reindex(ts_index).values
+    new_cols["rolling_mean_7d"] = dense_shifted.rolling(7 * 24, min_periods=48).mean().reindex(ts_index).values
+    new_cols["rolling_std_24h"] = dense_shifted.rolling(24, min_periods=12).std().fillna(0).reindex(ts_index).values
 
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -1841,39 +1880,42 @@ def _add_sub_sensor_lags_training(
 
     n_rows = len(df)
     ts_idx = pd.to_datetime(df["timestamp"])
+    hourly_grid = pd.date_range(ts_idx.min(), ts_idx.max(), freq="1h")
     new_cols: dict = {}
 
     for prefix, sub_df in sub_sensors.items():
         if sub_df is None or sub_df.empty:
             continue
         sub_series = sub_df.set_index(pd.to_datetime(sub_df["timestamp"]))["kwh"].sort_index()
-        kwh_series = pd.Series(pd.to_numeric(sub_series.reindex(ts_idx), errors="coerce").values)
-        nan_count = int(kwh_series.isna().sum())
-        if nan_count > len(kwh_series) * 0.5:
+        # Reindex to dense hourly grid for temporal shift accuracy (same fix as
+        # _add_lag_and_rolling_training — positional shift over gapped ts_idx is wrong).
+        dense_kwh = pd.to_numeric(sub_series.reindex(hourly_grid), errors="coerce")
+        nan_count = int(dense_kwh.reindex(ts_idx).isna().sum())
+        if nan_count > len(ts_idx) * 0.5:
             _LOGGER.warning(
                 "%s reindex introduces %d/%d NaN values during training — "
                 "sub-sensor data may have gaps or misaligned timestamps; "
                 "will be filled with training medians.",
                 prefix,
                 nan_count,
-                len(kwh_series),
+                len(ts_idx),
             )
-        new_cols[f"{prefix}_lag_24h"] = kwh_series.shift(24).values
+        new_cols[f"{prefix}_lag_24h"] = dense_kwh.shift(24).reindex(ts_idx).values
         if n_rows - 168 >= 100:  # lag_168h needs 168 lag rows + MIN_TRAINING_ROWS
-            new_cols[f"{prefix}_lag_168h"] = kwh_series.shift(168).values
+            new_cols[f"{prefix}_lag_168h"] = dense_kwh.shift(168).reindex(ts_idx).values
 
         # active_24h: was the appliance active any time in the past 24h?
         # Use shift(1) so the current-row value is excluded (lag semantics).
-        filled = kwh_series.fillna(0)
+        filled = dense_kwh.fillna(0)
         shifted_kwh = filled.shift(1)
         active = (shifted_kwh.rolling(24, min_periods=1).max() > 0).astype(int)
-        new_cols[f"{prefix}_active_24h"] = active.values
+        new_cols[f"{prefix}_active_24h"] = active.reindex(ts_idx).values
 
         # runs_7d: how many times did the appliance start (0→>0 transition) in
         # the past 168h?  shift(1) applied before rolling to exclude current row.
         is_start = ((filled > 0) & (filled.shift(1).fillna(0) == 0)).astype(float)
         runs = is_start.shift(1).rolling(168, min_periods=1).sum()
-        new_cols[f"{prefix}_runs_7d"] = runs.values
+        new_cols[f"{prefix}_runs_7d"] = runs.reindex(ts_idx).values
 
     if new_cols:
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)

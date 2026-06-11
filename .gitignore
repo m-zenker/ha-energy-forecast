@@ -1,8 +1,7 @@
 # apps.yaml may contain API credentials — keep a local copy only
 apps/apps.yaml
 
-.ipynb_checkpoints
-*/.ipynb_checkpoints/*
+**/.ipynb_checkpoints/
 __pycache__/
 .env
 .venv/
@@ -24,6 +23,9 @@ apps/energy_forecast/energy_history.csv
 # Temporary files / log drops
 temp/
 logs/
+work/
+htmlcov/
+.coverage
 
 # Local analysis data pulled from HA (runtime artifacts, never commit)
 data/

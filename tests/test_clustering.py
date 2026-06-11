@@ -1,4 +1,5 @@
 """Tests for the Daily Regime Clustering module."""
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,7 +20,7 @@ def test_clusterer_fit():
     # Regime 0: Flat
     # Regime 1: Morning peak
     # Regime 2: Evening peak
-    
+
     dates = pd.date_range("2024-01-01", periods=30, freq="D")
     rows = []
     for i, dt in enumerate(dates):
@@ -30,19 +31,17 @@ def test_clusterer_fit():
                 val = 2.0
             elif regime == 2 and 18 <= h <= 20:
                 val = 3.0
-            rows.append({
-                "timestamp": dt + pd.Timedelta(hours=h),
-                "gross_kwh": val
-            })
-    
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": val})
+
     df = pd.DataFrame(rows)
     clusterer = DailyProfileClusterer(n_clusters=3)
     labels = clusterer.fit(df)
-    
+
     assert clusterer.is_fitted
     assert len(clusterer.centroids) == 3
     assert len(labels) == 30
     assert labels.nunique() == 3
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_fit_relaxed_24h():
@@ -53,64 +52,70 @@ def test_clusterer_fit_relaxed_24h():
     for i, dt in enumerate(dates):
         hours = range(24)
         if i == 5:
-            hours = range(23) # Missing hour 23
+            hours = range(23)  # Missing hour 23
         for h in hours:
-            rows.append({
-                "timestamp": dt + pd.Timedelta(hours=h),
-                "gross_kwh": 1.0
-            })
-    
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0})
+
     df = pd.DataFrame(rows)
     clusterer = DailyProfileClusterer(n_clusters=2)
     labels = clusterer.fit(df)
-    
+
     assert clusterer.is_fitted
-    assert len(labels) == 20 # All days processed, including the 23h one
-    assert clusterer.centroids.shape == (2, 24) # Centroid still 24h
+    assert len(labels) == 20  # All days processed, including the 23h one
+    assert clusterer.centroids.shape == (2, 24)  # Centroid still 24h
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_regime_predictor():
     """Test that the regime predictor learns to map weather to clusters."""
     # 20 days, 2 regimes (0=Warm, 1=Cold)
     dates = pd.date_range("2024-01-01", periods=20, freq="D")
-    
+
     # Features: Temp (Warm days have 20C, Cold have 5C)
     weather_rows = []
     labels = []
     for i in range(20):
         is_cold = i % 2 == 0
-        weather_rows.append({
-            "temp_mean": 5.0 if is_cold else 20.0,
-            "temp_min": 0.0 if is_cold else 15.0,
-            "temp_max": 10.0 if is_cold else 25.0,
-            "sun_total": 100 if is_cold else 500,
-            "precip_total": 5 if is_cold else 0,
-            "day_of_week": dates[i].dayofweek,
-            "is_holiday": 0
-        })
+        weather_rows.append(
+            {
+                "temp_mean": 5.0 if is_cold else 20.0,
+                "temp_min": 0.0 if is_cold else 15.0,
+                "temp_max": 10.0 if is_cold else 25.0,
+                "sun_total": 100 if is_cold else 500,
+                "precip_total": 5 if is_cold else 0,
+                "day_of_week": dates[i].dayofweek,
+                "is_holiday": 0,
+            }
+        )
         labels.append(1 if is_cold else 0)
-    
+
     daily_features = pd.DataFrame(weather_rows, index=dates.date)
     label_series = pd.Series(labels, index=dates.date)
-    
+
     predictor = RegimePredictor()
     predictor.fit(daily_features, label_series)
-    
+
     assert predictor.is_fitted
-    
+
     # Predict on new similar data
-    test_features = pd.DataFrame([{
-        "temp_mean": 6.0,
-        "temp_min": 1.0,
-        "temp_max": 11.0,
-        "sun_total": 90,
-        "precip_total": 4,
-        "day_of_week": 0,
-        "is_holiday": 0
-    }], index=[pd.Timestamp("2024-02-01").date()])
-    
+    test_features = pd.DataFrame(
+        [
+            {
+                "temp_mean": 6.0,
+                "temp_min": 1.0,
+                "temp_max": 11.0,
+                "sun_total": 90,
+                "precip_total": 4,
+                "day_of_week": 0,
+                "is_holiday": 0,
+            }
+        ],
+        index=[pd.Timestamp("2024-02-01").date()],
+    )
+
     pred = predictor.predict(test_features)
     assert pred[0] == 1  # Should predict Cold regime
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_clusterer_fit_zero_weight_guard():
@@ -153,23 +158,26 @@ def test_clusterer_no_sklearn_fallback():
 
 # ── Helpers for new tests ──────────────────────────────────────────────────────
 
+
 def _make_daily_features(n: int = 20) -> tuple[pd.DataFrame, pd.Series]:
     """Return (daily_features, labels) with is_away and people_home columns."""
     dates = pd.date_range("2024-01-01", periods=n, freq="D")
     rows = []
     labels = []
     for i, dt in enumerate(dates):
-        rows.append({
-            "temp_mean": 5.0 if i % 2 == 0 else 20.0,
-            "temp_min": 0.0 if i % 2 == 0 else 15.0,
-            "temp_max": 10.0 if i % 2 == 0 else 25.0,
-            "sun_total": 100 if i % 2 == 0 else 500,
-            "precip_total": 5 if i % 2 == 0 else 0,
-            "day_of_week": dt.dayofweek,
-            "is_holiday": 0,
-            "is_away": 0,
-            "people_home": 2.0,
-        })
+        rows.append(
+            {
+                "temp_mean": 5.0 if i % 2 == 0 else 20.0,
+                "temp_min": 0.0 if i % 2 == 0 else 15.0,
+                "temp_max": 10.0 if i % 2 == 0 else 25.0,
+                "sun_total": 100 if i % 2 == 0 else 500,
+                "precip_total": 5 if i % 2 == 0 else 0,
+                "day_of_week": dt.dayofweek,
+                "is_holiday": 0,
+                "is_away": 0,
+                "people_home": 2.0,
+            }
+        )
         labels.append(i % 2)
     return pd.DataFrame(rows, index=dates.date), pd.Series(labels, index=dates.date)
 
@@ -177,15 +185,18 @@ def _make_daily_features(n: int = 20) -> tuple[pd.DataFrame, pd.Series]:
 def _make_weather_df(n_days: int = 10) -> pd.DataFrame:
     """Minimal hourly weather DataFrame for _prepare_daily_regime_features."""
     ts = pd.date_range("2024-03-01", periods=n_days * 24, freq="1h")
-    return pd.DataFrame({
-        "timestamp": ts,
-        "temp_c": [10.0] * len(ts),
-        "sunshine_min": [30.0] * len(ts),
-        "precipitation_mm": [0.0] * len(ts),
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [10.0] * len(ts),
+            "sunshine_min": [30.0] * len(ts),
+            "precipitation_mm": [0.0] * len(ts),
+        }
+    )
 
 
 # ── RegimePredictor: RF constraints and OOB score ─────────────────────────────
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_rf_constraints_applied():
@@ -217,6 +228,7 @@ def test_oob_score_accessible_and_in_range():
 def test_oob_warning_emitted_near_chance(caplog):
     """Shuffled (random) labels → OOB near chance → WARNING logged."""
     import logging
+
     feats, labels = _make_daily_features(n=20)
     # Shuffle labels so they're unlearnable from features
     shuffled = labels.sample(frac=1, random_state=99).values
@@ -233,6 +245,7 @@ def test_oob_warning_emitted_near_chance(caplog):
 
 # ── _prepare_daily_regime_features: occupancy columns ────────────────────────
 
+
 def test_daily_features_includes_is_away():
     """is_away column = daily max of hourly is_away values."""
     weather_df = _make_weather_df(n_days=3)
@@ -245,9 +258,9 @@ def test_daily_features_includes_is_away():
 
     assert "is_away" in result.columns
     dates = sorted(result.index)
-    assert result.loc[dates[0], "is_away"] == 1   # all away → max=1
-    assert result.loc[dates[1], "is_away"] == 1   # half away → max=1
-    assert result.loc[dates[2], "is_away"] == 0   # not away → max=0
+    assert result.loc[dates[0], "is_away"] == 1  # all away → max=1
+    assert result.loc[dates[1], "is_away"] == 1  # half away → max=1
+    assert result.loc[dates[2], "is_away"] == 0  # not away → max=0
 
 
 def test_daily_features_includes_people_home():
@@ -278,6 +291,7 @@ def test_daily_features_no_occupancy_defaults_zero():
 
 
 # ── find_optimal_k ────────────────────────────────────────────────────────────
+
 
 def _make_energy_df(n_days: int = 50, n_regimes: int = 3) -> pd.DataFrame:
     """Synthetic energy data with `n_regimes` distinct 24h profiles repeated over `n_days`.
@@ -311,12 +325,14 @@ def _make_aligned_weather_df(n_days: int = 50, n_regimes: int = 3) -> pd.DataFra
         regime = i % n_regimes
         temp = temp_map.get(regime % 3, 10.0)
         for h in range(24):
-            rows.append({
-                "timestamp": dt + pd.Timedelta(hours=h),
-                "temp_c": temp,
-                "sunshine_min": 30.0,
-                "precipitation_mm": 0.0,
-            })
+            rows.append(
+                {
+                    "timestamp": dt + pd.Timedelta(hours=h),
+                    "temp_c": temp,
+                    "sunshine_min": 30.0,
+                    "precipitation_mm": 0.0,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -405,6 +421,7 @@ def test_find_optimal_k_weighted():
 
 # ── Stage 3: test coverage additions ─────────────────────────────────────────
 
+
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_single_cluster_collapse():
     """When all profiles are nearly identical, homogeneous bail-out returns k_lo.
@@ -413,10 +430,7 @@ def test_find_optimal_k_single_cluster_collapse():
     """
     n_days = 30
     dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
-    rows = [
-        {"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0}
-        for dt in dates for h in range(24)
-    ]
+    rows = [{"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0} for dt in dates for h in range(24)]
     energy_df = pd.DataFrame(rows)
     weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=1)
     daily_features = _prepare_daily_regime_features(weather_df)
@@ -437,12 +451,11 @@ def test_clusterer_pkl_corruption_recovery(tmp_path):
     # _load() should silently fall back to None
     m = EnergyForecastModel(tmp_path)
     # The model dir exists but has no valid model; EnergyForecastModel._load() is called in __init__
-    assert m._clusterer is None, (
-        "Corrupt clusterer.pkl should result in _clusterer=None, not an exception"
-    )
+    assert m._clusterer is None, "Corrupt clusterer.pkl should result in _clusterer=None, not an exception"
 
 
 # ── Stage 1 algorithmic correctness tests ────────────────────────────────────
+
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_find_optimal_k_homogeneous_fallback():
@@ -450,10 +463,7 @@ def test_find_optimal_k_homogeneous_fallback():
     # All hours identical → KMeans inertia the same for every K → range ≈ 0
     n_days = 30
     dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
-    rows = [
-        {"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0}
-        for dt in dates for h in range(24)
-    ]
+    rows = [{"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0} for dt in dates for h in range(24)]
     energy_df = pd.DataFrame(rows)
     weather_df = _make_aligned_weather_df(n_days=n_days, n_regimes=1)
     daily_features = _prepare_daily_regime_features(weather_df)
@@ -472,16 +482,14 @@ def test_clusterer_fit_excludes_ev_days_from_centroids():
     rows = []
     for dt in dates:
         for h in range(24):
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
-                         "gross_kwh": 2.0 if h == 7 else 0.3})
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 2.0 if h == 7 else 0.3})
 
     # 3 "EV days" with a distinctive large evening spike at hour 20
     ev_dates = pd.date_range("2024-01-21", periods=3, freq="D")
     ev_day_set = {d.date() for d in ev_dates}
     for dt in ev_dates:
         for h in range(24):
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
-                         "gross_kwh": 8.0 if h == 20 else 0.3})
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 8.0 if h == 20 else 0.3})
 
     df = pd.DataFrame(rows)
     clusterer = DailyProfileClusterer(n_clusters=2)
@@ -541,8 +549,7 @@ def test_find_optimal_k_excludes_ev_days():
     ev_day_set = {d.date() for d in ev_dates}
     for dt in ev_dates:
         for h in range(24):
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
-                         "gross_kwh": 15.0 if 18 <= h <= 22 else 0.3})
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 15.0 if 18 <= h <= 22 else 0.3})
 
     df_all = pd.DataFrame(rows)
     df_no_ev = pd.DataFrame([r for r in rows if r["timestamp"].date() not in ev_day_set])
@@ -565,8 +572,7 @@ def test_clusterer_fit_no_ev_dates_unchanged():
     rows = []
     for i, dt in enumerate(dates):
         for h in range(24):
-            rows.append({"timestamp": dt + pd.Timedelta(hours=h),
-                         "gross_kwh": 1.0 if h == 8 else 0.3})
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0 if h == 8 else 0.3})
     df = pd.DataFrame(rows)
 
     clusterer_default = DailyProfileClusterer(n_clusters=2)
@@ -587,6 +593,7 @@ def test_clusterer_fit_no_ev_dates_unchanged():
 def test_regime_predictor_timeseries_cv_logged(caplog):
     """RegimePredictor.fit() logs TimeSeriesCV accuracy alongside OOB."""
     import logging
+
     # Use enough data for at least 2 CV folds (n_splits = min(3, max(2, n//30)))
     feats, labels = _make_daily_features(n=60)
 
@@ -594,6 +601,4 @@ def test_regime_predictor_timeseries_cv_logged(caplog):
         predictor = RegimePredictor()
         predictor.fit(feats, labels)
 
-    assert any("TimeSeriesCV" in r.message for r in caplog.records), (
-        "Expected 'TimeSeriesCV' in log output"
-    )
+    assert any("TimeSeriesCV" in r.message for r in caplog.records), "Expected 'TimeSeriesCV' in log output"

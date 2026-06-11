@@ -7,6 +7,7 @@ Covers:
   - _supplement_from_open_meteo: historical tail prepended, SRG values preserved,
     cloud/radiation filled from Open-Meteo
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,7 @@ from energy_forecast import weather
 from energy_forecast.weather import _supplement_from_open_meteo
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _make_response(hourly: dict) -> MagicMock:
     """Build a mock requests.Response returning the given hourly dict."""
@@ -27,10 +29,10 @@ def _make_response(hourly: dict) -> MagicMock:
 
 def _base_hourly(n: int = 4) -> dict:
     return {
-        "time":             [f"2026-03-12T{h:02d}:00" for h in range(n)],
-        "temperature_2m":   [5.0] * n,
-        "precipitation":    [0.0] * n,
-        "windspeed_10m":    [10.0] * n,
+        "time": [f"2026-03-12T{h:02d}:00" for h in range(n)],
+        "temperature_2m": [5.0] * n,
+        "precipitation": [0.0] * n,
+        "windspeed_10m": [10.0] * n,
     }
 
 
@@ -38,16 +40,16 @@ def _full_hourly(n: int = 4) -> dict:
     """Base hourly dict including all new fields."""
     return {
         **_base_hourly(n),
-        "sunshine_duration":  [1800] * n,
-        "cloud_cover":        [50]   * n,
-        "direct_radiation":   [200]  * n,
+        "sunshine_duration": [1800] * n,
+        "cloud_cover": [50] * n,
+        "direct_radiation": [200] * n,
     }
 
 
 # ── fetch_open_meteo ──────────────────────────────────────────────────────────
 
-class TestFetchOpenMeteo:
 
+class TestFetchOpenMeteo:
     def test_sunshine_duration_converted_to_minutes(self):
         """3600 seconds input must produce 60.0 minutes in sunshine_min."""
         hourly = {**_base_hourly(3), "sunshine_duration": [3600, 1800, 0]}
@@ -81,9 +83,30 @@ class TestFetchOpenMeteo:
     def test_network_error_returns_empty_dataframe(self):
         """On RequestException fetch_open_meteo must return an empty DataFrame."""
         import requests as req
+
         with patch("requests.get", side_effect=req.RequestException("timeout")):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
+
+    def test_network_error_returns_correct_columns(self):
+        """On failure, returned DataFrame must have all weather columns even if empty."""
+        import requests as req
+
+        with patch("requests.get", side_effect=req.RequestException("timeout")):
+            df = weather.fetch_open_meteo(47.0, 8.0)
+
+        expected_cols = {
+            "timestamp",
+            "temp_c",
+            "precipitation_mm",
+            "sunshine_min",
+            "wind_kmh",
+            "cloud_cover_pct",
+            "direct_radiation_wm2",
+            "humidity",
+        }
+        assert df.empty
+        assert expected_cols <= set(df.columns), f"Missing columns on failure return: {expected_cols - set(df.columns)}"
 
     def test_url_contains_sunshine_duration(self):
         """The outgoing URL must request sunshine_duration from the API."""
@@ -99,6 +122,18 @@ class TestFetchOpenMeteo:
             weather.fetch_open_meteo(47.0, 8.0)
         assert "past_days=3" in mock_get.call_args[0][0]
 
+    def test_url_contains_custom_past_days(self):
+        """fetch_open_meteo must honour the past_days parameter in the URL."""
+        with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
+            weather.fetch_open_meteo(47.0, 8.0, past_days=7)
+        assert "past_days=7" in mock_get.call_args[0][0]
+
+    def test_past_days_default_is_3(self):
+        """Default past_days must remain 3 so existing call sites are unaffected."""
+        with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
+            weather.fetch_open_meteo(47.0, 8.0)
+        assert "past_days=3" in mock_get.call_args[0][0]
+
     def test_url_contains_cloud_cover_and_direct_radiation(self):
         with patch("requests.get", return_value=_make_response(_full_hourly(2))) as mock_get:
             weather.fetch_open_meteo(47.0, 8.0)
@@ -107,15 +142,23 @@ class TestFetchOpenMeteo:
         assert "direct_radiation" in url
 
     def test_cloud_cover_pct_parsed_correctly(self):
-        hourly = {**_base_hourly(3), "sunshine_duration": [0]*3,
-                  "cloud_cover": [10, 50, 90], "direct_radiation": [0]*3}
+        hourly = {
+            **_base_hourly(3),
+            "sunshine_duration": [0] * 3,
+            "cloud_cover": [10, 50, 90],
+            "direct_radiation": [0] * 3,
+        }
         with patch("requests.get", return_value=_make_response(hourly)):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert list(df["cloud_cover_pct"]) == [10, 50, 90]
 
     def test_direct_radiation_wm2_parsed_correctly(self):
-        hourly = {**_base_hourly(3), "sunshine_duration": [0]*3,
-                  "cloud_cover": [0]*3, "direct_radiation": [100, 200, 300]}
+        hourly = {
+            **_base_hourly(3),
+            "sunshine_duration": [0] * 3,
+            "cloud_cover": [0] * 3,
+            "direct_radiation": [100, 200, 300],
+        }
         with patch("requests.get", return_value=_make_response(hourly)):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert list(df["direct_radiation_wm2"]) == [100, 200, 300]
@@ -126,7 +169,7 @@ class TestFetchOpenMeteo:
         NaN allows the safety-net median fill in _engineer_features to substitute
         a sensible value rather than treating missing data as "perfectly clear sky".
         """
-        hourly = {**_base_hourly(3), "sunshine_duration": [0]*3}  # no cloud/radiation
+        hourly = {**_base_hourly(3), "sunshine_duration": [0] * 3}  # no cloud/radiation
         with patch("requests.get", return_value=_make_response(hourly)):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df["cloud_cover_pct"].isna().all()
@@ -135,24 +178,31 @@ class TestFetchOpenMeteo:
     def test_returns_all_expected_columns(self):
         with patch("requests.get", return_value=_make_response(_full_hourly(3))):
             df = weather.fetch_open_meteo(47.0, 8.0)
-        expected = {"timestamp", "temp_c", "precipitation_mm", "sunshine_min",
-                    "wind_kmh", "cloud_cover_pct", "direct_radiation_wm2"}
+        expected = {
+            "timestamp",
+            "temp_c",
+            "precipitation_mm",
+            "sunshine_min",
+            "wind_kmh",
+            "cloud_cover_pct",
+            "direct_radiation_wm2",
+        }
         assert expected <= set(df.columns)
 
 
 # ── fetch_historical_weather ──────────────────────────────────────────────────
 
-class TestFetchHistoricalWeather:
 
+class TestFetchHistoricalWeather:
     def _make_archive_response(self, n: int = 3) -> MagicMock:
         hourly = {
-            "time":               [f"2026-01-01T{h:02d}:00" for h in range(n)],
-            "temperature_2m":     [2.0] * n,
-            "precipitation":      [0.0] * n,
-            "sunshine_duration":  [600] * n,
-            "windspeed_10m":      [8.0] * n,
-            "cloud_cover":        [40]  * n,
-            "direct_radiation":   [150] * n,
+            "time": [f"2026-01-01T{h:02d}:00" for h in range(n)],
+            "temperature_2m": [2.0] * n,
+            "precipitation": [0.0] * n,
+            "sunshine_duration": [600] * n,
+            "windspeed_10m": [8.0] * n,
+            "cloud_cover": [40] * n,
+            "direct_radiation": [150] * n,
         }
         mock = MagicMock()
         mock.raise_for_status = MagicMock()
@@ -161,20 +211,22 @@ class TestFetchHistoricalWeather:
 
     def test_returns_new_columns(self):
         from datetime import date
+
         with patch("requests.get", return_value=self._make_archive_response()):
             df = weather.fetch_historical_weather(47.0, 8.0, date(2026, 1, 1), date(2026, 1, 1))
-        assert "cloud_cover_pct"      in df.columns
+        assert "cloud_cover_pct" in df.columns
         assert "direct_radiation_wm2" in df.columns
 
     def test_new_columns_missing_key_fallback(self):
         """Archive response without cloud/radiation fields defaults to 0."""
         from datetime import date
+
         hourly = {
-            "time":              ["2026-01-01T00:00"],
-            "temperature_2m":    [2.0],
-            "precipitation":     [0.0],
+            "time": ["2026-01-01T00:00"],
+            "temperature_2m": [2.0],
+            "precipitation": [0.0],
             "sunshine_duration": [600],
-            "windspeed_10m":     [8.0],
+            "windspeed_10m": [8.0],
             # no cloud_cover, no direct_radiation
         }
         mock = MagicMock()
@@ -189,44 +241,48 @@ class TestFetchHistoricalWeather:
 
 # ── _supplement_from_open_meteo ───────────────────────────────────────────────
 
+
 def _make_srg_df(start: str, periods: int) -> pd.DataFrame:
     timestamps = pd.date_range(start, periods=periods, freq="1h")
-    return pd.DataFrame({
-        "timestamp":        timestamps,
-        "temp_c":           [10.0] * periods,
-        "precipitation_mm": [0.0]  * periods,
-        "sunshine_min":     [30.0] * periods,
-        "wind_kmh":         [5.0]  * periods,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "temp_c": [10.0] * periods,
+            "precipitation_mm": [0.0] * periods,
+            "sunshine_min": [30.0] * periods,
+            "wind_kmh": [5.0] * periods,
+        }
+    )
 
 
 def _make_om_df(start: str, periods: int, cloud: float = 60.0, rad: float = 250.0) -> pd.DataFrame:
     timestamps = pd.date_range(start, periods=periods, freq="1h")
-    return pd.DataFrame({
-        "timestamp":            timestamps,
-        "temp_c":               [8.0]   * periods,
-        "precipitation_mm":     [0.1]   * periods,
-        "sunshine_min":         [20.0]  * periods,
-        "wind_kmh":             [7.0]   * periods,
-        "cloud_cover_pct":      [cloud] * periods,
-        "direct_radiation_wm2": [rad]   * periods,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "temp_c": [8.0] * periods,
+            "precipitation_mm": [0.1] * periods,
+            "sunshine_min": [20.0] * periods,
+            "wind_kmh": [7.0] * periods,
+            "cloud_cover_pct": [cloud] * periods,
+            "direct_radiation_wm2": [rad] * periods,
+        }
+    )
 
 
 class TestSupplementFromOpenMeteo:
-
     def test_historical_rows_prepended(self):
         """OM rows before the SRG window must appear in the combined output."""
         srg = _make_srg_df("2026-03-12 08:00", 48)
         # OM covers 72h before + 48h future overlap
-        om  = _make_om_df("2026-03-09 08:00", 72 + 48)
+        om = _make_om_df("2026-03-09 08:00", 72 + 48)
         result = _supplement_from_open_meteo(srg, om)
         assert result["timestamp"].min() < srg["timestamp"].min()
 
     def test_srg_temp_values_preserved(self):
         """SRG temp_c must not be overwritten by Open-Meteo values."""
         srg = _make_srg_df("2026-03-12 08:00", 4)
-        om  = _make_om_df("2026-03-12 06:00", 6)  # 2h hist + 4h overlap
+        om = _make_om_df("2026-03-12 06:00", 6)  # 2h hist + 4h overlap
         result = _supplement_from_open_meteo(srg, om)
         future_rows = result[result["timestamp"] >= srg["timestamp"].min()]
         assert (future_rows["temp_c"] == 10.0).all()
@@ -234,7 +290,7 @@ class TestSupplementFromOpenMeteo:
     def test_cloud_radiation_filled_from_om(self):
         """cloud_cover_pct and direct_radiation_wm2 must come from Open-Meteo."""
         srg = _make_srg_df("2026-03-12 08:00", 4)
-        om  = _make_om_df("2026-03-12 06:00", 6, cloud=75.0, rad=300.0)
+        om = _make_om_df("2026-03-12 06:00", 6, cloud=75.0, rad=300.0)
         result = _supplement_from_open_meteo(srg, om)
         future_rows = result[result["timestamp"] >= srg["timestamp"].min()]
         assert (future_rows["cloud_cover_pct"] == 75.0).all()
@@ -250,19 +306,23 @@ class TestSupplementFromOpenMeteo:
     def test_tz_aware_srg_timestamps_do_not_raise(self):
         """SRG v2 returns ISO timestamps with +01:00 offset; _supplement must not crash."""
         # Reproduce real SRG v2 date_time strings (tz-aware, UTC+1)
-        tz_timestamps = pd.to_datetime([
-            "2026-03-12T08:00:00+01:00",
-            "2026-03-12T09:00:00+01:00",
-            "2026-03-12T10:00:00+01:00",
-            "2026-03-12T11:00:00+01:00",
-        ])
-        srg = pd.DataFrame({
-            "timestamp":        tz_timestamps,
-            "temp_c":           [10.0] * 4,
-            "precipitation_mm": [0.0]  * 4,
-            "sunshine_min":     [30.0] * 4,
-            "wind_kmh":         [5.0]  * 4,
-        })
+        tz_timestamps = pd.to_datetime(
+            [
+                "2026-03-12T08:00:00+01:00",
+                "2026-03-12T09:00:00+01:00",
+                "2026-03-12T10:00:00+01:00",
+                "2026-03-12T11:00:00+01:00",
+            ]
+        )
+        srg = pd.DataFrame(
+            {
+                "timestamp": tz_timestamps,
+                "temp_c": [10.0] * 4,
+                "precipitation_mm": [0.0] * 4,
+                "sunshine_min": [30.0] * 4,
+                "wind_kmh": [5.0] * 4,
+            }
+        )
         om = _make_om_df("2026-03-12 06:00", 6)
         result = _supplement_from_open_meteo(srg, om)
         # Must not raise; timestamps in result must be tz-naive
@@ -279,13 +339,15 @@ class TestSupplementFromOpenMeteo:
             "2026-03-29T03:00:00+02:00",  # 02:00 doesn't exist; DST skips to 03:00
             "2026-03-29T04:00:00+02:00",
         ]
-        srg = pd.DataFrame({
-            "timestamp":        mixed_timestamps,
-            "temp_c":           [5.0] * 4,
-            "precipitation_mm": [0.0] * 4,
-            "sunshine_min":     [0.0] * 4,
-            "wind_kmh":         [3.0] * 4,
-        })
+        srg = pd.DataFrame(
+            {
+                "timestamp": mixed_timestamps,
+                "temp_c": [5.0] * 4,
+                "precipitation_mm": [0.0] * 4,
+                "sunshine_min": [0.0] * 4,
+                "wind_kmh": [3.0] * 4,
+            }
+        )
         om = _make_om_df("2026-03-29 00:00", 6)
         result = _supplement_from_open_meteo(srg, om)
         assert result["timestamp"].dt.tz is None
@@ -294,12 +356,16 @@ class TestSupplementFromOpenMeteo:
 
 # ── fetch_forecast v2 ─────────────────────────────────────────────────────────
 
+
 def _make_srg_v2_response(n: int = 3) -> MagicMock:
     """Mock for /forecastpoint/{id} — v2 flat hours array."""
     hours = [
         {
             "date_time": f"2026-03-12T{h:02d}:00:00+01:00",
-            "TTT_C": 10, "RRR_MM": 1.5, "SUN_MIN": 30, "FF_KMH": 15,
+            "TTT_C": 10,
+            "RRR_MM": 1.5,
+            "SUN_MIN": 30,
+            "FF_KMH": 15,
         }
         for h in range(n)
     ]
@@ -334,21 +400,34 @@ def _make_token_response() -> MagicMock:
 def _om_empty() -> MagicMock:
     mock = MagicMock()
     mock.raise_for_status = MagicMock()
-    mock.json.return_value = {"hourly": {
-        "time": [], "temperature_2m": [], "precipitation": [],
-        "windspeed_10m": [], "sunshine_duration": [], "cloud_cover": [], "direct_radiation": [],
-    }}
+    mock.json.return_value = {
+        "hourly": {
+            "time": [],
+            "temperature_2m": [],
+            "precipitation": [],
+            "windspeed_10m": [],
+            "sunshine_duration": [],
+            "cloud_cover": [],
+            "direct_radiation": [],
+        }
+    }
     return mock
 
 
 class TestFetchForecastV2:
-
     def test_geolocation_resolved_via_latlon(self):
         """Geolocation must always be resolved via lat/lon (not PLZ) to match the registered station."""
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[
-                 _make_geo_latlon_response(), _make_srg_v2_response(), _om_empty(),
-             ]) as mock_get:
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch(
+                "requests.get",
+                side_effect=[
+                    _make_geo_latlon_response(),
+                    _make_srg_v2_response(),
+                    _om_empty(),
+                ],
+            ) as mock_get,
+        ):
             weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         first_url = mock_get.call_args_list[0][0][0]
         assert "geolocations" in first_url
@@ -357,10 +436,17 @@ class TestFetchForecastV2:
     def test_forecastpoint_called_with_id_from_latlon_lookup(self):
         """forecastpoint URL must use the id returned by the lat/lon lookup."""
         geo_id = "47.2263,7.5784"
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[
-                 _make_geo_latlon_response(geo_id), _make_srg_v2_response(), _om_empty(),
-             ]) as mock_get:
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch(
+                "requests.get",
+                side_effect=[
+                    _make_geo_latlon_response(geo_id),
+                    _make_srg_v2_response(),
+                    _om_empty(),
+                ],
+            ) as mock_get,
+        ):
             weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         forecast_url = mock_get.call_args_list[1][0][0]
         assert f"forecastpoint/{geo_id}" in forecast_url
@@ -370,17 +456,26 @@ class TestFetchForecastV2:
         empty_geo = MagicMock()
         empty_geo.raise_for_status = MagicMock()
         empty_geo.json.return_value = []
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[empty_geo, _om_empty()]):
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch("requests.get", side_effect=[empty_geo, _om_empty()]),
+        ):
             df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         assert isinstance(df, pd.DataFrame)
 
     def test_rrr_mm_mapped_to_precipitation_mm(self):
         """v2 field RRR_MM must be read as precipitation_mm (not PRP_MM)."""
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[
-                 _make_geo_latlon_response(), _make_srg_v2_response(), _om_empty(),
-             ]):
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch(
+                "requests.get",
+                side_effect=[
+                    _make_geo_latlon_response(),
+                    _make_srg_v2_response(),
+                    _om_empty(),
+                ],
+            ),
+        ):
             df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         srg_rows = df[df["precipitation_mm"].notna()]
         assert not srg_rows.empty
@@ -398,10 +493,17 @@ class TestFetchForecastV2:
         """fetch_forecast must always return tz-naive timestamps regardless of SRG offset strings."""
         # Use a non-empty OM response so _supplement_from_open_meteo runs its tz-strip path.
         om_mock = _make_response(_full_hourly(6))
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[
-                 _make_geo_latlon_response(), _make_srg_v2_response(3), om_mock,
-             ]):
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch(
+                "requests.get",
+                side_effect=[
+                    _make_geo_latlon_response(),
+                    _make_srg_v2_response(3),
+                    om_mock,
+                ],
+            ),
+        ):
             df = weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
         assert df["timestamp"].dt.tz is None
 
@@ -414,13 +516,21 @@ class TestFetchForecastV2:
         # Second call: GET (forecast) + GET (OM) = 2 requests (NO geo lookup)
         # Total: 1 POST, 3 GETs for first call, 2 GETs for second = 5 GETs total
         geo_id = "47.2263,7.5784"
-        with patch("requests.post", return_value=_make_token_response()), \
-             patch("requests.get", side_effect=[
-                 # First call: geo + forecast + OM
-                 _make_geo_latlon_response(geo_id), _make_srg_v2_response(), _om_empty(),
-                 # Second call: forecast + OM (no geo)
-                 _make_srg_v2_response(), _om_empty(),
-             ]) as mock_get:
+        with (
+            patch("requests.post", return_value=_make_token_response()),
+            patch(
+                "requests.get",
+                side_effect=[
+                    # First call: geo + forecast + OM
+                    _make_geo_latlon_response(geo_id),
+                    _make_srg_v2_response(),
+                    _om_empty(),
+                    # Second call: forecast + OM (no geo)
+                    _make_srg_v2_response(),
+                    _om_empty(),
+                ],
+            ) as mock_get,
+        ):
             # First call
             weather.fetch_forecast("4528", 47.2, 7.5, "key", "secret")
             # Second call with same lat/lon
@@ -442,38 +552,43 @@ class TestFetchForecastV2:
 
 # ── Stage 3: network failure scenarios (#78) ──────────────────────────────────
 
+
 class TestFetchOpenMeteoNetworkErrors:
     """#78 — fetch_open_meteo must return empty DataFrame on all network/parse errors."""
 
     def test_http_404_returns_empty(self):
         """404 response → requests raises HTTPError (subclass of RequestException) → empty df."""
         import requests as req_mod
+
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = req_mod.HTTPError("404")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
     def test_http_500_returns_empty(self):
         """500 response → HTTPError → empty df."""
         import requests as req_mod
+
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = req_mod.HTTPError("500")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
     def test_connection_timeout_returns_empty(self):
         """requests.Timeout → empty df (Timeout is a subclass of RequestException)."""
         import requests as req_mod
-        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.Timeout("timed out")):
+
+        with patch("requests.get", side_effect=req_mod.Timeout("timed out")):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
     def test_connection_error_returns_empty(self):
         """requests.ConnectionError → empty df."""
         import requests as req_mod
-        with patch("energy_forecast.weather.requests.get", side_effect=req_mod.ConnectionError("no route")):
+
+        with patch("requests.get", side_effect=req_mod.ConnectionError("no route")):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -482,7 +597,7 @@ class TestFetchOpenMeteoNetworkErrors:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.side_effect = ValueError("not json")
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
 
@@ -491,6 +606,72 @@ class TestFetchOpenMeteoNetworkErrors:
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         mock_resp.json.return_value = {"metadata": "no hourly key"}
-        with patch("energy_forecast.weather.requests.get", return_value=mock_resp):
+        with patch("requests.get", return_value=mock_resp):
             df = weather.fetch_open_meteo(47.0, 8.0)
         assert df.empty
+
+
+# ── L3: SRG token invalidation on 401 ────────────────────────────────────────
+
+
+class TestSRGTokenInvalidation:
+    """L3: _srg_token must be cleared when the forecast endpoint returns 401."""
+
+    def setup_method(self):
+        weather._srg_token = None
+        weather._srg_token_expires_at = 0.0
+        weather._srg_geo_id.clear()
+
+    def teardown_method(self):
+        weather._srg_token = None
+        weather._srg_token_expires_at = 0.0
+        weather._srg_geo_id.clear()
+
+    def test_401_on_forecast_clears_token(self):
+        """After a 401 on the forecast endpoint, _srg_token must be None."""
+        import time
+
+        import requests as req
+
+        # Pre-set a "fresh" cached token so auth is skipped
+        weather._srg_token = "stale_token"
+        weather._srg_token_expires_at = time.monotonic() + 3600
+        # Pre-set geo_id so the geo lookup is skipped too
+        weather._srg_geo_id[(47.0, 8.0)] = "test_geo_id"
+
+        # Mock requests.get to return a 401 response that raises on raise_for_status()
+        mock_res = MagicMock()
+        mock_res.status_code = 401
+        http_err = req.HTTPError()
+        http_err.response = mock_res
+        mock_res.raise_for_status.side_effect = http_err
+
+        with patch("requests.get", side_effect=[mock_res, _om_empty()]):
+            result = weather.fetch_forecast("8000", 47.0, 8.0, "cid", "secret")
+
+        # Token must be cleared
+        assert weather._srg_token is None
+        # Function must still return a DataFrame (Open-Meteo fallback)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_non_401_does_not_clear_token(self):
+        """A 503 (server error) must not clear the token — the token itself is valid."""
+        import time
+
+        import requests as req
+
+        weather._srg_token = "valid_token"
+        weather._srg_token_expires_at = time.monotonic() + 3600
+        weather._srg_geo_id[(47.0, 8.0)] = "test_geo_id"
+
+        mock_res = MagicMock()
+        mock_res.status_code = 503
+        err = req.HTTPError()
+        err.response = mock_res
+        mock_res.raise_for_status.side_effect = err
+
+        with patch("requests.get", side_effect=[mock_res, _om_empty()]):
+            weather.fetch_forecast("8000", 47.0, 8.0, "cid", "secret")
+
+        # Token must be preserved so next call reuses it without re-auth
+        assert weather._srg_token == "valid_token"

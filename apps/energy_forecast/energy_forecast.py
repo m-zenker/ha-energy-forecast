@@ -257,6 +257,7 @@ class EnergyForecast(hass.Hass):
         self._mqtt_namespace: str = str(self.args.get("mqtt_namespace", "mqtt"))
         self._mqtt_discovery_prefix: str = str(self.args.get("mqtt_discovery_prefix", "homeassistant"))
         self._mqtt_intervals_discovered: bool = False
+        self._scenario_mqtt_discovered: bool = False
 
         self._validate_config()
 
@@ -779,9 +780,9 @@ class EnergyForecast(hass.Hass):
                 return
 
             # Validate keys and time values; silently drop invalid entries
-            valid_prefixes = set(self._ml_model._appliance_signatures.keys()) | set(
-                (self.args or {}).get("sub_energy_sensors", {}).keys()
-            )
+            valid_prefixes = set(self._ml_model._appliance_signatures.keys()) | {
+                self._sub_sensor_prefix(e) for e in self._sub_energy_sensors
+            }
             cleaned: dict = {}
             for key, val in schedule.items():
                 if valid_prefixes and key not in valid_prefixes:
@@ -806,6 +807,7 @@ class EnergyForecast(hass.Hass):
                 people_home_series=self._cached_people_home,
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
+                room_areas=self._climate_room_areas or None,
             )
 
             if kwargs.get("publish", False):
@@ -848,46 +850,100 @@ class EnergyForecast(hass.Hass):
         def _sum(arr, s, e):
             return round(float(np.sum(arr[(p_times >= s) & (p_times < e)])), 3)
 
-        def _safe_set_scenario(entity_id: str, value: Any, friendly_name: str) -> None:
-            try:
-                val = float(value)
-                if _math.isnan(val) or _math.isinf(val):
-                    val = 0.0
-            except (TypeError, ValueError):
-                val = 0.0
-            self.set_state(
-                entity_id,
-                state=str(round(val, 3)),
-                attributes={
-                    "unit_of_measurement": "kWh",
-                    "friendly_name": friendly_name,
-                    "unique_id": entity_id.split(".", 1)[-1],
-                    "attribution": ATTRIBUTION,
-                },
-                replace=True,
-            )
-
         scenario_today = _sum(p_vals, today_np, tomorrow_np)
         scenario_tomorrow = _sum(p_vals, tomorrow_np, after_np)
         delta_today = _sum(d_vals, today_np, tomorrow_np)
 
-        _safe_set_scenario("sensor.energy_forecast_scenario_today", scenario_today, "Energy Forecast Scenario Today")
-        _safe_set_scenario(
-            "sensor.energy_forecast_scenario_tomorrow", scenario_tomorrow, "Energy Forecast Scenario Tomorrow"
-        )
-        _safe_set_scenario(
-            "sensor.energy_forecast_scenario_delta_today", delta_today, "Energy Forecast Scenario Delta Today"
-        )
-
-        for h in range(0, 24, 3):
-            slot = f"{h:02d}_{h + 3:02d}"
-            slot_start = today_np + np.timedelta64(h, "h")
-            slot_end = today_np + np.timedelta64(h + 3, "h")
-            _safe_set_scenario(
-                f"sensor.energy_forecast_scenario_today_{slot}",
-                _sum(p_vals, slot_start, slot_end),
-                f"Energy Forecast Scenario Today {h:02d}:{h + 3:02d}",
+        block_values: dict[str, float] = {}
+        for _h in range(0, 24, 3):
+            _slot = f"{_h:02d}_{_h + 3:02d}"
+            block_values[_slot] = _sum(
+                p_vals,
+                today_np + np.timedelta64(_h, "h"),
+                today_np + np.timedelta64(_h + 3, "h"),
             )
+
+        if self._mqtt_discovery:
+            if not self._scenario_mqtt_discovered:
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_today",
+                    "Energy Forecast Scenario Today",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    "energy",
+                    "measurement",
+                )
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_tomorrow",
+                    "Energy Forecast Scenario Tomorrow",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    "energy",
+                    "measurement",
+                )
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_delta_today",
+                    "Energy Forecast Scenario Delta Today",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    None,
+                    "measurement",
+                )
+                for _h in range(0, 24, 3):
+                    _slot = f"{_h:02d}_{_h + 3:02d}"
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_scenario_today_{_slot}",
+                        f"Energy Forecast Scenario Today {_h:02d}:{_h + 3:02d}",
+                        "kWh",
+                        "mdi:chart-bell-curve-cumulative",
+                        "energy",
+                        "measurement",
+                    )
+                self._scenario_mqtt_discovered = True
+            self._mqtt_set_sensor("energy_forecast_scenario_today", scenario_today)
+            self._mqtt_set_sensor("energy_forecast_scenario_tomorrow", scenario_tomorrow)
+            self._mqtt_set_sensor("energy_forecast_scenario_delta_today", delta_today)
+            for _slot, _val in block_values.items():
+                self._mqtt_set_sensor(f"energy_forecast_scenario_today_{_slot}", _val)
+        else:
+
+            def _safe(entity_id: str, value: Any, friendly_name: str) -> None:
+                try:
+                    val = float(value)
+                    if _math.isnan(val) or _math.isinf(val):
+                        val = 0.0
+                except (TypeError, ValueError):
+                    val = 0.0
+                self.set_state(
+                    entity_id,
+                    state=str(round(val, 3)),
+                    attributes={
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": friendly_name,
+                        "unique_id": entity_id.split(".", 1)[-1],
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
+
+            _safe("sensor.energy_forecast_scenario_today", scenario_today, "Energy Forecast Scenario Today")
+            _safe(
+                "sensor.energy_forecast_scenario_tomorrow",
+                scenario_tomorrow,
+                "Energy Forecast Scenario Tomorrow",
+            )
+            _safe(
+                "sensor.energy_forecast_scenario_delta_today",
+                delta_today,
+                "Energy Forecast Scenario Delta Today",
+            )
+            for _h in range(0, 24, 3):
+                _slot = f"{_h:02d}_{_h + 3:02d}"
+                _safe(
+                    f"sensor.energy_forecast_scenario_today_{_slot}",
+                    block_values[_slot],
+                    f"Energy Forecast Scenario Today {_h:02d}:{_h + 3:02d}",
+                )
 
     def _update_cb(self, event_name=None, data=None, kwargs=None) -> None:
         if self._ml_model.model is None:
@@ -1026,6 +1082,13 @@ class EnergyForecast(hass.Hass):
                 exc,
             )
             weather_df = _empty_weather_df()
+
+        # Cover the 5-day archive lag: Open-Meteo forecast API with past_days=7
+        # includes measured (not forecast) data for recent hours.
+        recent_weather = weather.fetch_open_meteo(self._lat, self._lon, timezone=self._timezone, past_days=7)
+        recent_weather = _strip_tz(recent_weather, self._timezone)
+        now_local = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        weather_df = _stitch_recent_weather(weather_df, recent_weather, now_local)
 
         away_df = ha_data.fetch_boolean_entity_history(self, self._away_mode_entity, days=30, timezone=self._timezone)
         if not away_df.empty:
@@ -1225,6 +1288,23 @@ class EnergyForecast(hass.Hass):
         self._cached_climate_recent = climate_recent or None
         self._cached_dhw_recent = dhw_recent if not dhw_recent.empty else None
 
+        # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
+        # all receive the pre-computed result to avoid triple feature engineering.
+        _prepared = self._ml_model._prepare_prediction_X(
+            forecast_df,
+            live_temp,
+            recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent or None,
+            dhw_recent=dhw_recent if not dhw_recent.empty else None,
+            room_areas=self._climate_room_areas or None,
+            heating_active_series=heating_active_series,
+            setpoint_on=heating_setpoint_on,
+            setpoint_off=heating_setpoint_off,
+        )
+
         predictions = self._ml_model.predict(
             forecast_df,
             live_temp,
@@ -1238,6 +1318,7 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            _prepared=_prepared,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
         self._publish_thermal_pressure()
@@ -1255,20 +1336,13 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            _prepared=_prepared,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
 
         # ── Store predictions for adaptive retrain tracking ───────────────────
-        # Keep-first: only store a prediction for each target hour the first time
-        # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
-        # Pruned to 30 days so mae_30d sensor has enough history (#41).
-        cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
-        self._pred_history = {ts: kwh for ts, kwh in self._pred_history.items() if pd.Timestamp(ts) >= cutoff}
-        for _, row in predictions.iterrows():
-            ts = pd.Timestamp(row["timestamp"])
-            if ts not in self._pred_history:
-                self._pred_history[ts] = float(row["predicted_kwh"])
+        self._pred_history = _accumulate_pred_history(self._pred_history, predictions, now_ts)
 
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
@@ -1345,6 +1419,7 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
+                    _prepared=_prepared,
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("SHAP summary failed: %s", exc)
@@ -1539,15 +1614,25 @@ class EnergyForecast(hass.Hass):
         if n_pairs < 24:
             return
         if live_mae > self._adaptive_retrain_threshold * cv_mae:
-            _LOGGER.warning(
-                "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
-                live_mae,
-                self._adaptive_retrain_threshold,
-                cv_mae,
-                n_pairs,
-            )
-            self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
-            self._retrain()
+            if not self._lock.acquire(blocking=False):
+                _LOGGER.debug("Adaptive retrain deferred — training lock busy (scheduled retrain in progress).")
+                return
+            try:
+                _LOGGER.warning(
+                    "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
+                    live_mae,
+                    self._adaptive_retrain_threshold,
+                    cv_mae,
+                    n_pairs,
+                )
+                self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
+                self._retrain()
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+
+                _LOGGER.error("Adaptive retraining failed: %s\n%s", exc, traceback.format_exc())
+            finally:
+                self._lock.release()
 
     # ── Sensor publishing ─────────────────────────────────────────────────────
 
@@ -1583,11 +1668,18 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_tomorrow_high",
             # Thermal pressure sensor (now served via MQTT)
             "sensor.energy_forecast_thermal_pressure_net",
+            # Scenario sensors (now served via MQTT when mqtt_discovery=True)
+            "sensor.energy_forecast_scenario_today",
+            "sensor.energy_forecast_scenario_tomorrow",
+            "sensor.energy_forecast_scenario_delta_today",
         ]
         # Block sensors
         for day in ("today", "tomorrow"):
             for slot in BLOCK_SLOTS:
                 legacy_ids.append(f"sensor.energy_forecast_{day}_{slot}")
+        # Scenario block sensors
+        for slot in BLOCK_SLOTS:
+            legacy_ids.append(f"sensor.energy_forecast_scenario_today_{slot}")
 
         for entity_id in legacy_ids:
             try:
@@ -1940,16 +2032,16 @@ class EnergyForecast(hass.Hass):
             }
 
         # For the "today" blended total, use actuals for elapsed hours.
-        # In baseline_mode, actuals must be corrected (EV and sub-sensors removed)
-        # to match the model's baseline predictions.
+        # Training is unconditionally EV-free → predictions are always EV-free baseline.
+        # Strip EV in both modes so elapsed actuals and future predictions share the same
+        # semantic.  Sub-sensors are only stripped in baseline_mode because in non-baseline
+        # mode they are included in training and therefore in predictions too.
         blended_actuals = full_actuals
-        if self._baseline_mode and full_actuals is not None and not full_actuals.empty:
-            # 1. Remove EV sessions
+        if full_actuals is not None and not full_actuals.empty:
             blended_actuals, _ = ha_data.split_ev_charging(
                 full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
             )
-            # 2. Remove controllable sub-sensors
-            if sub_sensors_recent:
+            if self._baseline_mode and sub_sensors_recent:
                 blended_actuals, _ = _subtract_sub_sensors(
                     blended_actuals, self._subtract_only_dict(sub_sensors_recent)
                 )
@@ -2079,6 +2171,25 @@ class EnergyForecast(hass.Hass):
 def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     """Convert timestamp column to naive local time. Delegates to const.strip_tz."""
     return _strip_tz_util(df, timezone)
+
+
+def _stitch_recent_weather(archive_df: Any, recent_df: Any, now_local: Any) -> Any:
+    """Extend archive weather with the measured tail from Open-Meteo, archive wins on overlap.
+
+    Trims recent_df to rows at or before now_local (strips forecast hours).
+    Returns archive_df unchanged when recent_df is empty after trimming.
+    """
+    import pandas as pd
+
+    tail = recent_df[recent_df["timestamp"] <= now_local]
+    if tail.empty:
+        return archive_df
+    return (
+        pd.concat([archive_df, tail])
+        .drop_duplicates(subset="timestamp", keep="first")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
 
 def _empty_weather_df() -> Any:
@@ -2224,6 +2335,29 @@ def _blend_today_totals(
         for h in range(0, 24, 3)
     }
     return today_total, blocks
+
+
+def _accumulate_pred_history(
+    pred_history: dict,
+    predictions: Any,
+    now_ts: Any,
+) -> dict:
+    """Keep-first at ≤25h horizon; prune entries older than 30 days.
+
+    Each target hour is stored the first time it enters the 24–25h window, so
+    mae_7d/mae_30d measure genuine day-ahead forecast quality.  Targets beyond
+    25h are deferred until the next hourly cycle when they enter the window.
+    """
+    import pandas as pd
+
+    cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
+    result = {ts: kwh for ts, kwh in pred_history.items() if pd.Timestamp(ts) >= cutoff}
+    now_h = now_ts.floor("1h")
+    for _, row in predictions.iterrows():
+        ts = pd.Timestamp(row["timestamp"])
+        if ts not in result and (ts - now_h).total_seconds() / 3600 <= 25:
+            result[ts] = float(row["predicted_kwh"])
+    return result
 
 
 def _compute_live_mae(

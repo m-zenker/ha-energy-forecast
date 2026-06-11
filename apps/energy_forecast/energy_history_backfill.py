@@ -30,6 +30,7 @@ DETAILS
 - Hours > MAX_HOURLY_KWH (50 kWh) are dropped as spikes/resets.
 - Merges into the existing CSV — CSV wins on timestamp conflicts.
 """
+
 from __future__ import annotations
 
 import logging
@@ -43,8 +44,8 @@ from .const import CACHE_PATH
 _LOGGER = logging.getLogger("energy_forecast")
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-LOOKBACK_YEARS  = 1
-MAX_HOURLY_KWH  = 50.0
+LOOKBACK_YEARS = 1
+MAX_HOURLY_KWH = 50.0
 DEFAULT_DB_PATH = "/config/home-assistant_v2.db"
 
 
@@ -63,6 +64,7 @@ class EnergyHistoryBackfill(hass.Hass):
             self._backfill()
         except Exception as exc:  # noqa: BLE001
             import traceback
+
             _LOGGER.error("Backfill FAILED: %s\n%s", exc, traceback.format_exc())
 
     # ── Main logic ────────────────────────────────────────────────────────────
@@ -73,7 +75,7 @@ class EnergyHistoryBackfill(hass.Hass):
         import pandas as pd
 
         entity_id = self.args["energy_sensor"]
-        db_path   = self.args.get("ha_db_path", DEFAULT_DB_PATH)
+        db_path = self.args.get("ha_db_path", DEFAULT_DB_PATH)
 
         if not Path(db_path).exists():
             raise FileNotFoundError(
@@ -85,28 +87,23 @@ class EnergyHistoryBackfill(hass.Hass):
 
         _LOGGER.info("Reading statistics for %s from %s …", entity_id, db_path)
 
-        cutoff_ts = (
-            datetime.now(tz=UTC) - timedelta(days=365 * LOOKBACK_YEARS)
-        ).timestamp()
+        cutoff_ts = (datetime.now(tz=UTC) - timedelta(days=365 * LOOKBACK_YEARS)).timestamp()
 
         # ── 1. Query the statistics table ─────────────────────────────────────
         # HA stores timestamps as Unix epoch in `start_ts` (since ~2022.10).
         # Older installs used a `start` datetime column — we handle both.
         con = sqlite3.connect(db_path)
         try:
-            cols = {
-                row[1]
-                for row in con.execute("PRAGMA table_info(statistics)")
-            }
+            cols = {row[1] for row in con.execute("PRAGMA table_info(statistics)")}
 
             if "start_ts" in cols:
-                ts_expr    = "s.start_ts"
-                where_col  = "s.start_ts"
+                ts_expr = "s.start_ts"
+                where_col = "s.start_ts"
                 cutoff_val: float | str = cutoff_ts
             else:
                 cutoff_val = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%d %H:%M:%S")
-                ts_expr    = "strftime('%s', s.start)"
-                where_col  = "s.start"
+                ts_expr = "strftime('%s', s.start)"
+                where_col = "s.start"
 
             # where_col is a hardcoded column reference, not user input.
             # cutoff_val is passed as a bound parameter to prevent injection.
@@ -136,15 +133,13 @@ class EnergyHistoryBackfill(hass.Hass):
 
         # ── 2. Convert to hourly kWh ──────────────────────────────────────────
         df = pd.DataFrame(rows, columns=["epoch", "cumsum"])
-        df["epoch"]  = pd.to_numeric(df["epoch"], errors="coerce")
+        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
         df["cumsum"] = pd.to_numeric(df["cumsum"], errors="coerce")
         df = df.dropna()
 
         # Convert Unix epoch → naive Europe/Zurich timestamp
         df["timestamp"] = (
-            pd.to_datetime(df["epoch"], unit="s", utc=True)
-            .dt.tz_convert("Europe/Zurich")
-            .dt.tz_localize(None)
+            pd.to_datetime(df["epoch"], unit="s", utc=True).dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
         )
 
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -172,30 +167,28 @@ class EnergyHistoryBackfill(hass.Hass):
 
         # ── 4. Merge — CSV wins on conflicts ──────────────────────────────────
         combined = (
-            pd.concat([df_new, df_cache])          # cache last → keep="last" favours it
+            pd.concat([df_new, df_cache])  # cache last → keep="last" favours it
             .drop_duplicates(subset=["timestamp"], keep="last")
             .sort_values("timestamp")
             .dropna(subset=["timestamp", "gross_kwh"])
             .reset_index(drop=True)
         )
 
-        added      = len(combined) - len(df_cache)
-        date_range = (
-            f"{combined['timestamp'].min().date()} → "
-            f"{combined['timestamp'].max().date()}"
-        )
+        added = len(combined) - len(df_cache)
+        date_range = f"{combined['timestamp'].min().date()} → {combined['timestamp'].max().date()}"
 
         # ── 5. Save ───────────────────────────────────────────────────────────
         combined.to_csv(CACHE_PATH, index=False)
 
         _LOGGER.info(
             "Saved %d rows to %s (%+d rows added). Range: %s.",
-            len(combined), CACHE_PATH.name, added, date_range,
+            len(combined),
+            CACHE_PATH.name,
+            added,
+            date_range,
         )
         _LOGGER.info("=" * 60)
         _LOGGER.info(
-            "Backfill complete — remove 'energy_history_backfill' from "
-            "apps.yaml and delete energy_history_backfill.py."
+            "Backfill complete — remove 'energy_history_backfill' from apps.yaml and delete energy_history_backfill.py."
         )
         _LOGGER.info("=" * 60)
-        
