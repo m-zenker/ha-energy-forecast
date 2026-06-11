@@ -146,14 +146,14 @@ also None (fresh install / old meta), `_engineer_features` raises `KeyError: 'ti
 (`model.py:2413`). Caught and logged, but the hourly update is skipped. Return an
 `_empty_weather_df()`-shaped frame instead so median-based prediction degrades gracefully.
 
-### [ ] L5 — `predict_scenario` drops `room_areas`
+### [x] L5 — `predict_scenario` drops `room_areas`
 
 `apps/energy_forecast/model.py:1047-1086` — the scenario baseline computes thermal
 pressure with `DEFAULT_ROOM_AREA_M2` for every room while the published forecast uses
 configured areas → the scenario delta isn't measured against the same baseline.
 Plumb `room_areas` through `predict_scenario` and `_get_scenario_cb`.
 
-### [ ] L6 — Scenario sensors bypass MQTT discovery
+### [x] L6 — Scenario sensors bypass MQTT discovery
 
 `apps/energy_forecast/energy_forecast.py:851-868` — `_publish_scenario_forecast` always
 uses `set_state`, recreating the ghost-entity problem `_cleanup_legacy_states` exists to
@@ -165,7 +165,7 @@ remove in MQTT mode; the cleanup list also doesn't include the scenario entities
 - [~] `HOLDOUT_FRACTION` name: existing comment already explains the inversion; name kept for backward compat — won't fix.
 - [x] `_pred_history` comments: comment removed; `_accumulate_pred_history` docstring documents the correct 24-25h window.
 
-### [ ] L8 — deploy.py nits
+### [x] L8 — deploy.py nits
 
 `scripts/deploy.py`
 
@@ -207,14 +207,14 @@ purely to produce one log line during auto-K selection.
 
 ## Repo hygiene
 
-### [ ] R1 — Stray artifacts in the tree
+### [x] R1 — Stray artifacts in the tree
 
 - `.ipynb_checkpoints` copies of app and test modules inside `apps/energy_forecast/` and
   `tests/` (deploy.py special-cases skipping them).
 - `temp/`, `htmlcov/`, `.coverage`, `logs/`, `work/` in the repo root.
 - Verify these are gitignored; `--cov=apps` in pyproject also counts checkpoint files.
 
-### [ ] R2 — `weather.py` imports pandas/numpy/requests at module top level
+### [x] R2 — `weather.py` imports pandas/numpy/requests at module top level
 
 Every other module deliberately defers heavy imports for AppDaemon startup; harmless but
 inconsistent with the established pattern.
