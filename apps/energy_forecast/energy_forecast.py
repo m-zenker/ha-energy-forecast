@@ -1541,14 +1541,14 @@ class EnergyForecast(hass.Hass):
             if not self._lock.acquire(blocking=False):
                 _LOGGER.debug("Adaptive retrain deferred — training lock busy (scheduled retrain in progress).")
                 return
-            _LOGGER.warning(
-                "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
-                live_mae,
-                self._adaptive_retrain_threshold,
-                cv_mae,
-                n_pairs,
-            )
             try:
+                _LOGGER.warning(
+                    "Adaptive retrain triggered: live_MAE=%.4f > %.4f× cv_MAE=%.4f (over %d matched hours)",
+                    live_mae,
+                    self._adaptive_retrain_threshold,
+                    cv_mae,
+                    n_pairs,
+                )
                 self._last_adaptive_retrain = pd.Timestamp.now(self._timezone).tz_localize(None)
                 self._retrain()
             except Exception as exc:  # noqa: BLE001
