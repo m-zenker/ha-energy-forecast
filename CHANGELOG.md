@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_maybe_adaptive_retrain` now acquires `self._lock` in non-blocking mode before calling `_retrain()`, preventing a race condition with the scheduled weekly retrain. If the lock is already held, the adaptive retrain is deferred (cooldown timestamp is not updated so it retries on the next cycle). Lock is always released in a `finally` block.
+
+### Changed
+- `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/model.py` — Feature matrix (`_prepare_prediction_X`) is now built once per hourly update in `_update_sensors` and passed via a `_prepared` parameter to `predict()`, `predict_intervals()`, and `shap_summary()`. Previously each of the three calls rebuilt the matrix independently, adding two redundant feature-engineering passes per cycle.
+- `apps/energy_forecast/clustering.py` — Removed the informational `RegimePredictor` fit from `find_optimal_k`. A full Random Forest was being trained solely to log an OOB score during auto-K selection; replaced with a single log line. The OOB tie-breaking fit (which does influence K selection) is retained.
+
+### Fixed
 - `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb` no longer crashes for users with appliances configured. It was calling `.keys()` on `sub_energy_sensors`, which is a list; fixed to build valid prefixes via a set comprehension over `_sub_sensor_prefix()`. The `energy_forecast/get_scenario` service now returns results correctly.
 - `apps/energy_forecast/energy_forecast.py` — `shap_summary` today-slice now uses `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` instead of the bare UTC system clock. On container-hosted HA instances (UTC timezone) the "today" window was offset by the local UTC delta, producing a misleading SHAP summary for the current day.
 - `apps/energy_forecast/weather.py` — SRG-SSR token is now cleared (and expiry reset) on a 401 response so the next call triggers a full re-authentication. Previously the stale token was left cached for up to 55 minutes, causing every subsequent call in that window to silently fall back to Open-Meteo.
