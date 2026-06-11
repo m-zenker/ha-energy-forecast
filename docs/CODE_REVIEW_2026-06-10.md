@@ -99,7 +99,7 @@ hours.
 **Fix:** decide one semantic ("today = actual usage so far + expected baseline" vs
 "today = baseline only") and apply it consistently in both modes.
 
-### [ ] M5 — Rolling-MAE sensors measure ~47h-ahead, not "day-ahead"
+### [x] M5 — Rolling-MAE sensors measure ~47h-ahead, not "day-ahead"
 
 `apps/energy_forecast/energy_forecast.py:1262-1271`
 
@@ -163,7 +163,7 @@ remove in MQTT mode; the cleanup list also doesn't include the scenario entities
 
 - [x] `_resolve_programs_for_series` docstring updated: 1 h → 2 h (`ha_data.py`).
 - [~] `HOLDOUT_FRACTION` name: existing comment already explains the inversion; name kept for backward compat — won't fix.
-- [ ] `_pred_history` "~24h ahead" comments: deferred to Batch 3 (tied to M5 semantic decision).
+- [x] `_pred_history` comments: comment removed; `_accumulate_pred_history` docstring documents the correct 24-25h window.
 
 ### [ ] L8 — deploy.py nits
 

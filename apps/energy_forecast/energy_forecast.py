@@ -1267,15 +1267,7 @@ class EnergyForecast(hass.Hass):
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
 
         # ── Store predictions for adaptive retrain tracking ───────────────────
-        # Keep-first: only store a prediction for each target hour the first time
-        # we see it (~24h ahead), so MAE is measured on day-ahead forecasts.
-        # Pruned to 30 days so mae_30d sensor has enough history (#41).
-        cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
-        self._pred_history = {ts: kwh for ts, kwh in self._pred_history.items() if pd.Timestamp(ts) >= cutoff}
-        for _, row in predictions.iterrows():
-            ts = pd.Timestamp(row["timestamp"])
-            if ts not in self._pred_history:
-                self._pred_history[ts] = float(row["predicted_kwh"])
+        self._pred_history = _accumulate_pred_history(self._pred_history, predictions, now_ts)
 
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
@@ -2250,6 +2242,29 @@ def _blend_today_totals(
         for h in range(0, 24, 3)
     }
     return today_total, blocks
+
+
+def _accumulate_pred_history(
+    pred_history: dict,
+    predictions: Any,
+    now_ts: Any,
+) -> dict:
+    """Keep-first at ≤25h horizon; prune entries older than 30 days.
+
+    Each target hour is stored the first time it enters the 24–25h window, so
+    mae_7d/mae_30d measure genuine day-ahead forecast quality.  Targets beyond
+    25h are deferred until the next hourly cycle when they enter the window.
+    """
+    import pandas as pd
+
+    cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
+    result = {ts: kwh for ts, kwh in pred_history.items() if pd.Timestamp(ts) >= cutoff}
+    now_h = now_ts.floor("1h")
+    for _, row in predictions.iterrows():
+        ts = pd.Timestamp(row["timestamp"])
+        if ts not in result and (ts - now_h).total_seconds() / 3600 <= 25:
+            result[ts] = float(row["predicted_kwh"])
+    return result
 
 
 def _compute_live_mae(

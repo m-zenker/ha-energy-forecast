@@ -1481,6 +1481,89 @@ class TestRollingMaeSensors:
         )
 
 
+# ── M5 — pred_history horizon ──────────────────────────────────────────────
+
+
+class TestAccumulatePredHistory:
+    """M5: predictions must be stored at ≤25h horizon, not ~47h (keep-first)."""
+
+    def test_horizon_beyond_25h_not_stored(self):
+        """Predictions at h > 25 must be deferred to the next cycle."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_30h = now_ts + pd.Timedelta(hours=30)
+        predictions = pd.DataFrame({"timestamp": [target_30h], "predicted_kwh": [2.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_30h not in result, f"Target at h=30 must NOT be stored (h>25), but got {result}"
+
+    def test_horizon_at_24h_is_stored(self):
+        """A prediction at h=24 is within the window and must be stored."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_24h = now_ts + pd.Timedelta(hours=24)
+        predictions = pd.DataFrame({"timestamp": [target_24h], "predicted_kwh": [2.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_24h in result
+        assert result[target_24h] == pytest.approx(2.0)
+
+    def test_horizon_at_25h_is_stored(self):
+        """Boundary: h=25 is the last slot accepted (stored this cycle)."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_25h = now_ts + pd.Timedelta(hours=25)
+        predictions = pd.DataFrame({"timestamp": [target_25h], "predicted_kwh": [3.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_25h in result
+
+    def test_keep_first_existing_entry_not_overwritten(self):
+        """Keep-first: an already-stored prediction must not be overwritten."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        ts = now_ts + pd.Timedelta(hours=20)
+        existing = {ts: 1.0}
+        predictions = pd.DataFrame({"timestamp": [ts], "predicted_kwh": [99.0]})
+
+        result = _accumulate_pred_history(existing, predictions, now_ts)
+
+        assert result[ts] == pytest.approx(1.0), "Keep-first must not overwrite existing entry with 99.0"
+
+    def test_old_predictions_pruned_beyond_30_days(self):
+        """Entries older than 30 days must be dropped regardless of predictions."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        old_ts = now_ts - pd.Timedelta(days=31)
+        existing = {old_ts: 2.0}
+        empty_preds = pd.DataFrame({"timestamp": pd.Series([], dtype="datetime64[ns]"), "predicted_kwh": []})
+
+        result = _accumulate_pred_history(existing, empty_preds, now_ts)
+
+        assert old_ts not in result, "Entry older than 30d must be pruned"
+
+    def test_recent_entry_within_30_days_preserved(self):
+        """Entries within 30 days must survive the pruning step."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        recent_ts = now_ts - pd.Timedelta(days=5)
+        existing = {recent_ts: 1.5}
+        empty_preds = pd.DataFrame({"timestamp": pd.Series([], dtype="datetime64[ns]"), "predicted_kwh": []})
+
+        result = _accumulate_pred_history(existing, empty_preds, now_ts)
+
+        assert recent_ts in result
+
+
 # ── #39 Anomaly detection sensor ──────────────────────────────────────────────
 
 
