@@ -1073,6 +1073,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        room_areas: dict[str, float] | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
@@ -1097,6 +1098,7 @@ class EnergyForecastModel:
             heating_active_series=heating_active_series,
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
+            room_areas=room_areas,
         )
         return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 

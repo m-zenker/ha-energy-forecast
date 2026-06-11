@@ -806,6 +806,7 @@ class EnergyForecast(hass.Hass):
                 people_home_series=self._cached_people_home,
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
+                room_areas=self._climate_room_areas or None,
             )
 
             if kwargs.get("publish", False):

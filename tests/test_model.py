@@ -3186,6 +3186,20 @@ class TestCompositeForecast:
         assert len(result) == 48
         assert (result["delta_kwh"] >= 0.0).all()
 
+    def test_predict_scenario_accepts_room_areas(self, tmp_path):
+        """predict_scenario() should accept a room_areas kwarg without error."""
+        m, forecast = _make_trained_model(tmp_path)
+        m._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
+        }
+        result = m.predict_scenario(
+            forecast,
+            live_temp=None,
+            schedule={"sub_dw": "12:00"},
+            room_areas={"climate.test": 30.0},
+        )
+        assert "delta_kwh" in result.columns
+
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
         df = _make_baseline_df(start="2024-06-01 10:00")

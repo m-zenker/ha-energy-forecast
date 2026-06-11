@@ -83,6 +83,29 @@ class TestGetScenarioCb:
         assert isinstance(records, list)
         assert len(records) == 48
 
+    def test_room_areas_forwarded_to_predict_scenario(self):
+        """_get_scenario_cb must pass _climate_room_areas to predict_scenario."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        app._climate_room_areas = {"climate.living": 40.0}
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False},
+        )
+
+        call_kwargs = app._ml_model.predict_scenario.call_args[1]
+        assert call_kwargs.get("room_areas") == {"climate.living": 40.0}
+
     def test_publish_flag_calls_publish_method(self):
         """publish=True should call _publish_scenario_forecast."""
         from energy_forecast.energy_forecast import EnergyForecast
