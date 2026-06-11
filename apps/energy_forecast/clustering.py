@@ -335,21 +335,7 @@ def find_optimal_k(
         best_candidates = [k for k, d2 in candidates if d2 >= best_d2 * 0.9]
         selected_k = best_candidates[0]
 
-        # Informational pass: log OOB for selected K (does not affect selection)
-        try:
-            km_sel = KMeans(n_clusters=selected_k, random_state=42, n_init=10)
-            labels_arr = km_sel.fit_predict(pivoted)
-            labels_series = pd.Series(labels_arr, index=pivoted.index)
-            predictor = RegimePredictor()
-            predictor.fit(daily_features, labels_series, sample_weight=sample_weight, verbose=False)
-            oob = predictor.model.oob_score_ if predictor.is_fitted else float("nan")
-            _LOGGER.info(
-                "Auto-K: inertia elbow selected K=%d. RegimePredictor OOB=%.2f (informational only).",
-                selected_k,
-                oob,
-            )
-        except Exception:
-            _LOGGER.info("Auto-K: inertia elbow selected K=%d.", selected_k)
+        _LOGGER.info("Auto-K: inertia elbow selected K=%d.", selected_k)
 
         return selected_k
 

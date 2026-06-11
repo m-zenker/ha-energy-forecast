@@ -186,7 +186,7 @@ projection, regime prediction). Computing `(future_hours, X)` once and passing i
 three would cut the hourly callback cost by roughly two-thirds — relevant given the
 documented AppDaemon 10 s callback concern.
 
-### [ ] P2 — `find_optimal_k` fits an informational RegimePredictor
+### [x] P2 — `find_optimal_k` fits an informational RegimePredictor
 
 `apps/energy_forecast/clustering.py:331-344` — full RandomForest + TimeSeriesSplit CV run
 purely to produce one log line during auto-K selection.
