@@ -178,7 +178,7 @@ remove in MQTT mode; the cleanup list also doesn't include the scenario entities
 
 ## Performance
 
-### [ ] P1 — Feature matrix built three times per hourly update
+### [x] P1 — Feature matrix built three times per hourly update
 
 `_update_sensors` calls `predict()`, `predict_intervals()`, and `shap_summary()`, each of
 which runs `_prepare_prediction_X` from scratch (feature engineering, RC indoor-temp

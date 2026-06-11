@@ -5196,3 +5196,71 @@ class TestHodLagFill:
         _, X_none = m._prepare_prediction_X(forecast, None, None)
         assert X_none is not None
         assert len(X_none) == 48
+
+
+class TestPreparedPrediction:
+    """P1: predict/predict_intervals/shap_summary must skip _prepare_prediction_X
+    when called with a pre-computed _prepared=(future_hours, X) tuple."""
+
+    def test_predict_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """predict() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.predict(forecast, live_temp=10.0, _prepared=(future_hours, X))
+
+        assert prepare_calls == [], "_prepare_prediction_X must not be called when _prepared is given"
+        assert len(result) == 48
+
+    def test_predict_intervals_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """predict_intervals() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        if m._model_q10 is None:
+            pytest.skip("quantile models not trained in this fixture")
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.predict_intervals(forecast, live_temp=10.0, _prepared=(future_hours, X))
+
+        assert prepare_calls == []
+        assert result is None or len(result) == 48
+
+    def test_shap_summary_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """shap_summary() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.shap_summary(forecast, live_temp=10.0, n=3, _prepared=(future_hours, X))
+
+        assert prepare_calls == []
+        assert isinstance(result, dict)
+
+    def test_predict_without_prepared_still_works(self, tmp_path):
+        """predict() without _prepared must work exactly as before."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.predict(forecast, live_temp=10.0)
+        assert len(result) == 48
+        assert (result["predicted_kwh"] >= 0).all()

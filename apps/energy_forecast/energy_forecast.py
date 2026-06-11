@@ -1232,6 +1232,23 @@ class EnergyForecast(hass.Hass):
         self._cached_climate_recent = climate_recent or None
         self._cached_dhw_recent = dhw_recent if not dhw_recent.empty else None
 
+        # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
+        # all receive the pre-computed result to avoid triple feature engineering.
+        _prepared = self._ml_model._prepare_prediction_X(
+            forecast_df,
+            live_temp,
+            recent_actuals,
+            sub_sensors_recent=sub_sensors_recent or None,
+            away_series=away_series,
+            people_home_series=people_home_series,
+            climate_recent=climate_recent or None,
+            dhw_recent=dhw_recent if not dhw_recent.empty else None,
+            room_areas=self._climate_room_areas or None,
+            heating_active_series=heating_active_series,
+            setpoint_on=heating_setpoint_on,
+            setpoint_off=heating_setpoint_off,
+        )
+
         predictions = self._ml_model.predict(
             forecast_df,
             live_temp,
@@ -1245,6 +1262,7 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            _prepared=_prepared,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
         self._publish_thermal_pressure()
@@ -1262,6 +1280,7 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            _prepared=_prepared,
         )
         if intervals is not None:
             intervals["timestamp"] = pd.to_datetime(intervals["timestamp"]).dt.tz_localize(None)
@@ -1344,6 +1363,7 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
+                    _prepared=_prepared,
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("SHAP summary failed: %s", exc)

@@ -963,6 +963,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
         import numpy as np
@@ -971,20 +972,23 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
         if "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
         else:
@@ -1011,6 +1015,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
@@ -1023,20 +1028,23 @@ class EnergyForecastModel:
         if self._model_q10 is None or self._model_q90 is None:
             return None
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
         if self._log_transform:
@@ -1107,6 +1115,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        _prepared: tuple | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
 
@@ -1124,20 +1133,23 @@ class EnergyForecastModel:
         if self.model is None or n <= 0:
             return {}
 
-        future_hours, X = self._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent,
-            away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent,
-            dhw_recent=dhw_recent,
-            room_areas=room_areas,
-            heating_active_series=heating_active_series,
-            setpoint_on=setpoint_on,
-            setpoint_off=setpoint_off,
-        )
+        if _prepared is not None:
+            future_hours, X = _prepared
+        else:
+            future_hours, X = self._prepare_prediction_X(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent,
+                away_series,
+                people_home_series=people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
 
         # Filter to today's local date; fall back to all rows if none match
         today = pd.Timestamp.now(tz=self._timezone).tz_localize(None).normalize()
