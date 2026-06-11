@@ -1,14 +1,10 @@
-from __future__ import annotations
-
 import logging
 import time
 from datetime import date
-from typing import TYPE_CHECKING
+
+import pandas as pd
 
 from .const import strip_tz as _strip_tz
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast")
 
