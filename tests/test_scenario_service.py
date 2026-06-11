@@ -29,7 +29,9 @@ def _make_app(cached_df=None):
     app._cached_people_home = None
     app._cached_climate_recent = None
     app._cached_dhw_recent = None
+    app._climate_room_areas = {}
     app._timezone = "Europe/Zurich"
+    app._mqtt_discovery = False
     return app
 
 
@@ -484,3 +486,54 @@ class TestMqttSwVersion:
                 assert dev["sw_version"] == __version__, (
                     f"MQTT sw_version '{dev['sw_version']}' != __version__ '{__version__}'"
                 )
+
+
+class TestPublishScenarioMqtt:
+    """L6: _publish_scenario_forecast must use _mqtt_set_sensor in MQTT mode."""
+
+    def _make_mqtt_app(self, already_discovered: bool = False):
+        app = _make_app()
+        app._mqtt_discovery = True
+        app._scenario_mqtt_discovered = already_discovered
+        app._mqtt_discovery_prefix = "homeassistant"
+        app._mqtt_namespace = "mqtt"
+        return app
+
+    def _make_result_df(self, value_kwh: float = 1.0):
+        today = pd.Timestamp.now(tz="Europe/Zurich").normalize().tz_localize(None)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "predicted_kwh": [value_kwh] * 48, "delta_kwh": [0.1] * 48})
+
+    def test_mqtt_mode_does_not_call_set_state(self):
+        """In MQTT mode, set_state must not be called."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_mqtt_app()
+        EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
+        app.set_state.assert_not_called()
+
+    def test_mqtt_mode_calls_mqtt_set_sensor_11_times(self):
+        """In MQTT mode, _mqtt_set_sensor must be called once per sensor (11 total)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_mqtt_app()
+        EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
+        assert app._mqtt_set_sensor.call_count == 11
+
+    def test_mqtt_discovery_registered_on_first_publish(self):
+        """When _scenario_mqtt_discovered is False, discovery must be published for all 11 sensors."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_mqtt_app(already_discovered=False)
+        EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
+        assert app._mqtt_publish_discovery.call_count == 11
+        assert app._scenario_mqtt_discovered is True
+
+    def test_mqtt_discovery_not_repeated_on_second_publish(self):
+        """When _scenario_mqtt_discovered is True, _mqtt_publish_discovery must not be called again."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_mqtt_app(already_discovered=True)
+        EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
+        app._mqtt_publish_discovery.assert_not_called()
+        assert app._mqtt_set_sensor.call_count == 11

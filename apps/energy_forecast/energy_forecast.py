@@ -257,6 +257,7 @@ class EnergyForecast(hass.Hass):
         self._mqtt_namespace: str = str(self.args.get("mqtt_namespace", "mqtt"))
         self._mqtt_discovery_prefix: str = str(self.args.get("mqtt_discovery_prefix", "homeassistant"))
         self._mqtt_intervals_discovered: bool = False
+        self._scenario_mqtt_discovered: bool = False
 
         self._validate_config()
 
@@ -849,46 +850,100 @@ class EnergyForecast(hass.Hass):
         def _sum(arr, s, e):
             return round(float(np.sum(arr[(p_times >= s) & (p_times < e)])), 3)
 
-        def _safe_set_scenario(entity_id: str, value: Any, friendly_name: str) -> None:
-            try:
-                val = float(value)
-                if _math.isnan(val) or _math.isinf(val):
-                    val = 0.0
-            except (TypeError, ValueError):
-                val = 0.0
-            self.set_state(
-                entity_id,
-                state=str(round(val, 3)),
-                attributes={
-                    "unit_of_measurement": "kWh",
-                    "friendly_name": friendly_name,
-                    "unique_id": entity_id.split(".", 1)[-1],
-                    "attribution": ATTRIBUTION,
-                },
-                replace=True,
-            )
-
         scenario_today = _sum(p_vals, today_np, tomorrow_np)
         scenario_tomorrow = _sum(p_vals, tomorrow_np, after_np)
         delta_today = _sum(d_vals, today_np, tomorrow_np)
 
-        _safe_set_scenario("sensor.energy_forecast_scenario_today", scenario_today, "Energy Forecast Scenario Today")
-        _safe_set_scenario(
-            "sensor.energy_forecast_scenario_tomorrow", scenario_tomorrow, "Energy Forecast Scenario Tomorrow"
-        )
-        _safe_set_scenario(
-            "sensor.energy_forecast_scenario_delta_today", delta_today, "Energy Forecast Scenario Delta Today"
-        )
-
-        for h in range(0, 24, 3):
-            slot = f"{h:02d}_{h + 3:02d}"
-            slot_start = today_np + np.timedelta64(h, "h")
-            slot_end = today_np + np.timedelta64(h + 3, "h")
-            _safe_set_scenario(
-                f"sensor.energy_forecast_scenario_today_{slot}",
-                _sum(p_vals, slot_start, slot_end),
-                f"Energy Forecast Scenario Today {h:02d}:{h + 3:02d}",
+        block_values: dict[str, float] = {}
+        for _h in range(0, 24, 3):
+            _slot = f"{_h:02d}_{_h + 3:02d}"
+            block_values[_slot] = _sum(
+                p_vals,
+                today_np + np.timedelta64(_h, "h"),
+                today_np + np.timedelta64(_h + 3, "h"),
             )
+
+        if self._mqtt_discovery:
+            if not self._scenario_mqtt_discovered:
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_today",
+                    "Energy Forecast Scenario Today",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    "energy",
+                    "total",
+                )
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_tomorrow",
+                    "Energy Forecast Scenario Tomorrow",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    "energy",
+                    "total",
+                )
+                self._mqtt_publish_discovery(
+                    "energy_forecast_scenario_delta_today",
+                    "Energy Forecast Scenario Delta Today",
+                    "kWh",
+                    "mdi:chart-bell-curve-cumulative",
+                    None,
+                    "measurement",
+                )
+                for _h in range(0, 24, 3):
+                    _slot = f"{_h:02d}_{_h + 3:02d}"
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_scenario_today_{_slot}",
+                        f"Energy Forecast Scenario Today {_h:02d}:{_h + 3:02d}",
+                        "kWh",
+                        "mdi:chart-bell-curve-cumulative",
+                        "energy",
+                        "total",
+                    )
+                self._scenario_mqtt_discovered = True
+            self._mqtt_set_sensor("energy_forecast_scenario_today", scenario_today)
+            self._mqtt_set_sensor("energy_forecast_scenario_tomorrow", scenario_tomorrow)
+            self._mqtt_set_sensor("energy_forecast_scenario_delta_today", delta_today)
+            for _slot, _val in block_values.items():
+                self._mqtt_set_sensor(f"energy_forecast_scenario_today_{_slot}", _val)
+        else:
+
+            def _safe(entity_id: str, value: Any, friendly_name: str) -> None:
+                try:
+                    val = float(value)
+                    if _math.isnan(val) or _math.isinf(val):
+                        val = 0.0
+                except (TypeError, ValueError):
+                    val = 0.0
+                self.set_state(
+                    entity_id,
+                    state=str(round(val, 3)),
+                    attributes={
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": friendly_name,
+                        "unique_id": entity_id.split(".", 1)[-1],
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
+
+            _safe("sensor.energy_forecast_scenario_today", scenario_today, "Energy Forecast Scenario Today")
+            _safe(
+                "sensor.energy_forecast_scenario_tomorrow",
+                scenario_tomorrow,
+                "Energy Forecast Scenario Tomorrow",
+            )
+            _safe(
+                "sensor.energy_forecast_scenario_delta_today",
+                delta_today,
+                "Energy Forecast Scenario Delta Today",
+            )
+            for _h in range(0, 24, 3):
+                _slot = f"{_h:02d}_{_h + 3:02d}"
+                _safe(
+                    f"sensor.energy_forecast_scenario_today_{_slot}",
+                    block_values[_slot],
+                    f"Energy Forecast Scenario Today {_h:02d}:{_h + 3:02d}",
+                )
 
     def _update_cb(self, event_name=None, data=None, kwargs=None) -> None:
         if self._ml_model.model is None:
@@ -1613,11 +1668,18 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_tomorrow_high",
             # Thermal pressure sensor (now served via MQTT)
             "sensor.energy_forecast_thermal_pressure_net",
+            # Scenario sensors (now served via MQTT when mqtt_discovery=True)
+            "sensor.energy_forecast_scenario_today",
+            "sensor.energy_forecast_scenario_tomorrow",
+            "sensor.energy_forecast_scenario_delta_today",
         ]
         # Block sensors
         for day in ("today", "tomorrow"):
             for slot in BLOCK_SLOTS:
                 legacy_ids.append(f"sensor.energy_forecast_{day}_{slot}")
+        # Scenario block sensors
+        for slot in BLOCK_SLOTS:
+            legacy_ids.append(f"sensor.energy_forecast_scenario_today_{slot}")
 
         for entity_id in legacy_ids:
             try:
