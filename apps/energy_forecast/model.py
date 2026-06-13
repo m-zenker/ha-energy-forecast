@@ -216,6 +216,21 @@ def ensure_ml_packages() -> tuple[bool, str]:
     return True, engine
 
 
+def _strip_partial_last_day(energy_df: pd.DataFrame) -> pd.DataFrame:
+    """Remove the last date if it has fewer than 24 complete hours.
+
+    Prevents today's partial profile from distorting clustering centroids when
+    a retrain fires late in the day (e.g. 23:xx → 23 complete hours pass the
+    ≥18-hour filter but leave column 23 bfill-interpolated).
+    """
+    if energy_df.empty:
+        return energy_df
+    last_date = energy_df["timestamp"].dt.date.max()
+    if (energy_df["timestamp"].dt.date == last_date).sum() < 24:
+        return energy_df[energy_df["timestamp"].dt.date != last_date]
+    return energy_df
+
+
 class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
@@ -400,14 +415,14 @@ class EnergyForecastModel:
                     presence_df=presence_df,
                 )
                 _actual_k = clustering.find_optimal_k(
-                    energy_df,
+                    _strip_partial_last_day(energy_df),
                     _prebuilt_daily_features,
                     sample_weight=daily_weights,
                     ev_day_dates=ev_day_dates,
                 )
             self._clusterer = clustering.DailyProfileClusterer(n_clusters=_actual_k)
             self._regime_count = _actual_k
-            labels = self._clusterer.fit(energy_df, ev_day_dates=ev_day_dates)
+            labels = self._clusterer.fit(_strip_partial_last_day(energy_df), ev_day_dates=ev_day_dates)
 
             if labels is not None and not labels.empty:
                 # ── Train Regime Predictor ──

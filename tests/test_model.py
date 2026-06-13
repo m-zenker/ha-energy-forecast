@@ -39,6 +39,7 @@ from energy_forecast.model import (
     _engineer_features,
     _learn_appliance_signatures,
     _project_indoor_temps,
+    _strip_partial_last_day,
 )
 
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
@@ -5278,3 +5279,29 @@ class TestPreparedPrediction:
         result = m.predict(forecast, live_temp=10.0)
         assert len(result) == 48
         assert (result["predicted_kwh"] >= 0).all()
+
+
+class TestStripPartialLastDay:
+    def test_removes_partial_last_day(self):
+        ts_full = pd.date_range("2024-01-01", periods=48, freq="1h")  # 2 complete days
+        ts_partial = pd.date_range("2024-01-03", periods=10, freq="1h")  # 10 h today
+        ts = ts_full.append(ts_partial)
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        result = _strip_partial_last_day(df)
+        assert result["timestamp"].dt.date.max() == pd.Timestamp("2024-01-02").date()
+        assert len(result) == 48
+
+    def test_keeps_complete_last_day(self):
+        ts = pd.date_range("2024-01-01", periods=48, freq="1h")  # 2 × 24 h exactly
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        result = _strip_partial_last_day(df)
+        assert len(result) == 48
+
+    def test_keeps_day_with_exactly_24_hours(self):
+        ts = pd.date_range("2024-01-01", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        assert len(_strip_partial_last_day(df)) == 24
+
+    def test_empty_df_returns_empty(self):
+        df = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns]"), "gross_kwh": pd.Series(dtype=float)})
+        assert _strip_partial_last_day(df).empty
