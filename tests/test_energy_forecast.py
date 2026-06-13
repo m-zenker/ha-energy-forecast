@@ -332,6 +332,38 @@ class TestAggregate:
         assert "00_03" in result["blocks_today"]
         assert "21_24" in result["blocks_today"]
 
+    def test_tomorrow_block_intervals_present_when_intervals_supplied(self):
+        """blocks_tomorrow_low and blocks_tomorrow_high must each have 8 slots
+        with correct per-slot sums when intervals are provided."""
+        today = pd.Timestamp.now().normalize()
+        now = today
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "low_kwh": np.full(48, 0.5),  # 3 × 0.5 = 1.5 per slot
+                "high_kwh": np.full(48, 2.0),  # 3 × 2.0 = 6.0 per slot
+            }
+        )
+        result = self._run(today, now, preds, intervals=ivs)
+
+        assert "blocks_tomorrow_low" in result, "blocks_tomorrow_low missing from result"
+        assert "blocks_tomorrow_high" in result, "blocks_tomorrow_high missing from result"
+        assert len(result["blocks_tomorrow_low"]) == 8
+        assert len(result["blocks_tomorrow_high"]) == 8
+        for slot in result["blocks_tomorrow_low"]:
+            assert abs(result["blocks_tomorrow_low"][slot] - 1.5) < 0.01, f"slot {slot} low wrong"
+            assert abs(result["blocks_tomorrow_high"][slot] - 6.0) < 0.01, f"slot {slot} high wrong"
+
+    def test_tomorrow_block_intervals_absent_when_no_intervals(self):
+        """Without quantile models, blocks_tomorrow_low/high must not appear in result."""
+        today = pd.Timestamp.now().normalize()
+        preds = _pred_df(today, n=48, kwh=1.0)
+        result = self._run(today, today, preds, intervals=None)
+        assert "blocks_tomorrow_low" not in result
+        assert "blocks_tomorrow_high" not in result
+
 
 # ── M4 — EV blending consistency ─────────────────────────────────────────────
 
