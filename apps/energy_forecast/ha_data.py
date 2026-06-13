@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import hassapi as hass
     import pandas as pd
 
-from .const import CACHE_PATH, MAX_HOURLY_KWH
+from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -288,6 +288,104 @@ def fetch_recent_energy(
     # next hourly HA fetch (HA-wins merge) and corrected on the next weekly compaction.
     completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
     return combined[combined["timestamp"] < completed_cutoff]
+
+
+def fetch_energy_history_15m(
+    app: hass.Hass,
+    entity_id: str,
+    cache_path: Path = CACHE_PATH_15M,
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Pull grid-import history at 15-min resolution, merging local CSV with fresh HA data.
+
+    Mirrors fetch_energy_history() but resamples to 15-minute slots. The return
+    value is not consumed by the production model; the caller's purpose is to grow
+    the background 15m cache for future use.
+    """
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            _LOGGER.warning("fetch_energy_history_15m: failed to load cache: %s", e)
+
+    raw_ha = _fetch_history(app, entity_id, days=30, timezone=timezone)
+
+    if raw_ha.empty and df_cache.empty:
+        raise ValueError(f"No history found in HA or Cache for {entity_id}")
+
+    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH)
+
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        _LOGGER.error("fetch_energy_history_15m: failed to save cache: %s", e)
+
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    return combined[combined["timestamp"] < completed_cutoff]
+
+
+_FETCH_RECENT_15M_TAIL_ROWS = 500  # 500 × 15 min = ~125 hours; no consumer needs more
+
+
+def fetch_recent_energy_15m(
+    app: hass.Hass,
+    entity_id: str,
+    cache_path: Path = CACHE_PATH_15M,
+    timezone: str = "Europe/Zurich",
+) -> None:
+    """Lightweight 15-minute cache update. Appends new slots without a full resync.
+
+    Called every hour from _update_sensors(). Returns None — the 15m cache is
+    not yet consumed by the production model.
+    """
+    import collections
+    import io
+
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    if cache_path.exists():
+        try:
+            with open(cache_path) as fh:
+                header_line = fh.readline()
+                tail_lines = list(collections.deque(fh, maxlen=_FETCH_RECENT_15M_TAIL_ROWS))
+            df_cache = pd.read_csv(io.StringIO(header_line + "".join(tail_lines)))
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            _LOGGER.warning("fetch_recent_energy_15m: failed to load cache: %s", e)
+
+    raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
+
+    if raw_ha.empty and df_cache.empty:
+        _LOGGER.warning("fetch_recent_energy_15m: no data from HA or cache for %s", entity_id)
+        return
+
+    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH)
+
+    combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
+
+    existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
+    new_rows = combined[~combined["timestamp"].isin(existing_ts)]
+    if not new_rows.empty:
+        try:
+            write_header = not cache_path.exists() or cache_path.stat().st_size == 0
+            new_rows.to_csv(cache_path, mode="a", header=write_header, index=False)
+        except OSError as e:
+            _LOGGER.error("fetch_recent_energy_15m: failed to append cache: %s", e)
 
 
 def split_ev_charging(
