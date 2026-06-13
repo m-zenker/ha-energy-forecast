@@ -1876,14 +1876,22 @@ class EnergyForecast(hass.Hass):
         # ── Forecast 3-hour blocks ────────────────────────────────────────────
         for day in ("today", "tomorrow"):
             blocks = data.get(f"blocks_{day}", {})
+            blocks_low = data.get(f"blocks_{day}_low", {})
+            blocks_high = data.get(f"blocks_{day}_high", {})
             for slot in BLOCK_SLOTS:
                 h_start, h_end = slot.split("_")
+                kwh10 = blocks_low.get(slot)
+                kwh90 = blocks_high.get(slot)
+                extra = {"kwh10": kwh10, "kwh90": kwh90} if kwh10 is not None and kwh90 is not None else None
                 safe_set(
                     f"sensor.energy_forecast_{day}_{slot}",
                     blocks.get(slot, 0),
                     f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00",
+                    extra_attrs=extra,
                     icon="mdi:calendar-clock",
                 )
+                if extra and self._mqtt_discovery:
+                    self._mqtt_publish_sensor_attributes(f"energy_forecast_{day}_{slot}", extra)
 
         # ── EV actuals sensors ────────────────────────────────────────────────
         ev_attrs = {

@@ -772,6 +772,11 @@ class _FakeMqttSelf:
 
         EnergyForecast._mqtt_publish_binary_sensor_discovery(self, *args, **kwargs)
 
+    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict, category: str = "sensor") -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        EnergyForecast._mqtt_publish_sensor_attributes(self, unique_id, attrs, category)
+
 
 class TestMqttPublishDiscovery:
     """Discovery payload structure and publish behaviour."""
@@ -1575,6 +1580,86 @@ class TestRollingMaeSensors:
         assert any("energy_forecast_mae_30d/config" in t for t in config_topics), (
             f"mae_30d config topic not found in: {config_topics}"
         )
+
+
+class TestPublishTomorrowBlockIntervals:
+    """_publish() must include kwh10/kwh90 attributes on tomorrow block sensors."""
+
+    def _make_data(self, with_intervals: bool) -> dict:
+        """Minimal data dict for _publish() with or without interval blocks."""
+        blocks_tomorrow = {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)}
+        data = {
+            "next_1h": 1.0,
+            "next_3h": 3.0,
+            "today": 8.0,
+            "tomorrow": 24.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": blocks_tomorrow,
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "live_temp": None,
+            "shap_top_features": {},
+            "shap_narrative": "",
+            "mae_7d": 0.5,
+            "mae_7d_pct": 5.0,
+            "mae_30d": 0.6,
+            "mae_30d_pct": 6.0,
+            "mae_7d_n_pairs": 10,
+            "mae_30d_n_pairs": 30,
+            "is_anomaly": False,
+            "anomaly_residual": 0.0,
+            "anomaly_std": 0.1,
+            "anomaly_n": 5,
+        }
+        if with_intervals:
+            data["blocks_tomorrow_low"] = {f"{h:02d}_{h + 3:02d}": 0.5 for h in range(0, 24, 3)}
+            data["blocks_tomorrow_high"] = {f"{h:02d}_{h + 3:02d}": 2.0 for h in range(0, 24, 3)}
+        return data
+
+    def test_setstate_mode_adds_kwh10_kwh90_to_tomorrow_blocks(self):
+        """In set_state mode, kwh10 and kwh90 must appear in tomorrow block attributes."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=True))
+
+        slot = "sensor.energy_forecast_tomorrow_00_03"
+        assert slot in fake._states, f"{slot} not published"
+        attrs = fake._states[slot]["attributes"]
+        assert attrs.get("kwh10") == 0.5, f"kwh10 wrong: {attrs.get('kwh10')}"
+        assert attrs.get("kwh90") == 2.0, f"kwh90 wrong: {attrs.get('kwh90')}"
+
+    def test_setstate_mode_no_kwh10_kwh90_when_no_intervals(self):
+        """Without interval blocks in data, kwh10/kwh90 must not appear in attributes."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=False))
+
+        slot = "sensor.energy_forecast_tomorrow_00_03"
+        assert slot in fake._states
+        attrs = fake._states[slot]["attributes"]
+        assert "kwh10" not in attrs
+        assert "kwh90" not in attrs
+
+    def test_mqtt_mode_publishes_attributes_for_tomorrow_blocks(self):
+        """In MQTT mode, an mqtt/publish call with kwh10/kwh90 must be made for each tomorrow block."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=True))
+
+        import json
+
+        attr_topics = {
+            p["topic"]: json.loads(p["payload"])
+            for p in fake._publishes
+            if "/attributes" in p["topic"] and "tomorrow" in p["topic"]
+        }
+        assert len(attr_topics) == 8, f"expected 8 attribute publishes for tomorrow, got {len(attr_topics)}"
+        for topic, payload in attr_topics.items():
+            assert payload.get("kwh10") == 0.5, f"{topic}: kwh10 wrong"
+            assert payload.get("kwh90") == 2.0, f"{topic}: kwh90 wrong"
 
 
 # ── M5 — pred_history horizon ──────────────────────────────────────────────
