@@ -20,6 +20,8 @@ MIN_CV_ROWS = 500  # Minimum rows for TimeSeriesSplit cross-validation
 
 # Data Storage
 CACHE_PATH = Path(__file__).parent / "energy_history.csv"
+CACHE_PATH_15M = Path(__file__).parent / "energy_history_15m.csv"
+MAX_15MIN_KWH = MAX_HOURLY_KWH / 4  # 12.5 kWh — per-slot cap for 15-min resolution
 PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
 
 # Occupancy Detection
