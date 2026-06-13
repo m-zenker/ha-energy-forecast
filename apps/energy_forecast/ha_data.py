@@ -137,6 +137,29 @@ def _merge_energy_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.
     return _merge_frames(df_winner, df_loser, "gross_kwh")
 
 
+def _raw_to_kwh_diff(raw_ha: pd.DataFrame, resolution: str, max_kwh: float) -> pd.DataFrame:
+    """Convert raw cumulative meter readings to per-slot kWh differences.
+
+    Args:
+        raw_ha:     DataFrame with columns [timestamp (tz-aware), value].
+        resolution: Pandas offset string, e.g. "1h" or "15min".
+        max_kwh:    Per-slot upper bound; slots above this are filtered out.
+
+    Returns:
+        DataFrame with columns [timestamp (naive local), gross_kwh], positive values only.
+    """
+    import pandas as pd
+
+    if raw_ha.empty:
+        return pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    slotted = raw_ha.set_index("timestamp")["value"].resample(resolution).last().ffill()
+    diff = slotted.diff().clip(lower=0).reset_index()
+    diff.columns = ["timestamp", "gross_kwh"]
+    if diff["timestamp"].dt.tz is not None:
+        diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
+    return diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < max_kwh)].copy()
+
+
 def fetch_energy_history(
     app: hass.Hass,
     entity_id: str,
@@ -167,15 +190,7 @@ def fetch_energy_history(
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
     # 3. Process HA data into hourly gross kWh
-    if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "gross_kwh"]
-        if diff["timestamp"].dt.tz is not None:
-            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
-        df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
-    else:
-        df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH)
 
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
@@ -247,15 +262,7 @@ def fetch_recent_energy(
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
     # 3. Process into hourly kWh and keep only the recent window
-    if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "gross_kwh"]
-        if diff["timestamp"].dt.tz is not None:
-            diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
-        df_new = diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < MAX_HOURLY_KWH)].copy()
-    else:
-        df_new = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH)
 
     # 4. Merge — fresh HA data wins on timestamp conflicts (for return value)
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)

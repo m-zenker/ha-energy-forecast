@@ -1567,3 +1567,67 @@ class TestFetchSubSensorHistoryWithProgram:
 
         assert len(result) == 1
         assert result.iloc[0]["kwh"] == pytest.approx(1.2)
+
+
+from energy_forecast.ha_data import _raw_to_kwh_diff  # noqa: E402
+
+
+class TestRawToKwhDiff:
+    def _make_raw(self, timestamps, values):
+        import pandas as pd
+
+        ts = pd.to_datetime(timestamps).tz_localize("Europe/Zurich")
+        return pd.DataFrame({"timestamp": ts, "value": values})
+
+    def test_basic_hourly_diff(self):
+        import pandas as pd
+
+        # Use one reading per hour so resample("1h").last() picks the only value
+        # in each bucket, giving clean 1.0 kWh diffs.
+        raw = self._make_raw(
+            [
+                "2024-01-01 00:30",
+                "2024-01-01 01:30",
+                "2024-01-01 02:30",
+            ],
+            [100.0, 101.0, 102.0],
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        assert list(result.columns) == ["timestamp", "gross_kwh"]
+        assert result["timestamp"].dt.tz is None  # naive
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 01:00")] - 1.0) < 0.01
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 1.0) < 0.01
+
+    def test_basic_15min_diff(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 00:15", "2024-01-01 00:30"],
+            [100.0, 100.25, 100.5],
+        )
+        result = _raw_to_kwh_diff(raw, "15min", max_kwh=12.5)
+        assert len(result) >= 1
+        assert result["gross_kwh"].max() <= 12.5
+
+    def test_empty_returns_empty(self):
+        import pandas as pd
+
+        result = _raw_to_kwh_diff(pd.DataFrame(), "1h", max_kwh=50.0)
+        assert list(result.columns) == ["timestamp", "gross_kwh"]
+        assert result.empty
+
+    def test_max_kwh_filter_applied(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [0.0, 100.0],  # 100 kWh in one hour — above any reasonable limit
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        assert result.empty  # filtered out
+
+    def test_negative_diff_clipped_to_zero(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
+            [100.0, 99.0, 101.0],  # meter reset between h0 and h1
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        # h1: diff = -1 → clipped to 0 → filtered (not > 0). h2: diff = 2 → kept.
+        assert all(result["gross_kwh"] > 0)
