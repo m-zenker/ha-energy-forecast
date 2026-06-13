@@ -171,6 +171,7 @@ class EnergyForecast(hass.Hass):
         self._ev_charger_kw: float = float(self.args.get("ev_charger_kw", 9.0))
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
+        self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
         self._timezone: str = str(self.args.get("timezone") or self.get_timezone() or "Europe/Zurich")
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
         self._holiday_country: str = str(self.args.get("holiday_country", "CH")).upper()
@@ -1161,6 +1162,16 @@ class EnergyForecast(hass.Hass):
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 
+        try:
+            ha_data.fetch_energy_history_15m(
+                self,
+                self._energy_sensor,
+                cache_path=self._cache_path_15m,
+                timezone=self._timezone,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("15m cache update failed (non-fatal): %s", exc)
+
     def _update_sensors(self) -> None:
         import numpy as np
         import pandas as pd
@@ -1445,6 +1456,16 @@ class EnergyForecast(hass.Hass):
         aggregated["anomaly_std"] = anomaly_std
         aggregated["anomaly_n"] = anomaly_n
         self._publish(aggregated)
+
+        try:
+            ha_data.fetch_recent_energy_15m(
+                self,
+                self._energy_sensor,
+                cache_path=self._cache_path_15m,
+                timezone=self._timezone,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("15m cache hourly update failed (non-fatal): %s", exc)
 
     def _read_live_temp(self) -> float | None:
         if not self._outdoor_sensor:

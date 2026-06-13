@@ -2695,3 +2695,99 @@ def test_publish_thermal_pressure_tau_none_not_coerced_to_zero():
     assert len(stub._calls) == 1, "set_state should have been called once"
     tau = stub._calls[0]["attributes"]["tau_hours"]
     assert tau is None, f"tau_hours must be None when uncalibrated, got {tau!r}"
+
+
+# ── #85 — 15m cache wiring ────────────────────────────────────────────────────
+
+
+class _FakeRetrain:
+    """Minimal stub for EnergyForecast._retrain() tests."""
+
+    def __init__(self, cache_path):
+        self._energy_sensor = "sensor.energy"
+        self._cache_path = cache_path
+        self._cache_path_15m = cache_path.parent / "energy_history_15m.csv"
+        self._timezone = "Europe/Zurich"
+        self._ev_threshold = 7.0
+        self._ev_charger_kw = 9.0
+        self._solar_sensor = None
+        self._grid_export_sensor = None
+        self._battery_charge_sensor = None
+        self._battery_discharge_sensor = None
+        self._sub_energy_sensors = []
+        self._program_sensors = {}
+        self._baseline_mode = False
+        self._baseline_included_sensors = []
+        self._lat = 47.0
+        self._lon = 8.5
+        self._away_mode_entity = None
+        self._presence_sensors = None
+        self._climate_entities = []
+        self._dhw_buffer_sensor = None
+        self._heating_active_entity = None
+        self._ml_model = MagicMock()
+        self._weight_halflife = 90.0
+        self._holiday_canton = None
+        self._holiday_country = "CH"
+        self._enable_regimes = False
+        self._regime_count = 3
+        self._climate_room_areas = None
+
+    def log(self, msg, level="INFO"):
+        pass
+
+
+def _make_energy_df(n=100):
+    ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+
+
+def _empty_weather():
+    return pd.DataFrame(columns=["timestamp"])
+
+
+class TestFifteenMinCache:
+    """#85 — 15m cache is populated during retrain."""
+
+    def _patch_retrain_deps(self, monkeypatch):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        energy_df = _make_energy_df(100)
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        return ha_data_mod
+
+    def test_retrain_calls_15m_fetch(self, tmp_path, monkeypatch):
+        """fetch_energy_history_15m() must be called inside _retrain()."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        ha_data_mod = self._patch_retrain_deps(monkeypatch)
+
+        called = []
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: called.append(True))
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        EnergyForecast._retrain(stub)
+
+        assert called, "fetch_energy_history_15m was not called during _retrain()"
+
+    def test_retrain_15m_error_does_not_crash_retrain(self, tmp_path, monkeypatch):
+        """A crash in fetch_energy_history_15m must not propagate out of _retrain()."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        ha_data_mod = self._patch_retrain_deps(monkeypatch)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", _boom)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        EnergyForecast._retrain(stub)  # must not raise
