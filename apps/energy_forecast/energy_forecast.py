@@ -654,7 +654,7 @@ class EnergyForecast(hass.Hass):
                 "measurement",
                 json_attributes_topic=attrs_topic,
             )
-        # 3h blocks — today and tomorrow, 8 slots each (P50 + P10/P90 percentile sensors)
+        # 3h blocks — today and tomorrow, 8 slots each (P50 only; P10/P90 registered lazily on first interval publish)
         for day in ("today", "tomorrow"):
             for h in range(0, 24, 3):
                 slot = f"{h:02d}_{h + 3:02d}"
@@ -662,22 +662,6 @@ class EnergyForecast(hass.Hass):
                 self._mqtt_publish_discovery(
                     f"energy_forecast_{day}_{slot}",
                     f"{day.title()} {h_start}:00–{h_end}:00",
-                    "kWh",
-                    "mdi:calendar-clock",
-                    "energy",
-                    "measurement",
-                )
-                self._mqtt_publish_discovery(
-                    f"energy_forecast_{day}_{slot}_10th_pct",
-                    f"{day.title()} {h_start}:00–{h_end}:00 P10",
-                    "kWh",
-                    "mdi:calendar-clock",
-                    "energy",
-                    "measurement",
-                )
-                self._mqtt_publish_discovery(
-                    f"energy_forecast_{day}_{slot}_90th_pct",
-                    f"{day.title()} {h_start}:00–{h_end}:00 P90",
                     "kWh",
                     "mdi:calendar-clock",
                     "energy",
@@ -1871,6 +1855,26 @@ class EnergyForecast(hass.Hass):
                     "energy",
                     "measurement",
                 )
+            for day in ("today", "tomorrow"):
+                for h in range(0, 24, 3):
+                    slot = f"{h:02d}_{h + 3:02d}"
+                    h_start, h_end = f"{h:02d}", f"{h + 3:02d}"
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_{day}_{slot}_10th_pct",
+                        f"{day.title()} {h_start}:00–{h_end}:00 P10",
+                        "kWh",
+                        "mdi:calendar-clock",
+                        "energy",
+                        "measurement",
+                    )
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_{day}_{slot}_90th_pct",
+                        f"{day.title()} {h_start}:00–{h_end}:00 P90",
+                        "kWh",
+                        "mdi:calendar-clock",
+                        "energy",
+                        "measurement",
+                    )
             self._mqtt_intervals_discovered = True
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             low = data.get(f"{key}_low")
