@@ -654,7 +654,7 @@ class EnergyForecast(hass.Hass):
                 "measurement",
                 json_attributes_topic=attrs_topic,
             )
-        # 3h blocks — today and tomorrow, 8 slots each
+        # 3h blocks — today and tomorrow, 8 slots each (P50 only; P10/P90 registered lazily on first interval publish)
         for day in ("today", "tomorrow"):
             for h in range(0, 24, 3):
                 slot = f"{h:02d}_{h + 3:02d}"
@@ -1855,6 +1855,26 @@ class EnergyForecast(hass.Hass):
                     "energy",
                     "measurement",
                 )
+            for day in ("today", "tomorrow"):
+                for h in range(0, 24, 3):
+                    slot = f"{h:02d}_{h + 3:02d}"
+                    h_start, h_end = f"{h:02d}", f"{h + 3:02d}"
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_{day}_{slot}_10th_pct",
+                        f"{day.title()} {h_start}:00–{h_end}:00 P10",
+                        "kWh",
+                        "mdi:calendar-clock",
+                        "energy",
+                        "measurement",
+                    )
+                    self._mqtt_publish_discovery(
+                        f"energy_forecast_{day}_{slot}_90th_pct",
+                        f"{day.title()} {h_start}:00–{h_end}:00 P90",
+                        "kWh",
+                        "mdi:calendar-clock",
+                        "energy",
+                        "measurement",
+                    )
             self._mqtt_intervals_discovered = True
         for key, label in [("next_3h", "Next 3h"), ("today", "Today"), ("tomorrow", "Tomorrow")]:
             low = data.get(f"{key}_low")
@@ -1880,18 +1900,28 @@ class EnergyForecast(hass.Hass):
             blocks_high = data.get(f"blocks_{day}_high", {})
             for slot in BLOCK_SLOTS:
                 h_start, h_end = slot.split("_")
-                kwh10 = blocks_low.get(slot)
-                kwh90 = blocks_high.get(slot)
-                extra = {"kwh10": kwh10, "kwh90": kwh90} if kwh10 is not None and kwh90 is not None else None
                 safe_set(
                     f"sensor.energy_forecast_{day}_{slot}",
                     blocks.get(slot, 0),
                     f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00",
-                    extra_attrs=extra,
                     icon="mdi:calendar-clock",
                 )
-                if extra and self._mqtt_discovery:
-                    self._mqtt_publish_sensor_attributes(f"energy_forecast_{day}_{slot}", extra)
+                kwh10 = blocks_low.get(slot)
+                kwh90 = blocks_high.get(slot)
+                if kwh10 is not None:
+                    safe_set(
+                        f"sensor.energy_forecast_{day}_{slot}_10th_pct",
+                        kwh10,
+                        f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00 P10",
+                        icon="mdi:calendar-clock",
+                    )
+                if kwh90 is not None:
+                    safe_set(
+                        f"sensor.energy_forecast_{day}_{slot}_90th_pct",
+                        kwh90,
+                        f"Energy Forecast {day.title()} {h_start}:00–{h_end}:00 P90",
+                        icon="mdi:calendar-clock",
+                    )
 
         # ── EV actuals sensors ────────────────────────────────────────────────
         ev_attrs = {
@@ -2111,6 +2141,22 @@ class EnergyForecast(hass.Hass):
                     "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
                 }
             )
+            result["blocks_today_low"] = {
+                f"{h:02d}_{h + 3:02d}": _isum(
+                    iv_low,
+                    today_np + np.timedelta64(h, "h"),
+                    today_np + np.timedelta64(h + 3, "h"),
+                )
+                for h in range(0, 24, 3)
+            }
+            result["blocks_today_high"] = {
+                f"{h:02d}_{h + 3:02d}": _isum(
+                    iv_high,
+                    today_np + np.timedelta64(h, "h"),
+                    today_np + np.timedelta64(h + 3, "h"),
+                )
+                for h in range(0, 24, 3)
+            }
             result["blocks_tomorrow_low"] = {
                 f"{h:02d}_{h + 3:02d}": _isum(
                     iv_low,

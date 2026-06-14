@@ -9,7 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- `apps/energy_forecast/energy_forecast.py` — Tomorrow 3h block sensors now include `kwh10` (P10) and `kwh90` (P90) prediction interval attributes when quantile models are trained, enabling ha-energy-manager's battery manager to use pessimistic/optimistic consumption estimates for overnight planning. ([cross-repo gap A])
+- `apps/energy_forecast/energy_forecast.py` — When quantile models are trained, publishes 32 new sensors (`sensor.energy_forecast_{today|tomorrow}_{slot}_10th_pct` / `_90th_pct`) for all 8 three-hour slots in each day. Enables ha-energy-manager's battery manager to use pessimistic/optimistic per-slot consumption estimates for overnight planning. MQTT discovery for these sensors is registered lazily on first interval publish to avoid orphan entities when quantile models are absent. ([cross-repo gap A])
 - `apps/energy_forecast/ha_data.py` — Background 15-minute energy history cache (`energy_history_15m.csv`) — accumulates alongside the hourly cache during every retrain and hourly sensor update. Not yet consumed by the model; data collection for a future sub-hourly upgrade. ([#85])
 
 ### Fixed

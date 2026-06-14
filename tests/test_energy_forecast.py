@@ -364,6 +364,26 @@ class TestAggregate:
         assert "blocks_tomorrow_low" not in result
         assert "blocks_tomorrow_high" not in result
 
+    def test_today_block_intervals_present_when_intervals_supplied(self):
+        """blocks_today_low and blocks_today_high must each have 8 slots."""
+        today = pd.Timestamp.now().normalize()
+        now = today
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "low_kwh": np.full(48, 0.5),
+                "high_kwh": np.full(48, 2.0),
+            }
+        )
+        result = self._run(today, now, preds, intervals=ivs)
+
+        assert "blocks_today_low" in result, "blocks_today_low missing from result"
+        assert "blocks_today_high" in result, "blocks_today_high missing from result"
+        assert len(result["blocks_today_low"]) == 8
+        assert len(result["blocks_today_high"]) == 8
+
 
 # ── M4 — EV blending consistency ─────────────────────────────────────────────
 
@@ -1582,19 +1602,18 @@ class TestRollingMaeSensors:
         )
 
 
-class TestPublishTomorrowBlockIntervals:
-    """_publish() must include kwh10/kwh90 attributes on tomorrow block sensors."""
+class TestPublishBlockIntervalSensors:
+    """_publish() must create separate _10th_pct/_90th_pct sensors (not attributes)."""
 
     def _make_data(self, with_intervals: bool) -> dict:
-        """Minimal data dict for _publish() with or without interval blocks."""
-        blocks_tomorrow = {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)}
+        blocks = {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)}
         data = {
             "next_1h": 1.0,
             "next_3h": 3.0,
             "today": 8.0,
             "tomorrow": 24.0,
-            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
-            "blocks_tomorrow": blocks_tomorrow,
+            "blocks_today": blocks.copy(),
+            "blocks_tomorrow": blocks.copy(),
             "ev_today": 0.0,
             "ev_yesterday": 0.0,
             "live_temp": None,
@@ -1612,54 +1631,51 @@ class TestPublishTomorrowBlockIntervals:
             "anomaly_n": 5,
         }
         if with_intervals:
+            data["blocks_today_low"] = {f"{h:02d}_{h + 3:02d}": 0.5 for h in range(0, 24, 3)}
+            data["blocks_today_high"] = {f"{h:02d}_{h + 3:02d}": 2.0 for h in range(0, 24, 3)}
             data["blocks_tomorrow_low"] = {f"{h:02d}_{h + 3:02d}": 0.5 for h in range(0, 24, 3)}
             data["blocks_tomorrow_high"] = {f"{h:02d}_{h + 3:02d}": 2.0 for h in range(0, 24, 3)}
         return data
 
-    def test_setstate_mode_adds_kwh10_kwh90_to_tomorrow_blocks(self):
-        """In set_state mode, kwh10 and kwh90 must appear in tomorrow block attributes."""
+    def test_setstate_mode_publishes_separate_10th_90th_sensors(self):
+        """set_state mode must create _10th_pct and _90th_pct as separate entities."""
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=False)
         EnergyForecast._publish(fake, self._make_data(with_intervals=True))
 
-        slot = "sensor.energy_forecast_tomorrow_00_03"
-        assert slot in fake._states, f"{slot} not published"
-        attrs = fake._states[slot]["attributes"]
-        assert attrs.get("kwh10") == 0.5, f"kwh10 wrong: {attrs.get('kwh10')}"
-        assert attrs.get("kwh90") == 2.0, f"kwh90 wrong: {attrs.get('kwh90')}"
+        for day in ("today", "tomorrow"):
+            slot_id = f"sensor.energy_forecast_{day}_00_03_10th_pct"
+            assert slot_id in fake._states, f"{slot_id} not published"
+            assert fake._states[slot_id]["state"] == "0.5", f"{slot_id} state wrong"
 
-    def test_setstate_mode_no_kwh10_kwh90_when_no_intervals(self):
-        """Without interval blocks in data, kwh10/kwh90 must not appear in attributes."""
+            slot_id_90 = f"sensor.energy_forecast_{day}_00_03_90th_pct"
+            assert slot_id_90 in fake._states, f"{slot_id_90} not published"
+            assert fake._states[slot_id_90]["state"] == "2.0", f"{slot_id_90} state wrong"
+
+    def test_setstate_mode_no_pct_sensors_when_no_intervals(self):
+        """Without interval data, _10th_pct/_90th_pct sensors must not be published."""
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = _FakeMqttSelf(mqtt_discovery=False)
         EnergyForecast._publish(fake, self._make_data(with_intervals=False))
 
-        slot = "sensor.energy_forecast_tomorrow_00_03"
-        assert slot in fake._states
-        attrs = fake._states[slot]["attributes"]
-        assert "kwh10" not in attrs
-        assert "kwh90" not in attrs
+        for day in ("today", "tomorrow"):
+            assert f"sensor.energy_forecast_{day}_00_03_10th_pct" not in fake._states
+            assert f"sensor.energy_forecast_{day}_00_03_90th_pct" not in fake._states
 
-    def test_mqtt_mode_publishes_attributes_for_tomorrow_blocks(self):
-        """In MQTT mode, an mqtt/publish call with kwh10/kwh90 must be made for each tomorrow block."""
+    def test_p50_block_sensor_has_no_interval_attributes(self):
+        """The base P50 block sensor must NOT have kwh10/kwh90 in its attributes."""
         from energy_forecast.energy_forecast import EnergyForecast
 
-        fake = _FakeMqttSelf(mqtt_discovery=True)
+        fake = _FakeMqttSelf(mqtt_discovery=False)
         EnergyForecast._publish(fake, self._make_data(with_intervals=True))
 
-        import json
-
-        attr_topics = {
-            p["topic"]: json.loads(p["payload"])
-            for p in fake._publishes
-            if "/attributes" in p["topic"] and "tomorrow" in p["topic"]
-        }
-        assert len(attr_topics) == 8, f"expected 8 attribute publishes for tomorrow, got {len(attr_topics)}"
-        for topic, payload in attr_topics.items():
-            assert payload.get("kwh10") == 0.5, f"{topic}: kwh10 wrong"
-            assert payload.get("kwh90") == 2.0, f"{topic}: kwh90 wrong"
+        slot = "sensor.energy_forecast_tomorrow_00_03"
+        assert slot in fake._states
+        attrs = fake._states[slot].get("attributes", {})
+        assert "kwh10" not in attrs
+        assert "kwh90" not in attrs
 
 
 # ── M5 — pred_history horizon ──────────────────────────────────────────────
