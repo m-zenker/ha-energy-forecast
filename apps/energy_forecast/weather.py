@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import logging
 import time
 from datetime import date
-
-import numpy as np
-import pandas as pd
-import requests
+from typing import TYPE_CHECKING
 
 from .const import strip_tz as _strip_tz
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -19,6 +21,20 @@ _srg_token_expires_at: float = 0.0  # Unix timestamp after which token is invali
 # the geolocation endpoint always returns the same station ID per location.
 # Caching avoids ~24 redundant geolocation lookups per day (50% quota savings).
 _srg_geo_id: dict[tuple[float, float], str] = {}  # (lat, lon) → geo station ID
+
+# Canonical column list for weather DataFrames.  Used to return a properly-columned
+# empty DataFrame on fetch failure so _engineer_features median-imputation applies
+# instead of raising KeyError on missing columns.
+_WEATHER_COLUMNS = [
+    "timestamp",
+    "temp_c",
+    "precipitation_mm",
+    "sunshine_min",
+    "wind_kmh",
+    "cloud_cover_pct",
+    "direct_radiation_wm2",
+    "humidity",
+]
 
 
 def _parse_sunshine_min(sunshine_seconds: list) -> list:
@@ -33,7 +49,8 @@ def _parse_sunshine_min(sunshine_seconds: list) -> list:
         _LOGGER.warning(
             "sunshine_duration contains %d value(s) > 60 min/h (max=%.1f) — clamping. "
             "This may indicate an API schema change.",
-            len(over), max(over),
+            len(over),
+            max(over),
         )
     return [min(60.0, v) for v in result]
 
@@ -49,6 +66,11 @@ def fetch_historical_weather(
         cloud_cover_pct, direct_radiation_wm2, humidity
     """
     import urllib.parse
+
+    import numpy as np
+    import pandas as pd
+    import requests
+
     tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
@@ -62,24 +84,30 @@ def fetch_historical_weather(
     res.raise_for_status()
     h = res.json()["hourly"]
     n = len(h["time"])
-    return pd.DataFrame({
-        "timestamp":             pd.to_datetime(h["time"]),
-        "temp_c":                h["temperature_2m"],
-        "precipitation_mm":      h["precipitation"],
-        # Open-Meteo returns sunshine_duration in seconds; model expects minutes
-        "sunshine_min":          _parse_sunshine_min(h["sunshine_duration"]),
-        "wind_kmh":              h["windspeed_10m"],
-        # Default to NaN (not 0) when the field is absent so the safety-net NaN fill
-        # in _engineer_features applies the feature median rather than 0% cloud cover
-        # (which would falsely imply a perfectly clear sky).
-        "cloud_cover_pct":       h.get("cloud_cover",      [np.nan] * n),
-        "direct_radiation_wm2":  h.get("direct_radiation", [np.nan] * n),
-        "humidity":              h.get("relative_humidity_2m", [np.nan] * n),
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(h["time"]),
+            "temp_c": h["temperature_2m"],
+            "precipitation_mm": h["precipitation"],
+            # Open-Meteo returns sunshine_duration in seconds; model expects minutes
+            "sunshine_min": _parse_sunshine_min(h["sunshine_duration"]),
+            "wind_kmh": h["windspeed_10m"],
+            # Default to NaN (not 0) when the field is absent so the safety-net NaN fill
+            # in _engineer_features applies the feature median rather than 0% cloud cover
+            # (which would falsely imply a perfectly clear sky).
+            "cloud_cover_pct": h.get("cloud_cover", [np.nan] * n),
+            "direct_radiation_wm2": h.get("direct_radiation", [np.nan] * n),
+            "humidity": h.get("relative_humidity_2m", [np.nan] * n),
+        }
+    )
 
 
 def fetch_forecast(
-    plz: str, lat: float, lon: float, client_id: str | None = None, client_secret: str | None = None,
+    plz: str,
+    lat: float,
+    lon: float,
+    client_id: str | None = None,
+    client_secret: str | None = None,
     timezone: str = "Europe/Zurich",
 ) -> pd.DataFrame:
     """Fetches high-quality forecast from SRG-SSR API with Open-Meteo fallback.
@@ -89,6 +117,9 @@ def fetch_forecast(
     and the 3-day historical tail needed to anchor temp_rolling_3d.  SRG
     values for temp_c, precipitation_mm, sunshine_min, wind_kmh are preserved.
     """
+    import pandas as pd
+    import requests
+
     if not client_id or not client_secret:
         return fetch_open_meteo(lat, lon, timezone=timezone)
 
@@ -105,7 +136,8 @@ def fetch_forecast(
             except (ValueError, KeyError):
                 _LOGGER.warning(
                     "SRG-SSR auth failed — HTTP %s, body: %.200r — falling back to Open-Meteo.",
-                    auth_res.status_code, auth_res.text,
+                    auth_res.status_code,
+                    auth_res.text,
                 )
                 return fetch_open_meteo(lat, lon, timezone=timezone)
         token = _srg_token
@@ -119,7 +151,8 @@ def fetch_forecast(
         if loc_key not in _srg_geo_id:
             geo_res = requests.get(
                 f"https://api.srgssr.ch/srf-meteo/v2/geolocations?latitude={lat}&longitude={lon}",
-                headers=headers, timeout=10,
+                headers=headers,
+                timeout=10,
             )
             geo_res.raise_for_status()
             geo_hits = geo_res.json()
@@ -139,23 +172,27 @@ def fetch_forecast(
             data = res.json()
         except ValueError:
             import re as _re
+
             _title = _re.search(r"<title[^>]*>(.*?)</title>", res.text, _re.I | _re.S)
             title_str = _title.group(1).strip() if _title else res.text[:120].strip()
             _LOGGER.warning(
                 "SRG-SSR forecast parse failed — HTTP %s, page: %r — falling back to Open-Meteo.",
-                res.status_code, title_str,
+                res.status_code,
+                title_str,
             )
             return fetch_open_meteo(lat, lon, timezone=timezone)
 
         records = []
         for hour in data.get("hours", []):
-            records.append({
-                "timestamp":        hour.get("date_time"),
-                "temp_c":           float(hour.get("TTT_C", 0)),
-                "precipitation_mm": float(hour.get("RRR_MM", 0)),
-                "sunshine_min":     float(hour.get("SUN_MIN", 0)),
-                "wind_kmh":         float(hour.get("FF_KMH", 0)),
-            })
+            records.append(
+                {
+                    "timestamp": hour.get("date_time"),
+                    "temp_c": float(hour.get("TTT_C", 0)),
+                    "precipitation_mm": float(hour.get("RRR_MM", 0)),
+                    "sunshine_min": float(hour.get("SUN_MIN", 0)),
+                    "wind_kmh": float(hour.get("FF_KMH", 0)),
+                }
+            )
 
         srg_df = pd.DataFrame(records)
 
@@ -164,6 +201,9 @@ def fetch_forecast(
         return _supplement_from_open_meteo(srg_df, om_df, timezone=timezone)
 
     except (requests.RequestException, KeyError, ValueError) as exc:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401:
+            _srg_token = None  # force re-auth on next call
+            _srg_token_expires_at = 0.0
         _LOGGER.warning("SRG-SSR forecast failed (%s) — falling back to Open-Meteo.", exc)
         return fetch_open_meteo(lat, lon, timezone=timezone)
 
@@ -182,6 +222,8 @@ def _supplement_from_open_meteo(
 
     If om_df is empty (Open-Meteo call failed), returns srg_df unchanged.
     """
+    import pandas as pd
+
     if om_df.empty:
         return srg_df
 
@@ -193,8 +235,8 @@ def _supplement_from_open_meteo(
         # utc=True normalises them before converting to local time.
         srg_df["timestamp"] = pd.to_datetime(srg_df["timestamp"], utc=True)
     srg_df = _strip_tz(srg_df, timezone)
-    om_df  = om_df.copy()
-    om_df["timestamp"]  = pd.to_datetime(om_df["timestamp"])
+    om_df = om_df.copy()
+    om_df["timestamp"] = pd.to_datetime(om_df["timestamp"])
 
     srg_start = srg_df["timestamp"].min()
 
@@ -223,20 +265,26 @@ def _supplement_from_open_meteo(
     return combined.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") -> pd.DataFrame:
-    """Forecast (+ 3-day historical tail) using the free Open-Meteo API.
+def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich", past_days: int = 3) -> pd.DataFrame:
+    """Forecast (+ measured historical tail) using the free Open-Meteo API.
 
-    past_days=3 adds ~72 h of measured history before the forecast window.
+    past_days adds measured history before the forecast window; default=3 anchors
+    temp_rolling_3d. Pass past_days=7 from _retrain to cover the 5-day archive lag.
     This anchors the temp_rolling_3d feature in _engineer_features so the
     3-day rolling mean is based on real observations, not forecast values.
     """
     import urllib.parse
+
+    import numpy as np
+    import pandas as pd
+    import requests
+
     tz_encoded = urllib.parse.quote(timezone, safe="")
     url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"
         ",cloud_cover,direct_radiation,relative_humidity_2m"
-        "&past_days=3"
+        f"&past_days={past_days}"
         f"&timezone={tz_encoded}"
     )
     try:
@@ -247,17 +295,19 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich") ->
         # Open-Meteo returns sunshine_duration in seconds; model expects minutes.
         # Use .get() with zero-filled fallbacks in case any field is absent.
         sunshine_s = h.get("sunshine_duration", [0] * n)
-        return pd.DataFrame({
-            "timestamp":            pd.to_datetime(h["time"]),
-            "temp_c":               h["temperature_2m"],
-            "precipitation_mm":     h["precipitation"],
-            "sunshine_min":         _parse_sunshine_min(sunshine_s),
-            "wind_kmh":             h["windspeed_10m"],
-            # Default to NaN (not 0) so missing data is imputed by median, not
-            # interpreted as "perfectly clear sky" / "zero radiation".
-            "cloud_cover_pct":      h.get("cloud_cover",      [np.nan] * n),
-            "direct_radiation_wm2": h.get("direct_radiation", [np.nan] * n),
-            "humidity":             h.get("relative_humidity_2m", [np.nan] * n),
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(h["time"]),
+                "temp_c": h["temperature_2m"],
+                "precipitation_mm": h["precipitation"],
+                "sunshine_min": _parse_sunshine_min(sunshine_s),
+                "wind_kmh": h["windspeed_10m"],
+                # Default to NaN (not 0) so missing data is imputed by median, not
+                # interpreted as "perfectly clear sky" / "zero radiation".
+                "cloud_cover_pct": h.get("cloud_cover", [np.nan] * n),
+                "direct_radiation_wm2": h.get("direct_radiation", [np.nan] * n),
+                "humidity": h.get("relative_humidity_2m", [np.nan] * n),
+            }
+        )
     except (requests.RequestException, KeyError, ValueError):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_WEATHER_COLUMNS)

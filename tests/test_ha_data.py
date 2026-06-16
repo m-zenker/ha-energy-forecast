@@ -1567,3 +1567,143 @@ class TestFetchSubSensorHistoryWithProgram:
 
         assert len(result) == 1
         assert result.iloc[0]["kwh"] == pytest.approx(1.2)
+
+
+from energy_forecast.ha_data import _raw_to_kwh_diff  # noqa: E402
+
+
+class TestRawToKwhDiff:
+    def _make_raw(self, timestamps, values):
+        import pandas as pd
+
+        ts = pd.to_datetime(timestamps).tz_localize("Europe/Zurich")
+        return pd.DataFrame({"timestamp": ts, "value": values})
+
+    def test_basic_hourly_diff(self):
+        import pandas as pd
+
+        # Use one reading per hour so resample("1h").last() picks the only value
+        # in each bucket, giving clean 1.0 kWh diffs.
+        raw = self._make_raw(
+            [
+                "2024-01-01 00:30",
+                "2024-01-01 01:30",
+                "2024-01-01 02:30",
+            ],
+            [100.0, 101.0, 102.0],
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        assert list(result.columns) == ["timestamp", "gross_kwh"]
+        assert result["timestamp"].dt.tz is None  # naive
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 01:00")] - 1.0) < 0.01
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 1.0) < 0.01
+
+    def test_basic_15min_diff(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 00:15", "2024-01-01 00:30"],
+            [100.0, 100.25, 100.5],
+        )
+        result = _raw_to_kwh_diff(raw, "15min", max_kwh=12.5)
+        assert len(result) >= 1
+        assert result["gross_kwh"].max() <= 12.5
+
+    def test_empty_returns_empty(self):
+        import pandas as pd
+
+        result = _raw_to_kwh_diff(pd.DataFrame(), "1h", max_kwh=50.0)
+        assert list(result.columns) == ["timestamp", "gross_kwh"]
+        assert result.empty
+
+    def test_max_kwh_filter_applied(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [0.0, 100.0],  # 100 kWh in one hour — above any reasonable limit
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        assert result.empty  # filtered out
+
+    def test_negative_diff_clipped_to_zero(self):
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
+            [100.0, 99.0, 101.0],  # meter reset between h0 and h1
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        # h1: diff = -1 → clipped to 0 → filtered (not > 0). h2: diff = 2 → kept.
+        assert all(result["gross_kwh"] > 0)
+
+
+class TestFetchEnergyHistory15m:
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_writes_15m_cache(self, mock_fetch, tmp_path):
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        ts = pd.date_range("2024-01-01", periods=120, freq="15min").tz_localize("Europe/Zurich")
+        readings = pd.DataFrame({"timestamp": ts, "value": range(len(ts))})
+        mock_fetch.return_value = readings
+        mock_app = MagicMock()
+
+        ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        assert cache.exists()
+        saved = pd.read_csv(cache)
+        assert list(saved.columns) == ["timestamp", "gross_kwh"]
+        assert len(saved) > 0
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_ha_empty_and_no_cache_raises(self, mock_fetch, tmp_path):
+        import pandas as pd
+
+        mock_fetch.return_value = pd.DataFrame()
+        mock_app = MagicMock()
+        cache = tmp_path / "energy_history_15m.csv"
+
+        with pytest.raises(ValueError, match="No history"):
+            ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_strips_partial_current_slot(self, mock_fetch, tmp_path):
+        """The returned DataFrame must not include the currently-open 15-min slot."""
+        import pandas as pd
+
+        ts = pd.date_range("2024-01-01", periods=120, freq="15min").tz_localize("Europe/Zurich")
+        readings = pd.DataFrame({"timestamp": ts, "value": list(range(120))})
+        mock_fetch.return_value = readings
+        mock_app = MagicMock()
+        cache = tmp_path / "energy_history_15m.csv"
+
+        result = ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+        cutoff = pd.Timestamp.now(tz="Europe/Zurich").floor("15min").tz_localize(None)
+        assert (result["timestamp"] < cutoff).all()
+
+
+class TestFetchRecentEnergy15m:
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_appends_new_rows_to_cache(self, mock_fetch, tmp_path):
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        seed_ts = pd.date_range("2024-01-01 00:00", periods=8, freq="15min")
+        pd.DataFrame({"timestamp": seed_ts, "gross_kwh": 0.5}).to_csv(cache, index=False)
+
+        ts = pd.date_range("2024-01-01", periods=200, freq="15min").tz_localize("Europe/Zurich")
+        readings = pd.DataFrame({"timestamp": ts, "value": list(range(200))})
+        mock_fetch.return_value = readings
+        mock_app = MagicMock()
+
+        ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        saved = pd.read_csv(cache)
+        assert len(saved) > 8
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_no_error_on_both_empty(self, mock_fetch, tmp_path):
+        """Unlike fetch_energy_history_15m, the recent variant logs and returns None."""
+        import pandas as pd
+
+        mock_fetch.return_value = pd.DataFrame()
+        mock_app = MagicMock()
+        cache = tmp_path / "energy_history_15m.csv"
+
+        ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)

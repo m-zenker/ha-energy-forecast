@@ -2,6 +2,9 @@
 pythonpath = ["apps"]
 addopts = "--cov=apps --cov-report=html --cov-report=term-missing"
 
+[tool.coverage.run]
+omit = ["**/.ipynb_checkpoints/**"]
+
 [tool.ruff]
 target-version = "py313"
 line-length = 120

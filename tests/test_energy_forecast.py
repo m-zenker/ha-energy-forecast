@@ -332,6 +332,122 @@ class TestAggregate:
         assert "00_03" in result["blocks_today"]
         assert "21_24" in result["blocks_today"]
 
+    def test_tomorrow_block_intervals_present_when_intervals_supplied(self):
+        """blocks_tomorrow_low and blocks_tomorrow_high must each have 8 slots
+        with correct per-slot sums when intervals are provided."""
+        today = pd.Timestamp.now().normalize()
+        now = today
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "low_kwh": np.full(48, 0.5),  # 3 × 0.5 = 1.5 per slot
+                "high_kwh": np.full(48, 2.0),  # 3 × 2.0 = 6.0 per slot
+            }
+        )
+        result = self._run(today, now, preds, intervals=ivs)
+
+        assert "blocks_tomorrow_low" in result, "blocks_tomorrow_low missing from result"
+        assert "blocks_tomorrow_high" in result, "blocks_tomorrow_high missing from result"
+        assert len(result["blocks_tomorrow_low"]) == 8
+        assert len(result["blocks_tomorrow_high"]) == 8
+        for slot in result["blocks_tomorrow_low"]:
+            assert abs(result["blocks_tomorrow_low"][slot] - 1.5) < 0.01, f"slot {slot} low wrong"
+            assert abs(result["blocks_tomorrow_high"][slot] - 6.0) < 0.01, f"slot {slot} high wrong"
+
+    def test_tomorrow_block_intervals_absent_when_no_intervals(self):
+        """Without quantile models, blocks_tomorrow_low/high must not appear in result."""
+        today = pd.Timestamp.now().normalize()
+        preds = _pred_df(today, n=48, kwh=1.0)
+        result = self._run(today, today, preds, intervals=None)
+        assert "blocks_tomorrow_low" not in result
+        assert "blocks_tomorrow_high" not in result
+
+    def test_today_block_intervals_present_when_intervals_supplied(self):
+        """blocks_today_low and blocks_today_high must each have 8 slots."""
+        today = pd.Timestamp.now().normalize()
+        now = today
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "low_kwh": np.full(48, 0.5),
+                "high_kwh": np.full(48, 2.0),
+            }
+        )
+        result = self._run(today, now, preds, intervals=ivs)
+
+        assert "blocks_today_low" in result, "blocks_today_low missing from result"
+        assert "blocks_today_high" in result, "blocks_today_high missing from result"
+        assert len(result["blocks_today_low"]) == 8
+        assert len(result["blocks_today_high"]) == 8
+
+
+# ── M4 — EV blending consistency ─────────────────────────────────────────────
+
+
+class TestAggregateEvBlending:
+    """M4: EV sessions must always be stripped from blended_actuals, regardless of baseline_mode."""
+
+    def _run(self, baseline_mode: bool, actuals: Any) -> dict:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        now = pd.Timestamp("2026-06-01 12:00")  # 12 elapsed hours
+        preds = _pred_df(now, n=24, kwh=1.0)  # future: 12:00–35:00, only 12-24 counts for today
+
+        fake = _fake_self_for_aggregate(ev_threshold=4.5, ev_charger_kw=9.0)
+        fake._baseline_mode = baseline_mode
+
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = now
+            return EnergyForecast._aggregate(fake, preds, actuals, live_temp=None)
+
+    def _make_actuals_with_ev(self) -> pd.DataFrame:
+        """12 elapsed actuals; hour 02 is an EV spike (gross=10.0 kWh)."""
+        today = pd.Timestamp("2026-06-01 00:00")
+        ts = pd.date_range(today, periods=12, freq="1h")
+        kwh = [1.0] * 12
+        kwh[2] = 10.0  # EV spike at 02:00 — 10.0 > ev_threshold=4.5
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+    def test_ev_stripped_in_default_mode(self):
+        """In non-baseline_mode, EV co-load (gross - charger_kw) must be used, not raw gross."""
+        actuals = self._make_actuals_with_ev()
+        result = self._run(baseline_mode=False, actuals=actuals)
+
+        # After fix with split_ev_charging(threshold=4.5, charger_kw=9.0):
+        #   hour 02: 10.0 - 9.0 = 1.0 (co-load kept)
+        # Elapsed 00-12: 12 × 1.0 = 12.0 kWh
+        # Future  12-24: 12 × 1.0 = 12.0 kWh
+        # today = 24.0
+        #
+        # Before fix (bug): elapsed includes raw 10.0 for hour 02 → today = 33.0
+        assert result["today"] == pytest.approx(24.0), (
+            f"EV hour should be replaced with co-load (1.0), got today={result['today']} "
+            f"(bug: raw EV gross would give 33.0)"
+        )
+
+    def test_ev_stripped_in_baseline_mode(self):
+        """In baseline_mode, EV stripping must still work (existing behaviour preserved)."""
+        actuals = self._make_actuals_with_ev()
+        result = self._run(baseline_mode=True, actuals=actuals)
+
+        # Same arithmetic as default mode — sub-sensors not passed so no sub-sensor subtraction
+        assert result["today"] == pytest.approx(24.0), f"EV strip must work in baseline_mode too, got {result['today']}"
+
+    def test_no_ev_actuals_unchanged_in_default_mode(self):
+        """When actuals have no EV spikes, blended total is unaffected by the fix."""
+        today = pd.Timestamp("2026-06-01 00:00")
+        ts = pd.date_range(today, periods=12, freq="1h")
+        actuals = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 12})  # all ≤ threshold
+
+        result = self._run(baseline_mode=False, actuals=actuals)
+
+        # Elapsed: 12 × 1.0 = 12; future: 12 × 1.0 = 12 → today = 24.0
+        assert result["today"] == pytest.approx(24.0)
+
 
 # ── EV kWh sensor calculation ────────────────────────────────────────────────
 
@@ -675,6 +791,11 @@ class _FakeMqttSelf:
         from energy_forecast.energy_forecast import EnergyForecast
 
         EnergyForecast._mqtt_publish_binary_sensor_discovery(self, *args, **kwargs)
+
+    def _mqtt_publish_sensor_attributes(self, unique_id: str, attrs: dict, category: str = "sensor") -> None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        EnergyForecast._mqtt_publish_sensor_attributes(self, unique_id, attrs, category)
 
 
 class TestMqttPublishDiscovery:
@@ -1481,6 +1602,165 @@ class TestRollingMaeSensors:
         )
 
 
+class TestPublishBlockIntervalSensors:
+    """_publish() must create separate _10th_pct/_90th_pct sensors (not attributes)."""
+
+    def _make_data(self, with_intervals: bool) -> dict:
+        blocks = {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)}
+        data = {
+            "next_1h": 1.0,
+            "next_3h": 3.0,
+            "today": 8.0,
+            "tomorrow": 24.0,
+            "blocks_today": blocks.copy(),
+            "blocks_tomorrow": blocks.copy(),
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "live_temp": None,
+            "shap_top_features": {},
+            "shap_narrative": "",
+            "mae_7d": 0.5,
+            "mae_7d_pct": 5.0,
+            "mae_30d": 0.6,
+            "mae_30d_pct": 6.0,
+            "mae_7d_n_pairs": 10,
+            "mae_30d_n_pairs": 30,
+            "is_anomaly": False,
+            "anomaly_residual": 0.0,
+            "anomaly_std": 0.1,
+            "anomaly_n": 5,
+        }
+        if with_intervals:
+            data["blocks_today_low"] = {f"{h:02d}_{h + 3:02d}": 0.5 for h in range(0, 24, 3)}
+            data["blocks_today_high"] = {f"{h:02d}_{h + 3:02d}": 2.0 for h in range(0, 24, 3)}
+            data["blocks_tomorrow_low"] = {f"{h:02d}_{h + 3:02d}": 0.5 for h in range(0, 24, 3)}
+            data["blocks_tomorrow_high"] = {f"{h:02d}_{h + 3:02d}": 2.0 for h in range(0, 24, 3)}
+        return data
+
+    def test_setstate_mode_publishes_separate_10th_90th_sensors(self):
+        """set_state mode must create _10th_pct and _90th_pct as separate entities."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=True))
+
+        for day in ("today", "tomorrow"):
+            slot_id = f"sensor.energy_forecast_{day}_00_03_10th_pct"
+            assert slot_id in fake._states, f"{slot_id} not published"
+            assert fake._states[slot_id]["state"] == "0.5", f"{slot_id} state wrong"
+
+            slot_id_90 = f"sensor.energy_forecast_{day}_00_03_90th_pct"
+            assert slot_id_90 in fake._states, f"{slot_id_90} not published"
+            assert fake._states[slot_id_90]["state"] == "2.0", f"{slot_id_90} state wrong"
+
+    def test_setstate_mode_no_pct_sensors_when_no_intervals(self):
+        """Without interval data, _10th_pct/_90th_pct sensors must not be published."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=False))
+
+        for day in ("today", "tomorrow"):
+            assert f"sensor.energy_forecast_{day}_00_03_10th_pct" not in fake._states
+            assert f"sensor.energy_forecast_{day}_00_03_90th_pct" not in fake._states
+
+    def test_p50_block_sensor_has_no_interval_attributes(self):
+        """The base P50 block sensor must NOT have kwh10/kwh90 in its attributes."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._make_data(with_intervals=True))
+
+        slot = "sensor.energy_forecast_tomorrow_00_03"
+        assert slot in fake._states
+        attrs = fake._states[slot].get("attributes", {})
+        assert "kwh10" not in attrs
+        assert "kwh90" not in attrs
+
+
+# ── M5 — pred_history horizon ──────────────────────────────────────────────
+
+
+class TestAccumulatePredHistory:
+    """M5: predictions must be stored at ≤25h horizon, not ~47h (keep-first)."""
+
+    def test_horizon_beyond_25h_not_stored(self):
+        """Predictions at h > 25 must be deferred to the next cycle."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_30h = now_ts + pd.Timedelta(hours=30)
+        predictions = pd.DataFrame({"timestamp": [target_30h], "predicted_kwh": [2.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_30h not in result, f"Target at h=30 must NOT be stored (h>25), but got {result}"
+
+    def test_horizon_at_24h_is_stored(self):
+        """A prediction at h=24 is within the window and must be stored."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_24h = now_ts + pd.Timedelta(hours=24)
+        predictions = pd.DataFrame({"timestamp": [target_24h], "predicted_kwh": [2.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_24h in result
+        assert result[target_24h] == pytest.approx(2.0)
+
+    def test_horizon_at_25h_is_stored(self):
+        """Boundary: h=25 is the last slot accepted (stored this cycle)."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        target_25h = now_ts + pd.Timedelta(hours=25)
+        predictions = pd.DataFrame({"timestamp": [target_25h], "predicted_kwh": [3.0]})
+
+        result = _accumulate_pred_history({}, predictions, now_ts)
+
+        assert target_25h in result
+
+    def test_keep_first_existing_entry_not_overwritten(self):
+        """Keep-first: an already-stored prediction must not be overwritten."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        ts = now_ts + pd.Timedelta(hours=20)
+        existing = {ts: 1.0}
+        predictions = pd.DataFrame({"timestamp": [ts], "predicted_kwh": [99.0]})
+
+        result = _accumulate_pred_history(existing, predictions, now_ts)
+
+        assert result[ts] == pytest.approx(1.0), "Keep-first must not overwrite existing entry with 99.0"
+
+    def test_old_predictions_pruned_beyond_30_days(self):
+        """Entries older than 30 days must be dropped regardless of predictions."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        old_ts = now_ts - pd.Timedelta(days=31)
+        existing = {old_ts: 2.0}
+        empty_preds = pd.DataFrame({"timestamp": pd.Series([], dtype="datetime64[ns]"), "predicted_kwh": []})
+
+        result = _accumulate_pred_history(existing, empty_preds, now_ts)
+
+        assert old_ts not in result, "Entry older than 30d must be pruned"
+
+    def test_recent_entry_within_30_days_preserved(self):
+        """Entries within 30 days must survive the pruning step."""
+        from energy_forecast.energy_forecast import _accumulate_pred_history
+
+        now_ts = pd.Timestamp("2024-01-10 12:00")
+        recent_ts = now_ts - pd.Timedelta(days=5)
+        existing = {recent_ts: 1.5}
+        empty_preds = pd.DataFrame({"timestamp": pd.Series([], dtype="datetime64[ns]"), "predicted_kwh": []})
+
+        result = _accumulate_pred_history(existing, empty_preds, now_ts)
+
+        assert recent_ts in result
+
+
 # ── #39 Anomaly detection sensor ──────────────────────────────────────────────
 
 
@@ -2130,6 +2410,101 @@ class TestUpdateCbNoLock:
         assert calls == [], "_update_sensors must NOT be called when model is None"
 
 
+# ── M3 — Adaptive retrain lock ────────────────────────────────────────────────
+
+
+class TestAdaptiveRetrainLock:
+    """M3: _maybe_adaptive_retrain must acquire self._lock before calling _retrain."""
+
+    def _make_fake(self):
+        """Stand-in for EnergyForecast with conditions that trigger adaptive retrain."""
+        import threading
+
+        fake = _FakeSelf()
+        fake._lock = threading.Lock()  # real lock, not mock
+        fake._ml_model.last_cv_mae = 0.5
+        fake._adaptive_retrain_threshold = 2.0
+        fake._pred_history = {}
+        fake._last_adaptive_retrain = pd.Timestamp("2024-01-01")  # > 24 h ago
+        fake._timezone = "Europe/Zurich"
+        return fake
+
+    def test_retrain_skipped_when_lock_held(self):
+        """_retrain must NOT be called when self._lock is already acquired."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        fake._lock.acquire()  # simulate _retrain_cb holding the lock
+
+        retrain_calls = []
+        fake._retrain = lambda: retrain_calls.append(1)
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        assert retrain_calls == [], "_retrain must be skipped when lock is busy"
+        fake._lock.release()
+
+    def test_retrain_fires_when_lock_free(self):
+        """_retrain IS called when the lock is free and MAE exceeds threshold."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        retrain_calls = []
+        fake._retrain = lambda: retrain_calls.append(1)
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        assert retrain_calls == [1], "_retrain must be called when lock is free and threshold exceeded"
+
+    def test_lock_released_after_retrain(self):
+        """self._lock must be released after adaptive retrain, even if _retrain succeeds."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        fake._retrain = lambda: None  # no-op retrain
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        # Lock must be acquirable again (was properly released)
+        acquired = fake._lock.acquire(blocking=False)
+        assert acquired, "Lock must be released after successful adaptive retrain"
+        fake._lock.release()
+
+    def test_lock_released_if_retrain_raises(self):
+        """self._lock must be released even when _retrain raises an exception."""
+        from unittest.mock import patch
+
+        import pandas as pd
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+
+        def boom():
+            raise RuntimeError("training failed")
+
+        fake._retrain = boom
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            # Must not propagate — adaptive path has its own except
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        acquired = fake._lock.acquire(blocking=False)
+        assert acquired, "Lock must be released even when _retrain raises"
+        fake._lock.release()
+
+
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
 
 
@@ -2363,6 +2738,75 @@ def test_publish_thermal_pressure_uses_mqtt_in_mqtt_mode():
     assert stub._mqtt_set_sensor_calls[0][0] == "energy_forecast_thermal_pressure_net"
 
 
+class TestStitchRecentWeather:
+    """M2: _stitch_recent_weather must extend archive with recent tail, archive wins on overlap."""
+
+    def test_recent_tail_appended_beyond_archive(self):
+        """Rows in recent_df beyond the archive cutoff are added."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=24, freq="1h"),
+                "temp_c": [10.0] * 24,
+            }
+        )
+        recent = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01 12:00", periods=24, freq="1h"),
+                "temp_c": [99.0] * 24,
+            }
+        )
+        cutoff = pd.Timestamp("2024-01-02 12:00")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+
+        assert len(result) > len(archive)
+        overlap_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 12:00")]
+        assert float(overlap_row["temp_c"].iloc[0]) == pytest.approx(10.0)
+
+    def test_future_rows_in_recent_are_excluded(self):
+        """Rows in recent_df after now_local must not be added."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=24, freq="1h"),
+                "temp_c": [10.0] * 24,
+            }
+        )
+        recent = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=24, freq="1h"),
+                "temp_c": [99.0] * 24,
+            }
+        )
+        cutoff = pd.Timestamp("2024-01-02 06:00")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+
+        assert result["timestamp"].max() <= cutoff
+
+    def test_empty_recent_returns_archive_unchanged(self):
+        """Empty recent_df must return archive as-is."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _stitch_recent_weather
+
+        archive = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=10, freq="1h"),
+                "temp_c": [10.0] * 10,
+            }
+        )
+        recent = pd.DataFrame(columns=["timestamp", "temp_c"])
+        cutoff = pd.Timestamp("2024-01-02")
+
+        result = _stitch_recent_weather(archive, recent, cutoff)
+        assert len(result) == len(archive)
+
+
 def test_publish_thermal_pressure_tau_none_not_coerced_to_zero():
     """tau_hours=None (uncalibrated) must be published as None, not 0.0."""
     from energy_forecast.energy_forecast import EnergyForecast
@@ -2384,3 +2828,99 @@ def test_publish_thermal_pressure_tau_none_not_coerced_to_zero():
     assert len(stub._calls) == 1, "set_state should have been called once"
     tau = stub._calls[0]["attributes"]["tau_hours"]
     assert tau is None, f"tau_hours must be None when uncalibrated, got {tau!r}"
+
+
+# ── #85 — 15m cache wiring ────────────────────────────────────────────────────
+
+
+class _FakeRetrain:
+    """Minimal stub for EnergyForecast._retrain() tests."""
+
+    def __init__(self, cache_path):
+        self._energy_sensor = "sensor.energy"
+        self._cache_path = cache_path
+        self._cache_path_15m = cache_path.parent / "energy_history_15m.csv"
+        self._timezone = "Europe/Zurich"
+        self._ev_threshold = 7.0
+        self._ev_charger_kw = 9.0
+        self._solar_sensor = None
+        self._grid_export_sensor = None
+        self._battery_charge_sensor = None
+        self._battery_discharge_sensor = None
+        self._sub_energy_sensors = []
+        self._program_sensors = {}
+        self._baseline_mode = False
+        self._baseline_included_sensors = []
+        self._lat = 47.0
+        self._lon = 8.5
+        self._away_mode_entity = None
+        self._presence_sensors = None
+        self._climate_entities = []
+        self._dhw_buffer_sensor = None
+        self._heating_active_entity = None
+        self._ml_model = MagicMock()
+        self._weight_halflife = 90.0
+        self._holiday_canton = None
+        self._holiday_country = "CH"
+        self._enable_regimes = False
+        self._regime_count = 3
+        self._climate_room_areas = None
+
+    def log(self, msg, level="INFO"):
+        pass
+
+
+def _make_energy_df(n=100):
+    ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+    return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * n})
+
+
+def _empty_weather():
+    return pd.DataFrame(columns=["timestamp"])
+
+
+class TestFifteenMinCache:
+    """#85 — 15m cache is populated during retrain."""
+
+    def _patch_retrain_deps(self, monkeypatch):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        energy_df = _make_energy_df(100)
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        return ha_data_mod
+
+    def test_retrain_calls_15m_fetch(self, tmp_path, monkeypatch):
+        """fetch_energy_history_15m() must be called inside _retrain()."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        ha_data_mod = self._patch_retrain_deps(monkeypatch)
+
+        called = []
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: called.append(True))
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        EnergyForecast._retrain(stub)
+
+        assert called, "fetch_energy_history_15m was not called during _retrain()"
+
+    def test_retrain_15m_error_does_not_crash_retrain(self, tmp_path, monkeypatch):
+        """A crash in fetch_energy_history_15m must not propagate out of _retrain()."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        ha_data_mod = self._patch_retrain_deps(monkeypatch)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", _boom)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        EnergyForecast._retrain(stub)  # must not raise

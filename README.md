@@ -6,13 +6,13 @@
 *Know your electricity bill before the day begins.*
 
 ![Version](https://img.shields.io/badge/version-v0.11.3-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-589%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-627%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
 > **Note:** Designed for Home Assistant power users with a smart meter (`total_increasing` kWh sensor). Requires Home Assistant 2023.x+ and AppDaemon 4.x.
 
-> **Status:** v0.11.3 on dev. v0.11.3 is the current stable release on main.
+> **Status:** v0.11.4-alpha-1 on dev. v0.11.3 is the current stable release on main.
 
 **What you get:**
 - Trains entirely on *your* historical grid-import data — no generic model, no cloud dependency

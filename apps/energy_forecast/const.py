@@ -14,12 +14,14 @@ MAX_HOURLY_KWH = 50.0  # Filters out meter resets or spikes
 EV_CHARGING_THRESHOLD_KWH = 7
 
 # Model Training
-MIN_TRAINING_ROWS = 100   # Minimum clean rows to proceed with training
-HOLDOUT_FRACTION  = 0.9   # Training fraction (first 90% of rows); name kept for backward compat
-MIN_CV_ROWS       = 500   # Minimum rows for TimeSeriesSplit cross-validation
+MIN_TRAINING_ROWS = 100  # Minimum clean rows to proceed with training
+HOLDOUT_FRACTION = 0.9  # Training fraction (first 90% of rows); name kept for backward compat
+MIN_CV_ROWS = 500  # Minimum rows for TimeSeriesSplit cross-validation
 
 # Data Storage
 CACHE_PATH = Path(__file__).parent / "energy_history.csv"
+CACHE_PATH_15M = Path(__file__).parent / "energy_history_15m.csv"
+MAX_15MIN_KWH = MAX_HOURLY_KWH / 4  # 12.5 kWh — per-slot cap for 15-min resolution
 PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
 
 # Occupancy Detection
@@ -35,7 +37,7 @@ SENSOR_FULL_TRUST_HOURS = 2
 SENSOR_BLEND_HOURS = 6
 
 # Thermal Projection (indoor temperature RC-ODE forward simulation)
-DEFAULT_TAU = 12.0        # hours — used when τ has not been calibrated yet
+DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
 
@@ -46,6 +48,7 @@ def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     dropped. Naive timestamps pass through unchanged.
     """
     import pandas as pd
+
     if "timestamp" in df.columns:
         ts = pd.to_datetime(df["timestamp"])
         if ts.dt.tz is not None:

@@ -39,6 +39,7 @@ from energy_forecast.model import (
     _engineer_features,
     _learn_appliance_signatures,
     _project_indoor_temps,
+    _strip_partial_last_day,
 )
 
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
@@ -345,6 +346,58 @@ class TestShortHorizonLags:
             assert "lag_2h" not in rec.message
             assert "lag_6h" not in rec.message
             assert "lag_12h" not in rec.message
+
+
+class TestLagFeaturesTemporalTraining:
+    """M1 regression — training lags must be temporal, not positional over gapped frames."""
+
+    def test_gap_produces_nan_lag_not_stale_value(self):
+        """A 24-hour training gap must cause lag_24h to be NaN for rows in the 24h after it."""
+        from energy_forecast.model import _add_lag_and_rolling_training
+
+        ts_before = pd.date_range("2024-01-01", periods=24, freq="1h")  # hours 0-23
+        ts_after = pd.date_range("2024-01-03", periods=24, freq="1h")  # hours 48-71 (gap = 2024-01-02)
+        ts = ts_before.tolist() + ts_after.tolist()
+        kwh = [1.0] * 24 + [2.0] * 24
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+        df = _add_lag_and_rolling_training(energy, [24])
+
+        after_rows = df[df["timestamp"] >= pd.Timestamp("2024-01-03")]
+        assert after_rows["lag_24h"].isna().all(), (
+            "Expected all lag_24h for rows after the gap to be NaN "
+            f"(2024-01-02 not in training data), got: {after_rows['lag_24h'].values}"
+        )
+
+    def test_continuous_data_lag_values_unchanged(self):
+        """Temporal lag fix must not change behavior when training data has no gaps."""
+        from energy_forecast.model import _add_lag_and_rolling_training
+
+        ts = pd.date_range("2024-01-01", periods=100, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": list(range(100))})
+
+        df = _add_lag_and_rolling_training(energy, [24])
+
+        # Row at hour 24: lag_24h should be the value from hour 0 = 0.0
+        first_valid = df["lag_24h"].dropna()
+        assert float(first_valid.iloc[0]) == pytest.approx(0.0)
+        assert float(first_valid.iloc[1]) == pytest.approx(1.0)
+
+    def test_sub_sensor_gap_produces_nan_lag_not_stale_value(self):
+        """Sub-sensor lag_24h must be NaN when the target timestamp is in a training gap."""
+        ts_before = pd.date_range("2024-01-01", periods=24, freq="1h")
+        ts_after = pd.date_range("2024-01-03", periods=24, freq="1h")  # 24h gap on 2024-01-02
+        ts = ts_before.tolist() + ts_after.tolist()
+        kwh = [1.0] * 24 + [2.0] * 24
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": kwh})
+        df = _add_sub_sensor_lags_training(energy, {"sub_hp": sub_df})
+
+        after_rows = df[df["timestamp"] >= pd.Timestamp("2024-01-03")]
+        assert after_rows["sub_hp_lag_24h"].isna().all(), (
+            f"Expected NaN sub_hp_lag_24h for rows after gap, got: {after_rows['sub_hp_lag_24h'].values}"
+        )
 
 
 # ── Bridge-day holiday features ───────────────────────────────────────────────
@@ -889,6 +942,56 @@ class TestBuildModel:
         GBR = self._gbr()
         model = _build_model(None, GBR, n_estimators=None)
         assert model.n_estimators == 300
+
+
+# ── Holdout MAE out-of-sample (L2) ───────────────────────────────────────────
+
+
+class TestHoldoutMAE:
+    """L2 regression — holdout MAE must be out-of-sample."""
+
+    def test_holdout_mae_is_out_of_sample(self, tmp_path):
+        """last_mae must come from a model trained on the first 90%, not all data.
+
+        With n < MIN_CV_ROWS (500), CV is skipped and last_mae = holdout_mae.
+        Dataset: first 360 rows gross_kwh=1.0; last 40 rows gross_kwh=500.0.
+
+        Before fix: final model sees all 400 rows → in-sample holdout_mae ≈ 0.
+        After fix:  holdout model sees only first 360 rows (all 1.0) → evaluates
+                    on last 40 rows (all 500.0) → holdout_mae >> 1.0.
+
+        The large jump (500x) is intentional: it overwhelms any temporal
+        extrapolation the model might do, making the in-sample vs out-of-sample
+        distinction unambiguous.
+        """
+        import pandas as pd
+
+        n = 400  # < MIN_CV_ROWS=500 → CV skipped; last_mae = holdout_mae
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        values = [1.0] * 360 + [500.0] * 40
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": values})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": [10.0] * n,
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+                "humidity": [70.0] * n,
+            }
+        )
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+
+        # After the fix: holdout model trained on rows 0-359 (all 1.0),
+        # evaluated on rows 360-399 (all 500.0) → MAE >> 1.0.
+        assert m.last_mae is not None
+        assert m.last_mae > 1.0, (
+            f"Expected out-of-sample holdout_mae > 1.0 "
+            f"(model should not have seen the 500.0 holdout rows), got {m.last_mae}"
+        )
 
 
 # ── Cantonal holidays (#9) ────────────────────────────────────────────────────
@@ -1889,6 +1992,27 @@ class TestShapSummary:
         m, forecast = _make_trained_model(tmp_path)
         result = m.shap_summary(forecast, live_temp=None, n=0)
         assert result == {}
+
+    def test_today_slice_uses_configured_timezone(self, tmp_path, monkeypatch):
+        """shap_summary must call pd.Timestamp.now with self._timezone, not without tz."""
+        # Build the model before installing the spy so that _make_trained_model's
+        # own pd.Timestamp.now() calls don't pollute the call list.
+        m, forecast = _make_trained_model(tmp_path)
+
+        calls = []
+        original_now = pd.Timestamp.now
+
+        def spy_now(*args, **kwargs):
+            calls.append(kwargs.get("tz", "__no_tz__"))
+            return original_now(*args, **kwargs)
+
+        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(spy_now))
+
+        m.shap_summary(forecast, live_temp=5.0, n=3)
+
+        assert "__no_tz__" not in calls, (
+            "shap_summary called pd.Timestamp.now() without a timezone — would use UTC inside the container"
+        )
 
 
 # ── Temperature sensor blending: bias fade ──────────────────────────────────────
@@ -3062,6 +3186,20 @@ class TestCompositeForecast:
         assert "delta_kwh" in result.columns
         assert len(result) == 48
         assert (result["delta_kwh"] >= 0.0).all()
+
+    def test_predict_scenario_accepts_room_areas(self, tmp_path):
+        """predict_scenario() should accept a room_areas kwarg without error."""
+        m, forecast = _make_trained_model(tmp_path)
+        m._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
+        }
+        result = m.predict_scenario(
+            forecast,
+            live_temp=None,
+            schedule={"sub_dw": "12:00"},
+            room_areas={"climate.test": 30.0},
+        )
+        assert "delta_kwh" in result.columns
 
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
@@ -5073,3 +5211,97 @@ class TestHodLagFill:
         _, X_none = m._prepare_prediction_X(forecast, None, None)
         assert X_none is not None
         assert len(X_none) == 48
+
+
+class TestPreparedPrediction:
+    """P1: predict/predict_intervals/shap_summary must skip _prepare_prediction_X
+    when called with a pre-computed _prepared=(future_hours, X) tuple."""
+
+    def test_predict_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """predict() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.predict(forecast, live_temp=10.0, _prepared=(future_hours, X))
+
+        assert prepare_calls == [], "_prepare_prediction_X must not be called when _prepared is given"
+        assert len(result) == 48
+
+    def test_predict_intervals_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """predict_intervals() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        if m._model_q10 is None:
+            pytest.skip("quantile models not trained in this fixture")
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.predict_intervals(forecast, live_temp=10.0, _prepared=(future_hours, X))
+
+        assert prepare_calls == []
+        assert result is None or len(result) == 48
+
+    def test_shap_summary_skips_prepare_when_prepared_given(self, tmp_path, monkeypatch):
+        """shap_summary() must not call _prepare_prediction_X when _prepared is supplied."""
+        m, forecast = _make_trained_model(tmp_path)
+        future_hours, X = m._prepare_prediction_X(forecast, live_temp=10.0, recent_actuals=None)
+
+        prepare_calls = []
+        original = m._prepare_prediction_X
+        monkeypatch.setattr(
+            m,
+            "_prepare_prediction_X",
+            lambda *a, **kw: (prepare_calls.append(1), original(*a, **kw))[1],
+        )
+
+        result = m.shap_summary(forecast, live_temp=10.0, n=3, _prepared=(future_hours, X))
+
+        assert prepare_calls == []
+        assert isinstance(result, dict)
+
+    def test_predict_without_prepared_still_works(self, tmp_path):
+        """predict() without _prepared must work exactly as before."""
+        m, forecast = _make_trained_model(tmp_path)
+        result = m.predict(forecast, live_temp=10.0)
+        assert len(result) == 48
+        assert (result["predicted_kwh"] >= 0).all()
+
+
+class TestStripPartialLastDay:
+    def test_removes_partial_last_day(self):
+        ts_full = pd.date_range("2024-01-01", periods=48, freq="1h")  # 2 complete days
+        ts_partial = pd.date_range("2024-01-03", periods=10, freq="1h")  # 10 h today
+        ts = ts_full.append(ts_partial)
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        result = _strip_partial_last_day(df)
+        assert result["timestamp"].dt.date.max() == pd.Timestamp("2024-01-02").date()
+        assert len(result) == 48
+
+    def test_keeps_complete_last_day(self):
+        ts = pd.date_range("2024-01-01", periods=48, freq="1h")  # 2 × 24 h exactly
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        result = _strip_partial_last_day(df)
+        assert len(result) == 48
+
+    def test_keeps_day_with_exactly_24_hours(self):
+        ts = pd.date_range("2024-01-01", periods=24, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        assert len(_strip_partial_last_day(df)) == 24
+
+    def test_empty_df_returns_empty(self):
+        df = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns]"), "gross_kwh": pd.Series(dtype=float)})
+        assert _strip_partial_last_day(df).empty
