@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Light background chip -->
+  <rect width="512" height="512" rx="115" fill="#EBF0F8"/>
+
+  <!-- Dotted lines: gray inputs -->
+  <line x1="148" y1="175" x2="218" y2="284"
+        stroke="#9BB0C0" stroke-width="5" stroke-dasharray="9 9" stroke-linecap="round"/>
+  <line x1="148" y1="348" x2="218" y2="284"
+        stroke="#9BB0C0" stroke-width="5" stroke-dasharray="9 9" stroke-linecap="round"/>
+
+  <!-- Gray input dots -->
+  <circle cx="148" cy="175" r="13" fill="#A8BCC8" opacity="0.9"/>
+  <circle cx="148" cy="348" r="13" fill="#A8BCC8" opacity="0.9"/>
+
+  <!-- Solid cyan lines -->
+  <line x1="218" y1="284" x2="306" y2="284"
+        stroke="#05C3DD" stroke-width="6" stroke-linecap="round"/>
+  <line x1="306" y1="284" x2="352" y2="224"
+        stroke="#05C3DD" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Amber forecast line -->
+  <line x1="352" y1="224" x2="398" y2="152"
+        stroke="#F5A623" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Cyan dots -->
+  <circle cx="218" cy="284" r="18" fill="#05C3DD"/>
+  <circle cx="306" cy="284" r="18" fill="#05C3DD"/>
+  <circle cx="352" cy="224" r="18" fill="#05C3DD"/>
+
+  <!-- Amber forecast ring -->
+  <circle cx="398" cy="152" r="22" fill="#EBF0F8" stroke="#F5A623" stroke-width="8"/>
+</svg>

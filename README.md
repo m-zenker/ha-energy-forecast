@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/logo_dark.png">
-  <img alt="HA Energy Forecast" src="assets/logo.png" height="60">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/energy_forecast_logo_dark.png">
+  <img alt="HA Energy Forecast" src="assets/energy_forecast_logo_light.png" height="60">
 </picture>
 
 *Know your electricity bill before the day begins.*
