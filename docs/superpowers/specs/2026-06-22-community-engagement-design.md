@@ -75,22 +75,22 @@ Two posts, staggered by one week. GitHub Discussions are seeded (Section 4) befo
 >
 > **Category:** Projects & Integration Showcase
 >
-> With solar panels it's not enough to know when the sun will shine — you also need to know when your household will *consume*. I built a Home Assistant app that predicts hourly energy consumption 48 hours ahead, so I can schedule my washing machine, dishwasher, and EV charger in the windows where solar surplus is largest.
+> With solar panels it's not enough to know when the sun will shine — you also need to know when your household will *consume*. I built a Home Assistant app that predicts hourly energy consumption 48 hours ahead, trained entirely on your own HA meter history. No cloud service, no generic averages — it learns your household's patterns (daily routines, heat pump cycles, seasonal swings) and publishes them as standard HA sensors.
 >
-> The model trains entirely on your own HA meter history — no cloud service, no generic averages. It learns your household's patterns (daily routines, heat pump cycles, seasonal swings) and publishes them as standard HA sensors.
+> My main use case is feeding the forecast into a companion app, [ha-energy-manager](https://github.com/m-zenker/ha-energy-manager), which combines it with a solar production forecast to compute expected surplus and automatically schedule deferrable loads. But the sensors also work directly in HA automations — `energy_forecast_tomorrow` and the 3-hour block sensors are enough for a threshold-based scheduling rule.
 >
-> **Key features**
-> - 48h hourly forecast with calibrated prediction intervals
-> - Scenario API: "what if I run the dishwasher at 14:00?" — returns the delta against the baseline forecast
+> A few things that make it more than a basic forecast:
+> - Scenario API: "what if I run the dishwasher at 14:00?" returns the delta against the baseline
 > - SHAP explainability: know *why* the model predicted high consumption today
-> - Rolling 7d/30d MAE sensors so you can track real-world accuracy over time
+> - Rolling 7d/30d MAE sensors to track real-world accuracy over time
+> - Physics-informed features: thermal pressure, DHW tank pressure, infiltration load, defrost risk
 > - Works on Raspberry Pi (automatic LightGBM → scikit-learn fallback)
 >
 > [screenshot: assets/dashboard_overview.png]
 >
 > GitHub: https://github.com/m-zenker/ha-energy-forecast
 >
-> I've just set up GitHub Discussions — curious what MAE values others are seeing and how you're using the forecast in automations. Happy to answer questions here or there.
+> I've set up GitHub Discussions if you want to compare accuracy or share how you're using it: [What's your MAE?](https://github.com/m-zenker/ha-energy-forecast/discussions/11) · [How are you using it?](https://github.com/m-zenker/ha-energy-forecast/discussions/12)
 
 ---
 
