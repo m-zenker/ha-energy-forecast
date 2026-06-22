@@ -315,7 +315,12 @@ CV, sample weighting, and interval calibration operate on `_target` as today. Af
 
 Published via existing MQTT discovery path:
 - `sensor.ha_energy_forecast_physics_base_today` — hourly physics baseline [kWh/h]
+  - State: current-hour value (float, kWh/h)
+  - Attributes: `{"hourly_kwh": [v0, v1, ..., v47]}` — 48-value list from midnight, matching the `sensor.ha_energy_forecast_consumption_today` payload structure
 - `sensor.ha_energy_forecast_ml_adjustment_today` — behavioural residual [kWh/h, may be negative]
+  - Same payload structure as above
+
+The existing main consumption forecast sensor gains one new attribute in both phases: `model_phase` = `"phase1"` or `"phase2"` (reflects `use_physics_residual` at last train time). This lets external consumers (e.g. the LP scheduler in ha-energy-manager) detect a phase transition and log a recalibration prompt without polling config.
 
 ### 5.4 Scenario API Extension
 
@@ -331,6 +336,12 @@ call_service("energy_forecast/get_scenario",
 When `dhw_schedule` is present: triggers fresh `predict_series(dhw_schedule_override=...)` rather than using `_cached_forecast_df`. Appliance overlay applied on top as today. Delta computed vs the **natural baseline** — defined as `predict_series()` using the current committed schedule from `physics_schedule.json` at the time of the call (including any prior `set_dhw_schedule` updates). The delta shows the incremental impact of the proposed `dhw_schedule` argument relative to whatever schedule is already in force; it is never computed relative to zero or the original factory schedule.
 
 New service `energy_forecast/set_dhw_schedule`: confirmed intent from energy manager; updates `physics_schedule.json` (atomic write-then-rename), **immediately invalidates `_cached_forecast_df`** so the next HA sensor publish reflects the updated schedule, and bypasses the legionella instability guard (see §3.3). Uses same `dhw_schedule_override` mechanism. Together with `get_scenario(dhw_schedule=...)`, this forms the oracle pattern for energy manager optimisation (see §8).
+
+**Caller cache responsibility**: ha-energy-forecast invalidates its own `_cached_forecast_df` on `set_dhw_schedule`, but callers that maintain a secondary scenario cache (e.g. `ConsumptionForecastApp._scenario_cache` / `_scenario_store`) must flush their own cache immediately after a successful `set_dhw_schedule` call — all prior `delta_kwh` entries were computed against the old DHW baseline and are now stale.
+
+**`dhw_schedule` caching rule**: `get_scenario` calls that include `dhw_schedule` bypass ha-energy-forecast's internal cache. Callers must either (a) exclude results from their own scenario cache when `dhw_schedule` is present, or (b) include the `dhw_schedule` dict in their cache key hash. The safest default: do not cache any scenario result computed with a non-None `dhw_schedule`.
+
+**Latency**: physics-enabled `predict_series()` adds O(1ms) for the 48-step DHW ODE; total p99 latency including feature engineering and LightGBM inference is expected < 500ms on typical HA hardware. The EM's existing 2-second scenario timeout requires no change.
 
 ### 5.5 Connections to Existing Infrastructure
 
@@ -437,7 +448,33 @@ New test file: `tests/test_physics.py`.
 
 ---
 
-## 8. Future Extensions
+## 8. ha-energy-manager Integration Review
+
+*Reviewed from the perspective of ha-energy-manager as a consumer of ha-energy-forecast results. Issues are listed with their resolution status and the spec section where the fix was applied.*
+
+### Issue 1 — `set_dhw_schedule` silently invalidates EM scenario cache — **RESOLVED (§5.4)**
+
+§5.4 now explicitly mandates: "Callers that maintain a secondary scenario cache must flush their own cache immediately after a successful `set_dhw_schedule` call." For `ConsumptionForecastApp` this means clearing `_scenario_cache` and saving `_scenario_store` after each successful service call. The spec also clarifies that ha-energy-forecast invalidates only its own `_cached_forecast_df`; secondary caches are the caller's responsibility.
+
+### Issue 2 — `dhw_schedule` not part of the scenario cache key — **RESOLVED (§5.4)**
+
+§5.4 now states the caching rule: callers must either (a) exclude results computed with a non-None `dhw_schedule` from their scenario cache, or (b) include the `dhw_schedule` dict in their cache key hash. The safest default is (a). This prevents false cache hits when the same appliance schedule is paired with different DHW schedules.
+
+### Issue 3 — Scenario response timeout may be too tight with physics — **RESOLVED (§5.4)**
+
+§5.4 now states the latency expectation: "physics-enabled `predict_series()` adds O(1ms) for the 48-step DHW ODE; total p99 latency including feature engineering and LightGBM inference is expected < 500ms on typical HA hardware. The EM's existing 2-second scenario timeout requires no change."
+
+### Issue 4 — `physics_base_today`/`ml_adjustment_today` payload format undefined — **RESOLVED (§5.3)**
+
+§5.3 now specifies: state = current-hour value (float, kWh/h); attributes = `{"hourly_kwh": [v0, v1, ..., v47]}`, matching the `sensor.ha_energy_forecast_consumption_today` payload structure. The bridge can expose these as `em_` entities using the same JSON-attribute parsing path as the existing consumption sensor.
+
+### Issue 5 — No observable phase indicator for LP scheduler risk calibration — **RESOLVED (§5.3)**
+
+§5.3 now specifies that the existing main consumption forecast sensor gains a `model_phase` attribute (`"phase1"` or `"phase2"`), updated at each train cycle. The EM can read this attribute to detect the Phase 1→2 transition and log a recalibration prompt for `risk_aversion`.
+
+---
+
+## 9. Future Extensions
 
 These are noted for awareness; none are in scope for the initial implementation.
 
