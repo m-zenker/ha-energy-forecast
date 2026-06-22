@@ -123,9 +123,10 @@ Create all four before the first HA forum post goes live.
 > The rolling MAE sensors (`sensor.energy_forecast_mae_7d`, `mae_30d`, `relative_mae_7d`) are the best way to gauge whether your model is well-fitted for your household. I'm curious how others compare — hardware, setup complexity, and time running all affect accuracy.
 >
 > **My numbers (to give you a reference):**
-> - 7d MAE: ~0.52 kWh/h · 30d MAE: ~0.55 kWh/h · relative 7d MAE: ~18%
+> - 7d MAE: 0.16 kWh/h · 30d MAE: 0.20 kWh/h
+> - Relative 7d MAE: 60% — but this is misleading in summer: solar covers most consumption, so grid import averages ~0.26 kWh/h and even a small absolute error looks large as a percentage. Absolute MAE is the more honest metric when you have solar.
 > - Running since: October 2025 (~8 months of training data)
-> - Hardware: x86 (LightGBM, not sklearn fallback)
+> - Hardware: Raspberry Pi 5 8 GB (LightGBM, not sklearn fallback)
 > - Optional features enabled: heat pump sub-sensor, thermal pressure, DHW pressure, daily regime clustering, EV detection, solar + battery target correction
 >
 > Share whatever you have — even a rough number is useful. If your MAE feels high, mention your setup and we can troubleshoot.
@@ -136,7 +137,9 @@ Create all four before the first HA forum post goes live.
 >
 > The forecast is most useful when it drives something — an automation, a scheduling decision, a dashboard alert. I'm curious what people have built.
 >
-> **My main use case:** I combine the 48h consumption forecast with a solar production forecast to compute expected hourly surplus, then use that to decide when to run deferrable loads (dishwasher, washing machine, heat pump DHW boost). The scenario API helps validate a candidate schedule — e.g. "if I run the washer at 14:00, what does total consumption look like?"
+> **My main use case:** the consumption forecast feeds into a companion app, [ha-energy-manager](https://github.com/m-zenker/ha-energy-manager), which combines it with a solar production forecast to compute expected hourly surplus and automatically schedules deferrable loads (dishwasher, washing machine, heat pump DHW boost) in the best windows. The scenario API is useful for sanity-checking a candidate schedule: "if I run the washer at 14:00, what does total consumption look like?"
+>
+> But you don't need the energy manager to get value — `energy_forecast_tomorrow` and the 3-hour block sensors work directly in HA automations. A simple threshold automation ("if surplus forecast for 13:00–15:00 > 1.5 kWh, start the dishwasher") goes a long way.
 >
 > What are you doing with yours? Paste an automation, a dashboard card, or just describe the decision you're automating. Happy to help adapt the sensor setup for your use case.
 
