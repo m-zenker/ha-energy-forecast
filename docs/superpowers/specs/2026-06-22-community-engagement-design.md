@@ -69,6 +69,29 @@ Two posts, staggered by one week. GitHub Discussions are seeded (Section 4) befo
 
 **Timing:** Post 1 first, Post 2 one week later.
 
+### Post 1 Draft
+
+> **Title:** I built an ML energy consumption forecaster to schedule loads around solar surplus
+>
+> **Category:** Projects & Integration Showcase
+>
+> With solar panels it's not enough to know when the sun will shine — you also need to know when your household will *consume*. I built a Home Assistant app that predicts hourly energy consumption 48 hours ahead, so I can schedule my washing machine, dishwasher, and EV charger in the windows where solar surplus is largest.
+>
+> The model trains entirely on your own HA meter history — no cloud service, no generic averages. It learns your household's patterns (daily routines, heat pump cycles, seasonal swings) and publishes them as standard HA sensors.
+>
+> **Key features**
+> - 48h hourly forecast with calibrated prediction intervals
+> - Scenario API: "what if I run the dishwasher at 14:00?" — returns the delta against the baseline forecast
+> - SHAP explainability: know *why* the model predicted high consumption today
+> - Rolling 7d/30d MAE sensors so you can track real-world accuracy over time
+> - Works on Raspberry Pi (automatic LightGBM → scikit-learn fallback)
+>
+> [screenshot: assets/dashboard_overview.png]
+>
+> GitHub: https://github.com/m-zenker/ha-energy-forecast
+>
+> I've just set up GitHub Discussions — curious what MAE values others are seeing and how you're using the forecast in automations. Happy to answer questions here or there.
+
 ---
 
 ## Section 4: Seed Discussion Posts (Launch Day)
@@ -76,25 +99,66 @@ Two posts, staggered by one week. GitHub Discussions are seeded (Section 4) befo
 Create all four before the first HA forum post goes live.
 
 ### 1. Pinned Welcome (General)
-Short intro: what the project does, what the three categories are for, maintainer's commitment to respond. Sets the community tone.
+
+> **Title:** Welcome — what this project is and how to use Discussions
+>
+> HA Energy Forecast is a Home Assistant app that predicts your household's hourly energy consumption 48 hours ahead, using a LightGBM model trained entirely on your own meter data. I use it mainly to schedule deferrable loads (dishwasher, washing machine, EV charger) in windows where solar surplus is largest — but people use it for bill prediction, anomaly detection, and heat pump scheduling too.
+>
+> This Discussions space has three active categories:
+>
+> - **Accuracy & Benchmarks** — share your MAE, compare model diagnostics, track accuracy over time
+> - **Use Cases & Setups** — show your automations, dashboards, and config; ask for setup advice
+> - **Roadmap & Feature Requests** — vote on what I should build next; propose your own ideas
+>
+> I check in here regularly and will respond to everything. Install questions and bug reports are also welcome here (or as GitHub Issues if you want them tracked).
+>
+> To get started: [→ What's your MAE?](link) · [→ How are you using it?](link) · [→ What should I build next?](link)
+
+*(Update the three links once the other seed posts are live.)*
 
 ### 2. Accuracy & Benchmarks seed
-**Title:** "What's your MAE? Share your model diagnostics"
-**Maintainer reply template (go first):**
-- 7d MAE and 30d MAE values
-- Hardware (Pi / x86 / other)
-- How long the model has been running
-- Which optional features are enabled (heat pump sub-sensor, thermal pressure, regimes, etc.)
 
-Providing the template as a first reply gives others a format to copy, lowering the participation barrier significantly.
+> **Title:** What's your MAE? Share your model diagnostics
+>
+> The rolling MAE sensors (`sensor.energy_forecast_mae_7d`, `mae_30d`, `relative_mae_7d`) are the best way to gauge whether your model is well-fitted for your household. I'm curious how others compare — hardware, setup complexity, and time running all affect accuracy.
+>
+> **My numbers (to give you a reference):**
+> - 7d MAE: ~0.52 kWh/h · 30d MAE: ~0.55 kWh/h · relative 7d MAE: ~18%
+> - Running since: October 2025 (~8 months of training data)
+> - Hardware: x86 (LightGBM, not sklearn fallback)
+> - Optional features enabled: heat pump sub-sensor, thermal pressure, DHW pressure, daily regime clustering, EV detection, solar + battery target correction
+>
+> Share whatever you have — even a rough number is useful. If your MAE feels high, mention your setup and we can troubleshoot.
 
 ### 3. Use Cases & Setups seed
-**Title:** "How are you using the forecast? Show your setup"
-**Maintainer reply:** describe the DHW/heat pump automation in use, paste a dashboard screenshot, list enabled optional features.
+
+> **Title:** How are you using the forecast? Show your setup
+>
+> The forecast is most useful when it drives something — an automation, a scheduling decision, a dashboard alert. I'm curious what people have built.
+>
+> **My main use case:** I combine the 48h consumption forecast with a solar production forecast to compute expected hourly surplus, then use that to decide when to run deferrable loads (dishwasher, washing machine, heat pump DHW boost). The scenario API helps validate a candidate schedule — e.g. "if I run the washer at 14:00, what does total consumption look like?"
+>
+> What are you doing with yours? Paste an automation, a dashboard card, or just describe the decision you're automating. Happy to help adapt the sensor setup for your use case.
 
 ### 4. Roadmap Vote seed
-**Title:** "What should I build next?"
-**Content:** List 3–4 backlog items with one-line descriptions (e.g. #83 predicted day total, #84 legionella hour, #87 trend deviation feature, #16 HACS packaging). Ask for 👍 reactions or comments with reasoning. Explicitly state: "this is how I prioritise."
+
+> **Title:** What should I build next? Vote on the roadmap
+>
+> Here are the top candidates for the next release. React with 👍 on the ones you'd find most useful, or comment if you have a reason to prioritise (or skip) one.
+>
+> **#16 — HACS support**
+> Make the app installable directly from HACS. No code changes needed — mostly packaging work. Would significantly lower the install barrier.
+>
+> **#87 — Recent consumption trend feature**
+> Add `trend_deviation` (24h rolling mean minus 7d rolling mean) as a model feature. A simulation on my own data shows ~18% daily MAE improvement on ordinary days. About 1h of work.
+>
+> **#15 — HVAC flow setpoint projection**
+> For heat pump households: project the heating curve forward using forecast outdoor temperatures, giving the model a more accurate thermal load signal for the full 48h window. High impact if you have a heat pump.
+>
+> **#10 — School holidays**
+> Add a school holiday flag (configurable per country/region) so the model learns that daytime consumption rises during school breaks. Medium impact for families.
+>
+> This is genuinely how I prioritise — your votes influence what goes in next.
 
 ---
 
