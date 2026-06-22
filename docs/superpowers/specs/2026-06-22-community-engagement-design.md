@@ -145,23 +145,17 @@ Create all four before the first HA forum post goes live.
 
 ### 4. Roadmap Vote seed
 
-> **Title:** What should I build next? Vote on the roadmap
+> **Title:** What I'm building next: teaching the model why your house uses energy, not just when
 >
-> Here are the top candidates for the next release. React with 👍 on the ones you'd find most useful, or comment if you have a reason to prioritise (or skip) one.
+> The current model is a pattern recogniser. It already has physics-informed features — thermal pressure, DHW pressure, infiltration load, defrost risk, solar gain — but it still learns correlations, not causation. It knows that on cold Tuesday mornings you tend to use 0.8 kWh between 6 and 7 because that's what happened last Tuesday. It can't reason about a cold snap it hasn't seen before.
 >
-> **#16 — HACS support**
-> Make the app installable directly from HACS. No code changes needed — mostly packaging work. Would significantly lower the install barrier.
+> The next step is adding a full physics layer: a building thermodynamics simulation that answers a different question — given your house's heat loss rate, solar gain, and DHW tank temperature right now, how much energy does the heating system *have* to consume over the next 48 hours? The app will auto-calibrate your building's heat loss coefficient from passive cooling windows overnight and your heat pump's COP curve from sensor data.
 >
-> **#87 — Recent consumption trend feature**
-> Add `trend_deviation` (24h rolling mean minus 7d rolling mean) as a model feature. A simulation on my own data shows ~18% daily MAE improvement on ordinary days. About 1h of work.
+> LightGBM then learns only what the physics gets wrong: occupancy patterns, behavioural quirks, the dishwasher you run every other day. The SHAP explanation gains a new first line: *"Physics expects 4.2 kWh; behaviour adds 1.1 kWh."*
 >
-> **#15 — HVAC flow setpoint projection**
-> For heat pump households: project the heating curve forward using forecast outdoor temperatures, giving the model a more accurate thermal load signal for the full 48h window. High impact if you have a heat pump.
+> The spec is written and reviewed. Implementation is next.
 >
-> **#10 — School holidays**
-> Add a school holiday flag (configurable per country/region) so the model learns that daytime consumption rises during school breaks. Medium impact for families.
->
-> This is genuinely how I prioritise — your votes influence what goes in next.
+> Does anyone else have a heat pump + DHW setup? Curious whether the calibration assumptions translate to other systems (Vaillant, Daikin, etc.) or whether they're too specific to my Kermi.
 
 ---
 
