@@ -142,6 +142,58 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #87 — Recent Consumption Trend Feature (`trend_deviation`)
+
+**Priority:** Low-Medium — standalone, no prerequisites.
+
+**Context:** Simulation (2026-06-21) on last-30-day holdout shows ~18% daily MAE improvement from adding `trend_deviation = rolling_mean_24h − rolling_mean_7d` to the feature set. The feature ranks 14th of 19 in importance — it adds signal the model cannot derive by itself from individual rolling stats because tree splits on pair-wise differences are expensive to find without an explicit feature. Confirmed by LightGBM simulation without weather features (weather-only simulation; absolute numbers not directly comparable to live model).
+
+**Design:**
+```python
+# In _engineer_features(), after rolling stats are computed:
+df["trend_deviation"] = df["rolling_mean_24h"] - df["rolling_mean_7d"]
+df["trend_z_score"]   = df["trend_deviation"] / (df["rolling_std_24h"].clip(lower=0.05))
+```
+Both columns added to `_FEATURES_BASE`. At prediction time, `trend_deviation` and `trend_z_score` are derived from already-computed rolling stats, so no new data fetching is needed.
+
+**Note:** Does not fix the thermal-transition cluster (Jun 4-12 type days) — those require shorter halflife or a temperature-similarity weighting scheme (see #88). Adds signal on ordinary days.
+
+**Effort:** ~1 h (code + 2 tests). **Impact:** LOW-MEDIUM (+18% daily MAE in simulation; smaller real-world gain expected with weather features present).
+
+---
+
+### #88 — Temperature-Similarity Sample Weighting
+
+**Priority:** Low-Medium — more effective as warm-weather history grows.
+
+**Context:** Simulation (2026-06-21) compared three weighting schemes on 30-day holdout (May 22 – Jun 21):
+
+| Scheme | Daily MAE | Daily MBE | Weighted mean train temp |
+|--------|-----------|-----------|--------------------------|
+| time-60 (current) | 3.52 kWh | −3.20 kWh | 8.5 °C |
+| time-30 (shorter halflife) | **3.20 kWh** | −2.84 kWh | 10.5 °C |
+| tempsim (time-60 × Gaussian kernel σ=5°C) | 3.35 kWh | −3.01 kWh | 12.8 °C |
+
+Holdout period mean outdoor temp: **19.9 °C**. Temperature-similarity shifts the effective training distribution toward warmer data, but can only shift 4°C (8.5→12.8) with current history — still 7°C below the holdout mean. The simpler time-30 halflife outperforms the combined approach.
+
+**Key finding:** Both improvements are modest; neither fixes the thermal-transition cluster (Jun 4-12 type days). The root cause of those outlier days is that the model has never seen warm-month data (history started Oct 2025). **As summer 2026 data accumulates, temperature-similarity weighting will become meaningfully effective.**
+
+**Design (when ready to implement):**
+```python
+# In train(), after existing exponential decay weights:
+temp_sigma = self._cfg.get("temp_weight_sigma_c", 5.0)  # configurable, 0 = off
+if temp_sigma > 0 and predict_temp is not None:
+    temp_sim = np.exp(-((train_temps - predict_temp)**2) / (2 * temp_sigma**2))
+    h_weights = h_weights * temp_sim
+```
+`predict_temp` = mean of last 24h outdoor temperature. New config key `temp_weight_sigma_c` (default 0 = off; suggest 5.0 once ≥ 12 months of history exists).
+
+**Prerequisite:** Revisit after first full year of data is available (earliest: Oct 2026).
+
+**Effort:** ~3 h. **Impact:** LOW now, MEDIUM once a full year of history is available.
+
+---
+
 ### #84 — Legionella / DHW Boost Hour Feature
 
 **Prerequisite:** DHW sub-sensor infrastructure (related to #22).
@@ -177,6 +229,8 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **done** |
 | 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
 | 84 | Legionella/DHW boost hour feature | low-medium | 3 h | after #22 |
+| 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
+| 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
