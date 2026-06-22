@@ -8,6 +8,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-06-22
+
+### Fixed
+- `apps/energy_forecast/requirements.txt`, `ha_appdaemon_config.yaml`, `README.md` — Pinned `scikit-learn<=1.6.0` in install instructions and requirements. The alpine-wheels index (which provides musl-compatible wheels for AppDaemon's Alpine Linux environment) only carries scikit-learn up to v1.6.0. Without this cap, pip resolved to PyPI's manylinux 1.8.0 wheel, which installs "successfully" on aarch64/armv7 but fails to import at runtime on Alpine/musl (Home Assistant Green, Raspberry Pi, and other ARM devices). ([#10])
+- `apps/energy_forecast/model.py` — `_try_import_sklearn_gbr()` now logs the actual `ImportError` at WARNING level before returning `None`, so users can see the real failure reason (e.g. missing shared library, ABI mismatch) in AppDaemon logs instead of only the generic "Check AppDaemon requirements.txt." message. ([#10])
+
 ## [0.11.4] - 2026-06-16
 
 ### Added
