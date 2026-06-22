@@ -77,12 +77,16 @@ Stable calibrated constants and frequently-written operational state are kept in
 
 **Space heating**
 
-`T_indoor_h` and `T_indoor_{h+1}` are the projected indoor temperatures for hour h and h+1, sourced from `_project_indoor_temps()` — **not** the thermostat setpoint. When the projected indoor temperature exceeds the setpoint, the building is coasting and `Q_heat = 0`.
+`T_indoor_h` and `T_indoor_{h+1}` are the indoor temperatures for hour h and h+1, sourced differently depending on path:
+- **Training**: actual historical readings from `room_thermostats[*].temp_sensor`, area-weighted across rooms. Consecutive actual readings give the real-world thermal mass term.
+- **Prediction**: output of `_project_indoor_temps()` ODE projection — **not** the raw thermostat setpoint.
+
+In both cases, when T_indoor exceeds the setpoint, `Q_heat = 0` (building is coasting).
 
 ```
 Q_loss    [W]     = UA_eff × max(0, T_indoor_h − T_outdoor)
 Q_solar   [W]     = solar_gain_area × GHI
-Q_gain_int [W]    = internal_gains_W               # default: Q_base_el × 800 W/kWh (calibration-period representative; 80% fraction = appliance waste heat at standing load; does not scale with instantaneous consumption — above-baseline gains are absorbed by LightGBM residual)
+Q_gain_int [W]    = Q_base_el × internal_gains_fraction × 1000   # default fraction = 0.8 (config: internal_gains_fraction); calibration-period representative — does not scale with instantaneous consumption; above-baseline gains absorbed by LightGBM residual
 Q_mass    [W]     = C_building_Wh_K × (T_indoor_{h+1} − T_indoor_h)   # thermal mass charge/discharge
 Q_heat    [W]     = max(0, Q_loss − Q_solar − Q_gain_int + Q_mass)
 Q_heat_el [kWh/h] = Q_heat / COP(T_outdoor) / 1000
@@ -115,6 +119,7 @@ State-simulated forward per hour from current `T_tank`. Timestep Δt = 1 h throu
 
 ```
 C_dhw [Wh/K]      = dhw_tank_volume_l × 1.163    # specific heat of water
+Q_dhw_power [W]   = dhw_power_w                   # HP rated DHW output — see source priority below
 
 dT = −UA_dhw × (T_tank − T_ambient) / C_dhw      # insulation loss [K/h]
    − draw_profile[h] × draw_rate                  # hot-water draws [K/h]
@@ -129,7 +134,12 @@ else:
 T_tank = clamp(T_tank + dT + heating_rise, T_lower, T_legionella)
 ```
 
-`heating_rise` is computed as `Q_dhw_power / C_dhw` each timestep, not stored as a fixed constant. This keeps the derivation valid if `Q_dhw_power` varies or if the timestep changes.
+**`Q_dhw_power` source priority:**
+1. Calibrated from energy meter: median HP electrical power during confirmed DHW-active hours × COP_dhw → stored in `physics_calibration.json`
+2. Config: `dhw_power_w` (explicit override)
+3. Fallback: 4000 W (typical mid-range ASHP DHW output for a 200L tank)
+
+`heating_rise` is computed as `Q_dhw_power / C_dhw` each timestep, not stored as a fixed constant.
 
 Post-legionella silence emerges naturally: tank initialises at `T_legionella` (60°C) and does not trigger heating until it cools below `T_lower`. No special-casing required.
 
@@ -241,6 +251,8 @@ physics:
   # Spec fallbacks — used only when sensor/inference unavailable
   cop_formula: {a: 2.5, b: 0.07}
   dhw_tank_volume_l: 200
+  dhw_power_w: 4000              # HP rated DHW heating output [W]; inferred from energy meter if available
+  internal_gains_fraction: 0.8   # fraction of Q_base_el [kWh/h] that becomes room heat; override if known
 
   # Override escapes (inferred by default when DHW sensor configured)
   # T_legionella: 60
