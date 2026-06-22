@@ -1,15 +1,20 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.11.0-alpha-14** — 2026-04-22, dev. 535 tests.
+Current: **v0.11.4** — 2026-06-16, main. 627 tests.
 
 ---
 
 ## Current Status
 
-Sub-sensor history for the heat pump (integrated 2026-03-18) was expected to reach full lag-feature activation (~672 rows) around 2026-04-20. MAE has improved from 0.7 → 0.52 kWh/h.
+**dev:** v0.11.4-alpha-2 (same codebase — release commit was made on main only). **main:** v0.11.4 released 2026-06-16.
 
-**v0.11.0-alpha-1 Update:** Daily Regime Clustering implemented as an optional module.
- This explicitly extracts 24h consumption patterns and uses a secondary model to predict the expected "regime" for tomorrow, providing a stable physics-informed prior to the main model.
+Recent releases:
+- v0.11.4 — 15-minute energy history cache (#85), strip partial day from clustering (#86), tomorrow block P10/P90 interval sensors, code review batch 1–5 (all open findings closed).
+- v0.11.0 — Daily Regime Clustering, EV-subtracted clustering input (#82 — live since 2026-04-23).
+
+**SHAP check due:** #82 (EV-clean clustering) has been live for ~2 months. Regime clusters should now reflect genuine intra-day shape patterns rather than EV charge timing. Run a SHAP summary to see whether `regime_kwh` ranks high (shape signal) or low (redundant with temperature features) — this determines whether #83 adds value.
+
+**MAE trajectory:** 0.7 → 0.52 kWh/h (as of April). Current value readable from `sensor.ha_energy_forecast_mae_30d`.
 
 ---
 
@@ -226,9 +231,9 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 | # | Item | Impact | Effort | Priority |
 |---|------|--------|--------|----------|
-| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | **done** |
-| 83 | `predicted_day_total` scale feature | medium | 3 h | after #82 |
-| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | after #22 |
+| 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | ✅ done (v0.11.0-alpha-16) |
+| 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
+| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | low urgency — lag features self-corrected |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
