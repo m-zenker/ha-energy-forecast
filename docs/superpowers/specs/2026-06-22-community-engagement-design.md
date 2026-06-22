@@ -102,19 +102,15 @@ Create all four before the first HA forum post goes live.
 
 > **Title:** Welcome — what this project is and how to use Discussions
 >
-> HA Energy Forecast is a Home Assistant app that predicts your household's hourly energy consumption 48 hours ahead, using a LightGBM model trained entirely on your own meter data. I use it mainly to schedule deferrable loads (dishwasher, washing machine, EV charger) in windows where solar surplus is largest — but people use it for bill prediction, anomaly detection, and heat pump scheduling too.
+> HA Energy Forecast predicts your household's hourly energy consumption 48 hours ahead using a LightGBM model trained entirely on your own HA meter data. My main use case is scheduling deferrable loads (dishwasher, washing machine, heat pump DHW boost) in windows where solar surplus is largest — but it also works standalone for bill prediction, anomaly detection, and heat pump anticipation.
 >
-> This Discussions space has three active categories:
+> I check in here regularly and will respond to everything. Three active threads to get started:
 >
-> - **Accuracy & Benchmarks** — share your MAE, compare model diagnostics, track accuracy over time
-> - **Use Cases & Setups** — show your automations, dashboards, and config; ask for setup advice
-> - **Roadmap & Feature Requests** — vote on what I should build next; propose your own ideas
+> - [What's your MAE? Share your model diagnostics](https://github.com/m-zenker/ha-energy-forecast/discussions/11)
+> - [How are you using the forecast? Show your setup](https://github.com/m-zenker/ha-energy-forecast/discussions/12)
+> - [What I'm building next: teaching the model why your house uses energy, not just when](https://github.com/m-zenker/ha-energy-forecast/discussions/13)
 >
-> I check in here regularly and will respond to everything. Install questions and bug reports are also welcome here (or as GitHub Issues if you want them tracked).
->
-> To get started: [→ What's your MAE?](link) · [→ How are you using it?](link) · [→ What should I build next?](link)
-
-*(Update the three links once the other seed posts are live.)*
+> Install questions and bug reports are welcome here too, or as a GitHub Issue if you want them tracked.
 
 ### 2. Accuracy & Benchmarks seed
 
