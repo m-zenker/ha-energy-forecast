@@ -374,7 +374,8 @@ class EnergyForecast(hass.Hass):
         for module, pip_name in _REQUIRED:
             try:
                 __import__(module)
-            except ImportError:
+            except ImportError as exc:
+                _LOGGER.debug("Import of %s failed: %s", module, exc)
                 missing.append(pip_name)
 
         if missing:

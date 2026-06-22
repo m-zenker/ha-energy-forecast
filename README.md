@@ -209,7 +209,7 @@ python_packages:
   - requests>=2.31.0
   - holidays>=0.46
 init_commands:
-  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy scikit-learn"
+  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
   - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
 ```
 

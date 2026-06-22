@@ -192,7 +192,8 @@ def _try_import_sklearn_gbr() -> Any | None:
         from sklearn.ensemble import GradientBoostingRegressor  # noqa: PLC0415
 
         return GradientBoostingRegressor
-    except ImportError:
+    except ImportError as exc:
+        _LOGGER.warning("sklearn import failed: %s", exc)
         return None
 
 
