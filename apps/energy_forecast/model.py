@@ -210,7 +210,12 @@ def ensure_ml_packages() -> tuple[bool, str]:
     lgb = _try_import_lgbm()
     gbr = _try_import_sklearn_gbr()
     if gbr is None:
-        _LOGGER.error("scikit-learn is not importable. Check AppDaemon requirements.txt.")
+        _LOGGER.error(
+            "scikit-learn is not importable. "
+            "Install it via the AppDaemon add-on config (init_commands), NOT via pip from a terminal — "
+            "terminal pip targets a different Python environment. "
+            "See README → Installation → AppDaemon add-on configuration."
+        )
         return False, "none"
     engine = "LightGBM" if lgb is not None else "sklearn GBR"
     _LOGGER.info("ML engine: %s", engine)
@@ -321,7 +326,10 @@ class EnergyForecastModel:
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
-            raise RuntimeError("scikit-learn unavailable — check AppDaemon requirements.txt.")
+            raise RuntimeError(
+                "scikit-learn unavailable — install via AppDaemon add-on init_commands, not terminal pip. "
+                "See README → Installation."
+            )
 
         lgb = _try_import_lgbm()
         GBR = _try_import_sklearn_gbr()
