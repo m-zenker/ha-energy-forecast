@@ -208,15 +208,14 @@ system_packages:
 python_packages:
   - requests>=2.31.0
   - holidays>=0.46
-  - scikit-learn<=1.6.0
 init_commands:
-  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy"
+  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
   - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
 ```
 
-`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source). `python_packages` handles pure-Python packages including scikit-learn (see note below).
+`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source) plus the `libgomp` OpenMP runtime required by scikit-learn. `python_packages` handles pure-Python packages.
 
-**Why `init_commands` for pandas/numpy but `python_packages` for scikit-learn?** AppDaemon runs on Alpine Linux (musl libc). The `python_packages` field uses the HA-maintained musl wheel index (`wheels.home-assistant.io/musllinux-index`), which provides proper musl-compiled wheels for scikit-learn. **Do not move scikit-learn into `init_commands`** — the alpine-wheels index serves a glibc-linked `linux_aarch64` wheel for aarch64 that installs without error but fails to import on musl (issue [#10](https://github.com/m-zenker/ha-energy-forecast/issues/10)). pandas and numpy stay in `init_commands` to use the alpine-wheels index for those. LightGBM must be compiled from source; the add-on's `/data/` volume cache means it compiles once (**~5 min on first restart**) and reuses the wheel on every subsequent start (**~30 sec**).
+**Why `init_commands` instead of `python_packages` for pandas/numpy/scikit-learn?** AppDaemon runs on Alpine Linux (musl libc). PyPI and the HA musllinux-index do not provide pre-built musl wheels for these packages on aarch64 — pip would fall back to a source build (very slow). The alpine-wheels index provides pre-built musl-compatible wheels. LightGBM must be compiled from source; the add-on's `/data/` volume cache means it compiles once (**~5 min on first restart**) and reuses the wheel on every subsequent start (**~30 sec**).
 
 > **Important:** each `init_commands` entry must be a **separate list item**. A single `>-` folded scalar merges all lines into one string, which can pass package names as stray tokens to an earlier pip command.
 
