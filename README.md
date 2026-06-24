@@ -219,7 +219,17 @@ init_commands:
 
 > **Important:** each `init_commands` entry must be a **separate list item**. A single `>-` folded scalar merges all lines into one string, which can pass package names as stray tokens to an earlier pip command.
 
-> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and `system_packages`. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
+> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and the build toolchain from `system_packages` — but keep `libgomp`, which scikit-learn requires at runtime on Alpine/aarch64:
+> ```yaml
+> system_packages:
+>   - libgomp
+> python_packages:
+>   - requests>=2.31.0
+>   - holidays>=0.46
+> init_commands:
+>   - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
+> ```
+> The app will automatically fall back to scikit-learn's GradientBoostingRegressor. Removing `libgomp` causes scikit-learn to fail to import even though it installs without error (issue [#10](https://github.com/m-zenker/ha-energy-forecast/issues/10)).
 
 This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root — copy either source.
 
