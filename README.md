@@ -213,13 +213,23 @@ init_commands:
   - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
 ```
 
-`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source). `python_packages` handles pure-Python packages.
+`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source) plus the `libgomp` OpenMP runtime required by scikit-learn. `python_packages` handles pure-Python packages.
 
-**Why `init_commands` instead of `python_packages`?** AppDaemon runs on Alpine Linux (musl libc). Heavy packages such as LightGBM have no pre-built Alpine wheels on PyPI and must be compiled from source. The add-on's `/data/` volume survives container restarts, so pointing pip's wheel cache there means LightGBM is compiled once (**~5 min on first restart**) and reused on every subsequent start (**~30 sec**). pandas, numpy, and scikit-learn are fetched as pre-built Alpine wheels from the `alpine-wheels` index and do not need compilation.
+**Why `init_commands` instead of `python_packages` for pandas/numpy/scikit-learn?** AppDaemon runs on Alpine Linux (musl libc). PyPI and the HA musllinux-index do not provide pre-built musl wheels for these packages on aarch64 — pip would fall back to a source build (very slow). The alpine-wheels index provides pre-built musl-compatible wheels. LightGBM must be compiled from source; the add-on's `/data/` volume cache means it compiles once (**~5 min on first restart**) and reuses the wheel on every subsequent start (**~30 sec**).
 
 > **Important:** each `init_commands` entry must be a **separate list item**. A single `>-` folded scalar merges all lines into one string, which can pass package names as stray tokens to an earlier pip command.
 
-> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and `system_packages`. The app will automatically fall back to scikit-learn's GradientBoostingRegressor.
+> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and the build toolchain from `system_packages` — but keep `libgomp`, which scikit-learn requires at runtime on Alpine/aarch64:
+> ```yaml
+> system_packages:
+>   - libgomp
+> python_packages:
+>   - requests>=2.31.0
+>   - holidays>=0.46
+> init_commands:
+>   - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
+> ```
+> The app will automatically fall back to scikit-learn's GradientBoostingRegressor. Removing `libgomp` causes scikit-learn to fail to import even though it installs without error (issue [#10](https://github.com/m-zenker/ha-energy-forecast/issues/10)).
 
 This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root — copy either source.
 
