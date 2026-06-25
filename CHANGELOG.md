@@ -8,6 +8,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-06-25
+
+### Fixed
+- `apps/energy_forecast/clustering.py` — Module-level sklearn import now logs the actual `ImportError` (including the missing shared-library name) at WARNING level instead of swallowing the exception. On Alpine/aarch64 systems without `libgomp`, the import error was silently discarded, making the root cause invisible in AppDaemon logs. ([#10])
+- `apps/energy_forecast/model.py` — `ensure_ml_packages()` error message and `train()` RuntimeError now point users to the AppDaemon add-on `init_commands` configuration and the README rather than the non-existent `requirements.txt`. ([#10])
+- `README.md`, `ha_appdaemon_config.yaml` — The "skip LightGBM" instructions previously advised removing all of `system_packages`. On Alpine/aarch64, `build-base` provides `libgomp`, the OpenMP runtime scikit-learn requires at import time. Removing it causes sklearn to fail to import even after a successful pip install. The docs now show the correct minimal no-LightGBM config with `system_packages: [libgomp]`. ([#10])
+
 ## [0.11.5] - 2026-06-22
 
 ### Fixed

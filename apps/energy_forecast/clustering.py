@@ -24,9 +24,14 @@ try:
     from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
     SKLEARN_AVAILABLE = True
-except ImportError:
+except ImportError as exc:
     SKLEARN_AVAILABLE = False
-    _LOGGER.warning("scikit-learn not found. Daily Regime Clustering will be disabled.")
+    _LOGGER.warning(
+        "scikit-learn not found (import error: %s). Daily Regime Clustering will be disabled. "
+        "On aarch64/Alpine, move scikit-learn to python_packages in the add-on config instead of init_commands — "
+        "the HA musllinux wheel index is needed for musl-compatible builds.",
+        exc,
+    )
 
 
 class DailyProfileClusterer:
