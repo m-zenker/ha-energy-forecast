@@ -440,9 +440,9 @@ class EnergyForecast(hass.Hass):
         sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
         return self._cache_path.parent / f"{prefix}_{sanitized}.csv"
 
-    @property
     def _ev_charging_cache_path(self) -> Path:
-        return self._cache_path.parent / "ev_charging.csv"
+        sanitized = self._ev_charging_sensor.split(".", 1)[-1].replace(".", "_")
+        return self._cache_path.parent / f"ev_{sanitized}.csv"
 
     # ── MQTT Discovery ────────────────────────────────────────────────────────
 
@@ -981,10 +981,30 @@ class EnergyForecast(hass.Hass):
 
         # ── Subtract EV charging from gross import ────────────────────────────
         if self._ev_charging_sensor:
-            _ev_hist = ha_data.fetch_sub_sensor_history(
-                self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
-            )
-            baseline_df, ev_df = ha_data.split_ev_charging_from_sensor(energy_df, _strip_tz(_ev_hist, self._timezone))
+            try:
+                _ev_hist = ha_data.fetch_sub_sensor_history(
+                    self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
+                )
+                _ev_hist_stripped = _strip_tz(_ev_hist, self._timezone)
+                if _ev_hist_stripped.empty:
+                    _LOGGER.warning(
+                        "EV sensor %s returned no history — falling back to threshold detection",
+                        self._ev_charging_sensor,
+                    )
+                    baseline_df, ev_df = ha_data.split_ev_charging(
+                        energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
+                else:
+                    baseline_df, ev_df = ha_data.split_ev_charging_from_sensor(energy_df, _ev_hist_stripped)
+            except (OSError, ValueError, KeyError) as exc:
+                _LOGGER.warning(
+                    "EV sensor %s fetch failed (%s) — falling back to threshold detection",
+                    self._ev_charging_sensor,
+                    exc,
+                )
+                baseline_df, ev_df = ha_data.split_ev_charging(
+                    energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+                )
         else:
             baseline_df, ev_df = ha_data.split_ev_charging(
                 energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
@@ -1217,12 +1237,18 @@ class EnergyForecast(hass.Hass):
                     self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
                 )
                 _ev_actuals_df = _strip_tz(_ev_recent, self._timezone)
-                recent_actuals, ev_detected = ha_data.split_ev_charging_from_sensor(full_actuals, _ev_actuals_df)
+                if not _ev_actuals_df.empty:
+                    recent_actuals, ev_detected = ha_data.split_ev_charging_from_sensor(full_actuals, _ev_actuals_df)
+                else:
+                    _ev_actuals_df = None
+                    recent_actuals, ev_detected = ha_data.split_ev_charging(
+                        full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
             else:
                 recent_actuals, ev_detected = ha_data.split_ev_charging(
                     full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
                 )
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, AttributeError) as exc:
             _LOGGER.warning("Could not fetch recent actuals for lag features: %s", exc)
             recent_actuals = None
             full_actuals = None
@@ -2121,7 +2147,7 @@ class EnergyForecast(hass.Hass):
         # mode they are included in training and therefore in predictions too.
         blended_actuals = full_actuals
         if full_actuals is not None and not full_actuals.empty:
-            if ev_actuals_df is not None:
+            if ev_actuals_df is not None and not ev_actuals_df.empty:
                 blended_actuals, _ = ha_data.split_ev_charging_from_sensor(full_actuals, ev_actuals_df)
             else:
                 blended_actuals, _ = ha_data.split_ev_charging(
@@ -2203,10 +2229,10 @@ class EnergyForecast(hass.Hass):
 
         # ── EV kWh from actuals ───────────────────────────────────────────────
         if full_actuals is not None and not full_actuals.empty:
-            if ev_actuals_df is not None:
+            if ev_actuals_df is not None and not ev_actuals_df.empty:
                 ev_rows = ev_actuals_df[ev_actuals_df["kwh"] > 0].copy()
                 ev_times = pd.to_datetime(ev_rows["timestamp"]).values.astype("datetime64[ns]")
-                ev_vals = ev_rows["kwh"].values.astype(float)
+                ev_vals = np.minimum(ev_rows["kwh"].values, self._ev_charger_kw).astype(float)
             else:
                 ev_mask = full_actuals["gross_kwh"] > self._ev_threshold
                 ev_rows = full_actuals[ev_mask].copy()
