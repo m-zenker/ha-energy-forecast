@@ -498,6 +498,98 @@ class TestEvKwhSensorCalc:
         assert abs(result["ev_today"] - 9.0) < 1e-6
 
 
+# ── EV charging sensor path ───────────────────────────────────────────────────
+
+
+class TestEvChargingSensor:
+    """When ev_charging_sensor is configured, sensor readings replace threshold inference."""
+
+    def _make_app(self, ev_charging_sensor: str | None = None):
+        app = _FakeSelf()
+        app._ev_threshold = 4.5
+        app._ev_charger_kw = 9.0
+        app._ev_charging_sensor = ev_charging_sensor
+        return app
+
+    def _make_actuals(self, today: pd.Timestamp, hours: int = 12) -> pd.DataFrame:
+        ts = pd.date_range(today, periods=hours, freq="1h")
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0] * hours})
+
+    def test_ev_sensor_today_reports_actual_kwh(self):
+        """ev_today reflects wallbox sensor kWh, not min(gross, charger_kw)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        today = pd.Timestamp.now().normalize()
+        app = self._make_app(ev_charging_sensor="sensor.wallbox_total_energy")
+        actuals = self._make_actuals(today, hours=12)
+
+        # Wallbox delivered 5.3 kWh during hour 2 (well below charger_kw=9)
+        ev_actuals_df = pd.DataFrame([{"timestamp": today + pd.Timedelta(hours=2), "kwh": 5.3}])
+
+        ts = pd.date_range(today, periods=48, freq="1h")
+        preds = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
+        noon = (today + pd.Timedelta(hours=12)).tz_localize("Europe/Zurich")
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = noon
+            result = EnergyForecast._aggregate(app, preds, actuals, live_temp=None, ev_actuals_df=ev_actuals_df)
+
+        assert abs(result["ev_today"] - 5.3) < 1e-6, (
+            f"ev_today should be actual wallbox kWh (5.3), got {result['ev_today']}"
+        )
+
+    def test_ev_sensor_blended_actuals_strips_wallbox_kwh(self):
+        """When ev_actuals_df is given, wallbox kWh is subtracted from blended actuals."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        today = pd.Timestamp.now().normalize()
+        app = self._make_app(ev_charging_sensor="sensor.wallbox_total_energy")
+
+        # 12 actuals at 2.0 kWh (hours 0-11); hour 2 has gross=2.0 but wallbox used 1.5 kWh
+        actuals = self._make_actuals(today, hours=12)
+        ev_actuals_df = pd.DataFrame([{"timestamp": today + pd.Timedelta(hours=2), "kwh": 1.5}])
+
+        ts = pd.date_range(today, periods=48, freq="1h")
+        preds = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
+
+        # mock_now at noon → 12 elapsed hours (0-11) + 12 future hours (12-23) = today
+        noon = (today + pd.Timedelta(hours=12)).tz_localize("Europe/Zurich")
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = noon
+            result = EnergyForecast._aggregate(app, preds, actuals, live_temp=None, ev_actuals_df=ev_actuals_df)
+
+        # Elapsed (0-11): hour 2 → 2.0 - 1.5 = 0.5; rest 11 × 2.0 = 22.0 → elapsed = 22.5
+        # Future (12-23): 12 × 1.0 = 12.0 → today = 34.5
+        assert result["today"] == pytest.approx(34.5), (
+            f"EV strip via sensor should give today=34.5, got {result['today']}"
+        )
+
+    def test_threshold_path_used_when_no_sensor(self):
+        """Without ev_charging_sensor, the threshold path is used (no regression)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        today = pd.Timestamp.now().normalize()
+        app = self._make_app(ev_charging_sensor=None)
+
+        # gross=10 at hour 2 → above threshold=4.5; charger_kw=9 subtracted → co-load=1.0
+        actuals = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(today, periods=12, freq="1h"),
+                "gross_kwh": [2.0] * 12,
+            }
+        )
+        actuals.at[2, "gross_kwh"] = 10.0
+
+        ts = pd.date_range(today, periods=48, freq="1h")
+        preds = pd.DataFrame({"timestamp": ts, "predicted_kwh": np.ones(48)})
+        noon = (today + pd.Timedelta(hours=12)).tz_localize("Europe/Zurich")
+        with patch("pandas.Timestamp.now") as mock_now:
+            mock_now.return_value = noon
+            result = EnergyForecast._aggregate(app, preds, actuals, live_temp=None, ev_actuals_df=None)
+
+        # ev_today = min(10, 9) = 9.0
+        assert abs(result["ev_today"] - 9.0) < 1e-6
+
+
 # ── Callback signature compatibility ─────────────────────────────────────────
 
 
@@ -2843,6 +2935,7 @@ class _FakeRetrain:
         self._timezone = "Europe/Zurich"
         self._ev_threshold = 7.0
         self._ev_charger_kw = 9.0
+        self._ev_charging_sensor = None
         self._solar_sensor = None
         self._grid_export_sensor = None
         self._battery_charge_sensor = None
