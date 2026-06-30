@@ -316,6 +316,11 @@ energy_forecast:
   # Lower = recent data weighted more heavily. 0 = disable weighting.
   weight_halflife_days: 90
 
+  # Unit of your energy_sensor (default: kWh). Set to MWh or Wh if your sensor
+  # reports in a different unit (some integrations default to MWh).
+  # If you add this after the app has been running, delete energy_history.csv first.
+  # energy_unit: kWh
+
   # EV charging detection thresholds (defaults shown).
   # ev_charging_threshold_kwh: 7    # hours above this are classified as EV
   # ev_charger_kw: 9.0              # fixed charger load subtracted from those hours
@@ -381,6 +386,7 @@ energy_forecast:
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging (threshold-based detection) |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
 | `ev_charging_sensor` | No | — | Entity ID of a cumulative wallbox energy meter (`total_increasing`, e.g. `sensor.wallbox_total_energy`). When set, actual sensor readings replace threshold-based EV detection — required for variable-power solar-surplus charging where grid import never exceeds the threshold. Falls back to threshold detection if the sensor returns no data. |
+| `energy_unit` | No | `kWh` | Unit reported by your `energy_sensor`. Supported: `kWh`, `MWh`, `Wh`. Set to `MWh` if your sensor reports in megawatt-hours (some integrations default to MWh). Values are converted to kWh before storage. If you add this after the app has been running, **delete `energy_history.csv`** so it rebuilds with correct values. Also accepted by the backfill tool. |
 | `solar_production_sensor` | No | — | Entity ID of a cumulative solar production kWh meter (`total_increasing`). Adds solar generation to the training target. See [Solar PV + battery](#solar-pv--battery). |
 | `grid_export_sensor` | No | — | Entity ID of a cumulative grid-export kWh meter (`total_increasing`). Subtracts exported energy from the training target. Recommended when solar is configured. |
 | `battery_charge_sensor` | No | — | Entity ID of a cumulative battery charge kWh meter (`total_increasing`). Subtracts battery charging from the training target. |
@@ -622,6 +628,7 @@ energy_history_backfill:
   class: EnergyHistoryBackfill
   energy_sensor: sensor.your_grid_import_sensor
   ha_db_path: /homeassistant/home-assistant_v2.db  # adjust path for your setup
+  # energy_unit: MWh  # add if your sensor reports in MWh or Wh (default: kWh)
 ```
 
 Common database paths:
