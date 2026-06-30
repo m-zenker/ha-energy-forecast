@@ -578,6 +578,63 @@ class TestSplitEvCharging:
         assert len(ev) == 2
 
 
+# ── split_ev_charging_from_sensor ────────────────────────────────────────────
+
+
+class TestSplitEvChargingFromSensor:
+    def _energy_df(self) -> pd.DataFrame:
+        """Four hourly rows at 3 kWh each."""
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-12 00:00", periods=4, freq="1h"),
+                "gross_kwh": [3.0, 3.0, 3.0, 3.0],
+            }
+        )
+
+    def _ev_df(self, hours_kwh: dict) -> pd.DataFrame:
+        """Build a wallbox kWh DataFrame. hours_kwh: {hour_int: kwh}."""
+        base = pd.Timestamp("2026-03-12 00:00")
+        rows = [{"timestamp": base + pd.Timedelta(hours=h), "kwh": v} for h, v in hours_kwh.items()]
+        return pd.DataFrame(rows)
+
+    def test_wallbox_kwh_subtracted_from_gross(self):
+        """Wallbox kWh is subtracted from gross_kwh for matching hours."""
+        baseline, ev = ha_data.split_ev_charging_from_sensor(self._energy_df(), self._ev_df({1: 2.5, 2: 4.0}))
+        assert abs(baseline.iloc[1]["gross_kwh"] - 0.5) < 1e-6  # 3.0 - 2.5
+        assert abs(baseline.iloc[2]["gross_kwh"] - 0.0) < 1e-6  # clipped at 0
+
+    def test_subtraction_clipped_to_zero(self):
+        """gross_kwh never goes negative even when wallbox > gross."""
+        baseline, _ = ha_data.split_ev_charging_from_sensor(self._energy_df(), self._ev_df({0: 10.0}))
+        assert baseline.iloc[0]["gross_kwh"] == 0.0
+
+    def test_ev_df_holds_actual_wallbox_kwh(self):
+        """ev_df.gross_kwh must equal actual wallbox kWh, not the original gross."""
+        _, ev = ha_data.split_ev_charging_from_sensor(self._energy_df(), self._ev_df({2: 4.7}))
+        assert len(ev) == 1
+        assert abs(ev.iloc[0]["gross_kwh"] - 4.7) < 1e-6
+
+    def test_zero_kwh_hours_not_marked_as_ev(self):
+        """Hours where wallbox kwh == 0 must not appear in ev_df."""
+        _, ev = ha_data.split_ev_charging_from_sensor(self._energy_df(), self._ev_df({0: 0.0, 1: 0.0}))
+        assert len(ev) == 0
+
+    def test_non_ev_hours_unchanged(self):
+        """Hours with no wallbox energy must keep original gross_kwh."""
+        baseline, _ = ha_data.split_ev_charging_from_sensor(self._energy_df(), self._ev_df({2: 1.0}))
+        assert abs(baseline.iloc[0]["gross_kwh"] - 3.0) < 1e-6
+        assert abs(baseline.iloc[1]["gross_kwh"] - 3.0) < 1e-6
+        assert abs(baseline.iloc[3]["gross_kwh"] - 3.0) < 1e-6
+
+    def test_timestamp_misalignment_floored_to_1h(self):
+        """Wallbox timestamps not on the hour are matched after flooring to 1h."""
+        ev_df = pd.DataFrame([{"timestamp": pd.Timestamp("2026-03-12 01:37"), "kwh": 3.0}])
+        baseline, ev = ha_data.split_ev_charging_from_sensor(self._energy_df(), ev_df)
+        # 01:37 → floor → 01:00 matches energy row at 01:00
+        assert abs(baseline.iloc[1]["gross_kwh"] - 0.0) < 1e-6
+        assert len(ev) == 1
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 

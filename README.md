@@ -319,6 +319,7 @@ energy_forecast:
   # EV charging detection thresholds (defaults shown).
   # ev_charging_threshold_kwh: 7    # hours above this are classified as EV
   # ev_charger_kw: 9.0              # fixed charger load subtracted from those hours
+  # ev_charging_sensor: sensor.wallbox_total_energy  # direct meter (solar-surplus wallboxes)
 
   # Solar PV + battery target correction (optional).
   # Corrects the training target from grid-import-only to true household consumption.
@@ -377,8 +378,9 @@ energy_forecast:
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
 | `timezone` | No | `Europe/Zurich` | IANA timezone name |
 | `weight_halflife_days` | No | `90` | Sample weight half-life in days. Must be `≥ 1`. Typical range: 60–180 (lower = recent data weighted more heavily). |
-| `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging |
+| `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging (threshold-based detection) |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
+| `ev_charging_sensor` | No | — | Entity ID of a cumulative wallbox energy meter (`total_increasing`, e.g. `sensor.wallbox_total_energy`). When set, actual sensor readings replace threshold-based EV detection — required for variable-power solar-surplus charging where grid import never exceeds the threshold. Falls back to threshold detection if the sensor returns no data. |
 | `solar_production_sensor` | No | — | Entity ID of a cumulative solar production kWh meter (`total_increasing`). Adds solar generation to the training target. See [Solar PV + battery](#solar-pv--battery). |
 | `grid_export_sensor` | No | — | Entity ID of a cumulative grid-export kWh meter (`total_increasing`). Subtracts exported energy from the training target. Recommended when solar is configured. |
 | `battery_charge_sensor` | No | — | Entity ID of a cumulative battery charge kWh meter (`total_increasing`). Subtracts battery charging from the training target. |
@@ -663,6 +665,8 @@ Any hour where gross grid import exceeds `ev_charging_threshold_kwh` (default 7 
 This means the model trains on the true household signal even on days with EV sessions. The raw detected EV kWh are published separately as `sensor.energy_forecast_ev_today` and `sensor.energy_forecast_ev_yesterday`.
 
 Tune the threshold in `apps.yaml` to match your charger and household ceiling. The default 7 kWh/h suits a 9–11 kW charger with a household ceiling below 6.5 kWh/h.
+
+**Solar-surplus wallboxes** charge at variable power tracking the PV surplus, so grid import never rises enough to trigger the threshold. For these setups, configure `ev_charging_sensor` with a cumulative kWh meter from the wallbox (e.g. `sensor.wallbox_total_energy`). Actual sensor readings replace threshold inference; the threshold path remains as an automatic fallback if the sensor goes offline.
 
 ---
 

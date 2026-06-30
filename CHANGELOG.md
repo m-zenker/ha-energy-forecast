@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `apps/energy_forecast/ha_data.py` — New `split_ev_charging_from_sensor()` function splits EV charging energy directly from a cumulative kWh wallbox sensor (e.g. `sensor.wallbox_total_energy`). Produces cleaner EV/house energy splits than the threshold heuristic on installations where an explicit wallbox meter is available.
+- `apps/energy_forecast/energy_forecast.py` — New optional config key `ev_charging_sensor`. Set it to a HA entity ID for a cumulative energy sensor on your wallbox (e.g. `sensor.wallbox_total_energy`) to replace threshold-based EV inference in both training and live sensor updates. The existing `ev_charging_threshold_kwh` / `ev_charger_kw` keys remain as a backward-compatible fallback for installations without a direct wallbox sensor.
+
 ## [0.11.6] - 2026-06-25
 
 ### Fixed

@@ -169,6 +169,7 @@ class EnergyForecast(hass.Hass):
         # Fixed charger power in kW — subtracted from charging hours so the
         # concurrent household baseline is preserved in training data.
         self._ev_charger_kw: float = float(self.args.get("ev_charger_kw", 9.0))
+        self._ev_charging_sensor: str | None = self.args.get("ev_charging_sensor") or None
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
@@ -438,6 +439,10 @@ class EnergyForecast(hass.Hass):
         """Return the CSV cache path for a generic absolute sensor."""
         sanitized = entity_id.split(".", 1)[-1].replace(".", "_")
         return self._cache_path.parent / f"{prefix}_{sanitized}.csv"
+
+    def _ev_charging_cache_path(self) -> Path:
+        sanitized = self._ev_charging_sensor.split(".", 1)[-1].replace(".", "_")
+        return self._cache_path.parent / f"ev_{sanitized}.csv"
 
     # ── MQTT Discovery ────────────────────────────────────────────────────────
 
@@ -975,7 +980,35 @@ class EnergyForecast(hass.Hass):
         energy_df = _strip_tz(energy_df, self._timezone)
 
         # ── Subtract EV charging from gross import ────────────────────────────
-        baseline_df, ev_df = ha_data.split_ev_charging(energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw)
+        if self._ev_charging_sensor:
+            try:
+                _ev_hist = ha_data.fetch_sub_sensor_history(
+                    self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
+                )
+                _ev_hist_stripped = _strip_tz(_ev_hist, self._timezone)
+                if _ev_hist_stripped.empty:
+                    _LOGGER.warning(
+                        "EV sensor %s returned no history — falling back to threshold detection",
+                        self._ev_charging_sensor,
+                    )
+                    baseline_df, ev_df = ha_data.split_ev_charging(
+                        energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
+                else:
+                    baseline_df, ev_df = ha_data.split_ev_charging_from_sensor(energy_df, _ev_hist_stripped)
+            except (OSError, ValueError, KeyError) as exc:
+                _LOGGER.warning(
+                    "EV sensor %s fetch failed (%s) — falling back to threshold detection",
+                    self._ev_charging_sensor,
+                    exc,
+                )
+                baseline_df, ev_df = ha_data.split_ev_charging(
+                    energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+                )
+        else:
+            baseline_df, ev_df = ha_data.split_ev_charging(
+                energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
+            )
         if len(ev_df):
             _LOGGER.info(
                 "EV filter: %d charging hours detected (%.1f kWh gross). Sessions on: %s",
@@ -1191,6 +1224,7 @@ class EnergyForecast(hass.Hass):
         # ── Fetch recent actuals ──────────────────────────────────────────────
         # Uses the lightweight fetch (last 2 days only) to stay well within
         # AppDaemon's 10s callback limit. Full 30-day resync happens in _retrain().
+        _ev_actuals_df: pd.DataFrame | None = None
         try:
             full_actuals = ha_data.fetch_recent_energy(
                 self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone
@@ -1198,10 +1232,23 @@ class EnergyForecast(hass.Hass):
             full_actuals = _strip_tz(full_actuals, self._timezone)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
-            recent_actuals, ev_detected = ha_data.split_ev_charging(
-                full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
-            )
-        except (OSError, ValueError, KeyError) as exc:
+            if self._ev_charging_sensor:
+                _ev_recent = ha_data.fetch_recent_sub_sensor(
+                    self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
+                )
+                _ev_actuals_df = _strip_tz(_ev_recent, self._timezone)
+                if not _ev_actuals_df.empty:
+                    recent_actuals, ev_detected = ha_data.split_ev_charging_from_sensor(full_actuals, _ev_actuals_df)
+                else:
+                    _ev_actuals_df = None
+                    recent_actuals, ev_detected = ha_data.split_ev_charging(
+                        full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
+            else:
+                recent_actuals, ev_detected = ha_data.split_ev_charging(
+                    full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+                )
+        except (OSError, ValueError, KeyError, AttributeError) as exc:
             _LOGGER.warning("Could not fetch recent actuals for lag features: %s", exc)
             recent_actuals = None
             full_actuals = None
@@ -1443,6 +1490,7 @@ class EnergyForecast(hass.Hass):
             live_temp,
             intervals=intervals,
             sub_sensors_recent=sub_sensors_recent or None,
+            ev_actuals_df=_ev_actuals_df,
         )
         aggregated["shap_top_features"] = shap_data
         aggregated["shap_narrative"] = _build_shap_narrative(shap_data)
@@ -2013,8 +2061,8 @@ class EnergyForecast(hass.Hass):
         # ── Anomaly detection sensor (#39) ────────────────────────────────────
         is_anomaly = data.get("is_anomaly", False)
         anomaly_attrs = {
-            "residual_kwh": data.get("anomaly_residual", float("nan")),
-            "residual_std_kwh": data.get("anomaly_std", float("nan")),
+            "residual_kwh": data.get("anomaly_residual"),
+            "residual_std_kwh": data.get("anomaly_std"),
             "sigma_threshold": self._anomaly_sigma_threshold,
             "n_pairs": data.get("anomaly_n", 0),
         }
@@ -2066,6 +2114,7 @@ class EnergyForecast(hass.Hass):
         live_temp: float | None,
         intervals: Any = None,
         sub_sensors_recent: dict[str, Any] | None = None,
+        ev_actuals_df: Any = None,
     ) -> dict:
         import numpy as np
         import pandas as pd
@@ -2098,9 +2147,12 @@ class EnergyForecast(hass.Hass):
         # mode they are included in training and therefore in predictions too.
         blended_actuals = full_actuals
         if full_actuals is not None and not full_actuals.empty:
-            blended_actuals, _ = ha_data.split_ev_charging(
-                full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
-            )
+            if ev_actuals_df is not None and not ev_actuals_df.empty:
+                blended_actuals, _ = ha_data.split_ev_charging_from_sensor(full_actuals, ev_actuals_df)
+            else:
+                blended_actuals, _ = ha_data.split_ev_charging(
+                    full_actuals, self._ev_threshold, charger_kw=self._ev_charger_kw
+                )
             if self._baseline_mode and sub_sensors_recent:
                 blended_actuals, _ = _subtract_sub_sensors(
                     blended_actuals, self._subtract_only_dict(sub_sensors_recent)
@@ -2175,18 +2227,19 @@ class EnergyForecast(hass.Hass):
                 for h in range(0, 24, 3)
             }
 
-        # ── EV kWh from actuals: charger load per detected hour ──────────────
-        # Always use original full_actuals for EV reporting, even in baseline_mode.
-        # EV energy per detected hour = charger_kw (the model's assumed fixed load).
-        # We clip by gross_kwh to handle partial hours near end-of-charge where
-        # gross may be slightly below charger_kw.
+        # ── EV kWh from actuals ───────────────────────────────────────────────
         if full_actuals is not None and not full_actuals.empty:
-            ev_mask = full_actuals["gross_kwh"] > self._ev_threshold
-            ev_rows = full_actuals[ev_mask].copy()
-            if not ev_rows.empty:
-                ev_rows["ev_kwh"] = np.minimum(ev_rows["gross_kwh"], self._ev_charger_kw)
+            if ev_actuals_df is not None and not ev_actuals_df.empty:
+                ev_rows = ev_actuals_df[ev_actuals_df["kwh"] > 0].copy()
+                ev_times = pd.to_datetime(ev_rows["timestamp"]).values.astype("datetime64[ns]")
+                ev_vals = np.minimum(ev_rows["kwh"].values, self._ev_charger_kw).astype(float)
+            else:
+                ev_mask = full_actuals["gross_kwh"] > self._ev_threshold
+                ev_rows = full_actuals[ev_mask].copy()
                 ev_times = ev_rows["timestamp"].values.astype("datetime64[ns]")
-                ev_vals = ev_rows["ev_kwh"].values.astype(float)
+                ev_vals = np.minimum(ev_rows["gross_kwh"].values, self._ev_charger_kw).astype(float)
+
+            if len(ev_vals):
 
                 def _ev_sum(s, e):
                     return round(float(np.sum(ev_vals[(ev_times >= s) & (ev_times < e)])), 3)
@@ -2493,11 +2546,11 @@ def _compute_anomaly(
     actuals_history: dict,  # {pd.Timestamp: float}            keep-last, floored 1h keys
     sigma_threshold: float,
     min_pairs: int = 10,
-) -> tuple[bool, float, float, int]:
+) -> tuple[bool, float | None, float | None, int]:
     """Return (is_anomaly, latest_abs_residual, residual_std, n_pairs).
 
     Fires when |latest actual − latest prediction| > sigma_threshold × std(all residuals).
-    Returns (False, nan, nan, 0) during cold start (< min_pairs matched pairs).
+    Returns (False, None, None, n) during cold start (< min_pairs matched pairs).
 
     DST fall-back caveat: the naive 02:xx hour appears twice in October; both map to
     the same floor("1h") key in pred_map, so the second overwrites the first — accepted
@@ -2507,7 +2560,7 @@ def _compute_anomaly(
     import pandas as pd
 
     if not pred_history or not actuals_history:
-        return False, float("nan"), float("nan"), 0
+        return False, None, None, 0
 
     pred_map = {pd.Timestamp(ts).floor("1h"): kwh for ts, kwh in pred_history.items()}
 
@@ -2519,7 +2572,7 @@ def _compute_anomaly(
 
     n = len(matched)
     if n < min_pairs:
-        return False, float("nan"), float("nan"), n
+        return False, None, None, n
 
     latest_ts = max(matched.keys())
     latest_residual = matched[latest_ts]

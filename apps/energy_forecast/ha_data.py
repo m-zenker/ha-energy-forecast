@@ -427,6 +427,38 @@ def split_ev_charging(
     return df, ev_df
 
 
+def split_ev_charging_from_sensor(
+    energy_df: pd.DataFrame,
+    ev_kwh_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split using actual wallbox readings instead of threshold inference.
+
+    Returns (baseline_df, ev_df) with the same contract as split_ev_charging():
+      baseline_df — gross_kwh with wallbox kWh subtracted, clipped ≥ 0
+      ev_df       — charging rows; gross_kwh column holds the wallbox kWh
+                    (for compatibility with downstream logging / model code)
+    """
+    import numpy as np
+    import pandas as pd
+
+    energy_df = energy_df.copy()
+    ev_active = ev_kwh_df[ev_kwh_df["kwh"] > 0][["timestamp", "kwh"]].copy()
+    ev_active["_ts"] = pd.to_datetime(ev_active["timestamp"]).dt.floor("1h")
+
+    energy_df["_ts"] = pd.to_datetime(energy_df["timestamp"]).dt.floor("1h")
+    merged = energy_df.merge(ev_active[["_ts", "kwh"]], on="_ts", how="left")
+    ev_kwh = merged["kwh"].fillna(0.0).values
+
+    ev_mask = ev_kwh > 0
+    energy_df.loc[ev_mask, "gross_kwh"] = np.maximum(0.0, energy_df.loc[ev_mask, "gross_kwh"] - ev_kwh[ev_mask])
+    energy_df.drop(columns=["_ts"], inplace=True)
+
+    ev_df = energy_df[ev_mask].copy()
+    ev_df["gross_kwh"] = ev_kwh[ev_mask]
+
+    return energy_df, ev_df
+
+
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
 
