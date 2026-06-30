@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from . import __version__, ha_data, weather
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME
+from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME, UNIT_TO_KWH
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
 
@@ -173,6 +173,23 @@ class EnergyForecast(hass.Hass):
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
+        _energy_unit: str = str(self.args.get("energy_unit", "kWh"))
+        if _energy_unit not in UNIT_TO_KWH:
+            _LOGGER.warning(
+                "energy_unit %r not recognised (valid: %s) — defaulting to kWh",
+                _energy_unit,
+                ", ".join(UNIT_TO_KWH),
+            )
+            _energy_unit = "kWh"
+        self._unit_multiplier: float = UNIT_TO_KWH[_energy_unit]
+        if self._unit_multiplier != 1.0:
+            _LOGGER.warning(
+                "energy_unit=%s: fetched values will be multiplied by %.4g. "
+                "If energy_history.csv was built without this setting, delete it "
+                "so it rebuilds with correct kWh values.",
+                _energy_unit,
+                self._unit_multiplier,
+            )
         self._timezone: str = str(self.args.get("timezone") or self.get_timezone() or "Europe/Zurich")
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
         self._holiday_country: str = str(self.args.get("holiday_country", "CH")).upper()
@@ -970,7 +987,11 @@ class EnergyForecast(hass.Hass):
 
         _LOGGER.info("Starting model retraining…")
         energy_df = ha_data.fetch_energy_history(
-            self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone
+            self,
+            self._energy_sensor,
+            cache_path=self._cache_path,
+            timezone=self._timezone,
+            unit_multiplier=self._unit_multiplier,
         )
 
         if len(energy_df) < MIN_HISTORY_HOURS:
@@ -1202,6 +1223,7 @@ class EnergyForecast(hass.Hass):
                 self._energy_sensor,
                 cache_path=self._cache_path_15m,
                 timezone=self._timezone,
+                unit_multiplier=self._unit_multiplier,
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("15m cache update failed (non-fatal): %s", exc)
@@ -1227,7 +1249,11 @@ class EnergyForecast(hass.Hass):
         _ev_actuals_df: pd.DataFrame | None = None
         try:
             full_actuals = ha_data.fetch_recent_energy(
-                self, self._energy_sensor, cache_path=self._cache_path, timezone=self._timezone
+                self,
+                self._energy_sensor,
+                cache_path=self._cache_path,
+                timezone=self._timezone,
+                unit_multiplier=self._unit_multiplier,
             )
             full_actuals = _strip_tz(full_actuals, self._timezone)
             # Subtract EV from actuals so lag_24h pointing at a charging hour
@@ -1512,6 +1538,7 @@ class EnergyForecast(hass.Hass):
                 self._energy_sensor,
                 cache_path=self._cache_path_15m,
                 timezone=self._timezone,
+                unit_multiplier=self._unit_multiplier,
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("15m cache hourly update failed (non-fatal): %s", exc)

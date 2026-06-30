@@ -850,6 +850,65 @@ class TestCsvAppendOnlyWrites:
         assert saved_ts.duplicated().sum() == 0
 
 
+# ── unit multiplier ──────────────────────────────────────────────────────────
+
+
+class TestUnitMultiplier:
+    """Unit conversion via unit_multiplier in _raw_to_kwh_diff and fetch_energy_history."""
+
+    def test_raw_to_kwh_diff_scales_mwh(self):
+        """_raw_to_kwh_diff with unit_multiplier=1000 converts MWh diffs to kWh."""
+        from energy_forecast.ha_data import _raw_to_kwh_diff
+
+        # Cumulative meter in MWh: 0.000 → 0.001 → 0.003 MWh per hour
+        raw = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-15 08:00", "2024-01-15 09:00", "2024-01-15 10:00"], utc=True
+                ).tz_convert("Europe/Zurich"),
+                "value": [0.000, 0.001, 0.003],
+            }
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, unit_multiplier=1000.0)
+        assert len(result) == 2
+        # 0.001 MWh × 1000 = 1.0 kWh; 0.002 MWh × 1000 = 2.0 kWh
+        assert abs(result.iloc[0]["gross_kwh"] - 1.0) < 1e-9
+        assert abs(result.iloc[1]["gross_kwh"] - 2.0) < 1e-9
+
+    def test_raw_to_kwh_diff_spike_filter_applied_after_scaling(self):
+        """Spike filter (max_kwh) is applied to scaled values, not raw ones."""
+        from energy_forecast.ha_data import _raw_to_kwh_diff
+
+        # 0.060 MWh diff → 60 kWh after scaling — exceeds MAX_HOURLY_KWH=50 → dropped
+        raw = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-15 08:00", "2024-01-15 09:00"], utc=True).tz_convert(
+                    "Europe/Zurich"
+                ),
+                "value": [0.000, 0.060],
+            }
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, unit_multiplier=1000.0)
+        assert result.empty
+
+    def test_fetch_energy_history_applies_unit_multiplier(self, mock_app, tmp_path):
+        """fetch_energy_history with unit_multiplier=1000 converts MWh sensor to kWh."""
+        cache_path = tmp_path / "energy_history.csv"
+        # Cumulative MWh meter: 0.000 → 0.002 → 0.005 MWh
+        raw = make_ha_raw(
+            ["2024-01-15 08:00:00+00:00", "2024-01-15 09:00:00+00:00", "2024-01-15 10:00:00+00:00"],
+            [0.000, 0.002, 0.005],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            result = ha_data.fetch_energy_history(
+                mock_app, "sensor.energy", cache_path=cache_path, unit_multiplier=1000.0
+            )
+        assert len(result) >= 1
+        assert result["gross_kwh"].max() <= 50.0  # spike filter still works
+        # 0.002 MWh diff × 1000 = 2.0 kWh
+        assert any(abs(v - 2.0) < 1e-6 for v in result["gross_kwh"])
+
+
 # ── #45 validate_energy_cache ─────────────────────────────────────────────────
 
 from energy_forecast.ha_data import validate_energy_cache  # noqa: E402

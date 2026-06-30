@@ -8,9 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-06-30
+
 ### Added
 - `apps/energy_forecast/ha_data.py` — New `split_ev_charging_from_sensor()` function splits EV charging energy directly from a cumulative kWh wallbox sensor (e.g. `sensor.wallbox_total_energy`). Produces cleaner EV/house energy splits than the threshold heuristic on installations where an explicit wallbox meter is available.
 - `apps/energy_forecast/energy_forecast.py` — New optional config key `ev_charging_sensor`. Set it to a HA entity ID for a cumulative energy sensor on your wallbox (e.g. `sensor.wallbox_total_energy`) to replace threshold-based EV inference in both training and live sensor updates. The existing `ev_charging_threshold_kwh` / `ev_charger_kw` keys remain as a backward-compatible fallback for installations without a direct wallbox sensor.
+- `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/ha_data.py`, `apps/energy_forecast/energy_history_backfill.py` — New optional config key `energy_unit` (`kWh` / `MWh` / `Wh`, default `kWh`). Set to `MWh` if your grid-import sensor reports in megawatt-hours (some integrations default to MWh). Values are converted to kWh before storage so the model always trains on consistent units. If you add this after the app has been running, delete `energy_history.csv` so it rebuilds with correct values. The backfill tool accepts the same key. ([#15])
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_compute_anomaly` now returns `None` instead of `float('nan')` when fewer than 10 matched hours are available (cold start). Prevents `AttributeError: 'float' object has no attribute 'attributes'` when publishing the anomaly binary sensor on a fresh install.
+- `apps/energy_forecast/energy_forecast.py` — Feature importance attribute now formats correctly as a list of `{feature, importance}` dicts. Was previously emitting raw numpy floats that the HA frontend could not render.
 
 ## [0.11.6] - 2026-06-25
 
