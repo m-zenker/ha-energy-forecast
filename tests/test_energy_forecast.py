@@ -1905,7 +1905,7 @@ class TestAnomalyDetection:
         assert n == 20
 
     def test_cold_start_returns_false(self):
-        """Fewer than min_pairs matched pairs → (False, nan, nan, n)."""
+        """Fewer than min_pairs matched pairs → (False, None, None, n)."""
         start = pd.Timestamp("2026-03-01 00:00")
         pred_history = self._make_pred_history(5, kwh=2.0, start=start)
         actuals_history = self._make_actuals_history(5, kwh=3.0, start=start)
@@ -1914,17 +1914,17 @@ class TestAnomalyDetection:
 
         assert is_anomaly is False
         assert n == 5
-        assert math.isnan(residual)
-        assert math.isnan(std)
+        assert residual is None
+        assert std is None
 
     def test_empty_histories_return_false(self):
-        """Both empty → (False, nan, nan, 0)."""
+        """Both empty → (False, None, None, 0)."""
         is_anomaly, residual, std, n = _compute_anomaly({}, {}, sigma_threshold=3.0)
 
         assert is_anomaly is False
         assert n == 0
-        assert math.isnan(residual)
-        assert math.isnan(std)
+        assert residual is None
+        assert std is None
 
     def test_near_zero_std_guard(self):
         """Perfect model (std < 0.01) must not fire anomaly even if latest residual is large."""

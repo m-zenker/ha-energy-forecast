@@ -682,7 +682,7 @@ class EnergyForecastModel:
             )[:10]
             _LOGGER.info(
                 "Feature importances (top 10): %s",
-                ", ".join(f"{n}={v:.0f}" for n, v in top),
+                ", ".join(f"{n}={v:.4f}" for n, v in top),
             )
 
         # ── Hold-out MAE (last 10%) — trained on train-split only for honest estimate ─

@@ -2061,8 +2061,8 @@ class EnergyForecast(hass.Hass):
         # ── Anomaly detection sensor (#39) ────────────────────────────────────
         is_anomaly = data.get("is_anomaly", False)
         anomaly_attrs = {
-            "residual_kwh": data.get("anomaly_residual", float("nan")),
-            "residual_std_kwh": data.get("anomaly_std", float("nan")),
+            "residual_kwh": data.get("anomaly_residual"),
+            "residual_std_kwh": data.get("anomaly_std"),
             "sigma_threshold": self._anomaly_sigma_threshold,
             "n_pairs": data.get("anomaly_n", 0),
         }
@@ -2546,11 +2546,11 @@ def _compute_anomaly(
     actuals_history: dict,  # {pd.Timestamp: float}            keep-last, floored 1h keys
     sigma_threshold: float,
     min_pairs: int = 10,
-) -> tuple[bool, float, float, int]:
+) -> tuple[bool, float | None, float | None, int]:
     """Return (is_anomaly, latest_abs_residual, residual_std, n_pairs).
 
     Fires when |latest actual − latest prediction| > sigma_threshold × std(all residuals).
-    Returns (False, nan, nan, 0) during cold start (< min_pairs matched pairs).
+    Returns (False, None, None, n) during cold start (< min_pairs matched pairs).
 
     DST fall-back caveat: the naive 02:xx hour appears twice in October; both map to
     the same floor("1h") key in pred_map, so the second overwrites the first — accepted
@@ -2560,7 +2560,7 @@ def _compute_anomaly(
     import pandas as pd
 
     if not pred_history or not actuals_history:
-        return False, float("nan"), float("nan"), 0
+        return False, None, None, 0
 
     pred_map = {pd.Timestamp(ts).floor("1h"): kwh for ts, kwh in pred_history.items()}
 
@@ -2572,7 +2572,7 @@ def _compute_anomaly(
 
     n = len(matched)
     if n < min_pairs:
-        return False, float("nan"), float("nan"), n
+        return False, None, None, n
 
     latest_ts = max(matched.keys())
     latest_residual = matched[latest_ts]
