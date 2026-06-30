@@ -76,6 +76,12 @@ class EnergyHistoryBackfill(hass.Hass):
 
         entity_id = self.args["energy_sensor"]
         db_path = self.args.get("ha_db_path", DEFAULT_DB_PATH)
+        energy_unit: str = self.args.get("energy_unit", "kWh")
+        _UNIT_TO_KWH = {"kWh": 1.0, "MWh": 1000.0, "Wh": 0.001}
+        unit_multiplier: float = _UNIT_TO_KWH.get(energy_unit, 1.0)
+        if energy_unit not in _UNIT_TO_KWH:
+            _LOGGER.warning("energy_unit %r not recognised — defaulting to kWh", energy_unit)
+            unit_multiplier = 1.0
 
         if not Path(db_path).exists():
             raise FileNotFoundError(
@@ -86,6 +92,8 @@ class EnergyHistoryBackfill(hass.Hass):
             )
 
         _LOGGER.info("Reading statistics for %s from %s …", entity_id, db_path)
+        if unit_multiplier != 1.0:
+            _LOGGER.info("Applying unit conversion: %s → kWh (×%.4g)", energy_unit, unit_multiplier)
 
         cutoff_ts = (datetime.now(tz=UTC) - timedelta(days=365 * LOOKBACK_YEARS)).timestamp()
 
@@ -144,8 +152,8 @@ class EnergyHistoryBackfill(hass.Hass):
 
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        # Diff cumulative sum → per-hour kWh; clip negatives (meter resets)
-        df["gross_kwh"] = df["cumsum"].diff().clip(lower=0)
+        # Diff cumulative sum → per-hour kWh; clip negatives (meter resets); apply unit conversion
+        df["gross_kwh"] = df["cumsum"].diff().clip(lower=0) * unit_multiplier
         df = df.dropna(subset=["gross_kwh"])
         df = df[(df["gross_kwh"] > 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)]
 
