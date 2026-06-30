@@ -40,6 +40,9 @@ SENSOR_BLEND_HOURS = 6
 DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
+# Supported energy sensor units and their kWh conversion factors.
+UNIT_TO_KWH: dict[str, float] = {"kWh": 1.0, "MWh": 1000.0, "Wh": 0.001}
+
 
 def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     """Convert the 'timestamp' column of a DataFrame to naive local time.

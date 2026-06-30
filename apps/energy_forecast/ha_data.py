@@ -142,14 +142,18 @@ def _raw_to_kwh_diff(
     resolution: str,
     max_kwh: float,
     timezone: str = "Europe/Zurich",
+    unit_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """Convert raw cumulative meter readings to per-slot kWh differences.
 
     Args:
-        raw_ha:     DataFrame with columns [timestamp (tz-aware), value].
-        resolution: Pandas offset string, e.g. "1h" or "15min".
-        max_kwh:    Per-slot upper bound; slots above this are filtered out.
-        timezone:   Timezone to convert to before stripping tzinfo.
+        raw_ha:          DataFrame with columns [timestamp (tz-aware), value].
+        resolution:      Pandas offset string, e.g. "1h" or "15min".
+        max_kwh:         Per-slot upper bound (in kWh, applied after conversion);
+                         slots above this are filtered out.
+        timezone:        Timezone to convert to before stripping tzinfo.
+        unit_multiplier: Factor to convert raw diff values to kWh.
+                         1.0 for kWh sensors, 1000.0 for MWh, 0.001 for Wh.
 
     Returns:
         DataFrame with columns [timestamp (naive local), gross_kwh], positive values only.
@@ -161,6 +165,8 @@ def _raw_to_kwh_diff(
     slotted = raw_ha.set_index("timestamp")["value"].resample(resolution).last().ffill()
     diff = slotted.diff().clip(lower=0).reset_index()
     diff.columns = ["timestamp", "gross_kwh"]
+    if unit_multiplier != 1.0:
+        diff["gross_kwh"] = diff["gross_kwh"] * unit_multiplier
     if diff["timestamp"].dt.tz is not None:
         diff["timestamp"] = diff["timestamp"].dt.tz_convert(timezone).dt.tz_localize(None)
     return diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < max_kwh)].copy()
@@ -171,6 +177,7 @@ def fetch_energy_history(
     entity_id: str,
     cache_path: Path = CACHE_PATH,
     timezone: str = "Europe/Zurich",
+    unit_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """Pull grid-import history, merging local CSV with fresh HA data."""
     import pandas as pd
@@ -196,7 +203,7 @@ def fetch_energy_history(
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
     # 3. Process HA data into hourly gross kWh
-    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH, timezone=timezone)
+    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
 
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
@@ -224,7 +231,11 @@ _FETCH_RECENT_TAIL_ROWS = 400  # 336 h max lag + buffer; limits memory use in ho
 
 
 def fetch_recent_energy(
-    app: hass.Hass, entity_id: str, cache_path: Path = CACHE_PATH, timezone: str = "Europe/Zurich"
+    app: hass.Hass,
+    entity_id: str,
+    cache_path: Path = CACHE_PATH,
+    timezone: str = "Europe/Zurich",
+    unit_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """Lightweight update for hourly sensor refreshes.
 
@@ -268,7 +279,7 @@ def fetch_recent_energy(
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
     # 3. Process into hourly kWh and keep only the recent window
-    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH, timezone=timezone)
+    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
 
     # 4. Merge — fresh HA data wins on timestamp conflicts (for return value)
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
@@ -301,6 +312,7 @@ def fetch_energy_history_15m(
     entity_id: str,
     cache_path: Path = CACHE_PATH_15M,
     timezone: str = "Europe/Zurich",
+    unit_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """Pull grid-import history at 15-min resolution, merging local CSV with fresh HA data.
 
@@ -326,7 +338,7 @@ def fetch_energy_history_15m(
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
-    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone)
+    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
@@ -349,6 +361,7 @@ def fetch_recent_energy_15m(
     entity_id: str,
     cache_path: Path = CACHE_PATH_15M,
     timezone: str = "Europe/Zurich",
+    unit_multiplier: float = 1.0,
 ) -> None:
     """Lightweight 15-minute cache update. Appends new slots without a full resync.
 
@@ -380,7 +393,7 @@ def fetch_recent_energy_15m(
         _LOGGER.warning("fetch_recent_energy_15m: no data from HA or cache for %s", entity_id)
         return
 
-    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone)
+    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
