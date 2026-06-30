@@ -2958,6 +2958,7 @@ class _FakeRetrain:
         self._enable_regimes = False
         self._regime_count = 3
         self._climate_room_areas = None
+        self._unit_multiplier = 1.0
 
     def log(self, msg, level="INFO"):
         pass
