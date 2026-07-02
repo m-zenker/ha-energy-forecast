@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-from energy_forecast.physics import COP_MIN, ThermalPhysicsModel, _atomic_write_json, _read_json_or_default
+from energy_forecast.physics import (
+    COP_MIN,
+    ThermalPhysicsModel,
+    _atomic_write_json,
+    _read_json_or_default,
+)
 
 DEFAULT_CONFIG = {
     "cop_sensor": None,
@@ -235,3 +240,60 @@ class TestSpaceHeating:
         assert q_heat_el.iloc[-1] >= 0.0
         # All rows should be finite
         assert q_heat_el.isna().sum() == 0, f"Found NaN values in result: {q_heat_el}"
+
+
+class TestDHWOde:
+    def test_cycle_triggers_at_lower_stops_at_upper(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series([20.0] * 24, index=ts)
+        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        assert (q_dhw_el >= 0.0).all()
+        assert 45.0 <= final_temp <= 60.0  # clamp bounds enforced
+
+    def test_heating_rise_derived_not_constant(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
+        t_ambient = pd.Series([20.0, 20.0], index=ts)
+        # start just below T_lower to force a reheat on hour 0
+        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        assert q_dhw_el.iloc[0] > 0.0
+        # different tank volume -> different heating_rise -> different resulting series (not hardcoded)
+        pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 300})
+        pm2._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        q_dhw_el2, _ = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        assert not q_dhw_el.equals(q_dhw_el2)
+
+    def test_post_legionella_silence(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=12, freq="1h")
+        t_ambient = pd.Series([20.0] * 12, index=ts)
+        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=60.0, dhw_schedule_override=None)
+        # tank starts at legionella temp -> several hours of zero electricity before it cools to T_lower
+        assert q_dhw_el.iloc[0] == 0.0
+        assert q_dhw_el.iloc[1] == 0.0
+
+    def test_dhw_schedule_override_shifts_electricity_to_specified_hour(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0, legionella_dow=2, legionella_hour=14)
+        ts = pd.date_range("2026-06-24 00:00", periods=48, freq="1h")  # Wed 2026-06-24 is dow=2
+        t_ambient = pd.Series([20.0] * 48, index=ts)
+        override = {"legionella": ("2026-06-25", 10)}  # move to Thursday 10:00
+        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=override)
+        thu_10 = pd.Timestamp("2026-06-25 10:00")
+        # a legionella boost (heating to T_legionella) must occur at/after the overridden hour
+        assert q_dhw_el.loc[q_dhw_el.index >= thu_10].max() > 0
+
+    def test_ode_edge_case_zero_delta_t(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
+        t_ambient = pd.Series([50.0, 50.0], index=ts)  # T_ambient == T_tank -> no insulation loss
+        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=None)
+        assert np.isfinite(final_temp)

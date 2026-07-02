@@ -202,3 +202,58 @@ class ThermalPhysicsModel:
         q_heat = (q_loss - q_solar - q_gain_int + q_mass).clip(lower=0.0)
         q_heat_el = q_heat / cop.clip(lower=COP_MIN) / 1000.0
         return q_heat_el
+
+    def _dhw_override_for_hour(self, ts: pd.Timestamp, override: dict | None) -> float | None:
+        """Return an override target temp (T_legionella) for *ts* if a legionella override applies, else None."""
+        if not override or "legionella" not in override:
+            return None
+        date_str, hour = override["legionella"]
+        target = pd.Timestamp(f"{date_str} {hour:02d}:00")
+        if ts == target:
+            return self._schedule["T_legionella"]
+        return None
+
+    def _dhw_kwh_series(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+        dhw_schedule_override: dict | None,
+    ) -> tuple[pd.Series, float]:
+        volume_l = self._config["dhw_tank_volume_l"]
+        c_dhw = volume_l * WATER_SPECIFIC_HEAT_WH_PER_L_K
+        q_dhw_power = self._config["dhw_power_w"]
+        heating_rise = q_dhw_power / c_dhw  # K/h, derived each call — not a stored constant
+
+        t_lower = self._schedule["T_dhw_lower"]
+        t_legionella = self._schedule["T_legionella"]
+
+        q_dhw_daily = self._calib.get("Q_dhw_daily") or 0.0
+        draw_rate = (q_dhw_daily * 1000.0 / c_dhw) if c_dhw > 0 else 0.0  # K-equivalent/day, scaled by shape below
+
+        cop_dhw = max(COP_MIN, self._cop_formula_value(t_ambient.iloc[0] if len(t_ambient) else 10.0, None))
+
+        t_tank = float(initial_t_tank)
+        el_kwh = np.zeros(len(timestamps))
+        for i, ts in enumerate(timestamps):
+            ua_dhw = self._calib.get("UA_dhw") or 15.0
+            dT = -ua_dhw * (t_tank - float(t_ambient.iloc[i])) / c_dhw
+            hour_of_day = ts.hour
+            dT -= _DEFAULT_DRAW_PROFILE[hour_of_day] * draw_rate
+
+            override_target = self._dhw_override_for_hour(ts, dhw_schedule_override)
+            if override_target is not None:
+                q_el_w = q_dhw_power / cop_dhw
+                el_kwh[i] = q_el_w / 1000.0
+                t_tank = override_target
+                continue
+
+            if t_tank < t_lower:
+                q_el_w = q_dhw_power / cop_dhw
+                el_kwh[i] = q_el_w / 1000.0
+                t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_legionella))
+            else:
+                el_kwh[i] = 0.0
+                t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))
+
+        return pd.Series(el_kwh, index=timestamps), t_tank
