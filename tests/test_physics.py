@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from energy_forecast.model import _find_passive_windows
 from energy_forecast.physics import (
     COP_MIN,
     ThermalPhysicsModel,
@@ -441,3 +442,61 @@ class TestPredictSeries:
         assert "physics predict_series failed" in caplog.text, (
             f"Expected warning about predict_series failure in log; got: {caplog.text}"
         )
+
+
+class TestFindPassiveWindows:
+    def test_excludes_hp_on_rows(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=6, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0] * 6,
+                "T_indoor": [20.0] * 6,
+                "hp_running": [False, False, True, False, False, False],
+                "dhw_tank_temp": [np.nan] * 6,
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert 2 not in idx  # hp_running row excluded
+
+    def test_excludes_delta_t_below_threshold(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [18.0, 18.0, 18.0],  # ΔT = 2K, below 8K threshold
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [np.nan] * 3,
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert len(idx) == 0
+
+    def test_excludes_rising_dhw_tank_temp_hours(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [45.0, 50.0, 50.0],  # rising 45->50 at row 1 = active DHW cycle
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert 1 not in idx
+
+    def test_requires_min_consecutive_off_hours(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=4, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0] * 4,
+                "T_indoor": [20.0] * 4,
+                "hp_running": [True, False, True, False],  # never 2 consecutive off hours
+                "dhw_tank_temp": [np.nan] * 4,
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert len(idx) == 0

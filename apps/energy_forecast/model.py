@@ -1467,6 +1467,21 @@ class EnergyForecastModel:
         if combined.empty:
             return None
 
+        combined_reset = combined.reset_index().rename(columns={"index": "timestamp"})
+        passive_df = pd.DataFrame(
+            {
+                "timestamp": combined_reset["timestamp"],
+                "T_outdoor": combined_reset["T_outdoor"],
+                "T_indoor": combined_reset["T_indoor"],
+                "hp_running": combined_reset["heating_active"].astype(bool),
+                "dhw_tank_temp": np.nan,  # τ calibration has no DHW filter input today — unchanged behaviour
+            }
+        )
+        passive_idx = _find_passive_windows(passive_df, min_delta_t=0.0, min_hp_off_hours=1)
+        # min_delta_t=0.0/min_hp_off_hours=1 here preserve τ's existing (looser) block semantics —
+        # τ's own per-block ΔT>0 and declining-delta filters below are unchanged and still authoritative.
+        combined = combined.iloc[passive_idx].copy() if len(passive_idx) else combined.iloc[0:0]
+
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
@@ -2334,6 +2349,37 @@ def _add_sub_sensor_lags_prediction(
         future_df[f"{prefix}_runs_7d"] = runs_count
 
     return future_df
+
+
+def _find_passive_windows(
+    df: pd.DataFrame,
+    *,
+    min_delta_t: float = 8.0,
+    min_hp_off_hours: int = 2,
+) -> pd.Index:
+    """Return the index of rows suitable for passive-cooling calibration (τ, UA_eff).
+
+    A row qualifies when: the heat pump has been off for at least
+    ``min_hp_off_hours`` consecutive hours ending at that row, ΔT = T_indoor −
+    T_outdoor ≥ ``min_delta_t``, and ``dhw_tank_temp`` is not rising into that
+    row (rising tank temp indicates an active DHW cycle, which would inflate
+    UA_eff / shorten apparent τ if included).
+    """
+    d = df.sort_values("timestamp").reset_index(drop=True)
+
+    off = (~d["hp_running"].astype(bool)).astype(int)
+    off_run_length = off.groupby((off != off.shift()).cumsum()).cumcount() + 1
+    off_run_length = off_run_length.where(off == 1, 0)
+    enough_off = off_run_length >= min_hp_off_hours
+
+    delta_t = d["T_indoor"] - d["T_outdoor"]
+    enough_delta = delta_t >= min_delta_t
+
+    dhw_rising = d["dhw_tank_temp"].diff() > 0
+    not_dhw_active = ~dhw_rising.fillna(False)
+
+    mask = enough_off & enough_delta & not_dhw_active
+    return d.index[mask]
 
 
 # ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
