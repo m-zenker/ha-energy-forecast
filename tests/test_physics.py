@@ -259,13 +259,15 @@ class TestDHWOde:
         ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
         t_ambient = pd.Series([20.0, 20.0], index=ts)
         # start just below T_lower to force a reheat on hour 0
-        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
         assert q_dhw_el.iloc[0] > 0.0
-        # different tank volume -> different heating_rise -> different resulting series (not hardcoded)
+        # different tank volume -> different heating_rise -> different final tank temp (not hardcoded)
         pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 300})
         pm2._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
-        q_dhw_el2, _ = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
-        assert not q_dhw_el.equals(q_dhw_el2)
+        q_dhw_el2, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        # within 2-hour window, electricity series is identical (same reheat power/COP hour 0, silent hour 1)
+        # but final tank temperature diverges due to different heating_rise values
+        assert final_temp != pytest.approx(final_temp2, abs=0.5)
 
     def test_post_legionella_silence(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
