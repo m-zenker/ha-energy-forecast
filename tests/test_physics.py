@@ -823,6 +823,60 @@ class TestInferDhwSchedule:
         result = pm._infer_dhw_schedule(dhw_df)
         assert result is None
 
+    def test_flat_buffer_temp_no_peaks_logs_warning(self, tmp_path, caplog):
+        """Test that flat buffer_temp (no local peaks) logs WARNING and returns None."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rows = []
+        base = pd.Timestamp("2026-01-01")
+        # Generate 7 days of constant buffer_temp (no local peaks)
+        for day in range(7):
+            for h in range(24):
+                ts = base + pd.Timedelta(days=day, hours=h)
+                rows.append({"timestamp": ts, "buffer_temp": 50.0})
+        dhw_df = pd.DataFrame(rows)
+
+        with caplog.at_level("WARNING"):
+            result = pm._infer_dhw_schedule(dhw_df)
+
+        assert result is None
+        assert "no local peaks found in temperature history" in caplog.text
+
+    def test_peaks_exist_but_no_legionella_boost_logs_warning(self, tmp_path, caplog):
+        """Test that peaks exist but none exceed T_dhw_upper+3.0K logs WARNING and returns None."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rows = []
+        base = pd.Timestamp("2026-01-01")
+        # Generate 4 weeks with peaks all at ~50°C, no legionella boost
+        # This ensures T_dhw_upper will be ~50°C, and no peak will exceed 50 + 3.0 = 53°C
+        for day in range(28):
+            for h in range(24):
+                ts = base + pd.Timedelta(days=day, hours=h)
+                # Create temperature oscillation with peaks all at 50°C
+                if h < 6:
+                    temp = 45.0
+                elif h < 8:
+                    temp = 45.0 + (h - 6) * 2.5  # Ramp to peak at h=8
+                elif h == 8:
+                    temp = 50.0  # Peak 1 at exactly 50°C
+                elif h < 14:
+                    temp = 50.0 - (h - 8) * 0.5  # Cool down
+                elif h == 14:
+                    temp = 50.0  # Peak 2 at exactly 50°C (no boost)
+                elif h < 20:
+                    temp = 50.0 - (h - 14) * 0.5  # Cool down
+                elif h == 20:
+                    temp = 50.0  # Peak 3 at exactly 50°C
+                else:
+                    temp = 50.0 - (h - 20) * 1.5  # Cool down
+                rows.append({"timestamp": ts, "buffer_temp": temp})
+        dhw_df = pd.DataFrame(rows)
+
+        with caplog.at_level("WARNING"):
+            result = pm._infer_dhw_schedule(dhw_df)
+
+        assert result is None
+        assert "no legionella boost peak found" in caplog.text
+
 
 class TestLegionellaStabilityGuard:
     def test_shift_within_2h_is_stable(self, tmp_path):

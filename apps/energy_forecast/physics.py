@@ -650,11 +650,15 @@ class ThermalPhysicsModel:
         is_peak = (d["buffer_temp"] > d["buffer_temp"].shift(1)) & (d["buffer_temp"] > d["buffer_temp"].shift(-1))
         peaks = d[is_peak.fillna(False)]
         if peaks.empty:
+            _LOGGER.warning("DHW schedule inference: no local peaks found in temperature history — skipping")
             return None
 
         t_dhw_upper = float(peaks["buffer_temp"].quantile(0.90))
         legionella_peaks = peaks[peaks["buffer_temp"] > t_dhw_upper + 3.0]
         if legionella_peaks.empty:
+            _LOGGER.warning(
+                "DHW schedule inference: no legionella boost peak found — no peak exceeds threshold — skipping"
+            )
             return None
 
         t_legionella = float(legionella_peaks["buffer_temp"].max())
