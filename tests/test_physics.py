@@ -118,3 +118,27 @@ class TestCOPModel:
         cop = pm._cop_series(ts, t_outdoor=pd.Series([-5.0, -5.0], index=ts), cop_sensor_series=sensor)
         assert cop.iloc[0] == pytest.approx(4.2)
         assert cop.iloc[1] != pytest.approx(4.2)  # falls back to formula
+
+    def test_cop_formula_missing_from_config_uses_default(self, tmp_path):
+        # Regression test: config dict missing cop_formula should not raise KeyError
+        config_without_formula = {
+            "cop_sensor": None,
+            "dhw_tank_temp_sensor": None,
+            "heating_buffer_temp_sensor": None,
+            "heating_curve_sensor": None,
+            # NOTE: cop_formula is intentionally omitted
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+        pm = ThermalPhysicsModel(tmp_path / "models", config_without_formula)
+        # Should not raise KeyError; should return a sane COP value
+        cop_value = pm._cop_formula_value(-5.0, None)
+        assert COP_MIN <= cop_value
+        # Also test via _cop_series
+        ts = pd.date_range("2026-01-15 00:00", periods=1, freq="1h")
+        cop_series = pm._cop_series(ts, t_outdoor=pd.Series([-5.0], index=ts), cop_sensor_series=None)
+        assert cop_series.iloc[0] >= COP_MIN
