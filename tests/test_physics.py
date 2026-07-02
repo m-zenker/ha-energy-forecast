@@ -536,6 +536,23 @@ class TestCalibrateBaseLoad:
         result = pm._calibrate_base_load(energy_df, away_df=None, ev_df=None, holdout_cutoff=pd.Timestamp("2026-07-01"))
         assert result == pytest.approx(0.4, abs=0.01)
 
+    def test_all_nan_gross_kwh_returns_none_regression(self, tmp_path):
+        """Regression test: _calibrate_base_load with all NaN gross_kwh should return None, not NaN.
+
+        Previously, 14+ rows of NaN gross_kwh would pass the length check, and
+        df["gross_kwh"].median() returns NaN, which float(nan) preserves. This would silently
+        poison downstream calibration. After fix: dropna filters out NaN rows before counting,
+        and the result median is checked for finiteness.
+        """
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rows = []
+        for day in pd.date_range("2026-06-01", periods=14, freq="1D"):
+            for hour in range(1, 5):
+                rows.append({"timestamp": day + pd.Timedelta(hours=hour), "gross_kwh": np.nan})
+        energy_df = pd.DataFrame(rows)
+        result = pm._calibrate_base_load(energy_df, away_df=None, ev_df=None, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result is None, f"Expected None for all-NaN data, got {result}"
+
 
 class TestCalibrateDhwDaily:
     def test_recovers_from_summer_daily_mean(self, tmp_path):
@@ -555,3 +572,39 @@ class TestCalibrateDhwDaily:
         )
         result = pm._calibrate_dhw_daily(energy_df, q_base_el=0.4, holdout_cutoff=pd.Timestamp("2026-07-01"))
         assert result is None
+
+    def test_excludes_post_holdout_rows(self, tmp_path):
+        """Holdout-exclusion test: verify post-holdout anomalies don't skew DHW daily calibration.
+
+        Construct 14+ summer days of normal DHW daily consumption (before holdout_cutoff)
+        plus a batch of post-holdout days with wildly inflated values. Verify the result
+        matches what the pre-holdout data alone would produce, i.e. post-holdout anomalies
+        are correctly excluded.
+        """
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        q_base_el = 0.4
+
+        # Pre-holdout: 14 summer days, consistent pattern (base 0.4 kWh/h * 24 + DHW 3.5 = 12.1 kWh/day)
+        ts_pre = pd.date_range("2026-06-01", periods=14 * 24, freq="1h")
+        vals_pre = np.full(len(ts_pre), q_base_el)
+        vals_pre[3::24] += 3.5  # DHW reheat hour 3 each day
+        energy_df_pre = pd.DataFrame({"timestamp": ts_pre, "gross_kwh": vals_pre})
+
+        # Post-holdout: 14 days with wildly inflated values (to verify they are excluded)
+        ts_post = pd.date_range("2026-07-15", periods=14 * 24, freq="1h")
+        vals_post = np.full(len(ts_post), q_base_el * 10)  # 10x normal
+        vals_post[3::24] += 35.0  # DHW scaled 10x
+        energy_df_post = pd.DataFrame({"timestamp": ts_post, "gross_kwh": vals_post})
+
+        # Combine into full dataset
+        energy_df = pd.concat([energy_df_pre, energy_df_post], ignore_index=True)
+
+        # Calibrate with holdout_cutoff that excludes the post-holdout anomaly
+        result = pm._calibrate_dhw_daily(energy_df, q_base_el=q_base_el, holdout_cutoff=pd.Timestamp("2026-07-01"))
+
+        # Expected: daily mean from pre-holdout only: 0.4*24 + 3.5 = 12.1 kWh/day
+        # Q_dhw_daily = daily_mean - 24*q_base_el = 12.1 - 24*0.4 = 12.1 - 9.6 = 2.5 kWh/day
+        expected = 3.5
+        assert result == pytest.approx(expected, rel=0.05), (
+            f"Expected {expected}, got {result} — holdout exclusion may have failed"
+        )

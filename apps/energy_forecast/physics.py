@@ -397,11 +397,18 @@ class ThermalPhysicsModel:
             ev_ts = set(pd.to_datetime(ev_df["timestamp"]).dt.floor("1h"))
             df = df[~df["timestamp"].dt.floor("1h").isin(ev_ts)]
 
+        # Drop rows with NaN gross_kwh before counting usable data
+        df = df.dropna(subset=["gross_kwh"])
+
         n_nights = df["timestamp"].dt.date.nunique()
         if n_nights < 14 or len(df) < 14:
             _LOGGER.warning(f"Q_base_el calibration: only {n_nights} summer nights available (need 14) — skipping")
             return None
-        return float(df["gross_kwh"].median())
+        result = float(df["gross_kwh"].median())
+        if not np.isfinite(result):
+            _LOGGER.warning("Q_base_el calibration: median is NaN/inf — skipping")
+            return None
+        return result
 
     def _calibrate_dhw_daily(
         self, energy_df: pd.DataFrame, q_base_el: float, holdout_cutoff: pd.Timestamp
