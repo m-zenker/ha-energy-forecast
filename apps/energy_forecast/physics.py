@@ -134,3 +134,43 @@ class ThermalPhysicsModel:
     @property
     def is_cold_start_gated(self) -> bool:
         return self._calib.get("n_calibration_windows_ua_eff", 0) < COLD_START_MIN_WINDOWS
+
+    def _t_flow_c(self, t_outdoor_c: float, live_shift_k: float | None) -> float:
+        points = self._config.get("heating_curve_points") or []
+        if not points:
+            return DEFAULT_T_FLOW_C
+        shift = live_shift_k if live_shift_k is not None else 0.0
+        xs = [p[0] for p in points]
+        ys = [p[1] + shift for p in points]
+        return float(np.interp(t_outdoor_c, xs, ys))
+
+    def _cop_formula_value(self, t_outdoor_c: float, live_shift_k: float | None) -> float:
+        formula = self._calib.get("cop_formula") or self._config["cop_formula"]
+        a, b = formula["a"], formula["b"]
+        t_flow_k = self._t_flow_c(t_outdoor_c, live_shift_k) + 273.15
+        t_outdoor_k = t_outdoor_c + 273.15
+        denom = t_flow_k - t_outdoor_k
+        carnot = ETA_CARNOT * t_flow_k / denom if denom > 0 else COP_MIN
+        linear = a + b * t_outdoor_c
+        return max(COP_MIN, min(carnot, linear))
+
+    def _cop_series(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_outdoor: pd.Series,
+        cop_sensor_series: pd.Series | None,
+        live_shift_series: pd.Series | None = None,
+    ) -> pd.Series:
+        formula_vals = np.array(
+            [
+                self._cop_formula_value(
+                    t_o, None if live_shift_series is None else live_shift_series.reindex(timestamps).iloc[i]
+                )
+                for i, t_o in enumerate(t_outdoor.reindex(timestamps).values)
+            ]
+        )
+        result = pd.Series(formula_vals, index=timestamps)
+        if cop_sensor_series is not None:
+            aligned = cop_sensor_series.reindex(timestamps)
+            result = aligned.combine_first(result)
+        return result.clip(lower=COP_MIN)
