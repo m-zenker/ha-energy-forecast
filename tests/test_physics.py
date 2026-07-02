@@ -608,3 +608,86 @@ class TestCalibrateDhwDaily:
         assert result == pytest.approx(expected, rel=0.05), (
             f"Expected {expected}, got {result} — holdout exclusion may have failed"
         )
+
+
+class TestCalibrateUAEff:
+    def _synthetic_winter_data(self, ua_eff_true=150.0, cop=3.0, n_nights=35, with_dhw_sensor=True):
+        rng = np.random.default_rng(1)
+        # build explicit 22:00-06:00 hourly rows per night
+        energy_rows, weather_rows, climate_rows, dhw_rows = [], [], [], []
+        t_indoor = 20.0
+        for night in range(n_nights):
+            base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=night)
+            for h in list(range(22, 24)) + list(range(0, 6)):
+                ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
+                t_outdoor = 0.0 + rng.normal(0, 0.3)
+                delta_t = t_indoor - t_outdoor
+                q_heat_w = ua_eff_true * delta_t
+                q_heat_el = q_heat_w / cop / 1000.0
+                energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
+                climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
+                dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0 if with_dhw_sensor else np.nan})
+        return (
+            pd.DataFrame(energy_rows),
+            pd.DataFrame(weather_rows),
+            {"climate.living_room": pd.DataFrame(climate_rows)},
+            pd.DataFrame(dhw_rows) if with_dhw_sensor else pd.DataFrame(columns=["timestamp", "buffer_temp"]),
+        )
+
+    def test_recovers_ua_eff_within_20_percent(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff is not None
+        assert ua_eff == pytest.approx(150.0, rel=0.20)
+        assert n_windows >= 30
+
+    def test_fewer_than_30_windows_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        # 3 nights x 8 rows/night = 24 rows, all of which pass the passive-window filter in
+        # this synthetic dataset (constant DHW temp, ΔT always well above the 8K gate) -> 24
+        # windows, genuinely below the 30-window cold-start threshold. (n_nights=10 would give
+        # 80 rows, all passing the filter, which would exercise the R² gate instead of the
+        # cold-start gate this test is meant to isolate.)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(n_nights=3)
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff is None
+        assert n_windows < 30
+
+    def test_excludes_post_holdout_rows(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        # holdout_cutoff before all data -> nothing left
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2025-11-01")
+        )
+        assert ua_eff is None
+        assert n_windows == 0
+
+    def test_dhw_sensor_absent_raises_min_delta_t_to_12(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, _ = self._synthetic_winter_data(
+            ua_eff_true=150.0, n_nights=35, with_dhw_sensor=False
+        )
+        empty_dhw = pd.DataFrame(columns=["timestamp", "buffer_temp"])
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, empty_dhw, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        # ΔT = 20K in this synthetic data, comfortably above the raised 12K bar
+        assert ua_eff is not None
+
+    def test_low_r_squared_discards_result(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rng = np.random.default_rng(2)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        # destroy the relationship with pure noise
+        energy_df["gross_kwh"] = rng.uniform(0, 10, size=len(energy_df))
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff is None
