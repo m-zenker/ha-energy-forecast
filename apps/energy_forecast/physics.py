@@ -714,6 +714,28 @@ class ThermalPhysicsModel:
         weather_df: pd.DataFrame,
         room_areas: dict[str, float] | None,
     ) -> pd.Series:
+        """Detect single-hour temperature anomalies consistent with instantaneous window openings.
+
+        Uses a one-step-ahead ODE projection (re-anchored every hour to the previous actual reading,
+        not open-loop) to compute each hour's expected indoor temperature, then flags hours where
+        the residual (actual - expected) deviates significantly from the median by more than 2× MAD.
+
+        LIMITATION: This is a single-hour-shock detector. It does NOT reliably detect gradual or
+        slow multi-hour drift events (e.g., a window left slightly ajar for several hours). Each
+        hour's residual is computed relative to the previous hour's *actual* reading, so a slow
+        drift "forgives" itself each step — the residual never accumulates into a single-hour
+        outlier large enough to clear the median/MAD threshold. Future consumers (e.g., Plan B's
+        training-sample weighting via `open_window_hour` flags) should be aware of this distinction
+        if they need to handle slower anomalous periods differently.
+
+        Args:
+            climate_dfs: Dict mapping room entity IDs to DataFrames with "timestamp" and "current_temp" columns.
+            weather_df: DataFrame with "timestamp" and "temp_c" columns (outdoor temperature).
+            room_areas: Optional dict mapping room entity IDs to area weights; defaults to 20.0 per room.
+
+        Returns:
+            Boolean Series indexed by timestamps, True for hours flagged as anomalous.
+        """
         from .model import _find_passive_windows
 
         if not climate_dfs:
