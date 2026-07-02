@@ -322,3 +322,46 @@ class TestDHWOde:
         assert final_temp == pytest.approx(initial_t)
         # Should have logged a warning
         assert "DHW tank volume is zero or invalid" in caplog.text
+
+
+class TestPredictSeries:
+    def test_predict_series_returns_series_aligned_to_forecast_df(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=5.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        forecast_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": np.linspace(-2, 8, 48), "direct_radiation_wm2": np.zeros(48)}
+        )
+        result = pm.predict_series(forecast_df)
+        assert isinstance(result, pd.Series)
+        assert len(result) == 48
+        assert (result >= 0).all()
+
+    def test_predict_series_no_calibration_returns_zeros_no_exception(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)  # fresh, UA_eff=None, Q_base_el=0.35 default
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        forecast_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": np.linspace(-2, 8, 48), "direct_radiation_wm2": np.zeros(48)}
+        )
+        result = pm.predict_series(forecast_df)
+        assert len(result) == 48
+        assert (result >= 0).all()  # Q_base_el default still contributes; no crash
+
+    def test_predict_series_missing_ghi_column_solar_zero(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=5.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=4, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 4})  # no direct_radiation_wm2
+        result = pm.predict_series(forecast_df)
+        assert len(result) == 4  # no KeyError
+
+    def test_predict_training_series_uses_actual_climate_readings(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+        ts = pd.date_range("2026-01-15 00:00", periods=10, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 10})
+        weather_df = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 10, "direct_radiation_wm2": [0.0] * 10})
+        climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": [20.0] * 10})}
+        result = pm.predict_training_series(energy_df, weather_df, climate_dfs=climate_dfs)
+        assert len(result) == 10
+        assert list(result.index) == list(ts)

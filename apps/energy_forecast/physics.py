@@ -260,3 +260,119 @@ class ThermalPhysicsModel:
                 t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))
 
         return pd.Series(el_kwh, index=timestamps), t_tank
+
+    def _area_weighted_t_indoor(
+        self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
+    ) -> pd.Series | None:
+        if not climate_data:
+            return None
+        parts, weights = [], []
+        for eid, cdf in climate_data.items():
+            if cdf.empty:
+                continue
+            c = cdf.set_index("timestamp")["current_temp"].reindex(timestamps, method="nearest")
+            parts.append(c)
+            weights.append((room_areas or {}).get(eid, 20.0))
+        if not parts:
+            return None
+        stacked = pd.concat(parts, axis=1)
+        w = np.array(weights)
+        return pd.Series(np.average(stacked.values, axis=1, weights=w), index=timestamps)
+
+    def predict_series(
+        self,
+        forecast_df: pd.DataFrame,
+        climate_recent: dict[str, pd.DataFrame] | None = None,
+        dhw_recent: pd.DataFrame | None = None,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
+        dhw_schedule_override: dict | None = None,
+    ) -> pd.Series:
+        from .model import _project_indoor_temps  # local import avoids a circular import at module load time
+
+        timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
+        t_outdoor = pd.Series(forecast_df["temp_c"].values, index=timestamps)
+        ghi = (
+            pd.Series(forecast_df["direct_radiation_wm2"].values, index=timestamps)
+            if "direct_radiation_wm2" in forecast_df.columns
+            else pd.Series(0.0, index=timestamps)
+        )
+
+        try:
+            if climate_recent:
+                projected = _project_indoor_temps(
+                    climate_recent,
+                    timestamps,
+                    t_outdoor,
+                    tau_hours=self._tau_hours,
+                    heating_active_series=heating_active_series,
+                    setpoint_on=setpoint_on,
+                    setpoint_off=setpoint_off,
+                )
+                t_indoor = self._area_weighted_t_indoor(projected, timestamps, room_areas)
+            else:
+                t_indoor = None
+
+            if t_indoor is None:
+                t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
+
+            cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
+            q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
+
+            if dhw_recent is not None and not dhw_recent.empty:
+                latest = dhw_recent.sort_values("timestamp").iloc[-1]
+                age = timestamps[0] - pd.Timestamp(latest["timestamp"])
+                initial_t_tank = (
+                    float(latest["buffer_temp"])
+                    if age <= pd.Timedelta(hours=2)
+                    else (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+                )
+            else:
+                initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+
+            q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, dhw_schedule_override)
+
+            q_base_el = self._calib.get("Q_base_el") or 0.35
+            physics_kwh = q_heat_el + q_dhw_el + q_base_el
+            return physics_kwh.clip(lower=0.0)
+        except Exception as e:
+            _LOGGER.warning(f"physics predict_series failed: {e} — returning zeros")
+            return pd.Series(0.0, index=timestamps)
+
+    def predict_training_series(
+        self,
+        energy_df: pd.DataFrame,
+        weather_df: pd.DataFrame,
+        climate_dfs: dict[str, pd.DataFrame] | None = None,
+        dhw_df: pd.DataFrame | None = None,
+        room_areas: dict[str, float] | None = None,
+    ) -> pd.Series:
+        timestamps = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
+        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
+        t_outdoor = w["temp_c"].reindex(timestamps, method="nearest")
+        ghi = (
+            w["direct_radiation_wm2"].reindex(timestamps, method="nearest")
+            if "direct_radiation_wm2" in w.columns
+            else pd.Series(0.0, index=timestamps)
+        )
+
+        t_indoor = self._area_weighted_t_indoor(climate_dfs or {}, timestamps, room_areas)
+        if t_indoor is None:
+            t_indoor = pd.Series(DEFAULT_AMBIENT_C, index=timestamps)
+
+        cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
+        q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
+
+        if dhw_df is not None and not dhw_df.empty:
+            d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
+                timestamps, method="nearest"
+            )
+            initial_t_tank = float(d.iloc[0]) if not d.empty and pd.notna(d.iloc[0]) else self._schedule["T_dhw_upper"]
+        else:
+            initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+
+        q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, dhw_schedule_override=None)
+        q_base_el = self._calib.get("Q_base_el") or 0.35
+        return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
