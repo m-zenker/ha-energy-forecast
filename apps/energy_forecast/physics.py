@@ -517,3 +517,122 @@ class ThermalPhysicsModel:
 
         ua_eff = slope * 1000.0
         return ua_eff, n_windows
+
+    def _calibrate_solar_gain_area(
+        self,
+        energy_df: pd.DataFrame,
+        weather_df: pd.DataFrame,
+        climate_dfs: dict[str, pd.DataFrame] | None,
+        ua_eff: float | None,
+        holdout_cutoff: pd.Timestamp,
+    ) -> float | None:
+        if ua_eff is None or not climate_dfs:
+            return None
+
+        e = energy_df.copy()
+        e["timestamp"] = pd.to_datetime(e["timestamp"])
+        e = e[e["timestamp"] < holdout_cutoff]
+        e = e[e["timestamp"].dt.month.isin([11, 12, 1, 2])]
+
+        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
+        ghi = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest")
+        e = e[ghi.values > 50]
+        if e.empty:
+            return None
+
+        n_days = e["timestamp"].dt.date.nunique()
+        if n_days < 14:
+            _LOGGER.warning(f"solar_gain_area calibration: only {n_days} sunny winter days (need 14) — skipping")
+            return None
+
+        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas=None)
+        t_outdoor = w["temp_c"].reindex(e["timestamp"], method="nearest").values
+        ghi_sub = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest").values
+        cop = np.array([self._cop_formula_value(t, None) for t in t_outdoor])
+
+        q_loss_w = ua_eff * np.clip((t_indoor.values if t_indoor is not None else 20.0) - t_outdoor, 0, None)
+        # gross_kwh includes standing base load (Q_base_el) — subtract it so q_heat_el_observed*cop*1000
+        # isolates space-heating-delivered watts only, mirroring the identical subtraction in
+        # _calibrate_ua_eff() and _calibrate_dhw_daily(). Verified numerically against this method's own
+        # test fixture (test_recovers_known_ghi_offset, true_area=8.0, Q_base_el=0.35): the regression
+        # slope comes out to 4.63 (42% low, outside the test's rel=0.3 tolerance) when gross_kwh is used
+        # directly, vs 8.05 (0.6% error) once Q_base_el is subtracted — the same class of bias Task 8
+        # found in _calibrate_ua_eff.
+        q_base_el = self._calib.get("Q_base_el") or 0.0
+        q_heat_el_observed = e["gross_kwh"].values - q_base_el
+        # residual = predicted UA-loss minus the heat actually delivered (reconstructed from observed
+        # electrical draw x COP). Physically, delivered heat = q_loss - q_solar (before any demand floor
+        # clipping), so residual = q_loss_w - (q_loss - q_solar) = q_solar = solar_gain_area * ghi — i.e.
+        # residual is POSITIVE and directly proportional to ghi with slope = solar_gain_area.
+        #
+        # NOTE: the brief's literal code set `y = -residual_w`, inverting this sign. That silently
+        # flipped every recovered slope negative, which the trailing `max(0.0, slope)` then clamped to
+        # 0.0 on every call — i.e. solar_gain_area calibration always returned exactly 0 regardless of
+        # any real solar effect. Confirmed numerically: literal code (with the Q_base_el fix applied)
+        # gives slope=-8.05 -> clamped to 0.0 (test asserts ~8.0, fails); removing the negation
+        # (y = residual_w, as below) gives slope=+8.05, matching the fixture's true_area=8.0.
+        residual_w = q_loss_w - q_heat_el_observed * cop * 1000.0
+        x = ghi_sub
+        y = residual_w
+        if np.sum(x**2) < 1e-9:
+            return None
+        slope = float(np.sum(x * y) / np.sum(x**2))
+        return max(0.0, slope)
+
+    def _calibrate_ua_dhw(
+        self,
+        dhw_df: pd.DataFrame,
+        weather_df: pd.DataFrame,
+        heating_active_df: pd.DataFrame,
+        holdout_cutoff: pd.Timestamp,
+    ) -> float | None:
+        if dhw_df is None or dhw_df.empty:
+            return None
+
+        d = dhw_df.copy()
+        d["timestamp"] = pd.to_datetime(d["timestamp"])
+        d = d[d["timestamp"] < holdout_cutoff].sort_values("timestamp").reset_index(drop=True)
+
+        ha = heating_active_df.copy() if heating_active_df is not None else pd.DataFrame()
+        if not ha.empty:
+            ha["timestamp"] = pd.to_datetime(ha["timestamp"])
+            hp_off = (
+                ha.set_index("timestamp")["heating_active"].reindex(d["timestamp"], method="nearest").fillna(0) == 0
+            )
+        else:
+            hp_off = pd.Series(True, index=d.index)
+
+        d["hp_running"] = ~hp_off.values
+        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
+        t_ambient = w["temp_c"].reindex(d["timestamp"], method="nearest").fillna(DEFAULT_AMBIENT_C).values
+
+        # passive decay = tank cooling with no reheat and no rising trend (a draw would also make it fall,
+        # so restrict to windows where the temp decline matches a smooth exponential, i.e. no big single-step drops)
+        #
+        # NOTE: the brief's literal bound was (-1.0, 0.0). That's tighter than this module's own default
+        # UA_dhw=15.0 (see _default_calibration()) actually produces: at deltaT=35K (55C tank / 20C
+        # ambient) and the default 200L tank, dT/dt = -15*35/(200*1.163) = -2.26 K/h, which falls outside
+        # (-1.0, 0.0) and would be filtered out entirely — confirmed via this method's own test fixture
+        # (test_passive_decay_regression_recovers_ua_dhw), where every one of the 11 available decay
+        # samples (diffs ranging -1.16 to -2.26 K/h) was excluded, leaving 0 rows and forcing an early
+        # None return. Widened to (-5.0, 0.0): comfortably covers realistic passive-decay rates (up to
+        # ~5 K/h even for a hotter/larger tank or higher UA) while still well below typical single-hour
+        # draw-event drops (multiple K from cold-water mixing), so it still discriminates decay from draws.
+        d["is_falling_smooth"] = d["buffer_temp"].diff().between(-5.0, 0.0)
+        mask = (~d["hp_running"]) & d["is_falling_smooth"].fillna(False)
+        sub = d[mask]
+        if len(sub) < 6:
+            return None
+
+        delta_t = sub["buffer_temp"].values - t_ambient[sub.index]
+        dT_dt = -sub["buffer_temp"].diff().fillna(0).values  # K lost per hour, positive
+        c_dhw = self._config["dhw_tank_volume_l"] * WATER_SPECIFIC_HEAT_WH_PER_L_K
+        # dT/dt = -UA_dhw * deltaT / C_dhw  ->  UA_dhw = (dT/dt * C_dhw) / deltaT
+        valid = delta_t > 0.5
+        if valid.sum() < 6:
+            return None
+        ua_dhw_samples = (dT_dt[valid] * c_dhw) / delta_t[valid]
+        ua_dhw_samples = ua_dhw_samples[(ua_dhw_samples > 0) & (ua_dhw_samples < 200)]
+        if len(ua_dhw_samples) < 3:
+            return None
+        return float(np.median(ua_dhw_samples))

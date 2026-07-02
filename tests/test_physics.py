@@ -8,6 +8,7 @@ import pytest
 from energy_forecast.model import _find_passive_windows
 from energy_forecast.physics import (
     COP_MIN,
+    WATER_SPECIFIC_HEAT_WH_PER_L_K,
     ThermalPhysicsModel,
     _atomic_write_json,
     _read_json_or_default,
@@ -691,3 +692,83 @@ class TestCalibrateUAEff:
             energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
         )
         assert ua_eff is None
+
+
+class TestCalibrateSolarGainArea:
+    def test_recovers_known_ghi_offset(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rng = np.random.default_rng(3)
+        rows_e, rows_w, rows_c = [], [], []
+        true_area = 8.0
+        ua_eff = 150.0
+        cop = 3.0
+        for day in pd.date_range("2025-12-01", periods=20, freq="1D"):
+            for h in range(10, 15):  # daytime hours
+                ts = day + pd.Timedelta(hours=h)
+                t_outdoor = 2.0
+                ghi = rng.uniform(60, 400)
+                q_loss = ua_eff * (20.0 - t_outdoor)
+                q_solar = true_area * ghi
+                q_heat_el = max(0.0, q_loss - q_solar) / cop / 1000.0
+                rows_e.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                rows_w.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": ghi})
+                rows_c.append({"timestamp": ts, "current_temp": 20.0})
+        energy_df, weather_df = pd.DataFrame(rows_e), pd.DataFrame(rows_w)
+        climate_dfs = {"climate.living_room": pd.DataFrame(rows_c)}
+        result = pm._calibrate_solar_gain_area(
+            energy_df, weather_df, climate_dfs, ua_eff=ua_eff, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert result == pytest.approx(true_area, rel=0.3)
+
+    def test_insufficient_sunny_days_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2025-12-01 12:00", periods=3, freq="1D")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 3})
+        weather_df = pd.DataFrame({"timestamp": ts, "temp_c": [2.0] * 3, "direct_radiation_wm2": [100.0] * 3})
+        climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": [20.0] * 3})}
+        result = pm._calibrate_solar_gain_area(
+            energy_df, weather_df, climate_dfs, ua_eff=150.0, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert result is None
+
+    def test_ua_eff_none_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        result = pm._calibrate_solar_gain_area(
+            pd.DataFrame({"timestamp": [], "gross_kwh": []}),
+            pd.DataFrame({"timestamp": [], "temp_c": [], "direct_radiation_wm2": []}),
+            {},
+            ua_eff=None,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+        )
+        assert result is None
+
+
+class TestCalibrateUADhw:
+    def test_passive_decay_regression_recovers_ua_dhw(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        true_ua_dhw = 15.0
+        c_dhw = 200 * WATER_SPECIFIC_HEAT_WH_PER_L_K
+        ts = pd.date_range("2026-01-15 00:00", periods=12, freq="1h")
+        t_ambient = 20.0
+        t_tank = 55.0
+        rows_dhw, rows_heat = [], []
+        for t in ts:
+            rows_dhw.append({"timestamp": t, "buffer_temp": t_tank})
+            rows_heat.append({"timestamp": t, "heating_active": 0})
+            dT = -true_ua_dhw * (t_tank - t_ambient) / c_dhw
+            t_tank += dT
+        dhw_df = pd.DataFrame(rows_dhw)
+        heating_active_df = pd.DataFrame(rows_heat)
+        weather_df = pd.DataFrame({"timestamp": ts, "temp_c": [t_ambient] * len(ts)})
+        result = pm._calibrate_ua_dhw(dhw_df, weather_df, heating_active_df, holdout_cutoff=pd.Timestamp("2026-06-01"))
+        assert result == pytest.approx(true_ua_dhw, rel=0.25)
+
+    def test_no_dhw_sensor_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        result = pm._calibrate_ua_dhw(
+            pd.DataFrame(columns=["timestamp", "buffer_temp"]),
+            pd.DataFrame(columns=["timestamp", "temp_c"]),
+            pd.DataFrame(columns=["timestamp", "heating_active"]),
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+        )
+        assert result is None
