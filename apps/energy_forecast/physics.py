@@ -196,7 +196,7 @@ class ThermalPhysicsModel:
 
         tau = self._tau_hours or 8.0
         c_building = self._config.get("c_building_wh_k") or (ua * tau)
-        t_indoor_next = t_indoor.shift(-1).bfill()
+        t_indoor_next = t_indoor.shift(-1).fillna(t_indoor)
         q_mass = c_building * (t_indoor_next - t_indoor)
 
         q_heat = (q_loss - q_solar - q_gain_int + q_mass).clip(lower=0.0)

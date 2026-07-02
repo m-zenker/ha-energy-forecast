@@ -212,3 +212,26 @@ class TestSpaceHeating:
         cop = pd.Series([3.0, 3.0], index=ts)
         q_heat_el = pm._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
         assert (q_heat_el == 0.0).all()
+
+    def test_last_row_not_nan_regression(self, tmp_path):
+        """Regression test: last row of _space_heating_kwh should be finite, not NaN.
+
+        Previously, shift(-1).bfill() would leave trailing NaN which propagates
+        through the calculation. This test ensures the fix (using fillna(t_indoor))
+        correctly handles the boundary.
+        """
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=0.0, Q_base_el=0.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=4, freq="1h")
+        t_indoor = pd.Series([20.0, 20.0, 20.0, 20.0], index=ts)
+        t_outdoor = pd.Series([10.0, 10.0, 10.0, 10.0], index=ts)
+        ghi = pd.Series([0.0, 0.0, 0.0, 0.0], index=ts)
+        cop = pd.Series([3.0, 3.0, 3.0, 3.0], index=ts)
+        q_heat_el = pm._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
+
+        # Last row should be finite, not NaN
+        assert np.isfinite(q_heat_el.iloc[-1]), f"Last row is NaN: {q_heat_el.iloc[-1]}"
+        # Last row should be non-negative (clipping ensures this)
+        assert q_heat_el.iloc[-1] >= 0.0
+        # All rows should be finite
+        assert q_heat_el.isna().sum() == 0, f"Found NaN values in result: {q_heat_el}"
