@@ -142,3 +142,73 @@ class TestCOPModel:
         ts = pd.date_range("2026-01-15 00:00", periods=1, freq="1h")
         cop_series = pm._cop_series(ts, t_outdoor=pd.Series([-5.0], index=ts), cop_sensor_series=None)
         assert cop_series.iloc[0] >= COP_MIN
+
+
+class TestSpaceHeating:
+    def test_matches_spec_worked_example(self, tmp_path):
+        # spec §7: UA_eff=150, ΔT=10°C, COP=3.0 -> 0.5 kWh/h (no solar/gains/mass)
+        config = {**DEFAULT_CONFIG, "internal_gains_fraction": 0.0}
+        pm = ThermalPhysicsModel(tmp_path / "models", config)
+        pm._calib["UA_eff"] = 150.0
+        pm._calib["solar_gain_area"] = 0.0
+        pm._calib["Q_base_el"] = 0.0
+        ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
+        t_indoor = pd.Series([20.0, 20.0], index=ts)  # constant -> Q_mass = 0
+        t_outdoor = pd.Series([10.0, 10.0], index=ts)
+        ghi = pd.Series([0.0, 0.0], index=ts)
+        cop = pd.Series([3.0, 3.0], index=ts)
+        q_heat_el = pm._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
+        assert q_heat_el.iloc[0] == pytest.approx(0.5, abs=1e-6)
+
+    def test_solar_offset_reduces_heating_load(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=10.0, Q_base_el=0.0)
+        ts = pd.date_range("2026-01-15 12:00", periods=2, freq="1h")
+        t_indoor = pd.Series([20.0, 20.0], index=ts)
+        t_outdoor = pd.Series([10.0, 10.0], index=ts)
+        cop = pd.Series([3.0, 3.0], index=ts)
+        no_sun = pm._space_heating_kwh(t_indoor, t_outdoor, pd.Series([0.0, 0.0], index=ts), cop)
+        with_sun = pm._space_heating_kwh(t_indoor, t_outdoor, pd.Series([200.0, 200.0], index=ts), cop)
+        assert with_sun.iloc[0] < no_sun.iloc[0]
+
+    def test_internal_gains_reduce_q_heat(self, tmp_path):
+        config = {**DEFAULT_CONFIG, "internal_gains_fraction": 0.8}
+        pm = ThermalPhysicsModel(tmp_path / "models", config)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=0.0, Q_base_el=0.35)
+        ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
+        t_indoor = pd.Series([20.0, 20.0], index=ts)
+        t_outdoor = pd.Series([10.0, 10.0], index=ts)
+        ghi = pd.Series([0.0, 0.0], index=ts)
+        cop = pd.Series([3.0, 3.0], index=ts)
+        with_gains = pm._space_heating_kwh(t_indoor, t_outdoor, ghi, cop).iloc[0]
+        config_no_gains = {**DEFAULT_CONFIG, "internal_gains_fraction": 0.0}
+        pm2 = ThermalPhysicsModel(tmp_path / "models2", config_no_gains)
+        pm2._calib.update(UA_eff=150.0, solar_gain_area=0.0, Q_base_el=0.35)
+        no_gains = pm2._space_heating_kwh(t_indoor, t_outdoor, ghi, cop).iloc[0]
+        assert with_gains < no_gains
+
+    def test_rising_indoor_temp_increases_q_heat_falling_decreases(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=0.0, Q_base_el=0.0)
+        pm._tau_hours = 8.0
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        t_outdoor = pd.Series([10.0] * 3, index=ts)
+        ghi = pd.Series([0.0] * 3, index=ts)
+        cop = pd.Series([3.0] * 3, index=ts)
+
+        rising = pd.Series([19.0, 20.0, 21.0], index=ts)
+        falling = pd.Series([21.0, 20.0, 19.0], index=ts)
+        q_rising = pm._space_heating_kwh(rising, t_outdoor, ghi, cop)
+        q_falling = pm._space_heating_kwh(falling, t_outdoor, ghi, cop)
+        assert q_rising.iloc[0] > q_falling.iloc[0]
+
+    def test_ua_eff_none_skips_heating_component(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib["UA_eff"] = None
+        ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
+        t_indoor = pd.Series([20.0, 20.0], index=ts)
+        t_outdoor = pd.Series([10.0, 10.0], index=ts)
+        ghi = pd.Series([0.0, 0.0], index=ts)
+        cop = pd.Series([3.0, 3.0], index=ts)
+        q_heat_el = pm._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
+        assert (q_heat_el == 0.0).all()

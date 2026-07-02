@@ -174,3 +174,31 @@ class ThermalPhysicsModel:
             aligned = cop_sensor_series.reindex(timestamps)
             result = aligned.combine_first(result)
         return result.clip(lower=COP_MIN)
+
+    def _space_heating_kwh(
+        self,
+        t_indoor: pd.Series,
+        t_outdoor: pd.Series,
+        ghi: pd.Series,
+        cop: pd.Series,
+    ) -> pd.Series:
+        ua = self._calib.get("UA_eff")
+        if ua is None:
+            return pd.Series(0.0, index=t_indoor.index)
+
+        solar_area = self._calib.get("solar_gain_area") or 0.0
+        q_base_el = self._calib.get("Q_base_el") or 0.0
+        gains_fraction = self._config["internal_gains_fraction"]
+
+        q_loss = ua * (t_indoor - t_outdoor).clip(lower=0.0)
+        q_solar = solar_area * ghi.fillna(0.0)
+        q_gain_int = q_base_el * gains_fraction * 1000.0
+
+        tau = self._tau_hours or 8.0
+        c_building = self._config.get("c_building_wh_k") or (ua * tau)
+        t_indoor_next = t_indoor.shift(-1).bfill()
+        q_mass = c_building * (t_indoor_next - t_indoor)
+
+        q_heat = (q_loss - q_solar - q_gain_int + q_mass).clip(lower=0.0)
+        q_heat_el = q_heat / cop.clip(lower=COP_MIN) / 1000.0
+        return q_heat_el
