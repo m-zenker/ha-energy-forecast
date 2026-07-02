@@ -894,3 +894,45 @@ class TestLegionellaStabilityGuard:
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm._schedule.update(legionella_dow=2, legionella_hour=14)
         assert pm._check_legionella_stability(new_dow=3, new_hour=14) is False
+
+
+class TestCalibrateOrchestration:
+    def test_calibrate_writes_both_files_atomically(self, tmp_path):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        rng = np.random.default_rng(4)
+        ts = pd.date_range("2025-06-01", periods=20 * 24, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": 0.4 + rng.normal(0, 0.02, len(ts))})
+        weather_df = pd.DataFrame({"timestamp": ts, "temp_c": 15.0, "direct_radiation_wm2": 100.0})
+        pm.calibrate(energy_df, weather_df, climate_dfs=None, dhw_df=None, holdout_cutoff=pd.Timestamp("2025-07-01"))
+        assert (model_dir / "physics_calibration.json").exists()
+        assert (model_dir / "physics_schedule.json").exists()
+        assert not (model_dir / "physics_calibration.json.tmp").exists()
+
+    def test_calibrate_updates_calibrated_at(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        assert pm._calib["calibrated_at"] is None
+        ts = pd.date_range("2025-06-01", periods=20 * 24, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.4] * len(ts)})
+        weather_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": [15.0] * len(ts), "direct_radiation_wm2": [0.0] * len(ts)}
+        )
+        pm.calibrate(energy_df, weather_df, climate_dfs=None, dhw_df=None, holdout_cutoff=pd.Timestamp("2025-07-01"))
+        assert pm._calib["calibrated_at"] is not None
+        assert pm.calibration_stale is False
+
+    def test_calibrate_persists_n_calibration_windows_ua_eff_across_reload(self, tmp_path):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        pm._calib["n_calibration_windows_ua_eff"] = 35
+        _atomic_write_json(pm._calibration_path, pm._calib)
+        pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        assert pm2._calib["n_calibration_windows_ua_eff"] == 35
+        assert pm2.is_cold_start_gated is False
+
+    def test_calibration_failure_falls_back_to_config_defaults_no_exception(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        empty = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        empty_w = pd.DataFrame(columns=["timestamp", "temp_c", "direct_radiation_wm2"])
+        pm.calibrate(empty, empty_w, climate_dfs=None, dhw_df=None, holdout_cutoff=pd.Timestamp("2025-07-01"))
+        assert pm._calib["Q_base_el"] == 0.35  # unchanged default, no crash

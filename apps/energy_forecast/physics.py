@@ -695,3 +695,54 @@ class ThermalPhysicsModel:
             )
             return False
         return True
+
+    def calibrate(
+        self,
+        energy_df: pd.DataFrame,
+        weather_df: pd.DataFrame,
+        climate_dfs: dict[str, pd.DataFrame] | None,
+        dhw_df: pd.DataFrame | None,
+        holdout_cutoff: pd.Timestamp,
+        heating_active_df: pd.DataFrame | None = None,
+        ev_df: pd.DataFrame | None = None,
+        away_df: pd.DataFrame | None = None,
+    ) -> None:
+        try:
+            q_base_el = self._calibrate_base_load(energy_df, away_df, ev_df, holdout_cutoff)
+            if q_base_el is not None:
+                self._calib["Q_base_el"] = q_base_el
+
+            q_dhw_daily = self._calibrate_dhw_daily(energy_df, self._calib["Q_base_el"], holdout_cutoff)
+            if q_dhw_daily is not None:
+                self._calib["Q_dhw_daily"] = q_dhw_daily
+
+            ua_eff, n_windows = self._calibrate_ua_eff(energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff)
+            self._calib["n_calibration_windows_ua_eff"] = n_windows
+            if ua_eff is not None:
+                self._calib["UA_eff"] = ua_eff
+            else:
+                _LOGGER.warning("UA_eff calibration unavailable — heating component will be skipped")
+
+            solar_area = self._calibrate_solar_gain_area(
+                energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff
+            )
+            if solar_area is not None:
+                self._calib["solar_gain_area"] = solar_area
+
+            ua_dhw = self._calibrate_ua_dhw(dhw_df, weather_df, heating_active_df, holdout_cutoff)
+            if ua_dhw is not None:
+                self._calib["UA_dhw"] = ua_dhw
+
+            self._calib["calibrated_at"] = pd.Timestamp.now().isoformat()
+            _atomic_write_json(self._calibration_path, self._calib)
+
+            if dhw_df is not None and not dhw_df.empty:
+                inferred = self._infer_dhw_schedule(dhw_df)
+                if inferred is not None:
+                    if self._check_legionella_stability(inferred["legionella_dow"], inferred["legionella_hour"]):
+                        self._schedule.update(inferred)
+                    else:
+                        self._schedule.update({k: v for k, v in inferred.items() if not k.startswith("legionella")})
+            _atomic_write_json(self._schedule_path, self._schedule)
+        except Exception as e:
+            _LOGGER.warning(f"Physics calibration failed: {e} — retaining previous/default parameters")
