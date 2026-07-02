@@ -936,3 +936,53 @@ class TestCalibrateOrchestration:
         empty_w = pd.DataFrame(columns=["timestamp", "temp_c", "direct_radiation_wm2"])
         pm.calibrate(empty, empty_w, climate_dfs=None, dhw_df=None, holdout_cutoff=pd.Timestamp("2025-07-01"))
         assert pm._calib["Q_base_el"] == 0.35  # unchanged default, no crash
+
+
+class TestZoneBoundaryAndOpenWindows:
+    def test_zone_boundary_warns_on_thermostat_list_change(self, tmp_path, caplog):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        pm._calib["room_thermostats_at_calibration"] = ["climate.living_room"]
+        with caplog.at_level("WARNING"):
+            pm.check_zone_boundary(["climate.living_room", "climate.bedroom"])
+        assert any("zone boundary" in r.message.lower() or "thermostat" in r.message.lower() for r in caplog.records)
+
+    def test_zone_boundary_silent_when_unchanged(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib["room_thermostats_at_calibration"] = ["climate.living_room"]
+        with caplog.at_level("WARNING"):
+            pm.check_zone_boundary(["climate.living_room"])
+        assert not any("zone boundary" in r.message.lower() for r in caplog.records)
+
+    def test_zone_boundary_silent_when_not_yet_calibrated(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.check_zone_boundary(["climate.living_room"])  # no calibration recorded yet -> no crash, no warning
+
+    def test_open_window_flags_large_residual(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0)
+        pm._tau_hours = 8.0
+        ts = pd.date_range("2026-01-15 00:00", periods=6, freq="1h")
+        weather_df = pd.DataFrame({"timestamp": ts, "temp_c": [0.0] * 6, "direct_radiation_wm2": [0.0] * 6})
+        # room temp crashes at hour 3 (open window) — far from the smooth ODE projection
+        actual_temps = [20.0, 19.9, 19.8, 12.0, 19.5, 19.4]
+        climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": actual_temps})}
+        flags = pm.detect_open_windows(climate_dfs, weather_df, room_areas=None)
+        assert flags.iloc[3] == True  # noqa: E712 — explicit bool comparison reads clearer here
+        assert flags.iloc[0] == False  # noqa: E712
+
+    def test_open_window_threshold_from_passive_windows_only(self, tmp_path):
+        # regression guard: a globally noisy dataset with no genuine open-window event
+        # should not blow the 2-sigma threshold out and flag everything
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0)
+        pm._tau_hours = 8.0
+        rng = np.random.default_rng(5)
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        weather_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": rng.uniform(-5, 5, 48), "direct_radiation_wm2": [0.0] * 48}
+        )
+        actual_temps = 20.0 + rng.normal(0, 0.1, 48)
+        climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": actual_temps})}
+        flags = pm.detect_open_windows(climate_dfs, weather_df, room_areas=None)
+        assert flags.sum() < 5  # not everything flagged

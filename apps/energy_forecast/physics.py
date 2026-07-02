@@ -696,6 +696,94 @@ class ThermalPhysicsModel:
             return False
         return True
 
+    def check_zone_boundary(self, current_thermostat_entities: list[str]) -> None:
+        recorded = self._calib.get("room_thermostats_at_calibration")
+        if not recorded:
+            return
+        if sorted(recorded) != sorted(current_thermostat_entities):
+            _LOGGER.warning(
+                "Zone boundary changed: room_thermostats at calibration time %s differs from current %s — "
+                "UA_eff may no longer be consistent with Q_loss until recalibration",
+                recorded,
+                current_thermostat_entities,
+            )
+
+    def detect_open_windows(
+        self,
+        climate_dfs: dict[str, pd.DataFrame],
+        weather_df: pd.DataFrame,
+        room_areas: dict[str, float] | None,
+    ) -> pd.Series:
+        from .model import _find_passive_windows
+
+        if not climate_dfs:
+            return pd.Series(dtype=bool)
+
+        timestamps = pd.DatetimeIndex(next(iter(climate_dfs.values()))["timestamp"])
+        t_actual = self._area_weighted_t_indoor(climate_dfs, timestamps, room_areas)
+        if t_actual is None:
+            return pd.Series(False, index=timestamps)
+
+        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
+        t_outdoor = w["temp_c"].reindex(timestamps, method="nearest")
+
+        # One-step-ahead ODE projection: each hour's expected temp is derived from the
+        # PREVIOUS hour's actual reading, not compounded forward from the first reading.
+        #
+        # NOTE: the brief's literal code anchored once at t_actual[0] and simulated the
+        # whole window open-loop (t_ode[i] built from t_ode[i-1]). That diverges hard from
+        # reality whenever the room is being actively heated (which this ODE has no notion
+        # of) — e.g. in test_open_window_flags_large_residual, actual indoor holds near 20C
+        # while outdoor sits at 0C; the open-loop projection with tau=8 free-decays toward
+        # 0C (17.5 -> 15.3 -> 13.4 -> ... by hour 3), so residual = actual - projection GROWS
+        # every hour regardless of any anomaly, hitting 7.8-9.1C by hours 4-5 while the actual
+        # open-window drop at hour 3 (-1.4C residual) is comparatively small — the growing
+        # baseline drift masks the real event (confirmed: literal code leaves flags.iloc[3]
+        # False). The same drift-driven bias blows up over 48h in
+        # test_open_window_threshold_from_passive_windows_only (residual pinned near a
+        # persistent multi-degree offset with tiny variance around it), so a plain
+        # `residual.abs() > 2*std` flags 42/48 hours — confirmed via direct run of the
+        # literal code. Re-anchoring every step at the previous actual reading keeps the
+        # residual stationary (bounded drift-free noise around a small constant offset)
+        # instead of an ever-growing open-loop error, so a real single-hour anomaly stands
+        # out from the rest.
+        tau = self._tau_hours or 8.0
+        t_actual_arr = t_actual.values
+        t_out_arr = t_outdoor.values
+        t_ode = np.empty(len(timestamps))
+        t_ode[0] = t_actual_arr[0]
+        for i in range(1, len(timestamps)):
+            t_ode[i] = t_actual_arr[i - 1] + (t_out_arr[i - 1] - t_actual_arr[i - 1]) / tau
+        t_ode_series = pd.Series(t_ode, index=timestamps)
+
+        residual = t_actual - t_ode_series
+
+        passive_df = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "T_outdoor": t_out_arr,
+                "T_indoor": t_actual_arr,
+                "hp_running": False,
+                "dhw_tank_temp": np.nan,
+            }
+        )
+        passive_idx = _find_passive_windows(passive_df, min_delta_t=0.0, min_hp_off_hours=1)
+        sample = residual.iloc[passive_idx] if len(passive_idx) >= 5 else residual
+
+        # Robust (median/MAD) spread rather than mean/std: with a single genuine
+        # open-window event, that hour's residual IS the outlier a mean/std estimate is
+        # not robust to — it inflates the mean and std enough to mask itself, especially
+        # in small samples (confirmed: mean/std centering on this same one-step residual
+        # still leaves flags.iloc[3] False in test_open_window_flags_large_residual).
+        median = float(sample.median()) if len(sample) else 0.0
+        mad = float((sample - median).abs().median()) if len(sample) else 0.0
+        sigma = 1.4826 * mad
+
+        if sigma <= 1e-9:
+            return pd.Series(False, index=timestamps)
+
+        return (residual - median).abs() > 2 * sigma
+
     def calibrate(
         self,
         energy_df: pd.DataFrame,
@@ -732,6 +820,9 @@ class ThermalPhysicsModel:
             ua_dhw = self._calibrate_ua_dhw(dhw_df, weather_df, heating_active_df, holdout_cutoff)
             if ua_dhw is not None:
                 self._calib["UA_dhw"] = ua_dhw
+
+            if climate_dfs:
+                self._calib["room_thermostats_at_calibration"] = sorted(climate_dfs.keys())
 
             self._calib["calibrated_at"] = pd.Timestamp.now().isoformat()
             _atomic_write_json(self._calibration_path, self._calib)
