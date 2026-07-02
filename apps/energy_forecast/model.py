@@ -1467,6 +1467,9 @@ class EnergyForecastModel:
         if combined.empty:
             return None
 
+        combined["off"] = (combined["heating_active"] == 0).astype(int)
+        combined["block"] = (combined["off"].diff().ne(0)).cumsum()
+
         combined_reset = combined.reset_index().rename(columns={"index": "timestamp"})
         passive_df = pd.DataFrame(
             {
@@ -1478,12 +1481,12 @@ class EnergyForecastModel:
             }
         )
         passive_idx = _find_passive_windows(passive_df, min_delta_t=0.0, min_hp_off_hours=1)
-        # min_delta_t=0.0/min_hp_off_hours=1 here preserve τ's existing (looser) block semantics —
-        # τ's own per-block ΔT>0 and declining-delta filters below are unchanged and still authoritative.
+        # block identity is computed above, on the full unfiltered timeline, so block boundaries
+        # reflect true temporal contiguity of on/off transitions. Filtering afterward only removes
+        # individual rows within already-correctly-bounded blocks (harmless with these loose
+        # min_delta_t=0.0/min_hp_off_hours=1 parameters, which add no filtering beyond off==1 given
+        # this input) — it does not merge distinct off-periods into one pseudo-block.
         combined = combined.iloc[passive_idx].copy() if len(passive_idx) else combined.iloc[0:0]
-
-        combined["off"] = (combined["heating_active"] == 0).astype(int)
-        combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
         candidates: list[tuple[float, float, int]] = []  # (tau, quality, hour_start)
 

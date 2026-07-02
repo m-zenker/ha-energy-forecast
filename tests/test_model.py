@@ -3861,6 +3861,91 @@ class TestCalibrateTau:
         assert result is not None, "25-hour declining block should produce a τ estimate"
         assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20, f"Expected τ ≈ {TRUE_TAU}, got {result:.2f}"
 
+    def test_two_separate_off_blocks_not_merged(self, tmp_path):
+        """Two genuinely separate off-periods (nights) with a real on-period gap between
+        them must be calibrated as two independent blocks, not merged into one.
+
+        Regression test for the Task 6 refactor bug where ``_find_passive_windows()``
+        was applied *before* ``off``/``block`` were computed: deleting the intervening
+        "on" rows made ``combined["off"].diff().ne(0)).cumsum()`` see no flip between the
+        two off-periods, merging them into a single pseudo-block. The downstream OLS fit
+        then used ``t = np.arange(len(d))`` — treating the row-adjacency of two distinct
+        nights (separated by a 10-hour heating-on day) as if they were 1-hour-apart
+        samples, which corrupts the τ estimate.
+
+        Construction (no artificial rising-prefix reset trick — deltas are monotonically
+        non-increasing across the night1→night2 seam, so the "declining" sub-sequence
+        filter does NOT accidentally re-split the merged block back apart; this is what
+        makes the bug reproducible here, unlike the existing evening-cooling-window test):
+
+        * Night 1: 8 h heating-off, T_indoor decays from 22 °C toward T_out=5 °C with
+          true τ=6 h (ΔT₀=17 °C), ending at ΔT≈5.29 °C.
+        * Day: 10 h heating-on gap (real elapsed time between the two nights).
+        * Night 2: 8 h heating-off, decays from ΔT₀=3 °C (< night 1's ending ΔT, so the
+          stacked delta sequence stays monotonically declining across the seam) with the
+          same true τ=6 h.
+
+        Hand-verified (see task report) that with block identity computed on the *full*
+        timeline (fixed behaviour), night 1 and night 2 fit as two separate 7-point
+        sub-sequences, each independently recovering τ≈6.0 h exactly. With the buggy
+        pre-Task-6-fix ordering, the two nights collapse into one artificial 15-point
+        declining run, capped at 12 points by the sub-sequence cap, spanning 7 points of
+        night 1 + 5 points of night 2 fit as a single fake exponential — this yields
+        τ≈4.63 h (~23% low), which would fail the tolerance below.
+        """
+        TRUE_TAU = 6.0
+        T_out = 5.0
+
+        j = np.arange(8)
+        night1_delta = 17.0 * np.exp(-j / TRUE_TAU)
+        night2_delta = 3.0 * np.exp(-j / TRUE_TAU)
+        assert night2_delta[0] < night1_delta[-1]  # no jump at the seam — see docstring
+
+        night1_ts = pd.date_range("2024-02-10 22:00", periods=8, freq="1h")
+        day_ts = pd.date_range("2024-02-11 06:00", periods=10, freq="1h")
+        night2_ts = pd.date_range("2024-02-11 16:00", periods=8, freq="1h")
+
+        all_ts = night1_ts.tolist() + day_ts.tolist() + night2_ts.tolist()
+        night1_indoor = (T_out + night1_delta).tolist()
+        # On-period indoor temp: heating-on rows are entirely excluded from τ analysis
+        # (only off==1 rows are grouped), so their exact values are immaterial to the
+        # result — a smooth ramp between the two nights' endpoints is used for realism.
+        day_indoor = np.linspace(T_out + night1_delta[-1], T_out + night2_delta[0], 10).tolist()
+        night2_indoor = (T_out + night2_delta).tolist()
+        all_T_in = night1_indoor + day_indoor + night2_indoor
+        all_heat = [0.0] * 8 + [1.0] * 10 + [0.0] * 8
+
+        ts = pd.DatetimeIndex(all_ts)
+        climate_dfs = {
+            "climate.test": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": all_T_in,
+                    "setpoint": [t + 1.0 for t in all_T_in],
+                }
+            )
+        }
+        heating_df = pd.DataFrame({"timestamp": ts, "heating_active": all_heat})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": [T_out] * len(ts),
+                "precipitation_mm": [0.0] * len(ts),
+                "sunshine_min": [0.0] * len(ts),
+                "wind_kmh": [0.0] * len(ts),
+                "cloud_cover_pct": [100.0] * len(ts),
+                "direct_radiation_wm2": [0.0] * len(ts),
+            }
+        )
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.10, (
+            f"Expected τ ≈ {TRUE_TAU} h (two independently-fit nights), got {result:.2f} h — "
+            "if this is ≈4.6 h, the two off-blocks were incorrectly merged into one."
+        )
+
     def test_thermal_pressure_scaled(self, tmp_path):
         """thermal_pressure is the area-weighted °C delta (no τ-division since v0.10.3)."""
         n = 10
