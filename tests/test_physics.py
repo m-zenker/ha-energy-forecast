@@ -500,3 +500,58 @@ class TestFindPassiveWindows:
         )
         idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
         assert len(idx) == 0
+
+
+class TestCalibrateBaseLoad:
+    def test_recovers_median_within_5_percent(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rng = np.random.default_rng(0)
+        # 30 summer nights, 01-05h, no EV/away, median load 0.4 kWh/h + noise
+        rows = []
+        for day in pd.date_range("2026-06-01", periods=30, freq="1D"):
+            for hour in range(1, 5):
+                rows.append({"timestamp": day + pd.Timedelta(hours=hour), "gross_kwh": 0.4 + rng.normal(0, 0.02)})
+        energy_df = pd.DataFrame(rows)
+        result = pm._calibrate_base_load(energy_df, away_df=None, ev_df=None, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result == pytest.approx(0.4, rel=0.05)
+
+    def test_insufficient_data_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-06-01 01:00", periods=5, freq="1h"), "gross_kwh": [0.4] * 5}
+        )
+        result = pm._calibrate_base_load(energy_df, away_df=None, ev_df=None, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result is None
+
+    def test_excludes_post_holdout_rows(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rows = []
+        for day in pd.date_range("2026-06-01", periods=14, freq="1D"):
+            for hour in range(1, 5):
+                rows.append({"timestamp": day + pd.Timedelta(hours=hour), "gross_kwh": 0.4})
+        for day in pd.date_range("2026-07-15", periods=14, freq="1D"):  # post-holdout, wildly different value
+            for hour in range(1, 5):
+                rows.append({"timestamp": day + pd.Timedelta(hours=hour), "gross_kwh": 99.0})
+        energy_df = pd.DataFrame(rows)
+        result = pm._calibrate_base_load(energy_df, away_df=None, ev_df=None, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result == pytest.approx(0.4, abs=0.01)
+
+
+class TestCalibrateDhwDaily:
+    def test_recovers_from_summer_daily_mean(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-06-01", periods=14 * 24, freq="1h")
+        # base load 0.4 kWh/h all day + 3.5 kWh spread over one DHW hour/day
+        vals = np.full(len(ts), 0.4)
+        vals[3::24] += 3.5  # hour 3 each day gets the DHW reheat
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": vals})
+        result = pm._calibrate_dhw_daily(energy_df, q_base_el=0.4, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result == pytest.approx(3.5, rel=0.05)
+
+    def test_insufficient_data_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-06-01", periods=10, freq="1h"), "gross_kwh": [0.4] * 10}
+        )
+        result = pm._calibrate_dhw_daily(energy_df, q_base_el=0.4, holdout_cutoff=pd.Timestamp("2026-07-01"))
+        assert result is None

@@ -376,3 +376,48 @@ class ThermalPhysicsModel:
         q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, dhw_schedule_override=None)
         q_base_el = self._calib.get("Q_base_el") or 0.35
         return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
+
+    def _calibrate_base_load(
+        self,
+        energy_df: pd.DataFrame,
+        away_df: pd.DataFrame | None,
+        ev_df: pd.DataFrame | None,
+        holdout_cutoff: pd.Timestamp,
+    ) -> float | None:
+        df = energy_df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df[df["timestamp"] < holdout_cutoff]
+        df = df[(df["timestamp"].dt.hour >= 1) & (df["timestamp"].dt.hour < 5)]
+        df = df[df["timestamp"].dt.month.isin([6, 7, 8])]
+
+        if away_df is not None and not away_df.empty:
+            away_ts = set(pd.to_datetime(away_df.loc[away_df["is_away"] > 0, "timestamp"]).dt.floor("1h"))
+            df = df[~df["timestamp"].dt.floor("1h").isin(away_ts)]
+        if ev_df is not None and not ev_df.empty:
+            ev_ts = set(pd.to_datetime(ev_df["timestamp"]).dt.floor("1h"))
+            df = df[~df["timestamp"].dt.floor("1h").isin(ev_ts)]
+
+        n_nights = df["timestamp"].dt.date.nunique()
+        if n_nights < 14 or len(df) < 14:
+            _LOGGER.warning(f"Q_base_el calibration: only {n_nights} summer nights available (need 14) — skipping")
+            return None
+        return float(df["gross_kwh"].median())
+
+    def _calibrate_dhw_daily(
+        self, energy_df: pd.DataFrame, q_base_el: float, holdout_cutoff: pd.Timestamp
+    ) -> float | None:
+        df = energy_df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df[df["timestamp"] < holdout_cutoff]
+        df = df[df["timestamp"].dt.month.isin([6, 7, 8])]
+        if df.empty:
+            _LOGGER.warning("Q_dhw_daily calibration: no summer data available — skipping")
+            return None
+
+        daily = df.set_index("timestamp")["gross_kwh"].resample("1D").sum().dropna()
+        if len(daily) < 14:
+            _LOGGER.warning(f"Q_dhw_daily calibration: only {len(daily)} summer days available (need 14) — skipping")
+            return None
+
+        result = float(daily.mean()) - 24 * q_base_el
+        return max(0.0, result)
