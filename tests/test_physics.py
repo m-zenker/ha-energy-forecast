@@ -772,3 +772,71 @@ class TestCalibrateUADhw:
             holdout_cutoff=pd.Timestamp("2026-06-01"),
         )
         assert result is None
+
+
+class TestInferDhwSchedule:
+    def test_four_synthetic_peaks_wednesday_1400(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        rows = []
+        # Generate 4 weeks of continuous hourly data with oscillating DHW temperature
+        # Tank heats up to peaks at ~08:00 and ~14:00, cools between peaks
+        # Normal peak: ~50°C; Wednesday 14:00 boost: 62°C
+        base = pd.Timestamp("2026-01-07")  # a Wednesday
+        for day in range(28):  # 4 weeks = 28 days
+            for h in range(24):
+                ts = base + pd.Timedelta(days=day, hours=h)
+                dow = ts.dayofweek  # 0=Monday, 2=Wednesday
+                # Temperature pattern: rises to peak during heating, falls during off periods
+                # Morning peak around 08:00, afternoon peak around 14:00
+                if h < 6:
+                    temp = 45.0  # Night: baseline
+                elif h < 8:
+                    temp = 45.0 + (h - 6) * 2.5  # Morning ramp up
+                elif h == 8:
+                    temp = 50.0  # Morning peak
+                elif h < 14:
+                    temp = 50.0 - (h - 8) * 0.5  # Gradual cooling
+                elif h == 14:
+                    # Wednesday gets legionella boost to 62°C; others stay at ~49°C
+                    temp = 62.0 if dow == 2 else 49.0
+                elif h < 18:
+                    temp = 49.0 - (h - 14) * 1.0  # Cooling from afternoon
+                elif h < 20:
+                    temp = 45.0 + (h - 18) * 2.5  # Evening ramp up
+                elif h == 20:
+                    temp = 50.0  # Evening peak
+                else:
+                    temp = 50.0 - (h - 20) * 1.5  # Evening cool-down
+                rows.append({"timestamp": ts, "buffer_temp": temp})
+        dhw_df = pd.DataFrame(rows)
+        result = pm._infer_dhw_schedule(dhw_df)
+        assert result is not None
+        assert result["legionella_dow"] == 2  # Wednesday
+        assert result["legionella_hour"] == 14
+        assert result["T_legionella"] > result["T_dhw_upper"]
+
+    def test_insufficient_data_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        dhw_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-01-01", periods=5, freq="1h"), "buffer_temp": [50.0] * 5}
+        )
+        result = pm._infer_dhw_schedule(dhw_df)
+        assert result is None
+
+
+class TestLegionellaStabilityGuard:
+    def test_shift_within_2h_is_stable(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._schedule.update(legionella_dow=2, legionella_hour=14)
+        assert pm._check_legionella_stability(new_dow=2, new_hour=15) is True
+
+    def test_shift_beyond_2h_suspends_autonomous_learning(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._schedule.update(legionella_dow=2, legionella_hour=14)
+        result = pm._check_legionella_stability(new_dow=2, new_hour=17)
+        assert result is False
+
+    def test_dow_change_treated_as_unstable(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._schedule.update(legionella_dow=2, legionella_hour=14)
+        assert pm._check_legionella_stability(new_dow=3, new_hour=14) is False

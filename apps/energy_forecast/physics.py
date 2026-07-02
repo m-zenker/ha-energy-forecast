@@ -636,3 +636,58 @@ class ThermalPhysicsModel:
         if len(ua_dhw_samples) < 3:
             return None
         return float(np.median(ua_dhw_samples))
+
+    def _infer_dhw_schedule(self, dhw_df: pd.DataFrame) -> dict | None:
+        if dhw_df is None or dhw_df.empty or len(dhw_df) < 7 * 24:
+            _LOGGER.warning("DHW schedule inference: insufficient history (need ≥7 days) — skipping")
+            return None
+
+        d = dhw_df.copy()
+        d["timestamp"] = pd.to_datetime(d["timestamp"])
+        d = d.sort_values("timestamp").reset_index(drop=True)
+
+        # local peaks: value higher than both neighbours
+        is_peak = (d["buffer_temp"] > d["buffer_temp"].shift(1)) & (d["buffer_temp"] > d["buffer_temp"].shift(-1))
+        peaks = d[is_peak.fillna(False)]
+        if peaks.empty:
+            return None
+
+        t_dhw_upper = float(peaks["buffer_temp"].quantile(0.90))
+        legionella_peaks = peaks[peaks["buffer_temp"] > t_dhw_upper + 3.0]
+        if legionella_peaks.empty:
+            return None
+
+        t_legionella = float(legionella_peaks["buffer_temp"].max())
+        legionella_dow = int(legionella_peaks["timestamp"].dt.dayofweek.mode().iloc[0])
+        legionella_hour = int(legionella_peaks["timestamp"].dt.hour.mode().iloc[0])
+
+        # cycle-start local minima -> T_dhw_lower
+        is_trough = (d["buffer_temp"] < d["buffer_temp"].shift(1)) & (d["buffer_temp"] < d["buffer_temp"].shift(-1))
+        troughs = d[is_trough.fillna(False) & (d["buffer_temp"] < t_dhw_upper)]
+        t_dhw_lower = float(troughs["buffer_temp"].quantile(0.5)) if not troughs.empty else t_dhw_upper - 10.0
+
+        return {
+            "T_dhw_upper": t_dhw_upper,
+            "T_legionella": t_legionella,
+            "legionella_dow": legionella_dow,
+            "legionella_hour": legionella_hour,
+            "T_dhw_lower": t_dhw_lower,
+            "dhw_tank_volume_l": self._schedule["dhw_tank_volume_l"],
+        }
+
+    def _check_legionella_stability(self, new_dow: int, new_hour: int) -> bool:
+        old_dow = self._schedule.get("legionella_dow")
+        old_hour = self._schedule.get("legionella_hour")
+        if old_dow is None or old_hour is None:
+            return True
+        if new_dow != old_dow:
+            _LOGGER.warning(
+                f"Legionella timing day-of-week shifted ({old_dow} -> {new_dow}) — suspending autonomous learning"
+            )
+            return False
+        if abs(new_hour - old_hour) > 2:
+            _LOGGER.warning(
+                f"Legionella timing shifted {abs(new_hour - old_hour)}h week-over-week — suspending autonomous learning"
+            )
+            return False
+        return True
