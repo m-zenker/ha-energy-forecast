@@ -365,3 +365,79 @@ class TestPredictSeries:
         result = pm.predict_training_series(energy_df, weather_df, climate_dfs=climate_dfs)
         assert len(result) == 10
         assert list(result.index) == list(ts)
+
+    def test_predict_series_uses_climate_recent_projection_path(self, tmp_path):
+        """Regression: climate_recent path should change results vs. flat fallback."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=5.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+
+        # Future forecast window
+        future_ts = pd.date_range("2026-01-15 12:00", periods=24, freq="1h")
+        forecast_df = pd.DataFrame(
+            {
+                "timestamp": future_ts,
+                "temp_c": np.linspace(8, 12, 24),
+                "direct_radiation_wm2": np.linspace(100, 200, 24),
+            }
+        )
+
+        # Recent history: 3 hours before forecast starts, with realistic indoor temp around 20°C
+        recent_ts = pd.date_range("2026-01-15 09:00", periods=3, freq="1h")
+        climate_recent = {
+            "climate.living_room": pd.DataFrame(
+                {
+                    "timestamp": recent_ts,
+                    "current_temp": [20.5, 20.3, 20.1],
+                    "setpoint": [21.0, 21.0, 21.0],
+                }
+            )
+        }
+
+        # Call predict_series: once with climate_recent, once without
+        result_with_climate = pm.predict_series(
+            forecast_df, climate_recent=climate_recent, room_areas={"climate.living_room": 35.0}
+        )
+        result_without_climate = pm.predict_series(forecast_df, climate_recent=None)
+
+        # Both should be valid Series of correct length
+        assert isinstance(result_with_climate, pd.Series)
+        assert isinstance(result_without_climate, pd.Series)
+        assert len(result_with_climate) == 24
+        assert len(result_without_climate) == 24
+
+        # The critical assertion: results should differ because climate_recent changes t_indoor
+        assert not result_with_climate.equals(result_without_climate), (
+            "climate_recent path produced identical results to fallback; "
+            "_project_indoor_temps may not be called or has no effect"
+        )
+
+    def test_predict_series_exception_fallback_returns_zeros_with_warning(self, tmp_path, monkeypatch, caplog):
+        """Regression: internal exceptions should return all-zero Series and log WARNING."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_eff=150.0, solar_gain_area=5.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+
+        ts = pd.date_range("2026-01-15 00:00", periods=48, freq="1h")
+        forecast_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": np.linspace(-2, 8, 48), "direct_radiation_wm2": np.zeros(48)}
+        )
+
+        # Monkeypatch an internal method to raise an exception
+        def raise_error(*args, **kwargs):
+            raise RuntimeError("Simulated physics calculation failure")
+
+        monkeypatch.setattr(pm, "_space_heating_kwh", raise_error)
+
+        # Capture log output
+        with caplog.at_level("WARNING"):
+            result = pm.predict_series(forecast_df)
+
+        # Assert fallback behavior: all zeros with correct length
+        assert isinstance(result, pd.Series)
+        assert len(result) == 48
+        assert (result == 0.0).all(), "Exception fallback should return all zeros"
+        assert list(result.index) == list(ts), "Result index should match forecast_df timestamps"
+
+        # Assert warning was logged
+        assert "physics predict_series failed" in caplog.text, (
+            f"Expected warning about predict_series failure in log; got: {caplog.text}"
+        )
