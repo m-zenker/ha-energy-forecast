@@ -222,6 +222,9 @@ class ThermalPhysicsModel:
     ) -> tuple[pd.Series, float]:
         volume_l = self._config["dhw_tank_volume_l"]
         c_dhw = volume_l * WATER_SPECIFIC_HEAT_WH_PER_L_K
+        if c_dhw <= 0:
+            _LOGGER.warning("DHW tank volume is zero or invalid — skipping DHW component")
+            return pd.Series(0.0, index=timestamps), float(initial_t_tank)
         q_dhw_power = self._config["dhw_power_w"]
         heating_rise = q_dhw_power / c_dhw  # K/h, derived each call — not a stored constant
 

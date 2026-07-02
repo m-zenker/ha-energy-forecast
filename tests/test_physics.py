@@ -299,3 +299,26 @@ class TestDHWOde:
         t_ambient = pd.Series([50.0, 50.0], index=ts)  # T_ambient == T_tank -> no insulation loss
         q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=None)
         assert np.isfinite(final_temp)
+
+    def test_zero_dhw_tank_volume_skips_dhw_component(self, tmp_path, caplog):
+        """Regression test: zero/invalid dhw_tank_volume_l should not raise ZeroDivisionError.
+
+        Previously, dividing by c_dhw=0 would crash. Now, the method gracefully
+        returns an all-zero series with initial tank temperature preserved.
+        """
+        config_zero_volume = {**DEFAULT_CONFIG, "dhw_tank_volume_l": 0}
+        pm = ThermalPhysicsModel(tmp_path / "models", config_zero_volume)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series([20.0] * 24, index=ts)
+        initial_t = 50.0
+
+        # Should not raise; should return zeros
+        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=initial_t, dhw_schedule_override=None)
+
+        # All electricity should be zero
+        assert (q_dhw_el == 0.0).all(), f"Expected all zeros, got {q_dhw_el.values}"
+        # Tank temperature should remain unchanged (returned as initial)
+        assert final_temp == pytest.approx(initial_t)
+        # Should have logged a warning
+        assert "DHW tank volume is zero or invalid" in caplog.text
