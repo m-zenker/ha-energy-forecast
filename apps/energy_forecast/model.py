@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
 
+    from .physics import ThermalPhysicsModel
+
 from . import clustering
 from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
@@ -319,6 +321,8 @@ class EnergyForecastModel:
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
         regime_count: int = 5,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -379,6 +383,39 @@ class EnergyForecastModel:
             elif heating_active_df is None or heating_active_df.empty:
                 _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
 
+        # ── Physics-ML hybrid: calibration trigger + physics baseline series ──
+        # (Plan B Task 4). Runs before the hourly_weights computation below so
+        # open_window_flags is available to fold into it, and before the
+        # _engineer_features() call further down so physics_kwh_series /
+        # heating_buffer_temp_series can be threaded through.
+        physics_kwh_series = None
+        heating_buffer_temp_series = None
+        open_window_flags = None
+        if physics_model is not None:
+            physics_model.check_zone_boundary(list(climate_dfs.keys()) if climate_dfs else [])
+            if physics_model.calibration_stale:
+                physics_model.calibrate(
+                    energy_df,
+                    weather_df,
+                    climate_dfs,
+                    dhw_df,
+                    holdout_cutoff=energy_df["timestamp"].max()
+                    - pd.Timedelta(days=int(len(energy_df) / 24 * 0.1) or 1),
+                    heating_active_df=heating_active_df,
+                    away_df=away_df,
+                )
+            physics_model._tau_hours = self._tau_hours
+            physics_kwh_series = physics_model.predict_training_series(
+                energy_df, weather_df, climate_dfs=climate_dfs, dhw_df=dhw_df, room_areas=room_areas
+            )
+            if climate_dfs:
+                open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
+
+        if heating_buffer_temp_df is not None and not heating_buffer_temp_df.empty:
+            heating_buffer_temp_series = heating_buffer_temp_df.set_index(
+                pd.to_datetime(heating_buffer_temp_df["timestamp"])
+            )["heating_buffer_temp"]
+
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
@@ -404,6 +441,12 @@ class EnergyForecastModel:
             h_weights = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
             hourly_weights = pd.Series(h_weights, index=energy_df["timestamp"])
             daily_weights = hourly_weights.groupby(energy_df["timestamp"].dt.date).mean()
+
+        # ── Down-weight open-window hours (Plan B Task 4) ───────────────────
+        if open_window_flags is not None and hourly_weights is not None:
+            ow = open_window_flags.reindex(df["timestamp"].values if "timestamp" in df else hourly_weights.index)
+            down_weight = pd.Series(np.where(ow.fillna(False), 0.5, 1.0), index=hourly_weights.index)
+            hourly_weights = hourly_weights * down_weight
 
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes
@@ -487,6 +530,8 @@ class EnergyForecastModel:
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
             heating_active_df=heating_active_df,
+            physics_kwh_series=physics_kwh_series,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
 
         # ── Build feature list from active lags ─────────────────────────────
@@ -509,6 +554,10 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
+        if physics_kwh_series is not None:
+            base_features = [*base_features, "physics_kwh"]
+        if heating_buffer_temp_series is not None:
+            base_features = [*base_features, "heating_buffer_temp"]
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns

@@ -45,7 +45,9 @@ from energy_forecast.model import (
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
 
 
-def _make_trained_model(tmp_path, n: int = 600, timezone: str = "Europe/Zurich") -> tuple:
+def _make_trained_model(
+    tmp_path, n: int = 600, timezone: str = "Europe/Zurich", physics_model=None, outdoor_df=None
+) -> tuple:
     """Return (model, forecast_df) after a full train() call."""
     rng = np.random.default_rng(0)
     ts = pd.date_range("2024-01-01", periods=n, freq="1h")
@@ -67,7 +69,7 @@ def _make_trained_model(tmp_path, n: int = 600, timezone: str = "Europe/Zurich")
         }
     )
     m = EnergyForecastModel(tmp_path, timezone=timezone)
-    m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+    m.train(energy, weather, outdoor_df=outdoor_df, weight_halflife_days=0, physics_model=physics_model)
     # Build a minimal forecast_df covering the next 48h
     future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
     forecast = pd.DataFrame(
@@ -1021,6 +1023,68 @@ class TestCantonalHolidays:
         result = _add_holiday_feature(self._ts_df(["2026-03-15"]), canton="INVALID")
         for col in ("is_public_holiday", "days_to_next_holiday", "days_since_last_holiday"):
             assert col in result.columns
+
+
+# ── Physics-ML hybrid: train() calibration trigger + feature inclusion (Plan B Task 4) ──
+
+
+class TestTrainWithPhysics:
+    def _physics_config(self) -> dict:
+        return {
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+
+    def test_physics_kwh_in_feature_cols_when_physics_model_given(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm)
+        assert "physics_kwh" in model.feature_cols
+
+    def test_physics_kwh_absent_from_feature_cols_when_none(self, tmp_path):
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=None)
+        assert "physics_kwh" not in model.feature_cols
+
+    def test_physics_kwh_in_feature_cols_when_sensor_also_configured(self, tmp_path):
+        """Regression test: physics_kwh must survive into feature_cols even when
+        use_sensor is True (outdoor_df provided), i.e. via the sensor_features path,
+        not just the base_features path."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        outdoor_df = pd.DataFrame({"timestamp": ts, "outdoor_temp_live": np.full(n, 12.0)})
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, outdoor_df=outdoor_df)
+        assert "physics_kwh" in model.feature_cols
+
+    def test_calibrate_called_when_calibration_stale(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        assert pm.calibration_stale is True
+        with patch.object(pm, "calibrate", wraps=pm.calibrate) as mock_calibrate:
+            _make_trained_model(tmp_path / "model", physics_model=pm)
+            mock_calibrate.assert_called_once()
+
+    def test_calibrate_skipped_when_fresh(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel, _atomic_write_json, _default_calibration
+
+        model_dir = tmp_path / "physics_models"
+        model_dir.mkdir(parents=True)
+        fresh_calib = {**_default_calibration(), "calibrated_at": pd.Timestamp.now().isoformat()}
+        _atomic_write_json(model_dir / "physics_calibration.json", fresh_calib)
+        pm = ThermalPhysicsModel(model_dir, self._physics_config())
+        assert pm.calibration_stale is False
+        with patch.object(pm, "calibrate") as mock_calibrate:
+            _make_trained_model(tmp_path / "model", physics_model=pm)
+            mock_calibrate.assert_not_called()
 
 
 # ── Prediction intervals (#13) ────────────────────────────────────────────────
