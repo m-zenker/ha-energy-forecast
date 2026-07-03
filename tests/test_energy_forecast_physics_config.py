@@ -161,6 +161,14 @@ class TestPhysicsSensorFetch:
         assert fetch_generic.call_count == 4  # dhw_tank, heating_buffer, cop, and the one room temp_sensor
         fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection
 
+        # Regression guard: physics.py's ThermalPhysicsModel hard-codes "buffer_temp"
+        # as the column name for the DHW tank dataframe (see _calibrate_ua_dhw() and
+        # _infer_dhw_schedule()). If the fetch call here uses any other column_name,
+        # calibrate() silently no-ops the DHW branch via its blanket except-Exception
+        # handler, with no test failure to catch it — so assert the literal string.
+        dhw_call = next(call for call in fetch_generic.call_args_list if call.args[1] == "sensor.kermi_dhw_buffer_temp")
+        assert dhw_call.kwargs["column_name"] == "buffer_temp"
+
 
 class TestRetrainCallsPhysicsFetch:
     """Task 2 gap fix: _retrain() must call _fetch_physics_sensor_histories() once per cycle."""

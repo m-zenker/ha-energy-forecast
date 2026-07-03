@@ -1049,7 +1049,7 @@ class EnergyForecast(hass.Hass):
             path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
             try:
                 df = ha_data.fetch_generic_sensor_history(
-                    self, entity_id, path, column_name="dhw_tank_temp", timezone=self._timezone
+                    self, entity_id, path, column_name="buffer_temp", timezone=self._timezone
                 )
                 self._physics_dhw_tank_df = _strip_tz(df, self._timezone) if not df.empty else df
             except (OSError, KeyError, ValueError) as exc:
