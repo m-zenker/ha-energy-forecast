@@ -1051,6 +1051,24 @@ class TestTrainWithPhysics:
         model, _ = _make_trained_model(tmp_path / "model", physics_model=None)
         assert "physics_kwh" not in model.feature_cols
 
+    def test_physics_phase1_diagnostic_populated_when_physics_model_given(self, tmp_path):
+        """train() must wire _validate_physics_phase1 when physics_model is not None (Plan B Task 6)."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm)
+        assert model.physics_phase1_diagnostic is not None
+        assert set(model.physics_phase1_diagnostic.keys()) == {
+            "shap_rank",
+            "shap_top5",
+            "ols_slope",
+            "calibration_good",
+        }
+
+    def test_physics_phase1_diagnostic_none_when_no_physics_model(self, tmp_path):
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=None)
+        assert model.physics_phase1_diagnostic is None
+
     def test_physics_kwh_in_feature_cols_when_sensor_also_configured(self, tmp_path):
         """Regression test: physics_kwh must survive into feature_cols even when
         use_sensor is True (outdoor_df provided), i.e. via the sensor_features path,
@@ -5544,3 +5562,81 @@ class TestPhysicsFeatureIntegration:
         weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
         result = _engineer_features(df, weather, outdoor_df=None)
         assert "heating_buffer_temp" not in result.columns
+
+
+def _make_phase1_test_model(tmp_path) -> EnergyForecastModel:
+    """Model with `self.model`/`self.engine`/`feature_cols` fit on exactly
+    ["physics_kwh", "other_feat"] — two columns, matching the shape of the
+    fabricated holdout X used by TestPhase1Validation.
+
+    Needed because `_validate_physics_phase1()` calls
+    `self.model.predict(X, pred_contrib=True)` for the SHAP-rank codepath,
+    and LightGBM's `Booster.predict()` requires the predict-time column
+    count to exactly match the training column count (raises
+    `LightGBMError: number of features ... not the same as ... training
+    data` otherwise — see TestPhase1Validation docstring for how this was
+    discovered). `_make_trained_model()` trains on the full ~30-column
+    `_FEATURES_BASE` set, so it cannot be reused here.
+    """
+    from energy_forecast.model import _build_model, _try_import_lgbm, _try_import_sklearn_gbr
+
+    lgb = _try_import_lgbm()
+    GBR = _try_import_sklearn_gbr()
+    rng = np.random.default_rng(0)
+    n = 50
+    X_train = pd.DataFrame(
+        {
+            "physics_kwh": rng.uniform(0.5, 5.0, size=n),
+            "other_feat": rng.uniform(0.0, 1.0, size=n),
+        }
+    )
+    y_train = X_train["physics_kwh"].to_numpy() + rng.normal(0, 0.05, size=n)
+
+    m = EnergyForecastModel(tmp_path)
+    fitted = _build_model(lgb, GBR, n_estimators=50)
+    fitted.fit(X_train, y_train)
+    m.model = fitted
+    m.engine = "LightGBM" if lgb is not None else "GBR"
+    m.feature_cols = ["physics_kwh", "other_feat"]
+    return m
+
+
+class TestPhase1Validation:
+    """The brief's Step 1 test code trains via `_make_trained_model()` (no
+    `physics_model` arg), which fits a real model on the full ~30-column
+    `_FEATURES_BASE` feature set. Against that model, the brief's fabricated
+    2-column holdout X made `self.model.predict(X, pred_contrib=True)` raise
+    `lightgbm.basic.LightGBMError: The number of features in data (2) is not
+    the same as it was in training data (66)` — confirmed by running the
+    brief's test verbatim before this fix. `_make_phase1_test_model()` (above)
+    replaces `_make_trained_model()` for the two tests that exercise the
+    SHAP-rank codepath, fitting a real model on exactly the 2 columns the
+    fabricated X uses, so `pred_contrib=True` is shape-consistent and
+    meaningful.  `test_physics_kwh_not_in_features_returns_none_rank` doesn't
+    touch the SHAP codepath (physics_kwh absent -> early return), so it's
+    left using `_make_trained_model()` unchanged from the brief.
+    """
+
+    def test_calibration_good_when_top5_and_slope_in_range(self, tmp_path):
+        model = _make_phase1_test_model(tmp_path / "model")
+        X = pd.DataFrame({"physics_kwh": [1.0, 2.0, 3.0], "other_feat": [0.1, 0.2, 0.3]})
+        y_gross = np.array([1.05, 2.1, 2.9])  # slope ~1.0, physics_kwh tracks gross_kwh closely
+        physics_vals = np.array([1.0, 2.0, 3.0])
+        result = model._validate_physics_phase1(X, y_gross, physics_vals)
+        assert result["ols_slope"] == pytest.approx(1.0, rel=0.1)
+        assert result["calibration_good"] is True
+
+    def test_calibration_bad_when_slope_out_of_range(self, tmp_path):
+        model = _make_phase1_test_model(tmp_path / "model")
+        X = pd.DataFrame({"physics_kwh": [1.0, 2.0, 3.0], "other_feat": [0.1, 0.2, 0.3]})
+        y_gross = np.array([3.0, 6.0, 9.0])  # slope 3.0, badly miscalibrated
+        physics_vals = np.array([1.0, 2.0, 3.0])
+        result = model._validate_physics_phase1(X, y_gross, physics_vals)
+        assert result["calibration_good"] is False
+
+    def test_physics_kwh_not_in_features_returns_none_rank(self, tmp_path):
+        model, _ = _make_trained_model(tmp_path / "model")
+        X = pd.DataFrame({"other_feat": [0.1, 0.2, 0.3]})
+        result = model._validate_physics_phase1(X, np.array([1.0, 2.0, 3.0]), None)
+        assert result["shap_rank"] is None
+        assert result["calibration_good"] is False

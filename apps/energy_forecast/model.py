@@ -771,6 +771,19 @@ class EnergyForecastModel:
             mae_str,
         )
 
+        # ── Phase 1 physics validation diagnostic (Plan B Task 6) ────────────
+        # Read-only: reports whether physics_kwh is a top-5 SHAP feature and
+        # well-calibrated (OLS slope ~1.0) against gross_kwh on the same
+        # holdout split used for holdout_mae above. Never flips config —
+        # `self.model`/`self.engine` are already assigned above so the SHAP
+        # codepath in _validate_physics_phase1 sees the freshly trained model.
+        self.physics_phase1_diagnostic: dict | None = None
+        if physics_model is not None and "physics_kwh" in feature_cols and holdout_mae is not None:
+            X_ho = X.iloc[split:]
+            y_ho_gross = y[split:]  # gross_kwh, not log-transformed
+            physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else None
+            self.physics_phase1_diagnostic = self._validate_physics_phase1(X_ho, y_ho_gross, physics_ho)
+
         # ── Quantile models for prediction intervals (CQR) ───────────────────
         # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
         # split-conformal calibration. Random split (not tail) is required so
@@ -1217,6 +1230,58 @@ class EnergyForecastModel:
             room_areas=room_areas,
         )
         return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
+
+    def _validate_physics_phase1(
+        self, X_holdout: pd.DataFrame, y_holdout_gross: np.ndarray, physics_kwh_holdout: np.ndarray | None
+    ) -> dict:
+        """Phase 1 read-only diagnostic: is `physics_kwh` a top-5 SHAP feature, well-calibrated (slope ~1.0)?
+
+        Reports whether the physics baseline is (a) among the model's top-5 most
+        important features by mean absolute SHAP contribution, and (b) linearly
+        calibrated against gross_kwh (OLS slope through the origin in [0.8, 1.2]).
+        Purely diagnostic — never flips ``use_physics_residual``. That remains a
+        manual operator decision (spec §2.1) once Phase 2 is planned.
+
+        Never raises: any missing precondition (no physics_kwh column, no
+        physics values, untrained model) yields the safe all-``None``/``False``
+        default dict.
+        """
+        import numpy as np
+        import pandas as pd
+
+        result = {"shap_rank": None, "shap_top5": False, "ols_slope": None, "calibration_good": False}
+        if "physics_kwh" not in X_holdout.columns or physics_kwh_holdout is None or self.model is None:
+            return result
+
+        if self.engine == "LightGBM":
+            contrib = self.model.predict(X_holdout, pred_contrib=True)
+            mean_abs = np.abs(contrib[:, :-1]).mean(axis=0)
+            ranked = pd.Series(mean_abs, index=X_holdout.columns).sort_values(ascending=False)
+            rank = int(ranked.index.get_loc("physics_kwh")) + 1  # 1-indexed
+            result["shap_rank"] = rank
+            result["shap_top5"] = rank <= 5
+
+        x = np.asarray(physics_kwh_holdout, dtype=float)
+        y = np.asarray(y_holdout_gross, dtype=float)
+        if np.sum(x**2) > 1e-9:
+            slope = float(np.sum(x * y) / np.sum(x**2))
+            result["ols_slope"] = slope
+            result["calibration_good"] = result["shap_top5"] and (0.8 <= slope <= 1.2)
+
+        if result["calibration_good"]:
+            _LOGGER.info(
+                "Phase 1 physics validation: PASS (shap_rank=%s, ols_slope=%.2f) — "
+                "physics signal is well-calibrated and predictive",
+                result["shap_rank"],
+                result["ols_slope"],
+            )
+        else:
+            _LOGGER.info(
+                "Phase 1 physics validation: not yet ready for Phase 2 (shap_rank=%s, ols_slope=%s)",
+                result["shap_rank"],
+                result["ols_slope"],
+            )
+        return result
 
     def shap_summary(
         self,
