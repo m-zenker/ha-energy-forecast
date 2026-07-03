@@ -160,3 +160,69 @@ class TestPhysicsSensorFetch:
         app._fetch_physics_sensor_histories()
         assert fetch_generic.call_count == 4  # dhw_tank, heating_buffer, cop, and the one room temp_sensor
         fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection
+
+
+class TestRetrainCallsPhysicsFetch:
+    """Task 2 gap fix: _retrain() must call _fetch_physics_sensor_histories() once per cycle."""
+
+    def _patch_retrain_deps(self, monkeypatch):
+        import pandas as pd
+        from energy_forecast import ha_data as ha_data_mod
+        from energy_forecast import weather as weather_mod
+
+        energy_df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2000, freq="1h"),
+                "gross_kwh": [1.0] * 2000,
+            }
+        )
+        empty_df = pd.DataFrame(columns=["timestamp"])
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(
+            ha_data_mod,
+            "split_ev_charging",
+            lambda df, *a, **kw: (df, pd.DataFrame(columns=["timestamp", "gross_kwh"])),
+        )
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+
+    def test_retrain_calls_fetch_physics_sensor_histories_when_physics_enabled(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_retrain_deps(monkeypatch)
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        assert app._physics_model is not None
+
+        app._ml_model = MagicMock()  # avoid a real training cycle
+        app._fetch_physics_sensor_histories = MagicMock()
+        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
+
+        app._retrain()
+
+        app._fetch_physics_sensor_histories.assert_called_once()
+
+    def test_retrain_skips_physics_fetch_when_no_physics_model(self, monkeypatch):
+        """Sanity check: the real (unmocked) _fetch_physics_sensor_histories() is a no-op
+        when physics is disabled, so calling it unconditionally from _retrain() is safe."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_retrain_deps(monkeypatch)
+
+        app = _make_app({"energy_sensor": "sensor.grid_import"})  # no physics: block
+        app.initialize()
+        assert app._physics_model is None
+
+        app._ml_model = MagicMock()
+        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
+
+        app._retrain()  # must not raise
+
+        assert app._physics_dhw_tank_df is None
+        assert app._physics_heating_buffer_df is None
+        assert app._physics_cop_df is None
+        assert app._room_thermostat_temp_dfs == {}

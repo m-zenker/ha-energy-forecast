@@ -1316,6 +1316,9 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
 
+        # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
+        self._fetch_physics_sensor_histories()
+
         self._ml_model.train(
             baseline_df,
             weather_df,
