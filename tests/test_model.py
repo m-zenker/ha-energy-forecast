@@ -1161,6 +1161,68 @@ class TestPredictWithPhysics:
         assert not result.empty
         assert "physics_kwh" not in model.feature_cols
 
+    def test_heating_buffer_temp_filled_with_zero_when_sensor_unavailable_at_predict_time(self, tmp_path, caplog):
+        """Mirrors test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time:
+        a model trained WITH heating_buffer_temp_df (so heating_buffer_temp lands in
+        feature_cols) must not raise KeyError when predicting WITHOUT
+        heating_buffer_temp_recent (sensor outage, config change, or predict_scenario()
+        which never supplies this series at all)."""
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        heating_buffer_temp_df = pd.DataFrame(
+            {"timestamp": ts, "heating_buffer_temp": 45.0 + rng.uniform(-2, 2, size=n)}
+        )
+
+        model = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        model.train(
+            energy,
+            weather,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            heating_buffer_temp_df=heating_buffer_temp_df,
+        )
+        assert "heating_buffer_temp" in model.feature_cols
+
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        forecast_df = pd.DataFrame(
+            {
+                "timestamp": future_ts,
+                "temp_c": [10.0] * 48,
+                "precipitation_mm": [0.0] * 48,
+                "sunshine_min": [30.0] * 48,
+                "wind_kmh": [10.0] * 48,
+                "cloud_cover_pct": [50.0] * 48,
+                "direct_radiation_wm2": [100.0] * 48,
+            }
+        )
+
+        # simulate sensor unavailable at predict time (heating_buffer_temp_recent defaults to None)
+        with caplog.at_level("WARNING"):
+            result = model.predict(forecast_df, live_temp=5.0)
+        assert not result.empty  # no exception / no KeyError
+
+        assert any("heating_buffer_temp" in rec.message.lower() and "0.0" in rec.message for rec in caplog.records), (
+            f"expected a heating_buffer_temp fallback WARNING, got: {[r.message for r in caplog.records]}"
+        )
+
+        # Verify the actual feature matrix used for prediction has heating_buffer_temp == 0.0
+        _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=None)
+        assert "heating_buffer_temp" in X.columns
+        assert (X["heating_buffer_temp"] == 0.0).all()
+
 
 # ── Prediction intervals (#13) ────────────────────────────────────────────────
 

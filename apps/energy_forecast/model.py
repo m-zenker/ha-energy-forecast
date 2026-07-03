@@ -954,6 +954,17 @@ class EnergyForecastModel:
                 "physics_kwh in trained feature list but physics_model disabled at predict time — filling with 0.0"
             )
 
+        # Same portability guarantee for heating_buffer_temp: a saved model may have
+        # heating_buffer_temp in feature_cols (trained with a buffer-temp sensor available)
+        # while heating_buffer_temp_recent is None/empty at predict time (sensor outage,
+        # config change, or predict_scenario() which never supplies it). Fill with 0.0
+        # rather than raising KeyError when feat_df[self.feature_cols] is sliced below.
+        if "heating_buffer_temp" in self.feature_cols and "heating_buffer_temp" not in feat_df.columns:
+            feat_df["heating_buffer_temp"] = 0.0
+            _LOGGER.warning(
+                "heating_buffer_temp in trained feature list but sensor unavailable at predict time — filling with 0.0"
+            )
+
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
             try:
