@@ -1087,6 +1087,47 @@ class TestTrainWithPhysics:
             mock_calibrate.assert_not_called()
 
 
+# ── Physics-ML hybrid: predict() physics feature + portability fallback (Plan B Task 5) ──
+
+
+class TestPredictWithPhysics:
+    def _physics_config(self) -> dict:
+        return {
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+
+    def test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        assert "physics_kwh" in model.feature_cols
+
+        # simulate physics disabled at predict time (sensor outage / config change)
+        result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
+        assert not result.empty  # no exception
+
+    def test_physics_kwh_computed_when_model_present_at_predict_time(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        assert not result.empty
+
+    def test_predict_without_physics_ever_trained_unaffected(self, tmp_path):
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=None)
+        result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
+        assert not result.empty
+        assert "physics_kwh" not in model.feature_cols
+
+
 # ── Prediction intervals (#13) ────────────────────────────────────────────────
 
 

@@ -821,6 +821,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame
+        | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -889,6 +892,29 @@ class EnergyForecastModel:
         else:
             _extended = forecast_df
 
+        # ── Physics-ML hybrid: physics baseline series at prediction time ────
+        # (Plan B Task 5). Uses the raw climate_recent (not climate_dfs_for_features,
+        # which is the RC-ODE-projected version built for _engineer_features()'s own
+        # climate feature) — predict_series() does its own internal projection.
+        physics_kwh_series = None
+        if physics_model is not None:
+            physics_kwh_series = physics_model.predict_series(
+                forecast_df,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
+
+        heating_buffer_temp_series = None
+        if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
+            # hold the most recent reading flat across the forecast horizon — same "recent" pattern
+            # used for dhw_recent/climate_recent elsewhere in this method
+            latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
+            heating_buffer_temp_series = pd.Series(latest_val, index=pd.DatetimeIndex(forecast_df["timestamp"]))
+
         feat_df = _engineer_features(
             future_df,
             _extended,
@@ -900,7 +926,20 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
+            physics_kwh_series=physics_kwh_series,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
+
+        # ── Model-artifact portability fallback ──────────────────────────────
+        # A saved model may have physics_kwh in feature_cols (trained with physics
+        # enabled) while physics_model is None at predict time (sensor outage,
+        # config change disabling physics). Fill with 0.0 rather than raising
+        # KeyError when feat_df[self.feature_cols] is sliced below.
+        if "physics_kwh" in self.feature_cols and "physics_kwh" not in feat_df.columns:
+            feat_df["physics_kwh"] = 0.0
+            _LOGGER.warning(
+                "physics_kwh in trained feature list but physics_model disabled at predict time — filling with 0.0"
+            )
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -1036,6 +1075,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
@@ -1061,6 +1102,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         if "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
