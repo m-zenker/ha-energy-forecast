@@ -36,6 +36,7 @@ from . import __version__, ha_data, weather
 from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME, UNIT_TO_KWH
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
+from .physics import ThermalPhysicsModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
 # Using logging.getLogger() here would produce an "AppDaemon" category in HA logs
@@ -254,6 +255,50 @@ class EnergyForecast(hass.Hass):
         self._heating_temp_off: float = float(self.args.get("heating_temp_off", 18.0))
         self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
+
+        # ── Physics model config (physics-ml-hybrid) ──────────────────────────
+        physics_raw = self.args.get("physics") or {}
+        if not isinstance(physics_raw, dict):
+            _LOGGER.warning("physics: config block must be a dict — ignoring")
+            physics_raw = {}
+
+        default_physics_config = {
+            "cop_sensor": None,
+            "dhw_tank_temp_sensor": None,
+            "heating_buffer_temp_sensor": None,
+            "heating_curve_sensor": None,
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+        self._physics_config: dict = {**default_physics_config, **physics_raw}
+
+        room_therm_raw = self._physics_config.get("room_thermostats") or []
+        self._room_thermostats: list[dict] = []
+        for item in room_therm_raw:
+            if not isinstance(item, dict) or "climate_entity" not in item or "temp_sensor" not in item:
+                _LOGGER.warning(
+                    f"room_thermostats: skipping invalid entry {item!r} — needs climate_entity and temp_sensor"
+                )
+                continue
+            self._room_thermostats.append(
+                {
+                    "climate_entity": str(item["climate_entity"]),
+                    "temp_sensor": str(item["temp_sensor"]),
+                    "area_m2": float(item.get("area_m2", 20.0)),
+                }
+            )
+        self._physics_config["room_thermostats"] = self._room_thermostats
+
+        physics_enabled = "physics" in self.args  # any physics: block present, even empty dict, enables the model
+        self._physics_model: ThermalPhysicsModel | None = None
+        if physics_enabled:
+            physics_model_dir = Path(__file__).parent / "models"
+            self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
