@@ -4,6 +4,32 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_loggers():
+    """Prevent EnergyForecast.initialize() from leaking a MagicMock _LOGGER.
+
+    initialize() reassigns the module-level `_LOGGER` global in
+    energy_forecast, ha_data, model, and weather to `self.logger` (intentional
+    production wiring for AppDaemon's per-app logger). Since these tests bind
+    and call the real initialize() against a MagicMock app, that permanently
+    overwrites those globals with a MagicMock for the rest of the pytest
+    process, breaking caplog-based assertions in other test modules. Snapshot
+    and restore the real loggers around every test in this file.
+    """
+    from energy_forecast import energy_forecast as ef_module
+    from energy_forecast import ha_data, model, weather
+
+    modules = (ef_module, ha_data, model, weather)
+    original_loggers = [m._LOGGER for m in modules]
+    try:
+        yield
+    finally:
+        for m, logger in zip(modules, original_loggers):
+            m._LOGGER = logger
+
 
 def _make_app(args: dict):
     """Build a minimal fake EnergyForecast instance for initialize() testing."""
