@@ -2480,6 +2480,8 @@ def _engineer_features(
     room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+    physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
+    heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
     import numpy as np
     import pandas as pd
@@ -2818,6 +2820,25 @@ def _engineer_features(
     if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
         delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
         df["regime_kwh"] *= 1.0 - (delta_168h / 8.0).clip(upper=1.0)
+
+    # ── Physics baseline (optional) ──────────────────────────────────────────
+    if physics_kwh_series is not None:
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(physics_kwh_series.to_frame("physics_kwh"), left_on="_ts_floor", right_index=True, how="left")
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["physics_kwh"] = df["physics_kwh"].fillna(0.0)
+
+    # ── Heating buffer temp (optional direct sensor feature) ──────────────────
+    if heating_buffer_temp_series is not None:
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(
+            heating_buffer_temp_series.to_frame("heating_buffer_temp"),
+            left_on="_ts_floor",
+            right_index=True,
+            how="left",
+        )
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["heating_buffer_temp"] = df["heating_buffer_temp"].ffill().fillna(df["heating_buffer_temp"].median())
 
     return df
 

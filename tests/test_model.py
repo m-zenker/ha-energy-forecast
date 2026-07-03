@@ -5390,3 +5390,36 @@ class TestStripPartialLastDay:
     def test_empty_df_returns_empty(self):
         df = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns]"), "gross_kwh": pd.Series(dtype=float)})
         assert _strip_partial_last_day(df).empty
+
+
+class TestPhysicsFeatureIntegration:
+    def test_physics_kwh_present_when_series_given(self):
+        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
+        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
+        physics_series = pd.Series([0.5] * 5, index=ts.floor("1h"))
+        result = _engineer_features(df, weather, outdoor_df=None, physics_kwh_series=physics_series)
+        assert "physics_kwh" in result.columns
+        assert result["physics_kwh"].iloc[0] == pytest.approx(0.5)
+
+    def test_physics_kwh_absent_not_zero_filled_when_none(self):
+        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
+        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
+        result = _engineer_features(df, weather, outdoor_df=None, physics_kwh_series=None)
+        assert "physics_kwh" not in result.columns
+
+    def test_heating_buffer_temp_present_when_series_given(self):
+        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
+        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
+        buffer_series = pd.Series([42.0] * 5, index=ts.floor("1h"))
+        result = _engineer_features(df, weather, outdoor_df=None, heating_buffer_temp_series=buffer_series)
+        assert "heating_buffer_temp" in result.columns
+
+    def test_heating_buffer_temp_absent_when_none(self):
+        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
+        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
+        result = _engineer_features(df, weather, outdoor_df=None)
+        assert "heating_buffer_temp" not in result.columns
