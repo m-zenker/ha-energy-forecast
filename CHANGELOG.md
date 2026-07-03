@@ -8,6 +8,76 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.8] — 2026-07-03
+
+Physics-ML Hybrid Phase 1: wires the thermal physics model (from the `feat/physics-core-engine`
+branch) into the LightGBM training and prediction pipeline as optional additive features. The
+`physics:` config block is the sole enablement gate — omitting it leaves behaviour byte-identical
+to v0.11.7.
+
+### Added
+- `apps/energy_forecast/energy_forecast.py` — New optional `physics:` block in `apps.yaml`.
+  When present (even as an empty `physics: {}`), the app instantiates the thermal physics model and
+  fetches sensor histories for COP, DHW tank temperature, heating buffer temperature, and configured
+  room thermostats before each retrain. Supported sub-keys: `cop_sensor`, `dhw_tank_temp_sensor`,
+  `heating_buffer_temp_sensor`, `heating_curve_sensor`, `cop_formula`, `dhw_tank_volume_l`, `dhw_power_w`,
+  `internal_gains_fraction`, `heating_curve_points`, `room_thermostats`, `use_physics_residual`.
+  Absent the block, no code paths change.
+- `apps/energy_forecast/energy_forecast.py` — New AppDaemon service
+  `energy_forecast/recalibrate_physics`. Call it from **Developer Tools → Services** to trigger
+  physics model recalibration on demand without waiting for the next scheduled weekly retrain.
+  Logs a WARNING if `physics:` is not configured.
+- `apps/energy_forecast/model.py` — Two new LightGBM features added to the trained feature set when
+  physics is configured and sensor data is available: `physics_kwh` (physics-model estimate of
+  heating energy in kWh for that training hour) and `heating_buffer_temp` (°C). These are never
+  constant-zero filler columns — they are omitted entirely when the underlying data is absent.
+  LightGBM still trains on `gross_kwh` (log1p-transformed) unchanged; this is a purely additive
+  input feature, not a target or architecture change.
+- `apps/energy_forecast/model.py` — `train()` now triggers physics model calibration automatically
+  when its stored calibration is stale, using a holdout cutoff consistent with the existing MAE
+  holdout. Training hours flagged as single-hour open-window shocks (by the physics model's
+  open-window detector, when climate sensors are configured) are down-weighted to 0.5× their normal
+  exponential sample weight.
+- `apps/energy_forecast/model.py` — Phase 1 physics validation diagnostic
+  (`physics_phase1_diagnostic`). After each retrain with physics enabled, logs whether `physics_kwh`
+  ranks in the SHAP top-5 features and whether a through-origin OLS slope of `physics_kwh` against
+  actual `gross_kwh` falls in the well-calibrated range 0.8–1.2. Purely informational — does not change any behaviour;
+  used to assess readiness for a future Phase 2 (residual-target training, a separate not-yet-built
+  plan).
+- `apps/energy_forecast/model.py` — Model-artifact portability for `physics_kwh` and
+  `heating_buffer_temp`. If a saved model artifact contains these features but physics is disabled
+  or a sensor is unavailable at prediction time, the missing columns are filled with `0.0` and a
+  WARNING is logged. Applies to `predict()`, `predict_intervals()`, and `shap_summary()` via the
+  shared `_prepare_prediction_X()` path — prediction never crashes on a physics-trained artifact.
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — DHW tank physics sensor history was fetched under the wrong
+  column name, causing a `KeyError` when the physics model attempted to read buffer temperature from
+  the returned DataFrame. Fixed the internal column label to `buffer_temp`.
+- `apps/energy_forecast/model.py` — `heating_buffer_temp` was missing its portability fallback,
+  unlike `physics_kwh` which already had one. A saved model trained with `heating_buffer_temp` would
+  crash `predict()` if the sensor was later removed from config. Fixed to apply the same 0.0-fill +
+  WARNING path.
+- `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` was never
+  actually called from `_retrain()`, so physics sensor data (DHW tank, heating buffer, COP, room
+  thermostats) was never populated during any real training cycle regardless of config — only
+  exercised in isolation by its own unit tests. Wired the call into `_retrain()` before
+  `train()` is invoked.
+
+### Notes
+- `use_physics_residual: true` in the `physics:` block is accepted but held at Phase 1: a
+  cold-start-gate check (`_effective_use_physics_residual()`) exists and logs a WARNING when the
+  gate isn't satisfied, but nothing in Phase 1 calls it yet — activating Phase 2 (residual-target
+  training) and wiring this gate into the training loop is a separate future plan.
+- `predict_scenario()` / the `energy_forecast/get_scenario` service logs one WARNING per call when
+  physics is configured, because it does not supply live physics sensor data — both `physics_kwh`
+  and `heating_buffer_temp` fall back to 0.0 each time. This is a documented Phase 1 limitation.
+
+### Tests
+- 766 passing (up from 649 in v0.11.7; +117 new tests covering physics config ingest, sensor fetch,
+  feature threading, train/predict wiring, portability fallbacks, open-window down-weighting,
+  validation diagnostic, and the recalibrate service).
+
 ## [0.11.7] - 2026-06-30
 
 ### Added
