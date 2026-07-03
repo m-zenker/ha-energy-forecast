@@ -1104,6 +1104,79 @@ class TestTrainWithPhysics:
             _make_trained_model(tmp_path / "model", physics_model=pm)
             mock_calibrate.assert_not_called()
 
+    def test_open_window_down_weight_active_with_physics_and_halflife(self, tmp_path):
+        """Covers the Plan B Task 4 down-weight block (model.py: `open_window_flags is not
+        None and hourly_weights is not None`), which is only reachable when physics_model +
+        climate_dfs are both configured AND weight_halflife_days > 0. No prior test combined
+        all three (physics tests use weight_halflife_days=0 / no climate_dfs)."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        # Smooth outdoor temperature so the one-step-ahead ODE projection isn't swamped
+        # by weather noise (mirrors the near-constant-outdoor setup in test_physics.py's
+        # test_open_window_flags_large_residual, scaled to a realistic training window).
+        outdoor_temp = 5.0 + 3.0 * np.sin(np.linspace(0, 20 * np.pi, n))
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": outdoor_temp,
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        # Indoor temp held ~constant near setpoint except one single-hour open-window shock.
+        anomaly_hour = 550
+        indoor_temp = 20.0 + rng.normal(0, 0.05, size=n)
+        indoor_temp[anomaly_hour] = 10.0
+        climate_dfs = {
+            "climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": indoor_temp, "setpoint": [20.0] * n})
+        }
+
+        config = self._physics_config()
+        config["room_thermostats"] = ["climate.living_room"]
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", config)
+
+        # Spy on detect_open_windows so we capture the exact flags Series train() computes
+        # and folds into hourly_weights, instead of recomputing it separately (which would
+        # only prove detect_open_windows works, not that train() wired it correctly).
+        captured: dict = {}
+        real_detect = pm.detect_open_windows
+
+        def _spy_detect(*args, **kwargs):
+            result = real_detect(*args, **kwargs)
+            captured["flags"] = result
+            return result
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch.object(pm, "detect_open_windows", side_effect=_spy_detect):
+            m.train(
+                energy,
+                weather,
+                outdoor_df=None,
+                weight_halflife_days=30.0,
+                climate_dfs=climate_dfs,
+                physics_model=pm,
+            )
+
+        # Model completes and is correctly shaped (the main smoke-test assertion).
+        assert m.model is not None
+        assert "physics_kwh" in m.feature_cols
+
+        # Real trigger: the injected single-hour anomaly was actually flagged by the same
+        # detect_open_windows() call train() used for down-weighting, and not everything
+        # was flagged (sanity check against a degenerate all-True detector).
+        assert "flags" in captured, "train() did not call detect_open_windows despite climate_dfs + physics_model"
+        flags = captured["flags"]
+        anomaly_ts = ts[anomaly_hour]
+        assert flags.loc[anomaly_ts] == True  # noqa: E712 — explicit bool comparison reads clearer here
+        assert flags.sum() < 10
+
 
 # ── Physics-ML hybrid: predict() physics feature + portability fallback (Plan B Task 5) ──
 
