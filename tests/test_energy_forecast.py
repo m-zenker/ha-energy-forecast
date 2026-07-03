@@ -2960,6 +2960,7 @@ class _FakeRetrain:
         self._climate_room_areas = None
         self._unit_multiplier = 1.0
         self._physics_model = None
+        self._physics_heating_buffer_df = None
         self._fetch_physics_sensor_histories = lambda: None
 
     def log(self, msg, level="INFO"):

@@ -300,6 +300,11 @@ class EnergyForecast(hass.Hass):
             physics_model_dir = Path(__file__).parent / "models"
             self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
 
+        # Populated by _fetch_physics_sensor_histories() (once per training cycle). Initialized
+        # here too so _update_sensors() can safely read it if it ever fires before the first
+        # _retrain() completes.
+        self._physics_heating_buffer_df: Any = None
+
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float] = {}
@@ -315,6 +320,12 @@ class EnergyForecast(hass.Hass):
         self._cached_people_home: Any = None
         self._cached_climate_recent: Any = None
         self._cached_dhw_recent: Any = None
+
+        # Physics recalibrate_physics service: the fully-processed energy/weather data from the
+        # most recent training cycle, cached so an operator-triggered recalibration doesn't need
+        # to refetch history. None until the first _retrain() completes.
+        self._cached_energy_df: Any = None
+        self._cached_weather_df: Any = None
 
         # MQTT Discovery (opt-in)
         self._mqtt_discovery: bool = bool(self.args.get("mqtt_discovery", False))
@@ -339,6 +350,8 @@ class EnergyForecast(hass.Hass):
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
         self.listen_event(self._rollback_model_cb, "energy_forecast_rollback_model")
         self.register_service("energy_forecast/get_scenario", self._get_scenario_cb)
+        if self._physics_model is not None:
+            self.register_service("energy_forecast/recalibrate_physics", self._recalibrate_physics_cb)
 
         self._check_setup()
         self._publish_unavailable()
@@ -1100,6 +1113,54 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Physics room climate %s history fetch failed: %s", climate_entity, exc)
 
+    def _recalibrate_physics_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/recalibrate_physics`: manually trigger a physics
+        recalibration on demand, using the energy/weather data cached by the most recent
+        training cycle (see `_retrain()`)."""
+        import pandas as pd
+
+        if self._physics_model is None:
+            _LOGGER.warning("recalibrate_physics called but physics is not configured — ignoring")
+            return
+        if self._cached_energy_df is None or self._cached_weather_df is None:
+            _LOGGER.warning(
+                "recalibrate_physics called before the first training cycle has completed — "
+                "no cached energy/weather data available yet. Ignoring."
+            )
+            return
+        try:
+            self._fetch_physics_sensor_histories()
+            energy_df = self._cached_energy_df
+            weather_df = self._cached_weather_df
+            holdout_cutoff = energy_df["timestamp"].max() - pd.Timedelta(days=max(int(len(energy_df) / 24 * 0.1), 1))
+            self._physics_model.calibrate(
+                energy_df,
+                weather_df,
+                climate_dfs=self._physics_climate_dfs,
+                dhw_df=self._physics_dhw_tank_df,
+                holdout_cutoff=holdout_cutoff,
+            )
+            _LOGGER.info("Physics recalibration complete")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"recalibrate_physics failed: {exc}")
+
+    def _effective_use_physics_residual(self) -> bool:
+        """Config intent AND-ed with the cold-start gate.
+
+        Read-only/logging only — never branches actual training behavior. Plan C (not built
+        yet) will read this to decide Phase 1 (physics as a feature) vs Phase 2 (residual
+        learning).
+        """
+        requested = bool(self._physics_config.get("use_physics_residual", False)) if self._physics_model else False
+        if requested and self._physics_model.is_cold_start_gated:
+            _LOGGER.warning(
+                "use_physics_residual=true but cold-start gate not satisfied "
+                f"({self._physics_model._calib.get('n_calibration_windows_ua_eff', 0)}/30 UA_eff windows) — "
+                "holding at Phase 1"
+            )
+            return False
+        return requested
+
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
@@ -1316,6 +1377,12 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
 
+        # Physics recalibrate_physics service: cache the fully-processed training data (post
+        # EV-subtraction/target-correction for baseline_df, post-stitch for weather_df) so an
+        # on-demand recalibration doesn't need to refetch history.
+        self._cached_energy_df = baseline_df
+        self._cached_weather_df = weather_df
+
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories()
 
@@ -1337,6 +1404,8 @@ class EnergyForecast(hass.Hass):
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
             regime_count=self._regime_count,
+            physics_model=self._physics_model,
+            heating_buffer_temp_df=self._physics_heating_buffer_df,
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
 
@@ -1511,6 +1580,8 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            physics_model=self._physics_model,
+            heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
 
         predictions = self._ml_model.predict(
@@ -1526,6 +1597,8 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            physics_model=self._physics_model,
+            heating_buffer_temp_recent=self._physics_heating_buffer_df,
             _prepared=_prepared,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
@@ -1627,6 +1700,8 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
+                    physics_model=self._physics_model,
+                    heating_buffer_temp_recent=self._physics_heating_buffer_df,
                     _prepared=_prepared,
                 )
             except Exception as exc:  # noqa: BLE001

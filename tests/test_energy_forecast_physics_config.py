@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 
@@ -234,3 +235,74 @@ class TestRetrainCallsPhysicsFetch:
         assert app._physics_heating_buffer_df is None
         assert app._physics_cop_df is None
         assert app._room_thermostat_temp_dfs == {}
+
+
+class TestRecalibratePhysicsService:
+    def test_service_registered_when_physics_enabled(self):
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        calls = [c.args[0] for c in app.register_service.call_args_list]
+        assert "energy_forecast/recalibrate_physics" in calls
+
+    def test_service_not_registered_when_physics_disabled(self):
+        app = _make_app({"energy_sensor": "sensor.grid_import"})
+        app.initialize()
+        calls = [c.args[0] for c in app.register_service.call_args_list]
+        assert "energy_forecast/recalibrate_physics" not in calls
+
+    def test_recalibrate_service_calls_physics_calibrate_and_updates_calibrated_at(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._recalibrate_physics_cb = EnergyForecast._recalibrate_physics_cb.__get__(app, type(app))
+        app._fetch_physics_sensor_histories = MagicMock()
+        app._physics_climate_dfs = {}
+        app._physics_dhw_tank_df = None
+        # minimal energy/weather fetch stand-ins
+        app._cached_energy_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-01-01", periods=10, freq="1h"), "gross_kwh": [1.0] * 10}
+        )
+        app._cached_weather_df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=10, freq="1h"),
+                "temp_c": [5.0] * 10,
+                "direct_radiation_wm2": [0.0] * 10,
+            }
+        )
+        with patch.object(app._physics_model, "calibrate") as mock_calibrate:
+            app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
+            mock_calibrate.assert_called_once()
+
+    def test_recalibrate_service_before_first_retrain_logs_warning_and_does_not_crash(self, caplog):
+        """No _cached_energy_df/_cached_weather_df yet (never retrained) — must not raise."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
+        app.initialize()
+        app._recalibrate_physics_cb = EnergyForecast._recalibrate_physics_cb.__get__(app, type(app))
+        assert app._cached_energy_df is None
+        assert app._cached_weather_df is None
+
+        with patch.object(app._physics_model, "calibrate") as mock_calibrate:
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
+            mock_calibrate.assert_not_called()
+        assert any("recalibrate_physics" in r.message.lower() for r in caplog.records)
+
+    def test_cold_start_gate_logs_warning_when_residual_requested_but_gated(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
+        app.initialize()
+        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
+        assert app._physics_model.is_cold_start_gated is True  # fresh model, no calibration windows yet
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app._effective_use_physics_residual()
+        assert any("cold-start" in r.message.lower() or "cold start" in r.message.lower() for r in caplog.records)

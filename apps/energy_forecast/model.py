@@ -1298,6 +1298,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
@@ -1332,6 +1334,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
 
         # Filter to today's local date; fall back to all rows if none match
