@@ -1102,7 +1102,7 @@ class TestPredictWithPhysics:
             "use_physics_residual": False,
         }
 
-    def test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time(self, tmp_path):
+    def test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time(self, tmp_path, caplog):
         from energy_forecast.physics import ThermalPhysicsModel
 
         pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
@@ -1110,8 +1110,19 @@ class TestPredictWithPhysics:
         assert "physics_kwh" in model.feature_cols
 
         # simulate physics disabled at predict time (sensor outage / config change)
-        result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
+        with caplog.at_level("WARNING"):
+            result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
         assert not result.empty  # no exception
+        assert any(
+            "physics" in rec.message.lower() and ("fallback" in rec.message.lower() or "0.0" in rec.message)
+            for rec in caplog.records
+        ), f"expected a physics fallback WARNING, got: {[r.message for r in caplog.records]}"
+
+        # Verify the actual feature matrix used for prediction has physics_kwh == 0.0,
+        # not just that predict() happened to return a non-empty result.
+        _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=None, physics_model=None)
+        assert "physics_kwh" in X.columns
+        assert (X["physics_kwh"] == 0.0).all()
 
     def test_physics_kwh_computed_when_model_present_at_predict_time(self, tmp_path):
         from energy_forecast.physics import ThermalPhysicsModel
@@ -1120,6 +1131,11 @@ class TestPredictWithPhysics:
         model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
         result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
         assert not result.empty
+
+        # Verify real physics values (not the 0.0 fallback) were actually used.
+        _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=None, physics_model=pm)
+        assert "physics_kwh" in X.columns
+        assert not (X["physics_kwh"] == 0.0).all()
 
     def test_predict_without_physics_ever_trained_unaffected(self, tmp_path):
         model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=None)
