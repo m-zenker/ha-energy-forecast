@@ -60,6 +60,7 @@ def _make_app(args: dict):
 
     # Bind the real initialize method to the mock
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
+    app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
     return app
 
 
@@ -111,3 +112,51 @@ class TestPhysicsConfigIngest:
         assert app._physics_config["dhw_tank_volume_l"] == 200
         assert app._physics_config["internal_gains_fraction"] == 0.8
         assert app._physics_config["use_physics_residual"] is False
+
+
+class TestPhysicsSensorFetch:
+    def test_no_physics_model_skips_all_physics_fetches(self, monkeypatch):
+        from energy_forecast import ha_data as hd
+
+        fetch_generic = MagicMock(return_value=None)
+        fetch_climate = MagicMock(return_value=None)
+        monkeypatch.setattr(hd, "fetch_generic_sensor_history", fetch_generic)
+        monkeypatch.setattr(hd, "fetch_climate_history", fetch_climate)
+
+        app = _make_app({"energy_sensor": "sensor.grid_import"})  # no physics: block
+        app.initialize()
+        app._fetch_physics_sensor_histories()
+        fetch_generic.assert_not_called()
+        fetch_climate.assert_not_called()
+
+    def test_physics_model_present_fetches_configured_sensors(self, monkeypatch):
+        import pandas as pd
+        from energy_forecast import ha_data as hd
+
+        empty_df = pd.DataFrame(columns=["timestamp", "value"])
+        fetch_generic = MagicMock(return_value=empty_df)
+        fetch_climate = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"]))
+        monkeypatch.setattr(hd, "fetch_generic_sensor_history", fetch_generic)
+        monkeypatch.setattr(hd, "fetch_climate_history", fetch_climate)
+
+        app = _make_app(
+            {
+                "energy_sensor": "sensor.grid_import",
+                "physics": {
+                    "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
+                    "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
+                    "cop_sensor": "sensor.kermi_cop",
+                    "room_thermostats": [
+                        {
+                            "climate_entity": "climate.living_room",
+                            "temp_sensor": "sensor.netatmo_living_room_temp",
+                            "area_m2": 35,
+                        }
+                    ],
+                },
+            }
+        )
+        app.initialize()
+        app._fetch_physics_sensor_histories()
+        assert fetch_generic.call_count == 4  # dhw_tank, heating_buffer, cop, and the one room temp_sensor
+        fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection

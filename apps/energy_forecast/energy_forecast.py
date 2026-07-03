@@ -1025,6 +1025,81 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("Sensor update failed: %s", exc)
 
+    # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
+
+    def _fetch_physics_sensor_histories(self) -> None:
+        """Fetch the additional sensor histories the physics model needs.
+
+        No-op (no fetch calls at all) when self._physics_model is None, so
+        absent physics: config behaves identically to v0.11.7.
+        """
+        self._room_thermostat_temp_dfs: dict[str, Any] = {}
+        self._physics_dhw_tank_df: Any = None
+        self._physics_heating_buffer_df: Any = None
+        self._physics_cop_df: Any = None
+        self._physics_climate_dfs: dict[str, Any] = {}
+
+        if self._physics_model is None:
+            return
+
+        cfg = self._physics_config
+
+        if cfg.get("dhw_tank_temp_sensor"):
+            entity_id = cfg["dhw_tank_temp_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="dhw_tank_temp", timezone=self._timezone
+                )
+                self._physics_dhw_tank_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics DHW tank %s history fetch failed: %s", entity_id, exc)
+
+        if cfg.get("heating_buffer_temp_sensor"):
+            entity_id = cfg["heating_buffer_temp_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_heating_buffer")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="heating_buffer_temp", timezone=self._timezone
+                )
+                self._physics_heating_buffer_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics heating buffer %s history fetch failed: %s", entity_id, exc)
+
+        if cfg.get("cop_sensor"):
+            entity_id = cfg["cop_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_cop")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="cop", timezone=self._timezone
+                )
+                self._physics_cop_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics COP %s history fetch failed: %s", entity_id, exc)
+
+        for i, rt in enumerate(self._room_thermostats):
+            temp_entity = rt["temp_sensor"]
+            climate_entity = rt["climate_entity"]
+            temp_path = self._generic_sensor_cache_path(temp_entity, prefix=f"physics_temp_{i}")
+            try:
+                temp_df = ha_data.fetch_generic_sensor_history(
+                    self, temp_entity, temp_path, column_name="current_temp", timezone=self._timezone
+                )
+                self._room_thermostat_temp_dfs[climate_entity] = (
+                    _strip_tz(temp_df, self._timezone) if not temp_df.empty else temp_df
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics room temp %s history fetch failed: %s", temp_entity, exc)
+
+            climate_path = self._climate_cache_path(climate_entity)
+            try:
+                climate_df = ha_data.fetch_climate_history(self, climate_entity, climate_path, timezone=self._timezone)
+                self._physics_climate_dfs[climate_entity] = (
+                    _strip_tz(climate_df, self._timezone) if not climate_df.empty else climate_df
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics room climate %s history fetch failed: %s", climate_entity, exc)
+
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
