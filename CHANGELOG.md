@@ -8,6 +8,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-07-07
+
+### Added
+- `apps/energy_forecast/const.py` — new `resolve_timezone()` shared helper used by both the main
+  app and the backfill tool. Precedence: explicit `timezone:` key in `apps.yaml` → Home Assistant's
+  configured timezone → `Europe/Zurich`. Logs a startup WARNING when `timezone:` is set but
+  differs from HA's own timezone; a mismatch shifts every historical timestamp by the UTC-offset
+  difference between the two zones (daytime consumption appears to occur at night). ([#15])
+- `apps/energy_forecast/energy_forecast.py` — sensor-type validation runs once at startup and logs
+  a WARNING for each configured sensor whose live `unit_of_measurement` or `state_class` does not
+  match its role. Energy sensors (`energy_sensor`, `ev_charging_sensor`, `sub_energy_sensors`, and
+  the solar/grid/battery correction sensors) must be cumulative `total_increasing` kWh/Wh/MWh
+  meters; `outdoor_temp_sensor` and `dhw_buffer_sensor` must report in °C/°F. Directly surfaces the
+  "power sensor configured where an energy sensor was required" class of misconfiguration from
+  discussion #15, which previously only appeared as a downstream forecast-quality symptom. ([#15])
+
+### Fixed
+- `apps/energy_forecast/energy_history_backfill.py` — backfill timestamps were computed in
+  `Europe/Zurich` regardless of the user's actual HA timezone, silently shifting all backfilled
+  historical data for non-CH-timezone users (daytime consumption appeared to occur at night). The
+  tool now calls `resolve_timezone()` with the same precedence as the main app. ([#15])
+
 ## [0.11.7] - 2026-06-30
 
 ### Added
