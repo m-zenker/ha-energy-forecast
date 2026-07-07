@@ -1,5 +1,6 @@
 """Constants for the Energy Forecast app."""
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -59,3 +60,30 @@ def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
         df = df.copy()
         df["timestamp"] = ts
     return df
+
+
+def resolve_timezone(configured: str | None, ha_timezone: str | None, logger: logging.Logger) -> str:
+    """Resolve the effective timezone for an app instance.
+
+    Precedence: an explicit *configured* value (the `timezone:` key in
+    apps.yaml) always wins. If *ha_timezone* (from AppDaemon's
+    ``get_timezone()``) is known and differs from *configured*, logs a
+    WARNING — a mismatch here silently shifts every historical timestamp by
+    the UTC-offset difference between the two zones, so daytime consumption
+    can appear to occur at night. Falls back to *ha_timezone*, then
+    "Europe/Zurich", when *configured* is not set.
+    """
+    if configured:
+        if ha_timezone and ha_timezone != configured:
+            logger.warning(
+                "Configured timezone %r does not match Home Assistant's timezone %r. "
+                "If this is unintentional, historical data will be shifted by the offset "
+                "between the two zones (e.g. daytime consumption may appear to occur at "
+                "night). Set timezone: %s in apps.yaml, or remove the override to use "
+                "HA's timezone automatically.",
+                configured,
+                ha_timezone,
+                ha_timezone,
+            )
+        return configured
+    return ha_timezone or "Europe/Zurich"
