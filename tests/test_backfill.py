@@ -8,13 +8,23 @@ import pandas as pd
 
 
 class _BackfillStub:
-    """Minimal stub with only what _backfill() accesses (self.args)."""
+    """Minimal stub with only what _backfill() accesses (self.args, self.get_timezone)."""
 
-    def __init__(self, args: dict):
+    def __init__(self, args: dict, ha_timezone: str | None = None):
         self.args = args
+        self._ha_timezone = ha_timezone
+
+    def get_timezone(self) -> str | None:
+        return self._ha_timezone
 
 
-def _run_backfill(energy_unit: str, cumsum_rows: list[tuple], tmp_path) -> pd.DataFrame:
+def _run_backfill(
+    energy_unit: str,
+    cumsum_rows: list[tuple],
+    tmp_path,
+    timezone_arg: str | None = None,
+    ha_timezone: str | None = None,
+) -> pd.DataFrame:
     """Run EnergyHistoryBackfill._backfill() with a mocked SQLite DB.
 
     Args:
@@ -22,19 +32,24 @@ def _run_backfill(energy_unit: str, cumsum_rows: list[tuple], tmp_path) -> pd.Da
         cumsum_rows: List of (epoch_seconds, cumulative_sum) tuples as the
                      statistics table would return.
         tmp_path:    pytest tmp_path fixture for the CSV output.
+        timezone_arg: Value for the optional `timezone` apps.yaml key, or
+                      None to omit it.
+        ha_timezone:  Value returned by self.get_timezone() (simulates HA's
+                      own configured timezone), or None.
 
     Returns:
         DataFrame read from the written CSV.
     """
     from energy_forecast.energy_history_backfill import EnergyHistoryBackfill
 
-    stub = _BackfillStub(
-        args={
-            "energy_sensor": "sensor.grid_import",
-            "ha_db_path": str(tmp_path / "fake.db"),
-            "energy_unit": energy_unit,
-        }
-    )
+    args = {
+        "energy_sensor": "sensor.grid_import",
+        "ha_db_path": str(tmp_path / "fake.db"),
+        "energy_unit": energy_unit,
+    }
+    if timezone_arg is not None:
+        args["timezone"] = timezone_arg
+    stub = _BackfillStub(args=args, ha_timezone=ha_timezone)
     cache_path = tmp_path / "energy_history.csv"
 
     # Create the fake DB file so Path(db_path).exists() passes
@@ -80,3 +95,39 @@ class TestBackfillUnitMultiplier:
         assert len(df) > 0
         # 0.0015 MWh × 1000 = 1.5 kWh
         assert any(abs(v - 1.5) < 1e-6 for v in df["gross_kwh"])
+
+
+class TestBackfillTimezone:
+    """_backfill() must honour timezone/get_timezone() instead of hardcoding Europe/Zurich."""
+
+    def test_default_falls_back_to_europe_zurich(self, tmp_path):
+        # base = 2024-01-15 10:00 UTC; the first row's diff is NaN and is
+        # dropped, so the surviving row is timestamped at base+3600
+        # (2024-01-15 11:00 UTC) == 2024-01-15 12:00 CET.
+        base = 1705312800.0
+        rows = [(base, 0.0), (base + 3600, 1.5)]
+        df = _run_backfill("kWh", rows, tmp_path, timezone_arg=None, ha_timezone=None)
+        assert pd.Timestamp(df["timestamp"].iloc[0]) == pd.Timestamp("2024-01-15 12:00:00")
+
+    def test_explicit_timezone_arg_used(self, tmp_path):
+        # Surviving row at base+3600 == 2024-01-15 11:00 UTC.
+        base = 1705312800.0
+        rows = [(base, 0.0), (base + 3600, 1.5)]
+        df = _run_backfill("kWh", rows, tmp_path, timezone_arg="America/New_York", ha_timezone=None)
+        # January = EST = UTC-5
+        assert pd.Timestamp(df["timestamp"].iloc[0]) == pd.Timestamp("2024-01-15 06:00:00")
+
+    def test_falls_back_to_get_timezone_when_arg_absent(self, tmp_path):
+        base = 1705312800.0
+        rows = [(base, 0.0), (base + 3600, 1.5)]
+        df = _run_backfill("kWh", rows, tmp_path, timezone_arg=None, ha_timezone="America/New_York")
+        assert pd.Timestamp(df["timestamp"].iloc[0]) == pd.Timestamp("2024-01-15 06:00:00")
+
+    def test_mismatch_between_arg_and_ha_timezone_logs_warning(self, tmp_path, caplog):
+        import logging
+
+        base = 1705312800.0
+        rows = [(base, 0.0), (base + 3600, 1.5)]
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _run_backfill("kWh", rows, tmp_path, timezone_arg="Europe/Zurich", ha_timezone="America/New_York")
+        assert any("America/New_York" in r.message for r in caplog.records)
