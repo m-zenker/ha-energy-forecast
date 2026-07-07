@@ -148,6 +148,39 @@ def _build_shap_narrative(shap_features: dict[str, float]) -> str:
     return "Mainly driven by: " + "; ".join(parts) + "."
 
 
+_ENERGY_SENSOR_UNITS = {"kwh", "wh", "mwh"}
+_ENERGY_SENSOR_STATE_CLASSES = {"total_increasing", "total"}
+_TEMPERATURE_SENSOR_UNITS = {"°c", "°f"}
+_POWER_UNITS = {"kw", "w"}
+
+
+def _describe_energy_mismatch(unit: str | None, state_class: str | None) -> str | None:
+    """Return a human-readable mismatch reason, or None if this looks like a valid energy meter."""
+    unit_l = (unit or "").strip().lower()
+    state_class_l = (state_class or "").strip().lower()
+    if unit_l in _POWER_UNITS:
+        return (
+            f"reports POWER (unit_of_measurement={unit!r}), not cumulative ENERGY — diffing "
+            "instantaneous power readings produces noise; point this at a kWh/Wh/MWh sensor "
+            "with state_class: total_increasing (integrate power via a Riemann sum helper first "
+            "if your integration only exposes power)"
+        )
+    problems = []
+    if unit_l and unit_l not in _ENERGY_SENSOR_UNITS:
+        problems.append(f"unit_of_measurement={unit!r} (expected kWh/Wh/MWh)")
+    if state_class_l and state_class_l not in _ENERGY_SENSOR_STATE_CLASSES:
+        problems.append(f"state_class={state_class!r} (expected total_increasing/total)")
+    return "; ".join(problems) if problems else None
+
+
+def _describe_temperature_mismatch(unit: str | None, state_class: str | None = None) -> str | None:
+    """Return a human-readable mismatch reason, or None if this looks like a valid temperature sensor."""
+    unit_l = (unit or "").strip().lower()
+    if unit_l and unit_l not in _TEMPERATURE_SENSOR_UNITS:
+        return f"unit_of_measurement={unit!r} (expected °C/°F)"
+    return None
+
+
 class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
@@ -286,6 +319,7 @@ class EnergyForecast(hass.Hass):
         self._scenario_mqtt_discovered: bool = False
 
         self._validate_config()
+        self._validate_sensor_types()
 
         if self._mqtt_discovery:
             self._cleanup_legacy_states()  # remove ghost set_state entities
@@ -377,6 +411,65 @@ class EnergyForecast(hass.Hass):
             self._shap_top_n,
             self._mqtt_discovery,
         )
+
+    def _validate_sensor_types(self) -> None:
+        """Warn at startup if configured sensors look like the wrong HA sensor type.
+
+        Compares each entity's live unit_of_measurement/state_class attributes
+        against what its role expects (e.g. energy_sensor must be a cumulative
+        kWh meter, not an instantaneous power sensor). Catches the "power sensor
+        configured where an energy sensor is required" mistake reported in
+        GitHub discussion #15, which silently corrupts training data via diff().
+        Warnings only — never blocks startup, since HA attributes may be
+        temporarily unavailable at boot.
+        """
+        energy_roles: list[tuple[str, str]] = [(self._energy_sensor, "energy_sensor")]
+        if self._ev_charging_sensor:
+            energy_roles.append((self._ev_charging_sensor, "ev_charging_sensor"))
+        for sensor in self._sub_energy_sensors:
+            energy_roles.append((sensor, "sub_energy_sensors"))
+        if self._solar_sensor:
+            energy_roles.append((self._solar_sensor, "solar_production_sensor"))
+        if self._grid_export_sensor:
+            energy_roles.append((self._grid_export_sensor, "grid_export_sensor"))
+        if self._battery_charge_sensor:
+            energy_roles.append((self._battery_charge_sensor, "battery_charge_sensor"))
+        if self._battery_discharge_sensor:
+            energy_roles.append((self._battery_discharge_sensor, "battery_discharge_sensor"))
+
+        # NOTE: physics.dhw_tank_temp_sensor, physics.heating_buffer_temp_sensor, and
+        # room_thermostats[].temp_sensor are intentionally not registered here — those
+        # config keys don't exist on this branch (they belong to the unmerged
+        # feat/physics-core-engine branch's physics config ingest). Add them here,
+        # following the exact pattern below, once that branch merges.
+        temperature_roles: list[tuple[str, str]] = []
+        if self._outdoor_sensor:
+            temperature_roles.append((self._outdoor_sensor, "outdoor_temp_sensor"))
+        if self._dhw_buffer_sensor:
+            temperature_roles.append((self._dhw_buffer_sensor, "dhw_buffer_sensor"))
+
+        for entity_id, role in energy_roles:
+            EnergyForecast._warn_on_sensor_mismatch(self, entity_id, role, _describe_energy_mismatch)
+        for entity_id, role in temperature_roles:
+            EnergyForecast._warn_on_sensor_mismatch(self, entity_id, role, _describe_temperature_mismatch)
+
+    def _warn_on_sensor_mismatch(self, entity_id: str, role: str, describe) -> None:
+        try:
+            state_obj = self.get_state(entity_id, attribute="all")
+        except Exception as exc:  # noqa: BLE001 — must never block startup
+            _LOGGER.debug("Sensor type check skipped for %s (%s): %s", entity_id, role, exc)
+            return
+        if not isinstance(state_obj, dict):
+            return
+        attrs = state_obj.get("attributes") or {}
+        reason = describe(attrs.get("unit_of_measurement"), attrs.get("state_class"))
+        if reason:
+            _LOGGER.warning(
+                "%s (%s) may be misconfigured: %s. Verify the entity_id in apps.yaml.",
+                entity_id,
+                role,
+                reason,
+            )
 
     # ── Setup checker ─────────────────────────────────────────────────────────
 

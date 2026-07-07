@@ -787,6 +787,126 @@ class TestValidateConfig:
         )
 
 
+# ── Sensor-type validation (discussion #15: power vs energy sensor mixups) ───
+
+
+class _FakeSensorTypeSelf:
+    """Minimal stand-in for _validate_sensor_types with controllable get_state."""
+
+    def __init__(self):
+        self._energy_sensor = "sensor.grid_import"
+        self._ev_charging_sensor: str | None = None
+        self._sub_energy_sensors: list[str] = []
+        self._solar_sensor: str | None = None
+        self._grid_export_sensor: str | None = None
+        self._battery_charge_sensor: str | None = None
+        self._battery_discharge_sensor: str | None = None
+        self._outdoor_sensor: str | None = None
+        self._dhw_buffer_sensor: str | None = None
+        self._states: dict[str, dict] = {}
+
+    def get_state(self, entity_id: str, attribute: str | None = None) -> dict | None:
+        return self._states.get(entity_id)
+
+
+def _state(unit: str | None, state_class: str | None) -> dict:
+    return {"attributes": {"unit_of_measurement": unit, "state_class": state_class}}
+
+
+class TestValidateSensorTypes:
+    """_validate_sensor_types must warn when a configured sensor's HA attributes
+    don't match its role (energy meter vs. temperature sensor vs. power sensor)."""
+
+    def test_no_warning_for_correctly_configured_energy_sensor(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert not caplog.records
+
+    def test_warns_when_energy_sensor_is_actually_a_power_sensor(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kW", "measurement")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("energy_sensor" in r.message and "POWER" in r.message for r in caplog.records)
+
+    def test_warns_for_ev_charging_sensor_wrong_state_class(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._ev_charging_sensor = "sensor.ev_charger_power"
+        fake._states["sensor.ev_charger_power"] = _state("kW", "measurement")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("ev_charging_sensor" in r.message for r in caplog.records)
+
+    def test_warns_for_sub_energy_sensor_wrong_unit(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._sub_energy_sensors = ["sensor.dishwasher"]
+        fake._states["sensor.dishwasher"] = _state("W", "measurement")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("sub_energy_sensors" in r.message for r in caplog.records)
+
+    def test_warns_for_temperature_sensor_wrong_unit(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._outdoor_sensor = "sensor.outdoor_temp"
+        fake._states["sensor.outdoor_temp"] = _state("kWh", None)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("outdoor_temp_sensor" in r.message for r in caplog.records)
+
+    def test_skips_silently_when_entity_state_unavailable(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        # sensor.grid_import intentionally absent from fake._states -> get_state returns None
+        EnergyForecast._validate_sensor_types(fake)  # must not raise
+
+    def test_skips_silently_when_get_state_raises(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+
+        def _raise(entity_id: str, attribute: str | None = None):
+            raise RuntimeError("boom")
+
+        fake.get_state = _raise
+        EnergyForecast._validate_sensor_types(fake)  # must not raise
+
+
+class TestSensorTypeValidationWiring:
+    """initialize() must call _validate_sensor_types() so misconfigured sensors surface at startup."""
+
+    def test_initialize_calls_validate_sensor_types(self):
+        app = _make_app({})
+        app._validate_sensor_types = MagicMock()
+        app.initialize()
+        app._validate_sensor_types.assert_called_once()
+
+
 # ── Setup checker sensor (#17) ────────────────────────────────────────────────
 
 
