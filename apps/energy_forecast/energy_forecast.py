@@ -33,7 +33,14 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from . import __version__, ha_data, weather
-from .const import CACHE_PATH, EV_CHARGING_THRESHOLD_KWH, PRED_HISTORY_PATH, PRESENCE_STATE_HOME, UNIT_TO_KWH
+from .const import (
+    CACHE_PATH,
+    EV_CHARGING_THRESHOLD_KWH,
+    PRED_HISTORY_PATH,
+    PRESENCE_STATE_HOME,
+    UNIT_TO_KWH,
+    resolve_timezone,
+)
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
 
@@ -190,7 +197,7 @@ class EnergyForecast(hass.Hass):
                 _energy_unit,
                 self._unit_multiplier,
             )
-        self._timezone: str = str(self.args.get("timezone") or self.get_timezone() or "Europe/Zurich")
+        self._timezone: str = resolve_timezone(self.args.get("timezone") or None, self.get_timezone(), _LOGGER)
         self._holiday_canton: str | None = self.args.get("holiday_canton") or None
         self._holiday_country: str = str(self.args.get("holiday_country", "CH")).upper()
         self._adaptive_retrain_threshold: float = float(self.args.get("adaptive_retrain_threshold", 2.0))

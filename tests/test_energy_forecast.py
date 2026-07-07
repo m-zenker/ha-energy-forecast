@@ -27,6 +27,59 @@ from energy_forecast.energy_forecast import (
 )
 from energy_forecast.model import EnergyForecastModel
 
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_loggers():
+    """Prevent EnergyForecast.initialize() from leaking a MagicMock _LOGGER.
+
+    initialize() reassigns the module-level `_LOGGER` global in
+    energy_forecast, ha_data, model, and weather to `self.logger` (intentional
+    production wiring for AppDaemon's per-app logger). Since these tests bind
+    and call the real initialize() against a MagicMock app, that permanently
+    overwrites those globals with a MagicMock for the rest of the pytest
+    process, breaking caplog-based assertions in other test modules. Snapshot
+    and restore the real loggers around every test in this file.
+    """
+    from energy_forecast import energy_forecast as ef_module
+    from energy_forecast import ha_data, model, weather
+
+    modules = (ef_module, ha_data, model, weather)
+    original_loggers = [m._LOGGER for m in modules]
+    try:
+        yield
+    finally:
+        for m, logger in zip(modules, original_loggers):
+            m._LOGGER = logger
+
+
+def _make_app(args: dict):
+    """Build a minimal fake EnergyForecast instance for initialize() testing.
+
+    Only `energy_sensor`, `latitude`, `longitude` are accessed via
+    `self.args[...]` (required) in `initialize()` — everything else uses
+    `.get()` with a default, so this minimal arg set is sufficient to run
+    the real `initialize()` end-to-end against a MagicMock app.
+    """
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    full_args = {
+        "energy_sensor": "sensor.grid_import",
+        "latitude": 47.3,
+        "longitude": 8.5,
+    }
+    full_args.update(args)
+
+    app = MagicMock()
+    app.args = full_args
+    app.logger = MagicMock()
+    app.get_timezone = MagicMock(return_value="Europe/Zurich")
+
+    app.initialize = EnergyForecast.initialize.__get__(app, type(app))
+    return app
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -3018,3 +3071,37 @@ class TestFifteenMinCache:
 
         stub = _FakeRetrain(tmp_path / "energy_history.csv")
         EnergyForecast._retrain(stub)  # must not raise
+
+
+# ── Timezone alignment warning (initialize()) ────────────────────────────────
+
+
+class TestTimezoneAlignmentWarning:
+    """initialize() must warn when apps.yaml `timezone` differs from HA's own timezone."""
+
+    def test_mismatch_logs_warning_but_keeps_configured_value(self, caplog):
+        import logging
+
+        app = _make_app({"timezone": "Europe/Zurich"})
+        app.get_timezone = MagicMock(return_value="America/New_York")
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees it
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app.initialize()
+        assert app._timezone == "Europe/Zurich"
+        assert any("America/New_York" in r.message for r in caplog.records)
+
+    def test_match_logs_no_mismatch_warning(self, caplog):
+        import logging
+
+        app = _make_app({"timezone": "Europe/Zurich"})
+        app.get_timezone = MagicMock(return_value="Europe/Zurich")
+        app.logger = logging.getLogger("energy_forecast")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app.initialize()
+        assert not any("does not match" in r.message for r in caplog.records)
+
+    def test_no_configured_timezone_falls_back_to_ha_timezone(self):
+        app = _make_app({})
+        app.get_timezone = MagicMock(return_value="America/New_York")
+        app.initialize()
+        assert app._timezone == "America/New_York"
