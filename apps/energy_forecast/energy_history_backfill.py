@@ -13,6 +13,9 @@ HOW TO USE
          class: EnergyHistoryBackfill
          energy_sensor: sensor.gplugk_z_ei
          ha_db_path: /config/home-assistant_v2.db   # default for HAOS
+         # timezone: Europe/Zurich   # optional; defaults to HA's own configured
+                                     # timezone. Set explicitly only if AppDaemon's
+                                     # timezone differs from your HA instance's.
 
 3. AppDaemon will start the app automatically. Watch the AppDaemon log for
    the final summary line.
@@ -39,7 +42,7 @@ from pathlib import Path
 
 import hassapi as hass
 
-from .const import CACHE_PATH
+from .const import CACHE_PATH, resolve_timezone
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -82,6 +85,7 @@ class EnergyHistoryBackfill(hass.Hass):
         if energy_unit not in _UNIT_TO_KWH:
             _LOGGER.warning("energy_unit %r not recognised — defaulting to kWh", energy_unit)
             unit_multiplier = 1.0
+        timezone: str = resolve_timezone(self.args.get("timezone") or None, self.get_timezone(), _LOGGER)
 
         if not Path(db_path).exists():
             raise FileNotFoundError(
@@ -92,6 +96,7 @@ class EnergyHistoryBackfill(hass.Hass):
             )
 
         _LOGGER.info("Reading statistics for %s from %s …", entity_id, db_path)
+        _LOGGER.info("Using timezone: %s", timezone)
         if unit_multiplier != 1.0:
             _LOGGER.info("Applying unit conversion: %s → kWh (×%.4g)", energy_unit, unit_multiplier)
 
@@ -145,10 +150,8 @@ class EnergyHistoryBackfill(hass.Hass):
         df["cumsum"] = pd.to_numeric(df["cumsum"], errors="coerce")
         df = df.dropna()
 
-        # Convert Unix epoch → naive Europe/Zurich timestamp
-        df["timestamp"] = (
-            pd.to_datetime(df["epoch"], unit="s", utc=True).dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
-        )
+        # Convert Unix epoch → naive local timestamp (resolved timezone, see resolve_timezone())
+        df["timestamp"] = pd.to_datetime(df["epoch"], unit="s", utc=True).dt.tz_convert(timezone).dt.tz_localize(None)
 
         df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -167,7 +170,7 @@ class EnergyHistoryBackfill(hass.Hass):
                 df_cache = pd.read_csv(CACHE_PATH)
                 ts = pd.to_datetime(df_cache["timestamp"])
                 if ts.dt.tz is not None:
-                    ts = ts.dt.tz_convert("Europe/Zurich").dt.tz_localize(None)
+                    ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
                 df_cache["timestamp"] = ts
                 _LOGGER.info("Loaded %d existing rows from %s.", len(df_cache), CACHE_PATH.name)
             except (OSError, pd.errors.ParserError) as exc:
