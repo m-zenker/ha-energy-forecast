@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.11.6-blue)
+![Version](https://img.shields.io/badge/version-v0.11.8-blue)
  ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-649%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
@@ -381,7 +381,7 @@ energy_forecast:
 | `srg_client_id` | No | — | SRG-SSR API client ID. If absent, Open-Meteo is used |
 | `srg_client_secret` | No | — | SRG-SSR API client secret |
 | `outdoor_temp_sensor` | No | — | Entity ID of an outdoor temperature sensor. Blended with forecast for hours 0–6 |
-| `timezone` | No | `Europe/Zurich` | IANA timezone name |
+| `timezone` | No | HA's own configured timezone, else `Europe/Zurich` | IANA timezone name. If set and it differs from Home Assistant's own configured timezone, a WARNING is logged at startup — a mismatch shifts historical timestamps by the offset between the two zones (daytime consumption can appear to occur at night). Also honoured by the backfill tool (see [Backfilling history](#backfilling-history)). |
 | `weight_halflife_days` | No | `90` | Sample weight half-life in days. Must be `≥ 1`. Typical range: 60–180 (lower = recent data weighted more heavily). |
 | `ev_charging_threshold_kwh` | No | `7` | Hours above this value (kWh/h) are treated as EV charging (threshold-based detection) |
 | `ev_charger_kw` | No | `9.0` | Fixed charger power subtracted from EV hours (kW) |
@@ -629,6 +629,7 @@ energy_history_backfill:
   energy_sensor: sensor.your_grid_import_sensor
   ha_db_path: /homeassistant/home-assistant_v2.db  # adjust path for your setup
   # energy_unit: MWh  # add if your sensor reports in MWh or Wh (default: kWh)
+  # timezone: Europe/Zurich  # only needed if AppDaemon's timezone differs from HA's; warns on mismatch
 ```
 
 Common database paths:
@@ -649,7 +650,7 @@ Backfill complete — remove 'energy_history_backfill' from apps.yaml and delete
 
 **3. Remove the backfill entry** from `apps.yaml` and delete `apps/energy_forecast/energy_history_backfill.py` from your AppDaemon apps directory. The main app will now have a full training set.
 
-> **Note:** The backfill tool requires the energy sensor to have `state_class: total_increasing` and to have been tracked by the HA recorder. The `statistics` table (never purged by HA) is used — not the short-lived `states` table.
+> **Note:** The backfill tool requires the energy sensor to have `state_class: total_increasing` and to have been tracked by the HA recorder. The `statistics` table (never purged by HA) is used — not the short-lived `states` table. It resolves its timezone the same way the main app does (`timezone:` config key, else HA's own timezone, else `Europe/Zurich`) and logs a WARNING if the two disagree.
 
 ---
 
