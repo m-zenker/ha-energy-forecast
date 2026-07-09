@@ -807,6 +807,32 @@ class EnergyForecast(hass.Hass):
             "measurement",
             json_attributes_topic=_tp_attrs_topic,
         )
+        # Physics baseline / ML adjustment sensors (only when a physics model is configured)
+        if self._physics_model is not None:
+            _physics_base_attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_physics_base_today/attributes"
+            )
+            self._mqtt_publish_discovery(
+                "energy_forecast_physics_base_today",
+                "Energy Forecast Physics Base Today",
+                "kWh",
+                "mdi:lightning-bolt-outline",
+                "energy",
+                "measurement",
+                json_attributes_topic=_physics_base_attrs_topic,
+            )
+            _ml_adjustment_attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_ml_adjustment_today/attributes"
+            )
+            self._mqtt_publish_discovery(
+                "energy_forecast_ml_adjustment_today",
+                "Energy Forecast ML Adjustment Today",
+                "kWh",
+                "mdi:tune-vertical",
+                "energy",
+                "measurement",
+                json_attributes_topic=_ml_adjustment_attrs_topic,
+            )
 
     def terminate(self) -> None:
         """AppDaemon lifecycle hook — publish offline availability on shutdown."""

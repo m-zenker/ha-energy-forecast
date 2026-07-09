@@ -817,6 +817,7 @@ class _FakeMqttSelf:
         self._mqtt_namespace = mqtt_namespace
         self._mqtt_discovery_prefix = mqtt_discovery_prefix
         self._mqtt_intervals_discovered = False
+        self._physics_model = None
         self._publishes: list[dict] = []  # records all mqtt_publish() calls
         self._warnings: list[str] = []
         self._removed_entities: list[str] = []

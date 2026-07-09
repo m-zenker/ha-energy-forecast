@@ -373,3 +373,38 @@ class TestPhysicsSensors:
         assert "energy_forecast_physics_base_today" in attr_ids
         assert "energy_forecast_ml_adjustment_today" in attr_ids
         app.set_state.assert_not_called()
+
+
+class TestPhysicsMqttDiscoveryRegistration:
+    """initialize() must register MQTT Discovery config for the physics sensors (follow-up to d12cfda).
+
+    _mqtt_set_sensor()/_mqtt_publish_sensor_attributes() publish sensor *state*, but HA's MQTT
+    integration only creates the entity once a retained discovery *config* payload has been
+    published for it — mirrors the existing energy_forecast_thermal_pressure_net registration.
+    """
+
+    def _make_mqtt_app(self, physics_args: dict | None):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        args: dict = {"energy_sensor": "sensor.grid_import", "mqtt_discovery": True}
+        if physics_args is not None:
+            args["physics"] = physics_args
+        app = _make_app(args)
+        # Bind the real _mqtt_publish_all_discovery so initialize()'s MQTT-mode branch actually
+        # runs its body (it stays a plain auto-mocked attribute otherwise, like _mqtt_publish_discovery).
+        app._mqtt_publish_all_discovery = EnergyForecast._mqtt_publish_all_discovery.__get__(app, type(app))
+        return app
+
+    def test_physics_sensors_registered_when_physics_configured(self):
+        app = self._make_mqtt_app({})
+        app.initialize()
+        registered_ids = [c.args[0] for c in app._mqtt_publish_discovery.call_args_list]
+        assert "energy_forecast_physics_base_today" in registered_ids
+        assert "energy_forecast_ml_adjustment_today" in registered_ids
+
+    def test_physics_sensors_not_registered_when_physics_disabled(self):
+        app = self._make_mqtt_app(None)
+        app.initialize()
+        registered_ids = [c.args[0] for c in app._mqtt_publish_discovery.call_args_list]
+        assert "energy_forecast_physics_base_today" not in registered_ids
+        assert "energy_forecast_ml_adjustment_today" not in registered_ids
