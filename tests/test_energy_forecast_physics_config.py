@@ -306,3 +306,46 @@ class TestRecalibratePhysicsService:
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             app._effective_use_physics_residual()
         assert any("cold-start" in r.message.lower() or "cold start" in r.message.lower() for r in caplog.records)
+
+
+class TestPhysicsSensors:
+    def test_physics_sensors_published_when_physics_configured(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
+        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
+        app._publish_physics_sensors(forecast_df)
+        published_entities = [c.args[0] for c in app.set_state.call_args_list]
+        assert "sensor.energy_forecast_physics_base_today" in published_entities
+        assert "sensor.energy_forecast_ml_adjustment_today" in published_entities
+
+    def test_physics_sensors_not_published_when_physics_disabled(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import"})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        app._publish_physics_sensors(pd.DataFrame({"timestamp": [], "predicted_kwh": []}))
+        app.set_state.assert_not_called()
+
+    def test_ml_adjustment_can_be_negative(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [0.5] * 48})  # physics baseline exceeds total
+        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.8] * 48, index=ts))
+        app._publish_physics_sensors(forecast_df)
+        adj_call = next(
+            c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_ml_adjustment_today"
+        )
+        assert float(adj_call.kwargs["state"]) < 0

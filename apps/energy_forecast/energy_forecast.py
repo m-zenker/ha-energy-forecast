@@ -1660,6 +1660,7 @@ class EnergyForecast(hass.Hass):
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
         self._publish_thermal_pressure()
+        self._publish_physics_sensors(predictions)
 
         intervals = self._ml_model.predict_intervals(
             forecast_df,
@@ -2058,6 +2059,61 @@ class EnergyForecast(hass.Hass):
                 state=str(round(float(value), 3)),
                 attributes=attrs,
             )
+
+    def _publish_physics_sensors(self, forecast_df: pd.DataFrame) -> None:
+        """Publish the physics-only baseline and the ML adjustment on top of it.
+
+        Published whenever a physics model is configured, independent of phase:
+        the physics baseline is computable (and diagnostically useful) in Phase 1
+        too, when it's only a model *feature* rather than the residual target.
+
+        `forecast_df` is the 48h `[timestamp, predicted_kwh]` frame returned by
+        `self._ml_model.predict(...)` — the main forecast. The physics baseline
+        itself is recomputed from `self._cached_forecast_df` (the raw weather
+        forecast, which carries `temp_c`/`direct_radiation_wm2` that
+        `predict_series()` needs and that `forecast_df` does not have).
+        """
+        if self._physics_model is None or forecast_df.empty:
+            return
+        try:
+            import pandas as pd
+
+            weather_df = self._cached_forecast_df if self._cached_forecast_df is not None else forecast_df
+            physics_series = self._physics_model.predict_series(
+                weather_df,
+                climate_recent=self._physics_climate_dfs,
+                dhw_recent=self._physics_dhw_tank_df,
+                room_areas=self._climate_room_areas or None,
+            )
+            physics_vals = physics_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
+            ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
+
+            self.set_state(
+                "sensor.energy_forecast_physics_base_today",
+                state=str(round(float(physics_vals[0]), 3)),
+                attributes={
+                    "hourly_kwh": [round(float(v), 3) for v in physics_vals],
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": "Energy Forecast Physics Base Today",
+                    "unique_id": "energy_forecast_physics_base_today",
+                    "attribution": ATTRIBUTION,
+                },
+                replace=True,
+            )
+            self.set_state(
+                "sensor.energy_forecast_ml_adjustment_today",
+                state=str(round(float(ml_adjustment_vals[0]), 3)),
+                attributes={
+                    "hourly_kwh": [round(float(v), 3) for v in ml_adjustment_vals],
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": "Energy Forecast ML Adjustment Today",
+                    "unique_id": "energy_forecast_ml_adjustment_today",
+                    "attribution": ATTRIBUTION,
+                },
+                replace=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(f"Failed to publish physics sensors: {exc}")
 
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
