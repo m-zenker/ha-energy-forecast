@@ -243,8 +243,17 @@ class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
     _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
-    _SPRING_BIAS_NIGHT_FRAC: float = 0.15  # fraction of nighttime candidates below which guard fires
-    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median above which guard fires
+    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median at/above which temp confidence is zero
+    _SPRING_BIAS_OUTDOOR_TEMP_FLOOR: float = 5.0  # °C outdoor median at/below which temp confidence is full
+    _SPRING_BIAS_NIGHT_FRAC_FULL: float = 0.40  # night_frac at/above which night confidence is full
+    _TAU_SAMPLE_CONF_REF: int = 3  # candidate count at/above which sample confidence is full
+    _TAU_EMA_MAX_NEW_WEIGHT: float = 0.2  # weight given to the fresh τ estimate at full confidence
+    _TAU_DRIFT_WINDOW_DAYS: int = 30  # short drift-cap window (days)
+    _TAU_MAX_DRIFT_FRAC: float = 0.35  # short drift-cap max fractional move
+    _TAU_LONG_DRIFT_WINDOW_DAYS: int = 180  # long drift-cap window (days)
+    _TAU_LONG_MAX_DRIFT_FRAC: float = 0.50  # long drift-cap max fractional move
+
+    assert _SPRING_BIAS_OUTDOOR_TEMP > _SPRING_BIAS_OUTDOOR_TEMP_FLOOR
 
     def __init__(self, model_dir: Path, model_archive_count: int = 3, timezone: str = "Europe/Zurich") -> None:
         self._model_dir = model_dir
@@ -1744,28 +1753,13 @@ class EnergyForecastModel:
                 hour_start = int(group.index[s].hour)
 
                 quality = r2 * outdoor_temp_score * n_score * solar_score * hour_score
-                candidates.append((tau, quality, hour_start))
+                candidates.append((tau, quality, hour_start, sub_t_outdoor))
 
         if not candidates:
             _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
 
-        # Spring-bias guard: if almost no nighttime candidates exist and outdoor temps
-        # are warm, the estimates are dominated by open-window ventilation rather than
-        # structural thermal mass.  Preserve the stored winter τ in that case.
         old_tau = self._tau_hours
-        if old_tau is not None and old_tau > 0 and len(candidates) >= 3:
-            night_frac = sum(1 for _, _, h in candidates if h >= 22 or h < 6) / len(candidates)
-            outdoor_median = float(combined[combined["off"] == 1]["T_outdoor"].median())
-            if night_frac < self._SPRING_BIAS_NIGHT_FRAC and outdoor_median > self._SPRING_BIAS_OUTDOOR_TEMP:
-                _LOGGER.info(
-                    "τ calibration skipped — spring/summer bias (%.0f%% nighttime candidates, "
-                    "T_out median=%.1f°C); preserving stored τ=%.1f h.",
-                    night_frac * 100,
-                    outdoor_median,
-                    old_tau,
-                )
-                return old_tau
 
         # With few candidates use top-50%; with many (≥ threshold) tighten to top-25%
         # to reduce bias from lower-quality windows in data-rich retrains.
@@ -1786,21 +1780,59 @@ class EnergyForecastModel:
             max(tau_estimates),
         )
 
+        # Confidence: requires BOTH a sufficient nighttime fraction AND a cold-enough outdoor
+        # median among the SELECTED (quality-filtered) candidates -- computed over the same
+        # population tau_median comes from, not the raw candidate pool. A single good signal
+        # must not be able to rescue full trust for a window where the other signal is bad
+        # (e.g. a warm, all-night window is a textbook summer ventilation case, not safe data).
+        night_frac = sum(1 for c in selected if c[2] >= 22 or c[2] < 6) / len(selected)
+        outdoor_median = float(np.median([c[3] for c in selected]))
+
+        night_conf = min(1.0, night_frac / self._SPRING_BIAS_NIGHT_FRAC_FULL)
+        temp_conf = min(
+            1.0,
+            max(
+                0.0,
+                (self._SPRING_BIAS_OUTDOOR_TEMP - outdoor_median)
+                / (self._SPRING_BIAS_OUTDOOR_TEMP - self._SPRING_BIAS_OUTDOOR_TEMP_FLOOR),
+            ),
+        )
+        # len(candidates) (pre-selection pool size) -- sparse retrains should be trusted less.
+        sample_conf = min(1.0, len(candidates) / self._TAU_SAMPLE_CONF_REF)
+
+        # Geometric mean, not a plain product: a plain 3-way product over-penalizes moderately
+        # -good conditions (three factors of 0.7 would multiply to 0.34); the geometric mean
+        # preserves the same AND-semantics at the boundaries (any single factor at exactly 0
+        # still forces confidence to exactly 0) while being much gentler in the interior.
+        confidence = (night_conf * temp_conf * sample_conf) ** (1.0 / 3.0)
+
         tau_median = float(np.median(tau_estimates))
 
         if old_tau is not None and old_tau > 0:
-            change_frac = abs(tau_median - old_tau) / old_tau
-            if change_frac > 0.5:
-                tau_result = 0.8 * old_tau + 0.2 * tau_median
+            new_weight = confidence * self._TAU_EMA_MAX_NEW_WEIGHT
+            tau_result = (1.0 - new_weight) * old_tau + new_weight * tau_median
+            if confidence < 0.05:
                 _LOGGER.info(
-                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
+                    "τ calibration: ~0%% confidence (night_frac=%.0f%%, T_out median=%.1f°C, "
+                    "%d candidates) — preserving stored τ=%.1f h.",
+                    night_frac * 100,
+                    outdoor_median,
+                    len(candidates),
+                    old_tau,
+                )
+            else:
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, new_weight=%.0f%%, confidence=%.0f%% "
+                    "[night=%.0f%%, temp=%.0f%%, sample=%.0f%%])",
                     old_tau,
                     tau_result,
                     tau_median,
-                    change_frac * 100,
+                    new_weight * 100,
+                    confidence * 100,
+                    night_conf * 100,
+                    temp_conf * 100,
+                    sample_conf * 100,
                 )
-            else:
-                tau_result = tau_median
         else:
             tau_result = tau_median
 

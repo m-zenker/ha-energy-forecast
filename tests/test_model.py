@@ -4809,23 +4809,12 @@ class TestTauCalibrationSafeguards:
         model = _make_tau_model(tmp_path)
         model._tau_hours = 10.0  # stored τ
         # tau_true=22 → ~120% above stored 10 → expect blend
-        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=22.0)
+        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=22.0, start_hour=22)
 
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
         assert result is not None
         # EMA: 0.8*10 + 0.2*~22 → result should be between 10 and 22
         assert 10.0 < result < 22.0
-
-    def test_no_ema_on_small_change(self, tmp_path):
-        """When new τ is within 50% of stored τ, raw median is returned."""
-        model = _make_tau_model(tmp_path)
-        model._tau_hours = 10.0  # stored τ
-        # tau_true=12 → ~20% above stored 10 → no blend, raw median accepted
-        climate_dfs, heating_df, weather_df = self._make_night_blocks(tau_true=12.0)
-
-        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
-        assert result is not None
-        assert result > 10.5  # closer to 12 than to 10
 
     def test_no_radiation_column_degrades_gracefully(self, tmp_path):
         """weather_df without direct_radiation_wm2 skips the solar mask (no crash)."""
@@ -4873,6 +4862,96 @@ class TestTauCalibrationSafeguards:
         assert result is not None
         # Top 50% should favour the good τ≈10 windows; result should not be near 50
         assert result < 30.0
+
+    def test_production_gray_zone_incident_now_preserves(self, tmp_path):
+        """Reproduces the literal incident conditions from the design spec §1 (night_frac~100%
+        of a small selected set, outdoor_median~14°C — just above the old guard's 12°C trigger,
+        which is exactly why the old guard never fired here). The rejected first-draft formula
+        also got this case wrong (confidence=1, full trust) because a single good signal (night)
+        could rescue trust. This is the regression test for the actual production bug.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = self._make_night_blocks(
+            tau_true=15.0,
+            n_days=6,
+            start_hour=23,
+            window_hours=3,
+            t_out=14.0,
+        )
+
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result == 10.0, "the exact production gray-zone condition must now be an exact preserve"
+
+    def test_warm_mostly_night_window_not_fully_trusted(self, tmp_path):
+        """Key counterexample the rejected first-draft formula got wrong: an all-nighttime but
+        warm window (a textbook summer window-ventilation case) must NOT reach full confidence
+        just because night_frac is good — both signals are required.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = self._make_night_blocks(tau_true=16.0, n_days=5, start_hour=22, t_out=18.0)
+
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result == 10.0
+
+    def test_sparse_candidates_reduce_confidence_not_maximize_it(self, tmp_path):
+        """len(candidates) below _TAU_SAMPLE_CONF_REF must scale confidence down, not leave it at
+        the old code's implicit "guard doesn't apply, proceed at full trust" default.
+
+        Compared against a full-confidence run on independently-generated data with the same
+        tau_true, rather than a captured/narrated number for this specific fixture.
+        """
+        model_sparse = _make_tau_model(tmp_path / "sparse")
+        model_sparse._tau_hours = 10.0
+        sparse_dfs, sparse_heat, sparse_wx = self._make_night_blocks(tau_true=12.0, start_hour=22, n_days=1)
+        sparse_result = model_sparse._calibrate_tau(sparse_dfs, sparse_heat, sparse_wx)
+
+        model_full = _make_tau_model(tmp_path / "full")
+        model_full._tau_hours = 10.0
+        full_dfs, full_heat, full_wx = self._make_night_blocks(tau_true=12.0, start_hour=22, n_days=5)
+        full_result = model_full._calibrate_tau(full_dfs, full_heat, full_wx)
+
+        assert sparse_result is not None and full_result is not None
+        assert 10.0 < sparse_result < full_result, (
+            "a 1-day (sparse) retrain must land strictly closer to the stored τ than an "
+            "otherwise-identical 5-day (ample-sample) retrain toward the same raw estimate"
+        )
+
+    def test_both_signals_good_updates_normally(self, tmp_path):
+        """Sanity check: when both night_frac and outdoor_median genuinely look winter-like,
+        normal (confidence≈1) damped updates still occur — this isn't a regression to "never
+        update."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = self._make_night_blocks(tau_true=12.0, start_hour=22, t_out=5.0)
+
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result is not None
+        assert 10.0 < result < 10.8
+
+    def test_cold_daytime_also_damped_not_fully_trusted(self, tmp_path):
+        """Deliberate behavior change from the original code (which fully trusted this case):
+        the codebase's own quality-scoring docstring (model.py:1731) attributes daytime bias to
+        ventilation, independent of temperature — confidence now correctly requires BOTH
+        night_frac and outdoor_median to be good, so this case gets confidence=0, same as the
+        "both bad" case, not a full update.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 25.0
+        cold_day_dfs, cold_day_heat, cold_day_wx = self._make_night_blocks(
+            tau_true=10.0,
+            n_days=5,
+            start_hour=10,
+            t_out=5.0,
+        )
+
+        result = model._calibrate_tau(cold_day_dfs, cold_day_heat, cold_day_wx)
+
+        assert result == 25.0, "night_frac=0% must zero out confidence regardless of temperature"
 
     def test_selectivity_switches_to_top25pct_above_threshold(self, tmp_path, monkeypatch):
         """At ≥ _TAU_SELECTIVITY_THRESHOLD candidates, top-25% is used instead of top-50%.
@@ -5151,21 +5230,6 @@ class TestTauCalibrationSafeguards:
         result = model._calibrate_tau(bias_dfs, bias_heat, bias_wx)
 
         assert result is not None, "First-run calibration should proceed even with spring-biased data"
-
-    def test_spring_bias_guard_not_triggered_with_cold_outdoor(self, tmp_path):
-        """Guard requires warm outdoor (>12°C) — cold outdoor must not suppress calibration."""
-        model = _make_tau_model(tmp_path)
-        model._tau_hours = 25.0
-
-        # 100% daytime windows but T_out=5°C → outdoor_median=5°C < 12°C → guard off
-        cold_day_dfs, cold_day_heat, cold_day_wx = self._make_night_blocks(
-            tau_true=10.0, n_days=5, start_hour=10, t_out=5.0
-        )
-
-        result = model._calibrate_tau(cold_day_dfs, cold_day_heat, cold_day_wx)
-
-        assert result is not None
-        assert result != 25.0, "Cold outdoor should allow τ to update even for daytime windows"
 
 
 # ── Auto-K Regime Selection ───────────────────────────────────────────────────
