@@ -265,6 +265,7 @@ class EnergyForecastModel:
         self.feature_cols: list[str] = _FEATURES_BASE
         self.last_trained: datetime = datetime.min
         self.last_mae: float | None = None
+        self.last_residual_mae: float | None = None  # Phase 2 only — internal diagnostic (residual scale)
         self.last_cv_mae: float | None = None  # cross-validated MAE
         self.engine: str = "not trained"
         self._feature_medians: dict = {}  # global medians — used to fill NaN at predict time
@@ -771,6 +772,7 @@ class EnergyForecastModel:
         # The final `model` is still trained on all rows for best accuracy; this
         # temporary holdout model is only for the MAE fallback used when CV is skipped.
         holdout_mae = None
+        self.last_residual_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
@@ -779,7 +781,16 @@ class EnergyForecastModel:
                     ho_model.fit(X.iloc[:split], y_fit[:split], sample_weight=sample_weight[:split])
                 else:
                     ho_model.fit(X.iloc[:split], y_fit[:split])
-                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_model.predict(X.iloc[split:])))), 4)
+
+                X_ho = X.iloc[split:]
+                ho_raw = ho_model.predict(X_ho)
+                if self._use_physics_residual:
+                    physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else 0.0
+                    gross_pred = np.maximum(0, physics_ho + ho_raw)
+                    holdout_mae = round(float(mae_fn(y[split:], gross_pred)), 4)
+                    self.last_residual_mae = round(float(mae_fn(y_fit[split:], ho_raw)), 4)
+                else:
+                    holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_raw))), 4)
             except (ValueError, IndexError):
                 pass
 
@@ -803,6 +814,10 @@ class EnergyForecastModel:
             len(feature_cols),
             mae_str,
         )
+        if self._use_physics_residual and self.last_residual_mae is not None:
+            _LOGGER.info(
+                f"Holdout MAE (gross kWh)={holdout_mae}, residual MAE (internal diagnostic)={self.last_residual_mae}"
+            )
 
         # ── Phase 1 physics validation diagnostic (Plan B Task 6) ────────────
         # Read-only: reports whether physics_kwh is a top-5 SHAP feature and

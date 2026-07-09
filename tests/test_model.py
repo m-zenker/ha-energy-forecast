@@ -6150,3 +6150,45 @@ class TestPhase2Predict:
         monkeypatch.setattr(pm, "predict_series", _broken_predict_series)
         result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
         assert not result.empty  # no exception propagates; falls back to ML-only reconstruction
+
+
+class TestGrossMAEReporting:
+    def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):
+        model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)
+        assert model.last_mae is not None
+        assert model.last_residual_mae is None
+
+    def test_phase2_last_mae_still_reported_on_gross_kwh(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        assert model.last_mae is not None
+        assert model.last_residual_mae is not None
+        # Regression guard for the exact bug this task fixes: the old code applied
+        # np.expm1() unconditionally to the raw prediction, which in Phase 2 is a residual
+        # (never log-transformed, can be negative) — not a log-transformed gross-kWh value.
+        # That produced a nonsensical MAE far outside the fixture's gross_kwh range
+        # (0.5-5.0): empirically ~7.56 for this fixture/seed vs. a correct ~0.9. A correctly
+        # reconstructed gross-kWh MAE must stay well inside the target's actual range.
+        assert model.last_mae < 3.0
+        # Note: last_mae and last_residual_mae are mathematically identical here by
+        # construction — MAE is translation-invariant per row (physics_kwh is subtracted
+        # from the target and added back to the prediction identically), so
+        # MAE(y, physics+pred) == MAE(y-physics, pred) exactly, *unless* the np.maximum(0, ...)
+        # floor-clip changes at least one holdout row. That only happens when the
+        # reconstructed prediction would go negative, which this fixture's holdout split
+        # doesn't trigger. last_residual_mae is still a distinct, separately-computed value
+        # (on the residual scale, unclipped) — it just happens to coincide numerically here.
