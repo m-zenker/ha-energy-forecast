@@ -5231,6 +5231,144 @@ class TestTauCalibrationSafeguards:
 
         assert result is not None, "First-run calibration should proceed even with spring-biased data"
 
+    def test_single_retrain_tau_move_bounded_by_drift_cap(self, tmp_path):
+        """For an extreme, fully-trusted pull, the drift cap's ±35%-of-anchor bound is the
+        *tighter* constraint (not the EMA weight's confidence*20%-of-gap alone), because the
+        anchor initializes to the pre-update stored value on the very first blended retrain."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = self._make_night_blocks(
+            tau_true=100.0,
+            start_hour=22,
+            t_out=5.0,
+            window_hours=12,
+        )
+
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result is not None
+        assert result == pytest.approx(13.5), "drift cap (anchor=10.0 * 1.35) must be the binding constraint"
+        assert abs(result - 10.0) <= 10.0 * 0.35 + 1e-6
+
+
+class TestTauDriftCap:
+    """Fix B: bounds cumulative τ movement to ±_TAU_MAX_DRIFT_FRAC (short) / ±_TAU_LONG_MAX_DRIFT_FRAC
+    (long) from the value at the start of each respective rolling window, independent of Fix A's
+    per-step damping and independent of how many retrains occur inside the window.
+
+    _make_night_blocks (tests/test_model.py:4749) hardcodes its dates to January 2026 -- all
+    anchor timestamps below are set well before January 2026 accordingly.
+    """
+
+    def _seed_anchors(self, model, anchor_hours, anchor_ts):
+        model._tau_anchor_hours = anchor_hours
+        model._tau_anchor_ts = anchor_ts
+        model._tau_long_anchor_hours = anchor_hours
+        model._tau_long_anchor_ts = anchor_ts
+
+    def test_clamps_when_cumulative_budget_exhausted(self, tmp_path):
+        """A single retrain's per-step-legal blend must still be clamped if it would push τ
+        beyond the rolling window's remaining budget. old_tau=6.0 sits below the window floor
+        (anchor=10.0 * 0.65 = 6.5); a modest raw pull (tau_true=6.5) gets clamped up to exactly
+        the floor. Anchor set 2025-12-15 -- ~19 days before the fixture's Jan 3-9 data, inside
+        the 30-day short window."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 6.0
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-12-15"))
+
+        dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+            tau_true=6.5,
+            start_hour=22,
+            t_out=5.0,
+            day_start=3,
+        )
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result is not None
+        assert result == pytest.approx(6.5), "must be clamped up to the 30-day drift floor (anchor * 0.65)"
+
+    def test_resets_after_window_elapses(self, tmp_path):
+        """Once _TAU_DRIFT_WINDOW_DAYS has passed since the anchor, a new anchor is set at the
+        current stored τ -- this is what allows genuine multi-month seasonal correction. Anchor
+        set 2025-10-01 -- roughly 97 days before the fixture's Jan 1-6 data, comfortably past
+        the 30-day window."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-10-01"))
+
+        dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+            tau_true=10.0,
+            start_hour=22,
+            t_out=5.0,
+            day_start=1,
+        )
+        model._calibrate_tau(dfs, heat, wx)
+
+        assert model._tau_anchor_ts > pd.Timestamp("2025-10-01")
+
+    def test_no_cap_within_budget(self, tmp_path):
+        """A modest, per-step-legal move well inside the 35% budget is not touched by the cap."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-12-15"))
+
+        dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+            tau_true=11.0,
+            start_hour=22,
+            t_out=5.0,
+            day_start=3,
+        )
+        result = model._calibrate_tau(dfs, heat, wx)
+
+        assert result is not None
+        assert 10.0 < result < 13.5  # within [anchor*0.65, anchor*1.35] = [6.5, 13.5]
+
+    def test_anchor_timestamps_are_tz_naive(self, tmp_path):
+        """Both anchor timestamps must stay tz-naive, matching combined.index."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+            tau_true=11.0,
+            start_hour=22,
+            t_out=5.0,
+        )
+        model._calibrate_tau(dfs, heat, wx)
+
+        assert model._tau_anchor_ts.tzinfo is None
+        assert model._tau_long_anchor_ts.tzinfo is None
+
+    def test_long_cap_bounds_multi_window_compounding(self, tmp_path):
+        """The short (30-day) cap alone only bounds movement WITHIN one window, not ACROSS
+        successive windows under sustained bias -- each window reset re-anchors at wherever the
+        previous window left off. Simulates 6 successive short-window resets under a sustained,
+        moderate (not confidence=0) pull and confirms the long (180-day) cap holds the line.
+
+        Without the long cap, 6 windows of unfettered 35%-per-window compounding would allow
+        10.0 * 0.65**6 =~ 0.75h. With the long cap, τ is held at exactly 10.0 * 0.5 = 5.0h.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+
+        for i in range(6):
+            dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+                tau_true=2.0,
+                n_days=5,
+                start_hour=22,
+                window_hours=8,
+                t_out=8.0,
+                day_start=1,
+            )
+            if i > 0:
+                model._tau_anchor_ts = model._tau_anchor_ts - pd.Timedelta(days=31)
+            result = model._calibrate_tau(dfs, heat, wx)
+            assert result is not None
+            model._tau_hours = result
+
+        assert model._tau_hours == pytest.approx(5.0), (
+            "sustained bias across many short-window resets must still be caught by the "
+            "180-day/50% long cap, not allowed to compound toward the naive ~0.75h"
+        )
+
 
 # ── Auto-K Regime Selection ───────────────────────────────────────────────────
 

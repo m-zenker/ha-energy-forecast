@@ -289,6 +289,11 @@ class EnergyForecastModel:
         self._sub_sensor_prefixes: list[str] = []
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
+        # Rolling drift-cap anchors for _tau_hours (short: 30-day/35%, long: 180-day/50%)
+        self._tau_anchor_hours: float | None = None
+        self._tau_anchor_ts: pd.Timestamp | None = None
+        self._tau_long_anchor_hours: float | None = None
+        self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
 
@@ -1476,6 +1481,10 @@ class EnergyForecastModel:
             "likely_ev_hours": self._likely_ev_hours,
             "sub_sensor_prefixes": self._sub_sensor_prefixes,
             "tau_hours": self._tau_hours,
+            "tau_anchor_hours": self._tau_anchor_hours,
+            "tau_anchor_ts": self._tau_anchor_ts,
+            "tau_long_anchor_hours": self._tau_long_anchor_hours,
+            "tau_long_anchor_ts": self._tau_long_anchor_ts,
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
             "weather_tail": self._weather_tail,
@@ -1833,6 +1842,40 @@ class EnergyForecastModel:
                     temp_conf * 100,
                     sample_conf * 100,
                 )
+
+            latest_ts = combined.index.max()
+
+            def _apply_drift_cap(anchor_h_attr, anchor_ts_attr, window_days, max_frac, result):
+                anchor_h = getattr(self, anchor_h_attr, None)
+                anchor_ts = getattr(self, anchor_ts_attr, None)
+                if anchor_h is None or anchor_ts is None or (latest_ts - anchor_ts).days >= window_days:
+                    anchor_h = old_tau
+                    setattr(self, anchor_h_attr, anchor_h)
+                    setattr(self, anchor_ts_attr, latest_ts)
+                max_drift = anchor_h * max_frac
+                lo, hi = anchor_h - max_drift, anchor_h + max_drift
+                if not (lo <= result <= hi):
+                    _LOGGER.warning(
+                        "τ drift cap (%d-day): %.1f h clamped to [%.1f, %.1f] h (anchor=%.1f h @ %s)",
+                        window_days,
+                        result,
+                        lo,
+                        hi,
+                        anchor_h,
+                        anchor_ts,
+                    )
+                return min(max(result, lo), hi)
+
+            tau_result = _apply_drift_cap(
+                "_tau_anchor_hours", "_tau_anchor_ts", self._TAU_DRIFT_WINDOW_DAYS, self._TAU_MAX_DRIFT_FRAC, tau_result
+            )
+            tau_result = _apply_drift_cap(
+                "_tau_long_anchor_hours",
+                "_tau_long_anchor_ts",
+                self._TAU_LONG_DRIFT_WINDOW_DAYS,
+                self._TAU_LONG_MAX_DRIFT_FRAC,
+                tau_result,
+            )
         else:
             tau_result = tau_median
 
@@ -1881,6 +1924,10 @@ class EnergyForecastModel:
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())
                     self._sub_sensor_prefixes = meta.get("sub_sensor_prefixes", [])
                     self._tau_hours = meta.get("tau_hours", None)
+                    self._tau_anchor_hours = meta.get("tau_anchor_hours", None)
+                    self._tau_anchor_ts = meta.get("tau_anchor_ts", None)
+                    self._tau_long_anchor_hours = meta.get("tau_long_anchor_hours", None)
+                    self._tau_long_anchor_ts = meta.get("tau_long_anchor_ts", None)
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
                     self._weather_tail = meta.get("weather_tail", None)
