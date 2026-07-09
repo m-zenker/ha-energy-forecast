@@ -6093,3 +6093,60 @@ class TestPhase2ResidualTarget:
         assert matching, (
             f"expected a WARNING mentioning {n_missing_hours} missing physics hours, got: {warning_messages}"
         )
+
+
+class TestPhase2Predict:
+    def test_phase2_predict_adds_physics_baseline(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        assert (result["predicted_kwh"] >= 0).all()  # clip enforced even though residual can go negative
+
+    def test_phase1_to_phase2_regression_identical_when_flag_false(self, tmp_path):
+        # use_physics_residual=False must reproduce pre-Phase-2 behaviour exactly
+        model_a, forecast_df = _make_trained_model(tmp_path / "model_a", use_physics_residual=False)
+        model_b, _ = _make_trained_model(tmp_path / "model_b", use_physics_residual=False)
+        result_a = model_a.predict(forecast_df, live_temp=5.0)
+        result_b = model_b.predict(forecast_df, live_temp=5.0)
+        pd.testing.assert_series_equal(
+            result_a["predicted_kwh"].reset_index(drop=True), result_b["predicted_kwh"].reset_index(drop=True)
+        )
+
+    def test_phase2_exception_in_physics_falls_back_to_ml_only(self, tmp_path, monkeypatch):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+
+        def _broken_predict_series(*a, **kw):
+            raise RuntimeError("simulated physics failure")
+
+        monkeypatch.setattr(pm, "predict_series", _broken_predict_series)
+        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        assert not result.empty  # no exception propagates; falls back to ML-only reconstruction

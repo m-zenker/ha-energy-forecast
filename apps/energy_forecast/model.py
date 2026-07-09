@@ -271,6 +271,7 @@ class EnergyForecastModel:
         self._feature_medians_by_how: dict = {}  # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool = False  # log1p target; False = backward compat
         self._use_physics_residual: bool = False  # Phase 2: train on gross_kwh - physics_kwh
+        self._last_physics_kwh_series: pd.Series | None = None  # set by _prepare_prediction_X(), read by predict()
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
         self._timezone: str = timezone  # local timezone for wall-clock "now"
@@ -943,15 +944,27 @@ class EnergyForecastModel:
         # climate feature) — predict_series() does its own internal projection.
         physics_kwh_series = None
         if physics_model is not None:
-            physics_kwh_series = physics_model.predict_series(
-                forecast_df,
-                climate_recent=climate_recent,
-                dhw_recent=dhw_recent,
-                room_areas=room_areas,
-                heating_active_series=heating_active_series,
-                setpoint_on=setpoint_on,
-                setpoint_off=setpoint_off,
-            )
+            try:
+                physics_kwh_series = physics_model.predict_series(
+                    forecast_df,
+                    climate_recent=climate_recent,
+                    dhw_recent=dhw_recent,
+                    room_areas=room_areas,
+                    heating_active_series=heating_active_series,
+                    setpoint_on=setpoint_on,
+                    setpoint_off=setpoint_off,
+                )
+            except Exception as e:
+                _LOGGER.warning(f"Physics baseline prediction failed at predict time: {e} — falling back to ML-only")
+                physics_kwh_series = None
+
+        # Stashed for predict()'s Phase 2 reconstruction step. predict() may consume
+        # a pre-built (future_hours, X) tuple via its `_prepared` param rather than
+        # calling this method directly (see energy_forecast.py's threading of
+        # _prepare_prediction_X()'s output into predict()/predict_intervals()/
+        # shap_summary()); this attribute lets it recover physics_kwh_series without
+        # widening that shared 2-tuple contract.
+        self._last_physics_kwh_series = physics_kwh_series
 
         heating_buffer_temp_series = None
         if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
@@ -1170,6 +1183,19 @@ class EnergyForecastModel:
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
+
+        if self._use_physics_residual and physics_model is not None:
+            try:
+                physics_kwh_series = self._last_physics_kwh_series
+                if physics_kwh_series is None:
+                    raise ValueError("physics baseline unavailable")
+                physics_baseline = (
+                    physics_kwh_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0).values
+                )
+                preds = physics_baseline + preds
+            except Exception as e:
+                _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
+
         preds = np.maximum(0, preds)
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
 
