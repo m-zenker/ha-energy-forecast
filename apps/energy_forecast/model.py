@@ -1605,12 +1605,15 @@ class EnergyForecastModel:
         * ``solar``          — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
         * ``hour``           — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.1 daytime
 
-        A spring-bias guard is applied before selection: if fewer than 15 % of candidates
-        are nighttime AND the heating-off outdoor median exceeds 12 °C, the stored τ is
-        preserved (spring open-window data is not representative of building thermal mass).
+        The top 50 % of candidates by quality (minimum 1) are used to compute the median τ.
 
-        The top 50 % of candidates by quality (minimum 1) are used to compute the
-        median τ, which is then EMA-smoothed against the stored value.
+        A continuous confidence weight — requiring both a sufficient nighttime fraction *and*
+        a cold-enough outdoor median among the selected top-N candidates, plus enough total
+        candidates — scales how much a fresh estimate can move the stored τ in a single retrain
+        (0–20 %). A two-tier rolling cap independently bounds total movement to ±35 % over any
+        30 days and ±50 % over any 180 days, regardless of retrain frequency. See
+        `docs/superpowers/specs/2026-07-09-tau-calibration-drift-fix-design.md` §2.1–2.2 for the
+        full design rationale.
         """
         import numpy as np
         import pandas as pd
