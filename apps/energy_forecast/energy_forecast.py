@@ -1243,6 +1243,17 @@ class EnergyForecast(hass.Hass):
             return False
         return requested
 
+    def _model_phase_attr(self) -> str | None:
+        """Which physics phase last trained the model, for display as a sensor attribute.
+
+        Returns `None` when physics isn't configured at all (no phase concept without
+        physics), otherwise "phase1" or "phase2" reflecting `self._ml_model._use_physics_residual`
+        as set during the last `train()` call.
+        """
+        if self._physics_model is None:
+            return None
+        return "phase2" if getattr(self._ml_model, "_use_physics_residual", False) else "phase1"
+
     # ── Core logic ────────────────────────────────────────────────────────────
 
     def _retrain(self) -> None:
@@ -2226,6 +2237,7 @@ class EnergyForecast(hass.Hass):
         # ── Forecast totals ───────────────────────────────────────────────────
         shap_features = data.get("shap_top_features") or {}
         shap_narrative = data.get("shap_narrative") or ""
+        model_phase = self._model_phase_attr()
         for key, label in [
             ("next_1h", "Next 1h"),
             ("next_3h", "Next 3h"),
@@ -2239,6 +2251,8 @@ class EnergyForecast(hass.Hass):
                     extra["shap_top_features"] = shap_features
                 if shap_narrative:
                     extra["shap_narrative"] = shap_narrative
+                if model_phase is not None:
+                    extra["model_phase"] = model_phase
                 if not extra:  # if no attributes, set to None
                     extra = None
             safe_set(
@@ -2248,13 +2262,16 @@ class EnergyForecast(hass.Hass):
                 extra_attrs=extra,
                 icon="mdi:lightning-bolt",
             )
-        # In MQTT mode, publish shap_top_features and shap_narrative as json_attributes for energy_forecast_today
-        if self._mqtt_discovery and (shap_features or shap_narrative):
+        # In MQTT mode, publish shap_top_features, shap_narrative, and model_phase as
+        # json_attributes for energy_forecast_today
+        if self._mqtt_discovery and (shap_features or shap_narrative or model_phase is not None):
             attrs = {}
             if shap_features:
                 attrs["shap_top_features"] = shap_features
             if shap_narrative:
                 attrs["shap_narrative"] = shap_narrative
+            if model_phase is not None:
+                attrs["model_phase"] = model_phase
             if attrs:
                 self._mqtt_publish_sensor_attributes(
                     "energy_forecast_today",

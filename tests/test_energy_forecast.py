@@ -856,6 +856,11 @@ class _FakeMqttSelf:
         if level == "WARNING":
             self._warnings.append(msg)
 
+    def _model_phase_attr(self) -> str | None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._model_phase_attr(self)
+
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
 

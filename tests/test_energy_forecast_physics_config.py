@@ -62,6 +62,7 @@ def _make_app(args: dict):
     # Bind the real initialize method to the mock
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
     app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
+    app._model_phase_attr = EnergyForecast._model_phase_attr.__get__(app, type(app))
     return app
 
 
@@ -408,3 +409,22 @@ class TestPhysicsMqttDiscoveryRegistration:
         registered_ids = [c.args[0] for c in app._mqtt_publish_discovery.call_args_list]
         assert "energy_forecast_physics_base_today" not in registered_ids
         assert "energy_forecast_ml_adjustment_today" not in registered_ids
+
+
+class TestModelPhaseAttribute:
+    def test_model_phase_absent_when_physics_disabled(self):
+        app = _make_app({"energy_sensor": "sensor.grid_import"})
+        app.initialize()
+        assert app._model_phase_attr() is None
+
+    def test_model_phase_is_phase1_by_default(self, tmp_path):
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._ml_model._use_physics_residual = False
+        assert app._model_phase_attr() == "phase1"
+
+    def test_model_phase_is_phase2_when_flag_set_on_model(self, tmp_path):
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._ml_model._use_physics_residual = True
+        assert app._model_phase_attr() == "phase2"
