@@ -45,6 +45,8 @@ _LOGGER = logging.getLogger("energy_forecast")
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600  # weekly
+STARTUP_RETRAIN_MIN_GAP_HOURS = 6  # skip the unconditional startup retrain if one already
+# happened this recently (e.g. a crash-loop restart)
 MIN_HISTORY_HOURS = 48
 BLOCK_SLOTS = [f"{h:02d}_{h + 3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
@@ -345,6 +347,7 @@ class EnergyForecast(hass.Hass):
         self._ml_model = EnergyForecastModel(
             model_dir, model_archive_count=self._model_archive_count, timezone=self._timezone
         )
+        self._seed_adaptive_cooldown()
         self._lock = threading.Lock()
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
@@ -355,7 +358,7 @@ class EnergyForecast(hass.Hass):
 
         self._check_setup()
         self._publish_unavailable()
-        self.run_in(self._retrain_cb, 10)
+        self.run_in(self._maybe_startup_retrain, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
@@ -842,6 +845,59 @@ class EnergyForecast(hass.Hass):
             _LOGGER.error("Model rollback failed: %s", exc)
         finally:
             self._lock.release()
+
+    def _last_trained_local(self) -> datetime:
+        """self._ml_model.last_trained as local wall-clock time.
+
+        It's persisted via datetime.now() in model.py's train() — system/UTC time in Docker/HA,
+        per the same reasoning already documented at _maybe_adaptive_retrain's local-time
+        construction. Every retrain-cadence comparison in this file uses
+        pd.Timestamp.now(self._timezone).tz_localize(None), so this converts last_trained to the
+        same basis before any comparison — without it, comparisons are off by the UTC offset
+        (1-2h for Europe/Zurich), which lets cooldown gates expire early near their boundary.
+        """
+        import pandas as pd
+
+        last_trained = self._ml_model.last_trained
+        if last_trained == datetime.min:
+            return last_trained
+        return pd.Timestamp(last_trained).tz_localize("UTC").tz_convert(self._timezone).tz_localize(None)
+
+    def _seed_adaptive_cooldown(self) -> None:
+        """Seed the adaptive-retrain cooldown from the persisted last-trained timestamp.
+
+        Without this, self._last_adaptive_retrain starts at datetime.min on every AppDaemon
+        restart, immediately re-arming the 24h adaptive-retrain cooldown. Re-synced at the end of
+        every _retrain() too (not just here at startup) — otherwise this seed is a one-shot and
+        _last_adaptive_retrain silently drifts apart from last_trained again after the very next
+        retrain, which would only mask the bug for a single restart cycle.
+        """
+        self._last_adaptive_retrain = self._last_trained_local()
+
+    def _maybe_startup_retrain(self, event_name=None, data=None, kwargs=None) -> None:
+        """Startup retrain (run_in(..., 10)), skipped if a retrain already completed recently.
+
+        Closes the other half of defect (A): previously *every* restart forced a full retrain
+        regardless of how recently one had already happened, so a crash-loop or repeated manual
+        restart could touch τ far more often than the intended weekly cadence. A restart shortly
+        after a genuine code deploy will run on the previous model until the next
+        scheduled/adaptive retrain — an acceptable trade-off given the model changes slowly
+        week to week, and RELOAD_ENERGY_MODEL remains available for an explicit forced reload.
+        """
+        import pandas as pd
+
+        last_local = self._last_trained_local()
+        if last_local != datetime.min:
+            hours_since = (pd.Timestamp.now(self._timezone).tz_localize(None) - last_local).total_seconds() / 3600
+            if hours_since < STARTUP_RETRAIN_MIN_GAP_HOURS:
+                _LOGGER.info(
+                    "Startup retrain skipped — last retrain was %.1fh ago (< %dh gap); the "
+                    "weekly/adaptive schedule will pick up the next real update.",
+                    hours_since,
+                    STARTUP_RETRAIN_MIN_GAP_HOURS,
+                )
+                return
+        self._retrain_cb(event_name, data, kwargs)
 
     def _get_scenario_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
         """AppDaemon service callback: energy_forecast/get_scenario.
@@ -1408,6 +1464,7 @@ class EnergyForecast(hass.Hass):
             heating_buffer_temp_df=self._physics_heating_buffer_df,
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
+        self._last_adaptive_retrain = self._last_trained_local()
 
         try:
             ha_data.fetch_energy_history_15m(
