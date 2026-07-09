@@ -2021,6 +2021,9 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_tomorrow_high",
             # Thermal pressure sensor (now served via MQTT)
             "sensor.energy_forecast_thermal_pressure_net",
+            # Physics baseline / ML adjustment sensors (now served via MQTT)
+            "sensor.energy_forecast_physics_base_today",
+            "sensor.energy_forecast_ml_adjustment_today",
             # Scenario sensors (now served via MQTT when mqtt_discovery=True)
             "sensor.energy_forecast_scenario_today",
             "sensor.energy_forecast_scenario_tomorrow",
@@ -2088,30 +2091,43 @@ class EnergyForecast(hass.Hass):
             physics_vals = physics_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
             ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
 
-            self.set_state(
-                "sensor.energy_forecast_physics_base_today",
-                state=str(round(float(physics_vals[0]), 3)),
-                attributes={
-                    "hourly_kwh": [round(float(v), 3) for v in physics_vals],
-                    "unit_of_measurement": "kWh",
-                    "friendly_name": "Energy Forecast Physics Base Today",
-                    "unique_id": "energy_forecast_physics_base_today",
-                    "attribution": ATTRIBUTION,
-                },
-                replace=True,
-            )
-            self.set_state(
-                "sensor.energy_forecast_ml_adjustment_today",
-                state=str(round(float(ml_adjustment_vals[0]), 3)),
-                attributes={
-                    "hourly_kwh": [round(float(v), 3) for v in ml_adjustment_vals],
-                    "unit_of_measurement": "kWh",
-                    "friendly_name": "Energy Forecast ML Adjustment Today",
-                    "unique_id": "energy_forecast_ml_adjustment_today",
-                    "attribution": ATTRIBUTION,
-                },
-                replace=True,
-            )
+            physics_attrs = {
+                "hourly_kwh": [round(float(v), 3) for v in physics_vals],
+                "unit_of_measurement": "kWh",
+                "friendly_name": "Energy Forecast Physics Base Today",
+            }
+            ml_attrs = {
+                "hourly_kwh": [round(float(v), 3) for v in ml_adjustment_vals],
+                "unit_of_measurement": "kWh",
+                "friendly_name": "Energy Forecast ML Adjustment Today",
+            }
+
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor("energy_forecast_physics_base_today", physics_vals[0])
+                self._mqtt_publish_sensor_attributes("energy_forecast_physics_base_today", physics_attrs)
+                self._mqtt_set_sensor("energy_forecast_ml_adjustment_today", ml_adjustment_vals[0])
+                self._mqtt_publish_sensor_attributes("energy_forecast_ml_adjustment_today", ml_attrs)
+            else:
+                self.set_state(
+                    "sensor.energy_forecast_physics_base_today",
+                    state=str(round(float(physics_vals[0]), 3)),
+                    attributes={
+                        **physics_attrs,
+                        "unique_id": "energy_forecast_physics_base_today",
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
+                self.set_state(
+                    "sensor.energy_forecast_ml_adjustment_today",
+                    state=str(round(float(ml_adjustment_vals[0]), 3)),
+                    attributes={
+                        **ml_attrs,
+                        "unique_id": "energy_forecast_ml_adjustment_today",
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning(f"Failed to publish physics sensors: {exc}")
 

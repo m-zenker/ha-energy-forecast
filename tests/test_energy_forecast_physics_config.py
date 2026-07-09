@@ -349,3 +349,27 @@ class TestPhysicsSensors:
             c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_ml_adjustment_today"
         )
         assert float(adj_call.kwargs["state"]) < 0
+
+    def test_physics_sensors_use_mqtt_in_mqtt_mode(self, monkeypatch):
+        """In MQTT mode, both sensors must go through _mqtt_set_sensor, not set_state."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app._mqtt_discovery = True
+        app.set_state = MagicMock()
+        app._mqtt_set_sensor = MagicMock()
+        app._mqtt_publish_sensor_attributes = MagicMock()
+        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
+        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
+        app._publish_physics_sensors(forecast_df)
+
+        mqtt_ids = [c.args[0] for c in app._mqtt_set_sensor.call_args_list]
+        assert "energy_forecast_physics_base_today" in mqtt_ids
+        assert "energy_forecast_ml_adjustment_today" in mqtt_ids
+        attr_ids = [c.args[0] for c in app._mqtt_publish_sensor_attributes.call_args_list]
+        assert "energy_forecast_physics_base_today" in attr_ids
+        assert "energy_forecast_ml_adjustment_today" in attr_ids
+        app.set_state.assert_not_called()
