@@ -621,6 +621,10 @@ class EnergyForecastModel:
         X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
         self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)
+        if use_physics_residual and not self._use_physics_residual:
+            _LOGGER.warning(
+                "use_physics_residual requested but no physics_kwh_series available — falling back to Phase 1."
+            )
 
         if self._use_physics_residual:
             physics_aligned = physics_kwh_series.reindex(df["timestamp"])

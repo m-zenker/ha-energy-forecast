@@ -6049,3 +6049,47 @@ class TestPhase2ResidualTarget:
         target = df["gross_kwh"].to_numpy(dtype=float) - physics_vals
         assert target[2] == pytest.approx(4.0)  # NaN -> 0, so residual = gross_kwh unmodified for that hour
         assert target[0] == pytest.approx(1.0)
+
+    def test_phase2_warns_end_to_end_when_physics_series_has_real_gap(self, tmp_path, caplog):
+        # Unlike test_phase2_nan_physics_hours_filled_with_zero_and_warned above (whose fixture is
+        # fully aligned and documents the *absence* of the warning), this test forces a genuine gap
+        # in physics_kwh_series so train()'s internal reindex(df["timestamp"]) — see model.py around
+        # `self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)`
+        # — produces real NaNs, and asserts the resulting WARNING is actually logged.
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+
+        orig_predict_training_series = pm.predict_training_series
+        n_missing_hours = 3
+
+        def _predict_training_series_with_gap(*args, **kwargs):
+            series = orig_predict_training_series(*args, **kwargs)
+            # Drop the last few timestamps entirely so the physics_kwh_series index no
+            # longer covers every training hour — a genuine gap, not just a NaN value.
+            return series.iloc[:-n_missing_hours]
+
+        with (
+            patch.object(pm, "predict_training_series", side_effect=_predict_training_series_with_gap),
+            caplog.at_level("WARNING"),
+        ):
+            model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+
+        assert model._use_physics_residual is True
+        warning_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        matching = [m for m in warning_messages if "physics" in m.lower() and str(n_missing_hours) in m]
+        assert matching, (
+            f"expected a WARNING mentioning {n_missing_hours} missing physics hours, got: {warning_messages}"
+        )
