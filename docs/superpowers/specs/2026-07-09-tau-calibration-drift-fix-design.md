@@ -1,10 +1,10 @@
 # τ Calibration Drift Fix — Design Spec
 
-**Date:** 2026-07-09 (rev. 2 — post multi-stakeholder review)
+**Date:** 2026-07-09 (rev. 3 — post multi-stakeholder review, round 2)
 **Status:** Proposed — pending approval before implementation
 **Branch base:** `feat/physics-core-engine` (current worktree; contains the Phase 1 physics integration this bug lives in)
 
-**Revision note:** rev. 1 of this spec was reviewed by three independent domain experts (building-thermal/controls, data science, software engineering) in parallel. That review surfaced a structural flaw in the confidence formula (it let a single good signal fully rescue trust, reproducing the exact bug being fixed) and a real UTC/local-timezone bug in the cooldown fix, among 20 total findings. This revision replaces the confidence formula, adds a rolling drift cap the first draft was missing, and fixes the timezone bug. See §5 for the full findings-to-changes mapping.
+**Revision note:** rev. 1 of this spec was reviewed by three independent domain experts (building-thermal/controls, data science, software engineering) in parallel. That review surfaced a structural flaw in the confidence formula (it let a single good signal fully rescue trust, reproducing the exact bug being fixed) and a real UTC/local-timezone bug in the cooldown fix, among 20 total findings. Rev. 2 replaced the confidence formula, added a rolling drift cap, and fixed the timezone bug (§5). The same three reviewers re-checked rev. 2 and found it mostly sound but surfaced a second round of issues: the drift cap only bounded movement *within* a single 30-day window (sustained bias could still compound *across* windows), the three-way confidence product was more punishing than intended for mid-range conditions, and — caught by the software engineer — an actual `AttributeError`-causing bug (`self.STARTUP_RETRAIN_MIN_GAP_HOURS` referencing a module-level constant) plus a test that used dates incompatible with the real (hardcoded-January) test fixture. This revision (rev. 3) adds a second, longer-window (180-day) drift cap, switches confidence to a geometric mean, and fixes both round-2 code/test bugs. See §5 (round 1) and §6 (round 2) for the full findings-to-changes mapping.
 
 ---
 
@@ -74,7 +74,7 @@ stop, because the guard and the smoothing both only defend against the *extreme*
 ## 2. Design
 
 Four changes. Fix A replaces the guard + EMA with a continuous, correctly-composed confidence
-weight. Fix B adds a rolling drift cap — a *second*, independent line of defense that bounds
+weight. Fix B adds a two-tier rolling drift cap — a *second*, independent line of defense that bounds
 *cumulative* movement regardless of how many times Fix A gets invoked, because per-update damping
 alone (however well-tuned) only slows convergence to a biased estimate, it doesn't prevent it over
 enough retrains (see §5, finding #2). Fix C persists the adaptive-retrain cooldown *and* gates the
@@ -137,11 +137,21 @@ temp_conf = min(
 )
 # len(candidates) (pre-selection pool size), not len(selected) (which is always >=1 by
 # construction) -- sparse RETRAINS should be trusted less, matching the existing
-# len(candidates) >= 3 threshold this replaces.
+# len(candidates) >= 3 threshold this replaces (kept at the same magnitude as that
+# pre-existing hard cutoff -- not re-derived from first principles, but not a new
+# arbitrary choice either; a follow-up could tune it against real candidate-count
+# distributions once more production data exists).
 sample_conf = min(1.0, len(candidates) / self._TAU_SAMPLE_CONF_REF)
 
 # AND, not "AND on badness" (rev. 1's bug): all three factors must be good simultaneously.
-confidence = night_conf * temp_conf * sample_conf
+# Geometric mean, not a plain product (rev. 2 used night_conf*temp_conf*sample_conf directly):
+# a plain 3-way product over-penalizes moderately-good conditions -- three factors of 0.7 each
+# would multiply to 0.34, more than halving trust even though every individual signal looks
+# "pretty good." The geometric mean preserves the exact same AND-semantics at the boundaries
+# (any single factor at exactly 0 still forces confidence to exactly 0 -- 0**(1/3) == 0, so
+# every "must be an exact preserve" case verified below is unaffected) while being much gentler
+# in the interior: geometric mean of (0.7, 0.7, 0.7) = 0.7, not 0.34.
+confidence = (night_conf * temp_conf * sample_conf) ** (1.0 / 3.0)
 
 tau_median = float(np.median(tau_estimates))
 
@@ -171,11 +181,21 @@ Removed entirely: the pre-selection guard block, the `change_frac` computation, 
 
 **Verified against the exact production incident** (offline replay, `night_frac≈100%` of *selected*
 candidates but `outdoor_median≈14°C`, i.e. the literal gray-zone condition from §1's table):
-`confidence=0` → exact preserve. **Verified against the reviewers' key counterexample** (warm,
-all-night window, `outdoor_median=18°C`): `confidence=0` → exact preserve — this is the case rev.
-1's formula got wrong (it produced `confidence=1`, full undamped trust). **Verified for the
-sample-size edge case** (`n_days=1`, few candidates): `sample_conf≈0.33`, correctly reducing trust
-rather than defaulting to full trust as rev. 1 did.
+`confidence=0` → exact preserve, unchanged by the geometric-mean switch (`0**(1/3) == 0`).
+**Verified against the reviewers' key counterexample** (warm, all-night window,
+`outdoor_median=18°C`): `confidence=0` → exact preserve — this is the case rev. 1's formula got
+wrong (it produced `confidence=1`, full undamped trust). **Verified for the sample-size edge
+case** (`n_days=1`, few candidates): with the geometric mean, `confidence≈0.69` (vs. `≈0.33` under
+the plain product), landing the blended result at `≈10.21h` rather than `≈10.10h` — still clearly
+damped relative to the raw estimate (`≈11.49h`), just less punitively than a straight product
+would be for a case where two of the three factors are already at full trust.
+
+**Persistence invariant (addresses a review question about state consistency):**
+`_tau_hours`, `_tau_anchor_hours`, and `_tau_anchor_ts` (§2.2) are always read and written together
+as part of the same `meta` dict via `_save()`/`_load()` (§2.6), and `_tau_hours` is never mutated
+anywhere outside `_calibrate_tau()` itself. A model rollback (`_rollback_model_cb`, which restores
+an archived `meta.pkl` wholesale) therefore restores all three fields from the same archived
+snapshot together — they cannot desync via any existing code path, including rollback.
 
 **Deliberate behavior change from rev. 1 and from the original code:** a cold-but-all-daytime
 window (`night_frac=0%, outdoor_median=5°C`) now also gets `confidence=0` (preserved), not a full
@@ -187,57 +207,91 @@ requiring both signals to be good is the physically consistent choice, not just 
 simplification. `tests/test_model.py::TestTauCalibrationSafeguards::test_spring_bias_guard_not_triggered_with_cold_outdoor`
 is renamed and its assertion inverted accordingly (§3.1).
 
-### 2.2 Fix B: rolling drift cap (new)
+### 2.2 Fix B: two-tier rolling drift cap (new)
 
 Per-update damping (Fix A) bounds how much a *single* retrain can move τ, but under sustained
 gray-zone conditions across many retrains it still asymptotically converges to the same
-(potentially biased) raw estimate — just more slowly (§5, finding #2). This is a second,
-independent safeguard: τ cannot move more than a fixed fraction from its value at the start of a
-rolling window, regardless of how many times it gets touched inside that window.
+(potentially biased) raw estimate — just more slowly (§5, finding #2). A single 30-day cap
+(rev. 2) closes this *within* one window, but round-2 review correctly pointed out that it doesn't
+stop compounding *across* windows: each time the window elapses, the anchor resets to wherever τ
+currently sits — including a τ that was itself pushed to the previous window's edge. This
+revision adds a second, longer, wider cap layered on top: both must hold simultaneously.
 
 ```python
-_TAU_DRIFT_WINDOW_DAYS: int = 30   # NEW
-_TAU_MAX_DRIFT_FRAC: float = 0.35  # NEW — max fractional move from the window's anchor value
+_TAU_DRIFT_WINDOW_DAYS: int = 30        # short cap — catches a single bad month
+_TAU_MAX_DRIFT_FRAC: float = 0.35
+_TAU_LONG_DRIFT_WINDOW_DAYS: int = 180  # NEW — long cap — catches sustained multi-month bias
+_TAU_LONG_MAX_DRIFT_FRAC: float = 0.50  # NEW
 ```
 
-New persisted state (added to `meta.pkl` alongside `tau_hours`, same pattern as `last_trained`):
+New persisted state (added to `meta.pkl` alongside `tau_hours`, same pattern as `last_trained`;
+see the persistence invariant note in §2.1 for why these can't desync from `tau_hours`):
 
 ```python
 self._tau_anchor_hours: float | None = None
 self._tau_anchor_ts: pd.Timestamp | None = None
+self._tau_long_anchor_hours: float | None = None
+self._tau_long_anchor_ts: pd.Timestamp | None = None
 ```
 
 Applied after Fix A's blend computes `tau_result`, using the latest timestamp already present in
 the passive-window data (`combined.index.max()`) as "now" — this keeps the cap's clock tied to the
 data's own time axis rather than wall-clock time, so it's deterministic in tests and unaffected by
-how often retrains happen to fire:
+how often retrains happen to fire. **Timezone note (round-2 review question):** `combined.index`
+is built entirely from the tz-naive local timestamps already flowing through this function
+(`climate_dfs`/`weather_df`/`heating_active_df`, all stripped of tzinfo upstream in
+`energy_forecast.py` before being passed in), and `_tau_anchor_ts`/`_tau_long_anchor_ts` are only
+ever assigned *from* `combined.index.max()` itself — never from an independently-sourced
+wall-clock value — so the two sides of every comparison are on the same basis by construction.
+This is different from Fix C's `_last_trained_local()` conversion (§2.3), which exists specifically
+*because* `last_trained` comes from a different source (`datetime.now()`, system/UTC time) than
+what it's compared against; no equivalent cross-source mismatch exists here. §3.2 adds a test
+asserting `_tau_anchor_ts.tzinfo is None`, matching `combined.index`, to keep this true as the
+code evolves.
 
 ```python
 if old_tau is not None and old_tau > 0:
+    new_weight = confidence * self._TAU_EMA_MAX_NEW_WEIGHT
+    tau_result = (1.0 - new_weight) * old_tau + new_weight * tau_median
     latest_ts = combined.index.max()
-    if (
-        self._tau_anchor_hours is None
-        or self._tau_anchor_ts is None
-        or (latest_ts - self._tau_anchor_ts).days >= self._TAU_DRIFT_WINDOW_DAYS
-    ):
-        self._tau_anchor_hours = old_tau
-        self._tau_anchor_ts = latest_ts
 
-    max_drift = self._tau_anchor_hours * self._TAU_MAX_DRIFT_FRAC
-    lo, hi = self._tau_anchor_hours - max_drift, self._tau_anchor_hours + max_drift
-    if not (lo <= tau_result <= hi):
-        _LOGGER.warning(
-            "τ drift cap: %.1f h clamped to [%.1f, %.1f] h (anchor=%.1f h @ %s, %d-day window)",
-            tau_result, lo, hi, self._tau_anchor_hours, self._tau_anchor_ts.date(),
-            self._TAU_DRIFT_WINDOW_DAYS,
-        )
-        tau_result = min(max(tau_result, lo), hi)
+    def _apply_drift_cap(anchor_h_attr, anchor_ts_attr, window_days, max_frac, result):
+        anchor_h = getattr(self, anchor_h_attr, None)
+        anchor_ts = getattr(self, anchor_ts_attr, None)
+        if anchor_h is None or anchor_ts is None or (latest_ts - anchor_ts).days >= window_days:
+            anchor_h = old_tau
+            setattr(self, anchor_h_attr, anchor_h)
+            setattr(self, anchor_ts_attr, latest_ts)
+        max_drift = anchor_h * max_frac
+        lo, hi = anchor_h - max_drift, anchor_h + max_drift
+        if not (lo <= result <= hi):
+            _LOGGER.warning(
+                "τ drift cap (%d-day): %.1f h clamped to [%.1f, %.1f] h (anchor=%.1f h @ %s)",
+                window_days, result, lo, hi, anchor_h, anchor_ts,
+            )
+        return min(max(result, lo), hi)
+
+    # Short cap first, then long cap on the (possibly already-clamped) result -- the tighter
+    # of the two always wins since both are applied in sequence.
+    tau_result = _apply_drift_cap("_tau_anchor_hours", "_tau_anchor_ts",
+                                   self._TAU_DRIFT_WINDOW_DAYS, self._TAU_MAX_DRIFT_FRAC, tau_result)
+    tau_result = _apply_drift_cap("_tau_long_anchor_hours", "_tau_long_anchor_ts",
+                                   self._TAU_LONG_DRIFT_WINDOW_DAYS, self._TAU_LONG_MAX_DRIFT_FRAC, tau_result)
+else:
+    tau_result = tau_median
 ```
 
 ±35% over 30 days is generous enough to allow genuine winter→spring seasonal correction over a
-realistic timeframe, while bounding runaway compounding within any given month regardless of
-retrain frequency — including the frequent-restart scenario Fix C reduces but (per finding #4,
-§2.3) doesn't fully eliminate.
+realistic timeframe, while ±50% over 180 days independently bounds the multi-window compounding
+case the short cap alone can't stop.
+
+**Verified the multi-window compounding gap is closed:** simulated 6 successive 30-day windows
+under sustained, moderate (not confidence=0) gray-zone bias (`night_frac` good, `outdoor_median=8°C`
+— partial `temp_conf`), forcing a short-window reset before each of the 6 retrains. Without the
+long cap, 6 windows of unfettered 35%-per-window compounding would allow
+`10.0 × 0.65⁶ ≈ 0.75h` — an implausible, near-total collapse. With the long cap active, τ is
+correctly held at exactly the long-window floor, `10.0 × 0.5 = 5.0h`, after the 4th window and stays
+there — bounded, not unbounded, under sustained bias.
 
 ### 2.3 Fix C: persist and correctly localize the adaptive-retrain cooldown; gate the startup retrain
 
@@ -275,7 +329,12 @@ def _seed_adaptive_cooldown(self) -> None:
     self._last_adaptive_retrain = self._last_trained_local()
 
 
-STARTUP_RETRAIN_MIN_GAP_HOURS = 6  # module-level constant
+STARTUP_RETRAIN_MIN_GAP_HOURS = 6  # module-level constant (same convention as RETRAIN_INTERVAL_S,
+                                   # energy_forecast.py:47 -- a bare module global, NOT a class
+                                   # attribute; round-2 review caught an earlier draft of this
+                                   # referencing it as self.STARTUP_RETRAIN_MIN_GAP_HOURS, which
+                                   # would raise AttributeError on first call since nothing sets
+                                   # it as an instance/class attribute)
 
 
 def _maybe_startup_retrain(self, event_name=None, data=None, kwargs=None) -> None:
@@ -291,11 +350,11 @@ def _maybe_startup_retrain(self, event_name=None, data=None, kwargs=None) -> Non
     last_local = self._last_trained_local()
     if last_local != datetime.min:
         hours_since = (pd.Timestamp.now(self._timezone).tz_localize(None) - last_local).total_seconds() / 3600
-        if hours_since < self.STARTUP_RETRAIN_MIN_GAP_HOURS:
+        if hours_since < STARTUP_RETRAIN_MIN_GAP_HOURS:
             _LOGGER.info(
                 "Startup retrain skipped — last retrain was %.1fh ago (< %dh gap); the "
                 "weekly/adaptive schedule will pick up the next real update.",
-                hours_since, self.STARTUP_RETRAIN_MIN_GAP_HOURS,
+                hours_since, STARTUP_RETRAIN_MIN_GAP_HOURS,
             )
             return
     self._retrain_cb(event_name, data, kwargs)
@@ -376,7 +435,7 @@ the bound this section documents without also breaking that test.
 
 | File | Change |
 |---|---|
-| `apps/energy_forecast/model.py` | `_calibrate_tau`: replace binary guard + conditional EMA with confidence-weighted blend computed over selected candidates (§2.1); add rolling drift cap (§2.2); update docstring (§2.4); new class constants; `_save`/`_load` gain `tau_anchor_hours`/`tau_anchor_ts` in the `meta` dict |
+| `apps/energy_forecast/model.py` | `_calibrate_tau`: replace binary guard + conditional EMA with confidence-weighted blend computed over selected candidates (§2.1); add two-tier rolling drift cap (§2.2); update docstring (§2.4); new class constants; `_save`/`_load` gain `tau_anchor_hours`/`tau_anchor_ts`/`tau_long_anchor_hours`/`tau_long_anchor_ts` in the `meta` dict |
 | `apps/energy_forecast/energy_forecast.py` | Add `_last_trained_local()`, `_seed_adaptive_cooldown()`, `_maybe_startup_retrain()` (§2.3); change `run_in(self._retrain_cb, 10)` → `run_in(self._maybe_startup_retrain, 10)`; add cooldown resync at the end of `_retrain()` |
 | `tests/test_model.py` | Update/extend `TestTauCalibrationSafeguards` (§3.1); new `TestTauDriftCap` (§3.2) |
 | `tests/test_energy_forecast.py` | Extend `TestAdaptiveRetrainLock`; new `TestSeedAdaptiveCooldown`, `TestMaybeStartupRetrain` (§3.3) |
@@ -472,17 +531,26 @@ def test_warm_mostly_night_window_not_fully_trusted(self, tmp_path):
 def test_sparse_candidates_reduce_confidence_not_maximize_it(self, tmp_path):
     """len(candidates) below _TAU_SAMPLE_CONF_REF must scale confidence down, not leave it at
     the old code's implicit "guard doesn't apply, proceed at full trust" default.
+
+    Compared against a full-confidence run on independently-generated data with the same
+    tau_true, rather than a captured/narrated number for this specific fixture -- avoids the
+    circular-derivation pattern flagged in round-1 review.
     """
-    model = _make_tau_model(tmp_path)
-    model._tau_hours = 10.0
-    dfs, heat, wx = self._make_night_blocks(tau_true=12.0, start_hour=22, n_days=1)
+    model_sparse = _make_tau_model(tmp_path / "sparse")
+    model_sparse._tau_hours = 10.0
+    sparse_dfs, sparse_heat, sparse_wx = self._make_night_blocks(tau_true=12.0, start_hour=22, n_days=1)
+    sparse_result = model_sparse._calibrate_tau(sparse_dfs, sparse_heat, sparse_wx)
 
-    result = model._calibrate_tau(dfs, heat, wx)
+    model_full = _make_tau_model(tmp_path / "full")
+    model_full._tau_hours = 10.0
+    full_dfs, full_heat, full_wx = self._make_night_blocks(tau_true=12.0, start_hour=22, n_days=5)
+    full_result = model_full._calibrate_tau(full_dfs, full_heat, full_wx)
 
-    assert result is not None
-    # Full-confidence blend of the same raw estimate would land at ~10.30h (0.8*10+0.2*11.49);
-    # a sample-reduced blend must land strictly closer to 10.0 than that.
-    assert 10.0 < result < 10.15
+    assert sparse_result is not None and full_result is not None
+    assert 10.0 < sparse_result < full_result, (
+        "a 1-day (sparse) retrain must land strictly closer to the stored τ than an "
+        "otherwise-identical 5-day (ample-sample) retrain toward the same raw estimate"
+    )
 
 
 def test_both_signals_good_updates_normally(self, tmp_path):
@@ -501,21 +569,37 @@ def test_both_signals_good_updates_normally(self, tmp_path):
 
 ### 3.2 `tests/test_model.py` — new `TestTauDriftCap`
 
+**Fixture-compatibility note (round-2 review caught this):** `_make_night_blocks` (the existing
+shared fixture helper, `tests/test_model.py:4706`) hardcodes its dates to January 2026
+(`f"2026-01-{day_start + day:02d} ..."`) — it does not take a month parameter. All anchor
+timestamps below are therefore set well *before* January 2026 (not "2026-06-01" as an earlier
+draft of this spec incorrectly used, which would have put the anchor *after* the fixture's data
+and broken every elapsed-days comparison).
+
 ```python
 class TestTauDriftCap:
-    """Fix B: bounds cumulative τ movement to ±_TAU_MAX_DRIFT_FRAC from the value at the
-    start of each _TAU_DRIFT_WINDOW_DAYS-day window, independent of Fix A's per-step damping
-    and independent of how many retrains occur inside the window."""
+    """Fix B: bounds cumulative τ movement to ±_TAU_MAX_DRIFT_FRAC (short) / ±_TAU_LONG_MAX_DRIFT_FRAC
+    (long) from the value at the start of each respective rolling window, independent of Fix A's
+    per-step damping and independent of how many retrains occur inside the window."""
+
+    def _seed_anchors(self, model, anchor_hours, anchor_ts):
+        """Seed both short and long anchors to the same value/timestamp -- the common case for
+        a model that's had a stable τ for a while before the window under test begins."""
+        model._tau_anchor_hours = anchor_hours
+        model._tau_anchor_ts = anchor_ts
+        model._tau_long_anchor_hours = anchor_hours
+        model._tau_long_anchor_ts = anchor_ts
 
     def test_clamps_when_cumulative_budget_exhausted(self, tmp_path):
         """A single retrain's per-step-legal blend must still be clamped if it would push τ
         beyond the rolling window's remaining budget. Verified: old_tau=6.0 sits below the
         window floor (anchor=10.0 * 0.65 = 6.5); even a modest raw pull (tau_true=6.5) that
-        would normally blend to something >= 6.0 gets clamped up to exactly the floor, 6.5."""
+        would normally blend to something >= 6.0 gets clamped up to exactly the floor, 6.5.
+        Anchor set 2025-12-15 -- ~19 days before the fixture's Jan 3-9 data, inside the 30-day
+        short window (so the short cap applies without resetting first)."""
         model = _make_tau_model(tmp_path)
         model._tau_hours = 6.0  # already drifted below the window's floor
-        model._tau_anchor_hours = 10.0
-        model._tau_anchor_ts = pd.Timestamp("2026-06-01")
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-12-15"))
 
         dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
             tau_true=6.5, start_hour=22, t_out=5.0, day_start=3,
@@ -528,25 +612,24 @@ class TestTauDriftCap:
     def test_resets_after_window_elapses(self, tmp_path):
         """Once _TAU_DRIFT_WINDOW_DAYS has passed since the anchor, a new anchor is set at
         the current stored τ — this is what allows genuine multi-month seasonal correction
-        rather than freezing τ forever after one bad month."""
+        rather than freezing τ forever after one bad month. Anchor set 2025-10-01 -- roughly
+        97 days before the fixture's Jan 1-6 data, comfortably past the 30-day window."""
         model = _make_tau_model(tmp_path)
         model._tau_hours = 10.0
-        model._tau_anchor_hours = 10.0
-        model._tau_anchor_ts = pd.Timestamp("2026-01-01")  # far enough in the past to have elapsed
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-10-01"))
 
         dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
             tau_true=10.0, start_hour=22, t_out=5.0, day_start=1,
         )
         model._calibrate_tau(dfs, heat, wx)
 
-        assert model._tau_anchor_ts > pd.Timestamp("2026-01-01")
+        assert model._tau_anchor_ts > pd.Timestamp("2025-10-01")
 
     def test_no_cap_within_budget(self, tmp_path):
         """A modest, per-step-legal move well inside the 35% budget is not touched by the cap."""
         model = _make_tau_model(tmp_path)
         model._tau_hours = 10.0
-        model._tau_anchor_hours = 10.0
-        model._tau_anchor_ts = pd.Timestamp("2026-06-01")
+        self._seed_anchors(model, 10.0, pd.Timestamp("2025-12-15"))
 
         dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
             tau_true=11.0, start_hour=22, t_out=5.0, day_start=3,
@@ -555,6 +638,51 @@ class TestTauDriftCap:
 
         assert result is not None
         assert 10.0 < result < 13.5  # within [anchor*0.65, anchor*1.35] = [6.5, 13.5]
+
+    def test_anchor_timestamps_are_tz_naive(self, tmp_path):
+        """Both anchor timestamps must stay tz-naive, matching combined.index -- guards the
+        round-2 review question about tz consistency (see §2.2's timezone note)."""
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+        dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+            tau_true=11.0, start_hour=22, t_out=5.0,
+        )
+        model._calibrate_tau(dfs, heat, wx)
+
+        assert model._tau_anchor_ts.tzinfo is None
+        assert model._tau_long_anchor_ts.tzinfo is None
+
+    def test_long_cap_bounds_multi_window_compounding(self, tmp_path):
+        """The round-2 review's key finding: the short (30-day) cap alone only bounds movement
+        WITHIN one window, not ACROSS successive windows under sustained bias -- each window
+        reset re-anchors at wherever the previous window left off. This test simulates 6
+        successive short-window resets under a sustained, moderate (not confidence=0) pull and
+        confirms the long (180-day) cap holds the line where the short cap alone would not.
+
+        Verified numerically: without the long cap, 6 windows of unfettered 35%-per-window
+        compounding would allow 10.0 * 0.65**6 =~ 0.75h -- an implausible near-total collapse.
+        With the long cap, τ is held at exactly the long-window floor, 10.0 * 0.5 = 5.0h.
+        """
+        model = _make_tau_model(tmp_path)
+        model._tau_hours = 10.0
+
+        for i in range(6):
+            dfs, heat, wx = TestTauCalibrationSafeguards()._make_night_blocks(
+                tau_true=2.0, n_days=5, start_hour=22, window_hours=8, t_out=8.0, day_start=1,
+            )
+            if i > 0:
+                # Force the short window to have elapsed before each subsequent retrain,
+                # simulating six real 30-day windows without needing six actual calendar months
+                # of synthetic data (the shared fixture's dates are fixed to January).
+                model._tau_anchor_ts = model._tau_anchor_ts - pd.Timedelta(days=31)
+            result = model._calibrate_tau(dfs, heat, wx)
+            assert result is not None
+            model._tau_hours = result
+
+        assert model._tau_hours == pytest.approx(5.0), (
+            "sustained bias across many short-window resets must still be caught by the "
+            "180-day/50% long cap, not allowed to compound toward the naive ~0.75h"
+        )
 ```
 
 ### 3.3 `tests/test_energy_forecast.py`
@@ -716,15 +844,19 @@ for p in json.load(sys.stdin)[0]:
 
 Expect: (a) at most one or two τ updates per week post-deploy (confirms Fix C — no more
 restart-doubled or restart-repeated retrains), (b) week-over-week τ changes bounded to roughly
-≤20% of the old→new gap per update once in steady state (confirms Fix A), and (c) over any
-30-day span, total movement bounded to ±35% of the value at the start of that span regardless of
-how many updates occurred (confirms Fix B — the actual guarantee against the originally-reported
-"slow slip," as opposed to (b) which only bounds individual steps).
+≤20% of the old→new gap per update once in steady state (confirms Fix A), (c) over any 30-day
+span, total movement bounded to ±35% of the value at the start of that span regardless of how many
+updates occurred (confirms Fix B's short cap), and (d) over any 180-day span, bounded to ±50%
+regardless of how many 30-day windows elapsed within it (confirms Fix B's long cap — the actual
+guarantee against the originally-reported "slow slip" persisting across a full seasonal
+transition, as opposed to (c) alone which a sustained bias could still walk through one
+window-reset at a time).
 
 No config or migration changes to existing fields — `_tau_hours` itself is unaffected in shape
-(still `float | None` persisted in `meta.pkl`). The two new persisted fields
-(`_tau_anchor_hours`, `_tau_anchor_ts`) default to `None` and self-initialize on the first
-retrain after deploy, so existing deployments pick this up with no manual intervention.
+(still `float | None` persisted in `meta.pkl`). The four new persisted fields
+(`_tau_anchor_hours`, `_tau_anchor_ts`, `_tau_long_anchor_hours`, `_tau_long_anchor_ts`) default to
+`None` and self-initialize on the first retrain after deploy, so existing deployments pick this up
+with no manual intervention.
 
 ---
 
@@ -756,3 +888,33 @@ Disposition:
 | 18 | Low | Cooldown seed is one-shot, drifts from `last_trained` after first retrain | **Fixed** — §2.3, resync added at the end of every `_retrain()` |
 | 19 | Low | No invariant guard on the two temp constants | **Fixed** — `assert` added in §2.1 |
 | 20 | Low | "Confidence" conflates bias-risk and sample-size uncertainty | **Fixed** — `sample_conf` is now a named, separate factor rather than an implicit default |
+
+---
+
+## 6. Round-2 Review — Findings and Disposition
+
+Rev. 2 (§5's fixes applied) was re-reviewed by the same three experts. 9 issues carried over for
+re-verification (all RESOLVED or PARTIALLY RESOLVED, none NOT RESOLVED), plus 7 new issues raised
+against the rev. 2 changes themselves. Disposition of the new issues:
+
+| # | Sev | Finding | Source | Disposition |
+|---|---|---|---|---|
+| 1 | High | The 30-day drift cap bounds movement *within* a window but not *across* successive windows — sustained bias could still compound roughly `0.65ⁿ` over `n` window resets | DS + DSE | **Fixed** — §2.2 adds a second, longer (180-day/50%) cap layered on top; verified numerically to hold τ at the correct floor (5.0h) where an unbounded short-cap-only design would allow ~0.75h over 6 sustained-bias windows |
+| 2 | Medium | Unconditional clamp could in principle override a zero-confidence "exact preserve" if `tau_hours` and the anchor fields ever desynced (e.g. via model rollback) | DS | **Addressed** — §2.1 adds an explicit persistence-invariant note: all three fields are always saved/loaded together in the same `meta` dict, and `tau_hours` is never mutated outside `_calibrate_tau()`, so this can't happen via any existing code path |
+| 3 | Medium | Three-way multiplicative product (`night_conf*temp_conf*sample_conf`) over-penalizes moderately-good conditions relative to the stated "both signals independently look winter-like" design intent | DS | **Fixed** — §2.1 switches to the geometric mean, `(night_conf*temp_conf*sample_conf)**(1/3)`; verified the exact-zero boundary cases (all "must preserve" tests) are unaffected, while the interior sample-size case moves from `confidence≈0.33` to `≈0.69` |
+| 4 | Medium | tz basis of `combined.index.max()` vs. the persisted anchor timestamp never explicitly confirmed or tested | DSE | **Addressed** — §2.2 adds an explicit note (both sides are always tz-naive local time by construction, unlike Fix C's `last_trained` which genuinely needs conversion) plus a regression test (`test_anchor_timestamps_are_tz_naive`) |
+| 5 | Low | `_TAU_SAMPLE_CONF_REF=3` carried over from the old cutoff without re-justifying the magnitude | DSE | **Acknowledged, not re-derived** — §2.1 adds a comment noting it's kept at the same magnitude as the pre-existing hard cutoff (not new arbitrariness) with re-tuning flagged as a data-driven follow-up once more production candidate-count history exists |
+| 6 | High | `STARTUP_RETRAIN_MIN_GAP_HOURS` was referenced as `self.STARTUP_RETRAIN_MIN_GAP_HOURS` despite being declared as a module-level constant — would raise `AttributeError` on first call | SWE | **Fixed** — §2.3, both references changed to the bare module-level name, matching the existing `RETRAIN_INTERVAL_S` convention |
+| 7 | Medium | `test_resets_after_window_elapses` used an anchor date (`2026-01-01`) and fixture `day_start` that, given the shared `_make_night_blocks` helper's *hardcoded* January dates, produced a data range only ~5 days after the anchor — not the 30+ days needed to actually exercise the reset branch; the assertion would have failed | SWE | **Fixed** — §3.2, all `TestTauDriftCap` anchor dates moved to genuinely pre-January-2026 dates (`2025-10-01` / `2025-12-15`) verified against the real fixture's date construction, not a custom test-only helper |
+
+**Software-engineer's verification of round-1 fixes (round 2), for completeness:** all 8 of that
+reviewer's round-1 issues confirmed RESOLVED against the actual current codebase (not just
+plausible-looking spec prose) — including tracing the exact `tz_localize("UTC").tz_convert(...)
+.tz_localize(None)` chain in §2.3 against the established pattern already in
+`_maybe_adaptive_retrain` (`energy_forecast.py:1904`), and confirming `_FakeSelf`'s
+unbound-method-call compatibility with the new `_seed_adaptive_cooldown`/`_maybe_startup_retrain`
+methods.
+
+No further review round required: every High and Medium finding from both rounds is now Fixed or
+Addressed with an executable test; remaining Low items are either Acknowledged trade-offs (§6
+row 5) or Moot due to an earlier claim being retracted (§5 row 17).
