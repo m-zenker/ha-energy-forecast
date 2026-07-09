@@ -685,7 +685,16 @@ class EnergyForecastModel:
                                 )
                             except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                            sweep_maes[nl] = float(mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx]))))
+                            nl_raw = m_nl.predict(X.iloc[val_idx])
+                            if self._use_physics_residual:
+                                X_val_nl = X.iloc[val_idx]
+                                physics_val_nl = (
+                                    X_val_nl["physics_kwh"].values if "physics_kwh" in X_val_nl.columns else 0.0
+                                )
+                                nl_pred = np.maximum(0, physics_val_nl + nl_raw)
+                            else:
+                                nl_pred = np.expm1(nl_raw)
+                            sweep_maes[nl] = float(mae_fn(y[val_idx], nl_pred))
                         best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
                         _LOGGER.info(
                             "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
@@ -733,8 +742,16 @@ class EnergyForecastModel:
                                 m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         else:
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                        # MAE reported in original kWh space (expm1 undoes log1p)
-                        fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
+                        # MAE reported in original kWh space (expm1 undoes log1p, or
+                        # reconstructed from physics + residual in Phase 2)
+                        fold_raw = m.predict(X.iloc[val_idx])
+                        if self._use_physics_residual:
+                            X_val = X.iloc[val_idx]
+                            physics_val = X_val["physics_kwh"].values if "physics_kwh" in X_val.columns else 0.0
+                            fold_pred = np.maximum(0, physics_val + fold_raw)
+                        else:
+                            fold_pred = np.expm1(fold_raw)
+                        fold_maes.append(float(mae_fn(y[val_idx], fold_pred)))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(

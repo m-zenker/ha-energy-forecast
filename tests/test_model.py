@@ -6192,3 +6192,46 @@ class TestGrossMAEReporting:
         # reconstructed prediction would go negative, which this fixture's holdout split
         # doesn't trigger. last_residual_mae is still a distinct, separately-computed value
         # (on the residual scale, unclipped) — it just happens to coincide numerically here.
+
+    def test_phase2_cv_mae_is_gross_kwh_mae_not_residual_garbage(self, tmp_path):
+        """Regression guard for the CV-fold-path twin of the bug fixed above.
+
+        `test_phase2_last_mae_still_reported_on_gross_kwh` above uses the default
+        n=600, which after the lag_336h dropna leaves ~264 clean rows — under
+        MIN_CV_ROWS=500, so CV is skipped and last_mae falls back to holdout_mae.
+        That means the previous test never exercised the CV path at all, even
+        though CV is what actually runs (and what feeds last_mae) for any
+        real-sized training set. Need n>=836 so that >=500 clean rows remain
+        for TimeSeriesSplit (see TestFeatureImportanceLogging for the same
+        n=900 pattern).
+
+        Before the fix, both the num_leaves sweep and the fold-MAE loop applied
+        np.expm1() unconditionally to the raw (residual, never log-transformed)
+        prediction, producing an MAE far outside the fixture's gross_kwh range
+        (0.5-5.0) — e.g. ~6.44 empirically. After the fix, both call sites
+        reconstruct gross-kWh as physics_kwh + residual (clipped at 0) before
+        scoring, matching the already-fixed holdout block.
+        """
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, _ = _make_trained_model(tmp_path / "model", n=900, physics_model=pm, use_physics_residual=True)
+        # Proves CV actually ran (not skipped, not silently falling back to holdout).
+        assert model.last_cv_mae is not None
+        assert model.last_mae == model.last_cv_mae
+        # Fixture's gross_kwh is uniform(0.5, 5.0) — a correctly reconstructed MAE
+        # must stay well inside that range, not the ~6x-larger garbage the
+        # unconditional np.expm1()-on-residual bug produced.
+        assert model.last_mae < 3.0
