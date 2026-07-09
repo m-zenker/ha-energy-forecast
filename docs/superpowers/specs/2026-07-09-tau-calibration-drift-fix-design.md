@@ -829,6 +829,87 @@ required to catch anything not enumerated above.
 
 ## 4. Rollout / Post-deploy Verification
 
+### 4.1 One-time seed for the already-biased live value
+
+The fixes in §2 stop *further* drift; they don't retroactively correct the bias that's already
+happened. The live `sensor.ha_energy_forecast_thermal_pressure_net`'s `tau_hours` is currently
+~6.9h, down from a value the drift-cap anchors would (if deployed as-is) simply adopt as their new
+starting point — locking in the bias rather than fixing it. Two options were considered and
+rejected before landing on the one below:
+
+- **Reset `_tau_hours` to `None`** (forcing a "fresh" first-ever calibration) — wrong at this time
+  of year specifically: with `old_tau is None`, `_calibrate_tau` takes the no-damping, no-cap
+  branch by design (there's nothing to protect against on a genuine first run). Doing this in July
+  would immediately compute a fresh, fully-undamped, summer-biased estimate — reproducing the
+  exact bug being fixed, once, at the worst possible time of year.
+- **Leave the current (biased) value in place** and let the caps take over from here — safe, but
+  slow: recovery only happens once real winter conditions return and confidence rises, likely
+  months away, during which `physics_kwh` predictions stay biased.
+
+**Chosen approach: seed both `tau_hours` and the drift-cap anchors from a value derived by running
+the real (rev-3) calibration algorithm against the deployed model's own cached data, truncated to
+before the 2026 spring transition set in.**
+
+**Derivation.** The deployed model's cached CSVs (`climate_*.csv`,
+`heating_active_heizung_wintermodus.csv`) and the matching Open-Meteo archive only go back to
+2026-04-01 — there's no true winter (Dec-Mar) data available, so this is the best estimate
+obtainable from what's on disk, not a genuine full-winter calibration. Running
+`EnergyForecastModel._calibrate_tau()` (the rev-3 version from §2.1, called with `_tau_hours=None`
+so it returns a raw, undamped estimate — correct for a one-time seed, since there's nothing to
+blend against yet) against that data at a range of cutoffs:
+
+| Cutoff | τ | confidence | outdoor_median |
+|---|---|---|---|
+| 2026-04-10 | 8.8h | 0.00 | 12.7°C |
+| **2026-04-12 through 04-16** | **11.64h (identical, stable)** | **0.73 (peak)** | **9.3°C** |
+| 2026-04-18 | 8.8h | 0.20 | 11.9°C |
+| 2026-04-20 onward | 5.7-5.9h | 0.00 | 13.3°C+ |
+| 2026-05-22 | 24.3h | 0.70 | 9.7°C |
+| 2026-05-29 | 17.1h | 0.54 | 10.9°C |
+
+The formula's own confidence score is doing real work here: it flags most of April 20 onward as
+untrustworthy (matching the outdoor-temperature record independently crossing 12°C around then),
+and the 2026-04-12 through 04-16 cutoffs land on a genuine plateau — no new passive-cooling
+candidates enter the pool across that span, and confidence peaks there (0.73, the highest of any
+cutoff tested) before degrading monotonically as the season progresses. Two later cutoffs
+(05-22, 05-29) also clear confidence >0.5 but disagree with each other and with the April estimate
+(24.3h, 17.1h vs. 11.6h) — expected, since they're deeper into the shoulder season and supported
+by fewer, noisier candidates; the April plateau is preferred as the more stable, earlier, and
+higher-confidence estimate, and it matches the pre-drift order of magnitude visible in the live
+history table in §1 (9.68h on 2026-07-01, itself already partway through the decline).
+
+**Seed value: τ = 11.64h.**
+
+**Procedure.** Applied once, at deploy time, after the code fix (§2) is live but before its first
+retrain runs — via the model's own `_save()`, not a hand-edited pickle (the persisted `meta.pkl`
+has a `.sha256` sidecar checked by `_verify_hash()` on load; editing the pickle bytes directly
+without regenerating that hash would cause the next `_load()` to reject the file and fall back to
+an untrained model):
+
+```python
+# One-off script, run against the deployed models/ directory after the code fix is uploaded.
+from pathlib import Path
+import pandas as pd
+from energy_forecast.model import EnergyForecastModel
+
+m = EnergyForecastModel(Path("/config/apps/energy_forecast/models"))  # _load()s the live model
+seed_ts = pd.Timestamp.now()  # local time is fine -- only used as the anchor's own reference point
+m._tau_hours = 11.64
+m._tau_anchor_hours = 11.64
+m._tau_anchor_ts = seed_ts
+m._tau_long_anchor_hours = 11.64
+m._tau_long_anchor_ts = seed_ts
+m._save()
+```
+
+Seeding the anchors *at the same time* as `tau_hours` (not just `tau_hours` alone) means the caps
+protect the seed value immediately — the first post-deploy retrain (likely still mid-summer, low
+confidence) is bounded to ±35%/30d and ±50%/180d around 11.64h from the start, rather than an
+anchor-less first retrain being free to pull it back toward whatever the current biased raw
+estimate is before any anchor exists.
+
+### 4.2 Post-deploy Verification
+
 Same diagnostic path used to find this bug is the way to confirm the fix:
 
 ```bash
