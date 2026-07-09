@@ -8,6 +8,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `apps/energy_forecast/model.py` — `train()` accepts a new `use_physics_residual: bool = False`
+  parameter. When `True` and a physics model with `physics_kwh` data is available, LightGBM trains
+  on `gross_kwh − physics_kwh` instead of raw consumption; the log1p transform is disabled because
+  residuals can be negative. Predictions are reconstructed as
+  `(physics_kwh + lgbm_residual).clip(lower=0)`; Phase 1 continues to use
+  `lgbm_raw.clip(lower=0)`. Any exception from the physics predictor at inference time falls back
+  silently to ML-only output — two independent `try/except` layers ensure a physics error never
+  crashes a forecast cycle. `last_mae` (the HA-facing metric) always reports gross-kWh MAE across
+  all three computation sites (holdout, CV hyperparameter sweep, and CV-fold loop); a new
+  `last_residual_mae` attribute carries the Phase 2 residual MAE as an internal diagnostic only
+  (not published to any HA sensor). The cold-start gate (`_effective_use_physics_residual()`)
+  keeps Phase 2 dormant until ≥ 30 winter UA_eff calibration windows have been collected — not
+  expected before winter 2026/27. No config change is needed when the gate clears; the next
+  scheduled weekly retrain promotes automatically.
+- `apps/energy_forecast/energy_forecast.py` — Two new sensors published whenever `physics:` is
+  configured, active in both Phase 1 and Phase 2: `sensor.energy_forecast_physics_base_today`
+  (physics-model-only hourly kWh estimate for today) and
+  `sensor.energy_forecast_ml_adjustment_today` (net ML correction over the physics baseline,
+  `main_forecast − physics_base` kWh; negative when the ML model corrects the physics estimate
+  downward). Both sensors respect `mqtt_discovery` (full MQTT discovery-config registration with
+  state and attribute publish parity matching existing sensors) and are registered in
+  `_cleanup_legacy_states()` so no ghost entities persist when switching between MQTT and
+  `set_state` modes.
+- `apps/energy_forecast/energy_forecast.py` — `model_phase` attribute (`"phase1"` or `"phase2"`)
+  added to `sensor.energy_forecast_today` whenever `physics:` is configured; absent entirely when
+  `physics:` is omitted. Allows `ha-energy-manager` to detect which training phase is active
+  without polling a separate sensor.
+- `ROADMAP.md` — Operator reminder to verify empirical prediction-interval coverage on gross kWh
+  once Phase 2 has been live for ≥ 30 days, following the existing "SHAP check due" convention.
+
 ### Fixed
 - `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
 - `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.

@@ -58,7 +58,7 @@ Dashboard YAML is in `dashboard/`.
 - [Occupancy / Presence](#occupancy--presence)
 - [Baseline / Passive mode](#baseline--passive-mode)
 - [Thermal & DHW modeling](#thermal--dhw-modeling)
-- [Physics-ML Hybrid (Phase 1)](#physics-ml-hybrid-phase-1-optional)
+- [Physics-ML Hybrid (Phases 1 & 2)](#physics-ml-hybrid-phases-1--2-optional)
 - [MQTT Discovery](#mqtt-discovery-optional)
 - [Dashboard Setup](#dashboard-setup)
 - [Troubleshooting](#troubleshooting)
@@ -143,13 +143,16 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns (e.g. Workday, Weekend, High-Heating) and predicts the most likely regime for tomorrow; provides the model with a stable `regime_kwh` prior
 - **MQTT Discovery** (optional) — registers all sensors in the HA entity registry for area assignment, labels, and UI renaming
 
-### Stage 5 — Physics-ML Hybrid (Phase 1)
+### Stage 5 — Physics-ML Hybrid (Phases 1 & 2)
 - **Physics-driven additive features** — optional `physics_kwh` and `heating_buffer_temp` features derived from the thermal physics model; injected into LightGBM training only when sensor data is available (never a constant-zero column)
 - **Automatic physics recalibration** — `train()` recalibrates the physics model when its stored calibration is stale; holdout cutoff matches the existing MAE holdout so training and calibration windows are consistent
 - **Open-window anomaly down-weighting** — training hours flagged as single-hour open-window temperature shocks (detected from climate sensor data) are down-weighted to 0.5× their normal sample weight
 - **Phase 1 validation diagnostic** — after each retrain, logs whether `physics_kwh` ranks in the SHAP top-5 and whether its OLS calibration slope is near 1.0; informational only, does not affect predictions
 - **On-demand recalibration service** — `energy_forecast/recalibrate_physics` AppDaemon service lets you trigger physics recalibration from **Developer Tools → Services** without a full AppDaemon restart
 - **Model-artifact portability** — if a model was trained with physics features but physics is later disabled or a sensor goes offline, `predict()` fills the missing columns with `0.0` and logs a WARNING; no crashes, no stale data
+- **Phase 2 residual-target training (dormant by default)** — when `use_physics_residual: true` is set, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + ML_residual`; dormant until the cold-start gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27); promotes automatically on the next weekly retrain after the gate clears
+- **Physics-baseline diagnostic sensors** — `sensor.energy_forecast_physics_base_today` and `sensor.energy_forecast_ml_adjustment_today` published whenever `physics:` is configured (Phase 1 and Phase 2); useful for monitoring the physics-vs-ML contribution split before activating Phase 2
+- **`model_phase` attribute** — `"phase1"` or `"phase2"` on `sensor.energy_forecast_today` when physics is configured; lets automations and `ha-energy-manager` detect which training phase is active
 
 ---
 
@@ -459,7 +462,7 @@ energy_forecast:
 | `physics.internal_gains_fraction` | No | `0.8` | Fraction of rated heater power treated as internal thermal gains. |
 | `physics.heating_curve_points` | No | `[[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]]` | List of `[outdoor_temp_°C, flow_temp_°C]` pairs defining the heating curve. |
 | `physics.room_thermostats` | No | `[]` | List of `{climate_entity, temp_sensor, area_m2}` dicts — a dedicated, more accurate sensor per room used for training-time UA_eff calibration accuracy (separate from, and complementary to, the existing `climate_entities`/`climate_room_areas`). Entries missing `climate_entity` or `temp_sensor` are skipped with a WARNING; `area_m2` defaults to `20.0`. |
-| `physics.use_physics_residual` | No | `false` | Phase 2 flag. Accepted and logged but held at Phase 1 until sufficient calibration history accumulates (cold-start gate). A WARNING is emitted at each retrain until the gate clears. |
+| `physics.use_physics_residual` | No | `false` | Phase 2 flag. When `true`, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + lgbm_residual`. Remains inactive until the cold-start gate clears (≥ 30 winter UA_eff calibration windows; not expected before winter 2026/27). No config change needed when the gate clears — the next weekly retrain will promote automatically. |
 
 **`sub_energy_sensors` — dict form with `program_sensor`:**
 
@@ -495,7 +498,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features) and `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"). |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features), `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"), and `model_phase` (`"phase1"` or `"phase2"` when `physics:` is configured; absent otherwise). |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
 ### Prediction intervals (calibrated 80% coverage)
@@ -552,6 +555,13 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | Entity ID | Description |
 |-----------|-------------|
 | `binary_sensor.energy_forecast_unusual_consumption` | `on` when the latest actual consumption deviates more than `anomaly_sigma_threshold` std-deviations from the stored day-ahead prediction. `off` during cold-start (< 10 matched hours). Attributes: `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`. |
+
+### Physics diagnostics (when `physics:` is configured)
+
+| Entity ID | Description |
+|-----------|-------------|
+| `sensor.energy_forecast_physics_base_today` | Physics-model-only estimate of today's heating energy (kWh). Published from Phase 1 onward whenever `physics:` is configured. Useful for monitoring how much of the forecast originates from the physics model vs. the ML correction. |
+| `sensor.energy_forecast_ml_adjustment_today` | Net ML correction over the physics baseline today (`main_forecast − physics_base`, kWh). Negative when the ML model reduces the physics estimate. |
 
 ---
 
@@ -963,7 +973,7 @@ The following features activate when the corresponding sensors are configured an
 
 ---
 
-## Physics-ML Hybrid (Phase 1) (optional)
+## Physics-ML Hybrid (Phases 1 & 2) (optional)
 
 Phase 1 wires the thermal physics model into the LightGBM pipeline as optional additive input
 features. The physics model is built on the `feat/physics-core-engine` branch and covers DHW
@@ -1049,15 +1059,16 @@ physics is later disabled (or a sensor goes offline), prediction does not crash.
 columns are filled with `0.0` and a WARNING is logged. This applies to `predict()`,
 `predict_intervals()`, and `shap_summary()`.
 
-### Phase 1 limitations
+### Known limitations
 
 - `predict_scenario()` / `energy_forecast/get_scenario` log one WARNING per call when physics is
-  configured, because the what-if path does not supply live physics sensor values — both features
-  fall back to `0.0` for every scenario row. This is a known Phase 1 limitation, not a bug.
-- `use_physics_residual: true` is accepted in config but the Phase 2 residual-target architecture
-  is not yet implemented. A cold-start-gate check exists and would log a WARNING when the gate
-  isn't satisfied, but Phase 1 doesn't call it yet — wiring the gate into the training loop and
-  activating Phase 2 is a separate future plan.
+  configured, because the what-if path does not supply live physics sensor values — both `physics_kwh`
+  and `heating_buffer_temp` fall back to `0.0` for every scenario row. This is a known limitation,
+  not a bug.
+- Phase 2 (`use_physics_residual: true`) is implemented but dormant — the cold-start gate blocks
+  activation until ≥ 30 winter UA_eff calibration windows have been collected. No config change is
+  needed; the next weekly retrain after the gate clears will promote automatically to Phase 2 and
+  update the `model_phase` attribute on `sensor.energy_forecast_today`.
 
 ---
 
@@ -1122,8 +1133,9 @@ All sensors are registered at startup. The 6 prediction-interval sensors (`*_low
 | Setup status | 1 |
 | Anomaly detection (`unusual_consumption`) | 1 |
 | Thermal pressure (`thermal_pressure_net`) | 1 |
+| Physics diagnostics (`physics_base_today`, `ml_adjustment_today`) | 2 (when `physics:` configured) |
 | Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
-| **Total** | **36** |
+| **Total** | **36** (+ 2 when `physics:` is configured) |
 
 ### Availability
 
