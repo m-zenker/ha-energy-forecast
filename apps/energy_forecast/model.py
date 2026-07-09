@@ -270,6 +270,7 @@ class EnergyForecastModel:
         self._feature_medians: dict = {}  # global medians — used to fill NaN at predict time
         self._feature_medians_by_how: dict = {}  # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool = False  # log1p target; False = backward compat
+        self._use_physics_residual: bool = False  # Phase 2: train on gross_kwh - physics_kwh
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
         self._timezone: str = timezone  # local timezone for wall-clock "now"
@@ -337,6 +338,7 @@ class EnergyForecastModel:
         regime_count: int = 5,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        use_physics_residual: bool = False,
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -618,7 +620,19 @@ class EnergyForecastModel:
 
         X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
-        y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
+        self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)
+
+        if self._use_physics_residual:
+            physics_aligned = physics_kwh_series.reindex(df["timestamp"])
+            n_nans = int(physics_aligned.isna().sum())
+            if n_nans > 0:
+                _LOGGER.warning(
+                    f"{n_nans} hours have no physics prediction — set to 0 in residual target (check weather data gaps)"
+                )
+            physics_vals = physics_aligned.fillna(0).values
+            y_fit = y - physics_vals  # residual target — can be negative, no log transform
+        else:
+            y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
 
         # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
@@ -770,7 +784,7 @@ class EnergyForecastModel:
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
         self.engine = engine_name
-        self._log_transform = True
+        self._log_transform = not self._use_physics_residual
         self._canton = canton
         self._country = country
         self._sub_sensor_prefixes = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
@@ -1476,6 +1490,7 @@ class EnergyForecastModel:
             "feature_medians": self._feature_medians,
             "feature_medians_by_how": self._feature_medians_by_how,
             "log_transform": self._log_transform,
+            "use_physics_residual": self._use_physics_residual,
             "canton": self._canton,
             "country": self._country,
             "likely_ev_hours": self._likely_ev_hours,
@@ -1922,6 +1937,7 @@ class EnergyForecastModel:
                     self._feature_medians = meta.get("feature_medians", {})
                     self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform = meta.get("log_transform", False)
+                    self._use_physics_residual = meta.get("use_physics_residual", False)
                     self._canton = meta.get("canton", None)
                     self._country = meta.get("country", "CH")
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())

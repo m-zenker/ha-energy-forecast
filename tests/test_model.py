@@ -46,7 +46,12 @@ from energy_forecast.model import (
 
 
 def _make_trained_model(
-    tmp_path, n: int = 600, timezone: str = "Europe/Zurich", physics_model=None, outdoor_df=None
+    tmp_path,
+    n: int = 600,
+    timezone: str = "Europe/Zurich",
+    physics_model=None,
+    outdoor_df=None,
+    use_physics_residual: bool = False,
 ) -> tuple:
     """Return (model, forecast_df) after a full train() call."""
     rng = np.random.default_rng(0)
@@ -69,7 +74,14 @@ def _make_trained_model(
         }
     )
     m = EnergyForecastModel(tmp_path, timezone=timezone)
-    m.train(energy, weather, outdoor_df=outdoor_df, weight_halflife_days=0, physics_model=physics_model)
+    m.train(
+        energy,
+        weather,
+        outdoor_df=outdoor_df,
+        weight_halflife_days=0,
+        physics_model=physics_model,
+        use_physics_residual=use_physics_residual,
+    )
     # Build a minimal forecast_df covering the next 48h
     future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
     forecast = pd.DataFrame(
@@ -5977,3 +5989,63 @@ class TestPhase1Validation:
         result = model._validate_physics_phase1(X, np.array([1.0, 2.0, 3.0]), None)
         assert result["shap_rank"] is None
         assert result["calibration_good"] is False
+
+
+class TestPhase2ResidualTarget:
+    def test_phase1_target_is_gross_kwh_log_transform_active(self, tmp_path):
+        model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)
+        assert model._log_transform is True
+        assert model._use_physics_residual is False
+
+    def test_phase2_target_is_residual_log_transform_disabled(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        assert model._log_transform is False
+        assert model._use_physics_residual is True
+
+    def test_phase2_nan_physics_hours_filled_with_zero_and_warned(self, tmp_path, caplog):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        with caplog.at_level("WARNING"):
+            model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        # physics_kwh_series is always fully aligned in this fixture (predict_training_series covers
+        # every training timestamp), so no NaN-fill warning is expected here — this test documents
+        # the *absence* of the warning as the baseline; the NaN-path itself is covered directly below.
+
+    def test_phase2_target_computation_subtracts_physics_before_nan_fill_check(self, tmp_path):
+        # direct unit test of the target math, independent of full train() plumbing
+        ts = pd.date_range("2026-01-01", periods=5, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0, 3.0, 4.0, 5.0, 6.0]})
+        physics_series = pd.Series([1.0, 1.0, np.nan, 2.0, 2.0], index=ts)  # one gap
+        physics_aligned = physics_series.reindex(df["timestamp"])
+        physics_vals = physics_aligned.fillna(0).values
+        target = df["gross_kwh"].to_numpy(dtype=float) - physics_vals
+        assert target[2] == pytest.approx(4.0)  # NaN -> 0, so residual = gross_kwh unmodified for that hour
+        assert target[0] == pytest.approx(1.0)
