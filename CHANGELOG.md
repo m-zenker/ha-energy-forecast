@@ -8,6 +8,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
+- `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.
+- `apps/energy_forecast/energy_forecast.py` — Two defects allowed an AppDaemon restart to fire two uncapped τ retrains in rapid succession: `_last_adaptive_retrain` was reset to `datetime.min` on every restart instead of being seeded from the persisted `last_trained` timestamp (also fixing a UTC-vs-local timezone mismatch in that seeding); and the unconditional startup retrain now skips if a retrain completed within the last 6 hours (`STARTUP_RETRAIN_MIN_GAP_HOURS`).
+
 ## [0.11.8] — 2026-07-03
 
 Physics-ML Hybrid Phase 1: wires the thermal physics model (from the `feat/physics-core-engine`
