@@ -3086,6 +3086,13 @@ class _FakeRetrain:
 
         return EnergyForecast._last_trained_local(self)
 
+    def _effective_use_physics_residual(self):
+        # _retrain() passes this through to self._ml_model.train(). Delegate to the real
+        # implementation; with self._physics_model = None it short-circuits to False.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._effective_use_physics_residual(self)
+
 
 def _make_energy_df(n=100):
     ts = pd.date_range("2024-01-01", periods=n, freq="1h")

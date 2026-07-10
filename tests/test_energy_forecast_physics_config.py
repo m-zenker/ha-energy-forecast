@@ -238,6 +238,77 @@ class TestRetrainCallsPhysicsFetch:
         assert app._room_thermostat_temp_dfs == {}
 
 
+class TestRetrainWiresUsePhysicsResidual:
+    """Final-review fix: `_retrain()` must pass `_effective_use_physics_residual()` through to
+    `EnergyForecastModel.train()` as `use_physics_residual=`. Without this wiring, the
+    cold-start-gate design (config intent AND-ed with calibration-window count) is computed but
+    never actually reaches training, so Phase 2 residual learning can never activate."""
+
+    def _patch_retrain_deps(self, monkeypatch):
+        import pandas as pd
+        from energy_forecast import ha_data as ha_data_mod
+        from energy_forecast import weather as weather_mod
+
+        energy_df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2000, freq="1h"),
+                "gross_kwh": [1.0] * 2000,
+            }
+        )
+        empty_df = pd.DataFrame(columns=["timestamp"])
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(
+            ha_data_mod,
+            "split_ev_charging",
+            lambda df, *a, **kw: (df, pd.DataFrame(columns=["timestamp", "gross_kwh"])),
+        )
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+
+    def _make_retrain_ready_app(self, monkeypatch, *, use_physics_residual: bool):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_retrain_deps(monkeypatch)
+
+        app = _make_app(
+            {"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": use_physics_residual}}
+        )
+        app.initialize()
+        assert app._physics_model is not None
+
+        app._ml_model = MagicMock()  # avoid a real training cycle
+        app._fetch_physics_sensor_histories = MagicMock()
+        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
+        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
+        return app
+
+    def test_retrain_passes_use_physics_residual_true_when_gate_clear(self, monkeypatch):
+        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
+
+        # Clear the cold-start gate so _effective_use_physics_residual() resolves to True.
+        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
+        assert app._physics_model.is_cold_start_gated is False
+
+        app._retrain()
+
+        app._ml_model.train.assert_called_once()
+        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is True
+
+    def test_retrain_passes_use_physics_residual_false_when_gate_not_clear(self, monkeypatch):
+        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
+
+        # Fresh model, no calibration windows accumulated yet — gate stays closed.
+        assert app._physics_model.is_cold_start_gated is True
+
+        app._retrain()
+
+        app._ml_model.train.assert_called_once()
+        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is False
+
+
 class TestRecalibratePhysicsService:
     def test_service_registered_when_physics_enabled(self):
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})

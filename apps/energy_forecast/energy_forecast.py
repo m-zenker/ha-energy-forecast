@@ -1229,9 +1229,8 @@ class EnergyForecast(hass.Hass):
     def _effective_use_physics_residual(self) -> bool:
         """Config intent AND-ed with the cold-start gate.
 
-        Read-only/logging only — never branches actual training behavior. Plan C (not built
-        yet) will read this to decide Phase 1 (physics as a feature) vs Phase 2 (residual
-        learning).
+        Passed to `EnergyForecastModel.train()` as `use_physics_residual=` to decide Phase 1
+        (physics as a feature) vs Phase 2 (residual learning).
         """
         requested = bool(self._physics_config.get("use_physics_residual", False)) if self._physics_model else False
         if requested and self._physics_model.is_cold_start_gated:
@@ -1499,6 +1498,7 @@ class EnergyForecast(hass.Hass):
             regime_count=self._regime_count,
             physics_model=self._physics_model,
             heating_buffer_temp_df=self._physics_heating_buffer_df,
+            use_physics_residual=self._effective_use_physics_residual(),
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
         self._last_adaptive_retrain = self._last_trained_local()
