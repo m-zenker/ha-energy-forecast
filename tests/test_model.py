@@ -3595,6 +3595,101 @@ class TestScenarioDhwDelta:
         expected_combined = appliance_only["delta_kwh"] + dhw_only["delta_kwh"]
         pd.testing.assert_series_equal(combined["delta_kwh"], expected_combined, check_exact=False, rtol=1e-6)
 
+    def test_set_dhw_schedule_then_get_scenario_with_different_override(self, tmp_path):
+        """Plan D Task 7 integration test: `set_dhw_schedule(A)` then
+        `get_scenario(dhw_schedule=B)` must compute `delta_kwh` vs. the
+        A-committed natural baseline, never vs. B and never vs. a
+        truly-uncommitted baseline.
+
+        Combines Task 1 (`ThermalPhysicsModel.commit_dhw_schedule()` persists
+        a committed override that becomes the new natural baseline), Task 3
+        (`predict_scenario()`'s natural-vs-scenario delta split), and Task 5
+        (`energy_forecast/set_dhw_schedule` calls `commit_dhw_schedule()` —
+        simulated here by calling `commit_dhw_schedule()` directly, which is
+        exactly what the service callback does).
+
+        Uses `use_physics_residual=True` (Phase 2 mode) for the same reason as
+        the other tests in this class: in Phase 1 mode `physics_kwh` has
+        ~zero learned SHAP importance against this fixture's random training
+        data, so a DHW override never moves `predicted_kwh` and every
+        assertion below would hold vacuously regardless of correctness.
+        """
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        calib_kwargs = dict(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+        physics_config = {
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": True,
+        }
+
+        # pm backs the trained model. Nothing is committed on it yet at train
+        # time -- commit_dhw_schedule() only affects predict_series(), not
+        # training.
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", physics_config)
+        pm._calib.update(**calib_kwargs)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+
+        # Independent instance, identical calibration, but commit_dhw_schedule()
+        # is never called on it -- represents a genuinely uncommitted baseline
+        # so we can prove A is really baked into pm's "natural" state below,
+        # rather than merely asserting the scenario delta differs from B.
+        pm_never_committed = ThermalPhysicsModel(tmp_path / "physics_models_uncommitted", physics_config)
+        pm_never_committed._calib.update(**calib_kwargs)
+
+        hour_a = int(forecast_df["timestamp"].iloc[10].hour)
+        hour_b = (hour_a + 10) % 24  # deliberately a different hour than A
+        assert hour_a != hour_b
+        date_str = str(forecast_df["timestamp"].iloc[10].date())
+        override_a = {"legionella": (date_str, hour_a)}
+        override_b = {"legionella": (date_str, hour_b)}
+
+        # Task 5: simulate `set_dhw_schedule(A)` -- the service callback does
+        # exactly this: `physics_model.commit_dhw_schedule(override)`.
+        pm.commit_dhw_schedule(override_a)
+
+        # Task 1 proof: the natural baseline (no explicit override passed to
+        # predict()) now reflects committed A, not "no override at all".
+        pred_natural_with_a = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        pred_truly_uncommitted = model.predict(forecast_df, live_temp=5.0, physics_model=pm_never_committed)
+        assert not np.allclose(
+            pred_natural_with_a["predicted_kwh"].to_numpy(),
+            pred_truly_uncommitted["predicted_kwh"].to_numpy(),
+        ), "committed override A must change the natural baseline vs. a truly-uncommitted physics model"
+
+        # Task 3: get_scenario(dhw_schedule=B) after set_dhw_schedule(A) was
+        # already committed -- delta_kwh must be vs. the A-committed natural
+        # baseline, not vs. B and not vs. zero.
+        scenario_b = model.predict_scenario(
+            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override_b
+        )
+        pred_scenario_b_only = model.predict(
+            forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=override_b
+        )
+
+        # Correct delta: scenario(B) - natural(A-committed).
+        expected_delta_vs_a = pred_scenario_b_only["predicted_kwh"] - pred_natural_with_a["predicted_kwh"]
+        pd.testing.assert_series_equal(
+            scenario_b["delta_kwh"], expected_delta_vs_a, check_names=False, check_exact=False, rtol=1e-9
+        )
+
+        # The regression this test exists to catch: if predict_scenario()'s
+        # natural-baseline computation ignored the committed override, the
+        # delta would instead equal scenario(B) - truly-uncommitted baseline.
+        # Prove that is NOT what happened.
+        wrong_delta_vs_uncommitted = pred_scenario_b_only["predicted_kwh"] - pred_truly_uncommitted["predicted_kwh"]
+        assert not np.allclose(scenario_b["delta_kwh"].to_numpy(), wrong_delta_vs_uncommitted.to_numpy()), (
+            "delta_kwh must be anchored to the A-committed baseline, not a truly-uncommitted baseline"
+        )
+
+        # Sanity: the real delta must actually be nonzero somewhere, else both
+        # assertions above would hold vacuously.
+        assert scenario_b["delta_kwh"].abs().sum() > 0
+
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
         df = _make_baseline_df(start="2024-06-01 10:00")
