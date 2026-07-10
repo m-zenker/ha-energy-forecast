@@ -38,11 +38,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   without polling a separate sensor.
 - `ROADMAP.md` — Operator reminder to verify empirical prediction-interval coverage on gross kWh
   once Phase 2 has been live for ≥ 30 days, following the existing "SHAP check due" convention.
+- `apps/energy_forecast/physics.py` — `ThermalPhysicsModel.commit_dhw_schedule(override: dict)`
+  persists a confirmed DHW schedule override to `physics_schedule.json`. Because an
+  operator-confirmed reschedule is not unexpected drift, the legionella instability guard is
+  bypassed; the committed schedule becomes the new natural baseline for every subsequent prediction
+  until superseded by another commit.
+- `apps/energy_forecast/model.py` — `predict()` and `predict_scenario()` accept a new optional
+  `dhw_schedule_override` dict (e.g. `{"legionella": ["2026-01-16", 10]}`). A per-call override
+  takes precedence over the committed baseline for that call only, leaving the persisted schedule
+  untouched. `predict_scenario()`'s `delta_kwh` now reflects the combined signed difference of
+  both appliance-schedule and DHW-schedule overlays vs. the currently-committed natural baseline —
+  never vs. zero, never vs. the scenario's own override.
+- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` extended with an
+  optional `dhw_schedule` kwarg (transient per-call DHW schedule override, e.g.
+  `{"legionella": ["2026-01-16", 10]}`). Designed for "what if DHW/legionella ran at a different
+  time?" queries from `ha-energy-manager`. A `dhw_schedule` supplied here overrides the committed
+  baseline for that call only and does not persist.
+- `apps/energy_forecast/energy_forecast.py` — New AppDaemon service
+  `energy_forecast/set_dhw_schedule`. Commits a DHW schedule override persistently: writes
+  `physics_schedule.json` and immediately invalidates the forecast cache so the next scheduled
+  cycle reflects the new baseline. Requires `physics:` to be configured; logs a WARNING if the
+  physics model is unavailable. **Caller-cache contract for `ha-energy-manager`**: flush your own
+  scenario cache after calling this service — any cached `get_scenario` result keyed without
+  `dhw_schedule` is stale after a commit.
 
 ### Fixed
 - `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
 - `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.
 - `apps/energy_forecast/energy_forecast.py` — Two defects allowed an AppDaemon restart to fire two uncapped τ retrains in rapid succession: `_last_adaptive_retrain` was reset to `datetime.min` on every restart instead of being seeded from the persisted `last_trained` timestamp (also fixing a UTC-vs-local timezone mismatch in that seeding); and the unconditional startup retrain now skips if a retrain completed within the last 6 hours (`STARTUP_RETRAIN_MIN_GAP_HOURS`).
+- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` never passed the
+  instantiated physics model to the scenario path, causing every scenario call when `physics:` was
+  configured to fall back to `physics_kwh=0.0` with a WARNING. The physics model is now always
+  forwarded, so scenario calls use real cached sensor data — identical to the main forecast path.
 
 ## [0.11.8] — 2026-07-03
 
