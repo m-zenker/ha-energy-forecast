@@ -986,3 +986,40 @@ class TestZoneBoundaryAndOpenWindows:
         climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": actual_temps})}
         flags = pm.detect_open_windows(climate_dfs, weather_df, room_areas=None)
         assert flags.sum() < 5  # not everything flagged
+
+
+class TestCommittedDhwSchedule:
+    def test_commit_persists_override_and_bypasses_stability_guard(self, tmp_path):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        pm._schedule.update(legionella_dow=2, legionella_hour=14)
+        # a >2h shift would normally be rejected by _check_legionella_stability
+        pm.commit_dhw_schedule({"legionella": ("2026-06-25", 22)})
+        assert pm._schedule["committed_override"] == {
+            "legionella": ["2026-06-25", 22]
+        }  # JSON round-trips tuples as lists
+        # reload from disk to confirm persistence
+        pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        assert pm2._schedule["committed_override"] == {"legionella": ["2026-06-25", 22]}
+
+    def test_natural_baseline_applies_committed_override_by_default(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        pm.commit_dhw_schedule({"legionella": ("2026-06-25", 10)})
+        ts = pd.date_range("2026-06-25 00:00", periods=24, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
+        # no explicit dhw_schedule_override passed — the committed one should still apply
+        result = pm.predict_series(forecast_df)
+        assert len(result) == 24  # no crash; committed override consumed internally
+
+    def test_explicit_per_call_override_takes_precedence_over_committed(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm.commit_dhw_schedule({"legionella": ("2026-06-25", 10)})
+        ts = pd.date_range("2026-06-25 00:00", periods=24, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
+        override = {"legionella": ("2026-06-25", 20)}
+        result_a = pm.predict_series(forecast_df, dhw_schedule_override=override)
+        result_b = pm.predict_series(forecast_df)  # committed override (hour 10) applies
+        assert not result_a.equals(result_b)

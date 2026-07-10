@@ -78,6 +78,7 @@ def _default_schedule() -> dict[str, Any]:
         "legionella_hour": 14,
         "T_dhw_lower": 45.0,
         "dhw_tank_volume_l": 200,
+        "committed_override": None,
     }
 
 
@@ -332,7 +333,10 @@ class ThermalPhysicsModel:
             else:
                 initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
-            q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, dhw_schedule_override)
+            effective_override = (
+                dhw_schedule_override if dhw_schedule_override is not None else self._schedule.get("committed_override")
+            )
+            q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
 
             q_base_el = self._calib.get("Q_base_el") or 0.35
             physics_kwh = q_heat_el + q_dhw_el + q_base_el
@@ -373,7 +377,8 @@ class ThermalPhysicsModel:
         else:
             initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
-        q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, dhw_schedule_override=None)
+        effective_override = self._schedule.get("committed_override")
+        q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
         q_base_el = self._calib.get("Q_base_el") or 0.35
         return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
 
@@ -859,3 +864,11 @@ class ThermalPhysicsModel:
             _atomic_write_json(self._schedule_path, self._schedule)
         except Exception as e:
             _LOGGER.warning(f"Physics calibration failed: {e} — retaining previous/default parameters")
+
+    def commit_dhw_schedule(self, override: dict) -> None:
+        """Persist *override* as the new standing DHW schedule, bypassing the instability guard."""
+        # Convert to JSON-serializable form (tuples -> lists)
+        serializable_override = json.loads(json.dumps(override))
+        self._schedule["committed_override"] = serializable_override
+        _atomic_write_json(self._schedule_path, self._schedule)
+        _LOGGER.info(f"DHW schedule committed: {override}")
