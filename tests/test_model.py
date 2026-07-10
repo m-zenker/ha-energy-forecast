@@ -6235,3 +6235,43 @@ class TestGrossMAEReporting:
         # must stay well inside that range, not the ~6x-larger garbage the
         # unconditional np.expm1()-on-residual bug produced.
         assert model.last_mae < 3.0
+
+
+class TestPredictDhwScheduleOverride:
+    """Plan D Task 2: dhw_schedule_override parameter threading."""
+
+    def test_dhw_schedule_override_forwarded_to_physics_model(self, tmp_path, monkeypatch):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": False,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+
+        received = {}
+        original = pm.predict_series
+
+        def _spy(*args, **kwargs):
+            received.update(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(pm, "predict_series", _spy)
+
+        override = {"legionella": ("2026-06-25", 10)}
+        model.predict(forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=override)
+        assert received.get("dhw_schedule_override") == override
+
+    def test_dhw_schedule_override_none_by_default(self, tmp_path):
+        model, forecast_df = _make_trained_model(tmp_path / "model")
+        result = model.predict(forecast_df, live_temp=5.0)  # no exception with default None
+        assert not result.empty

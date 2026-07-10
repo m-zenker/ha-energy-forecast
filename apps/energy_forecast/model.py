@@ -902,6 +902,7 @@ class EnergyForecastModel:
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
+        dhw_schedule_override: dict | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -985,6 +986,7 @@ class EnergyForecastModel:
                     heating_active_series=heating_active_series,
                     setpoint_on=setpoint_on,
                     setpoint_off=setpoint_off,
+                    dhw_schedule_override=dhw_schedule_override,
                 )
             except Exception as e:
                 _LOGGER.warning(f"Physics baseline prediction failed at predict time: {e} — falling back to ML-only")
@@ -1178,6 +1180,7 @@ class EnergyForecastModel:
         setpoint_off: float | None = None,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        dhw_schedule_override: dict | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
@@ -1205,6 +1208,7 @@ class EnergyForecastModel:
                 setpoint_off=setpoint_off,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
+                dhw_schedule_override=dhw_schedule_override,
             )
         if "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
