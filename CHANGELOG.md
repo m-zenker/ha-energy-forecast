@@ -123,6 +123,14 @@ publicly released) `0.11.8` heading below, which predates `dev`'s actual `v0.11.
   thermostats) was never populated during any real training cycle regardless of config — only
   exercised in isolation by its own unit tests. Wired the call into `_retrain()` before
   `train()` is invoked.
+- `apps/energy_forecast/energy_forecast.py` — `_publish_physics_sensors()` (run every hourly
+  update cycle) raised `AttributeError` the first time `physics:` was enabled on a live instance,
+  because only `_physics_heating_buffer_df` was defensively initialized in `initialize()` — the
+  other four attributes populated by `_fetch_physics_sensor_histories()` (`_physics_climate_dfs`,
+  `_physics_dhw_tank_df`, `_physics_cop_df`, `_room_thermostat_temp_dfs`) don't exist until the
+  first `_retrain()` completes, which can be up to a week away on a freshly-configured instance.
+  Found live during the v0.12.0-alpha-1 rollout; fixed by initializing all five attributes
+  together at the same point in `initialize()`.
 
 ### Notes
 - `use_physics_residual: true` in the `physics:` block is accepted but held dormant behind a
