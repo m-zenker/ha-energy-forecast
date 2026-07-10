@@ -167,10 +167,16 @@ data:
   schedule:
     sub_dishwasher: "22:30"        # key = entity ID suffix from sub_energy_sensors
     sub_washing_machine: "off"     # "off" or null to exclude from scenario
+  dhw_schedule:                    # optional: transient physics DHW override (requires `physics:` block)
+    legionella: ["2026-06-25", 10] # [date string, hour] — NOT persisted
   publish: true                    # optional: write result to HA sensors
 ```
 
 Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after the last `.`, e.g. `sub_dishwasher` from `sensor.dishwasher_energy_kwh`. Alternatively, pass the full entity ID. Unknown keys are silently skipped.
+
+`dhw_schedule` is an optional, **transient** (non-persisted) override of the physics model's DHW/legionella schedule, shaped `{"legionella": ["YYYY-MM-DD", hour]}`. It only affects this one `get_scenario` call — it is never written to `physics_schedule.json` and does not survive past the call. When provided, `delta_kwh` reflects the **combined** appliance-schedule + dhw-schedule delta versus the natural (currently committed) baseline. To persist a DHW schedule change instead, use `energy_forecast/set_dhw_schedule` (see [Physics-ML Hybrid](#physics-ml-hybrid-phases-1--2-optional)).
+
+> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app only invalidates its internal forecast cache, not any cache kept by the caller.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
@@ -183,7 +189,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 }
 ```
 
-`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances relative to the baseline forecast — positive values mean higher consumption than baseline.
+`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline.
 
 **Published sensors** (when `publish: true`):
 
@@ -1027,6 +1033,27 @@ service: appdaemon/energy_forecast_recalibrate_physics
 Call it from **Developer Tools → Services** or from an automation. Logs a WARNING if `physics:`
 is not configured.
 
+### Committing a DHW schedule override
+
+`energy_forecast/set_dhw_schedule` persists a DHW/legionella schedule override to the physics
+model, bypassing the automatic-calibration instability guard (the same guard that would otherwise
+reject a newly inferred legionella time slot that swings too far from the previous one):
+
+```yaml
+service: appdaemon/energy_forecast_set_dhw_schedule
+data:
+  dhw_schedule:
+    legionella: ["2026-06-25", 10]   # [date string, hour]
+```
+
+Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, see [Scenario / What-If API](#scenario--what-if-api)),
+this override is **committed** — it is written to `physics_schedule.json` as `committed_override`
+and persists across restarts until overwritten. Calling it also invalidates this app's internal
+forecast cache (`_cached_forecast_df`), so the next hourly cycle recomputes with the new schedule.
+It does **not** invalidate any scenario cache kept by a consuming app (see the caller cache
+contract above) — flush that separately after a successful call. Logs a WARNING and no-ops if
+`physics:` is not configured or `dhw_schedule` is not a dict.
+
 ### Open-window down-weighting
 
 When `room_thermostats` are configured, the physics model's open-window detector flags training
@@ -1061,10 +1088,13 @@ columns are filled with `0.0` and a WARNING is logged. This applies to `predict(
 
 ### Known limitations
 
-- `predict_scenario()` / `energy_forecast/get_scenario` log one WARNING per call when physics is
-  configured, because the what-if path does not supply live physics sensor values — both `physics_kwh`
-  and `heating_buffer_temp` fall back to `0.0` for every scenario row. This is a known limitation,
-  not a bug.
+- `energy_forecast/get_scenario` now always passes `physics_model` to `predict_scenario()` when
+  physics is configured, so `physics_kwh` is computed from the same real, cached sensor data
+  (`climate_recent` / `dhw_recent` / `room_areas`) used by the main forecast — it is no longer a
+  `0.0` stub, and the "physics disabled at predict time" WARNING no longer fires for `get_scenario`.
+  However, `heating_active_series` / `setpoint_on` / `setpoint_off` are still not passed from
+  `_get_scenario_cb`, so indoor-temperature-projection quality within a scenario can differ
+  slightly from the main hourly forecast, which does supply those inputs.
 - Phase 2 (`use_physics_residual: true`) is implemented but dormant — the cold-start gate blocks
   activation until ≥ 30 winter UA_eff calibration windows have been collected. No config change is
   needed; the next weekly retrain after the gate clears will promote automatically to Phase 2 and

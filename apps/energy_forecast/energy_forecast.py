@@ -931,7 +931,17 @@ class EnergyForecast(hass.Hass):
 
         Accepts kwargs:
           schedule (dict[str, str]): {prefix: "HH:MM" | "off" | None}
+          dhw_schedule (dict | None): transient physics DHW override, e.g.
+              {"legionella": ("2026-06-25", 10)} — NOT persisted. Delta is
+              computed vs. the natural (currently committed) baseline.
           publish  (bool):           if True, publish scenario sensors to HA
+
+        Caller cache contract (see spec §5.4): results computed with a non-None
+        dhw_schedule must NOT be cached by the caller unless dhw_schedule is
+        included in the cache key. The safest default is to never cache them.
+        After a successful set_dhw_schedule call, callers must flush their own
+        scenario cache — this app only invalidates its own _cached_forecast_df.
+
         Fires event "energy_forecast_scenario_result" with the forecast payload.
         """
         try:
