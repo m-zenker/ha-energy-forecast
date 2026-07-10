@@ -3538,6 +3538,19 @@ class TestScenarioDhwDelta:
         assert (result["delta_kwh"] == 0.0).all()  # no appliance schedule, no dhw override -> no delta
 
     def test_appliance_and_dhw_deltas_both_present_are_additive(self, tmp_path):
+        """Proves delta_kwh is genuinely additive: combined(appliance+dhw) ==
+        appliance_only_delta + dhw_only_delta, computed from three separate
+        predict_scenario() calls with a real (nonzero) appliance schedule AND a
+        real (nonzero) dhw override in the combined case.
+
+        Uses `use_physics_residual=True` (Phase 2 mode) for the same reason
+        documented on `test_delta_kwh_reflects_dhw_shift_vs_natural_baseline`
+        above: in Phase 1 mode, physics_kwh has ~zero learned SHAP importance
+        against random training data, so the dhw override never moves
+        predicted_kwh and its delta component would be deterministically zero
+        -- which would make this test pass trivially regardless of whether the
+        combined-delta plumbing in predict_scenario() is correct.
+        """
         from energy_forecast.physics import ThermalPhysicsModel
 
         pm = ThermalPhysicsModel(
@@ -3549,21 +3562,38 @@ class TestScenarioDhwDelta:
                 "internal_gains_fraction": 0.8,
                 "heating_curve_points": [[-20, 55.5], [20, 25.0]],
                 "room_thermostats": [],
-                "use_physics_residual": False,
+                "use_physics_residual": True,
             },
         )
         pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
 
-        override = {"legionella": (str(forecast_df["timestamp"].iloc[5].date()), forecast_df["timestamp"].iloc[5].hour)}
+        # Give the model a real, non-empty appliance signature (same pattern as
+        # TestScenarioComposite.test_predict_scenario_returns_delta_column above)
+        # so the schedule below actually produces a nonzero appliance-side delta.
+        model._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.6, 0.9, 0.4], "total_kwh": 1.9, "peak_hour": 1, "n_cycles": 5}
+        }
+        schedule = {"sub_dw": "12:00"}
+        override = {
+            "legionella": (str(forecast_df["timestamp"].iloc[10].date()), forecast_df["timestamp"].iloc[10].hour)
+        }
+
         dhw_only = model.predict_scenario(
             forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
         )
+        appliance_only = model.predict_scenario(forecast_df, live_temp=5.0, schedule=schedule, physics_model=pm)
         combined = model.predict_scenario(
-            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
+            forecast_df, live_temp=5.0, schedule=schedule, physics_model=pm, dhw_schedule_override=override
         )
-        # same call twice (no appliance signatures learned in this fixture) should be deterministic
-        pd.testing.assert_series_equal(dhw_only["delta_kwh"], combined["delta_kwh"])
+
+        # Sanity: both component deltas must actually be nonzero, otherwise
+        # additivity would hold trivially (0 + 0 == 0) and prove nothing.
+        assert dhw_only["delta_kwh"].abs().sum() > 0
+        assert appliance_only["delta_kwh"].abs().sum() > 0
+
+        expected_combined = appliance_only["delta_kwh"] + dhw_only["delta_kwh"]
+        pd.testing.assert_series_equal(combined["delta_kwh"], expected_combined, check_exact=False, rtol=1e-6)
 
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
