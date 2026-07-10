@@ -1308,11 +1308,16 @@ class EnergyForecastModel:
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
         room_areas: dict[str, float] | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        dhw_schedule_override: dict | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
         Runs the baseline predict() then overlays the appliance profiles from
-        *schedule* using the learned appliance signatures.
+        *schedule* using the learned appliance signatures. If *dhw_schedule_override*
+        and *physics_model* are both given, also folds in the DHW-schedule delta
+        (scenario vs. the natural/no-override baseline) so `delta_kwh` reflects
+        the combined signed difference of both overlays vs. the natural baseline.
 
         Raises:
             RuntimeError: if the model has not been trained yet.
@@ -1320,7 +1325,7 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        baseline_df = self.predict(
+        natural_baseline_df = self.predict(
             forecast_df,
             live_temp,
             recent_actuals,
@@ -1333,8 +1338,36 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
             room_areas=room_areas,
+            physics_model=physics_model,  # dhw_schedule_override intentionally omitted — this is the natural baseline
         )
-        return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
+
+        if dhw_schedule_override is not None and physics_model is not None:
+            scenario_baseline_df = self.predict(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent=sub_sensors_recent,
+                away_series=away_series,
+                people_home_series=people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+                room_areas=room_areas,
+                physics_model=physics_model,
+                dhw_schedule_override=dhw_schedule_override,
+            )
+        else:
+            scenario_baseline_df = natural_baseline_df
+
+        result = _composite_forecast(scenario_baseline_df, schedule, self._appliance_signatures)
+
+        if dhw_schedule_override is not None and physics_model is not None:
+            dhw_delta = (scenario_baseline_df["predicted_kwh"] - natural_baseline_df["predicted_kwh"]).to_numpy()
+            result["delta_kwh"] = result["delta_kwh"] + dhw_delta
+
+        return result
 
     def _validate_physics_phase1(
         self, X_holdout: pd.DataFrame, y_holdout_gross: np.ndarray, physics_kwh_holdout: np.ndarray | None

@@ -3487,6 +3487,84 @@ class TestCompositeForecast:
         )
         assert "delta_kwh" in result.columns
 
+
+class TestScenarioDhwDelta:
+    def test_delta_kwh_reflects_dhw_shift_vs_natural_baseline(self, tmp_path):
+        """NOTE: deviates from the brief by adding `use_physics_residual=True` to
+        `_make_trained_model()` (Phase 2 mode). Confirmed via debug run that in
+        Phase 1 mode (brief's exact fixture, `use_physics_residual` defaulting to
+        False) `physics_kwh` is fed to the ML model as just one of ~30 features
+        trained against fully random/uncorrelated data — it ends up with ~zero
+        learned importance, so a single-hour DHW override changes the
+        `physics_kwh` feature value but never moves `predicted_kwh` at all,
+        making `delta_kwh` deterministically zero and this assertion fail
+        regardless of whether predict_scenario()'s DHW-delta plumbing is
+        correct. This is the same class of fixture flaw already documented on
+        `TestPhase1Validation` above. Phase 2 mode feeds physics_kwh additively
+        into predicted_kwh (model.py `preds = physics_baseline + preds`),
+        guaranteeing the override is observable regardless of ML feature
+        importance, matching the pattern used in
+        `TestPhase2ResidualTarget.test_phase2_target_is_residual_log_transform_disabled`.
+        """
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+
+        override = {
+            "legionella": (str(forecast_df["timestamp"].iloc[10].date()), forecast_df["timestamp"].iloc[10].hour)
+        }
+        result = model.predict_scenario(
+            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
+        )
+        assert "delta_kwh" in result.columns
+        assert result["delta_kwh"].abs().sum() > 0  # dhw shift produced a nonzero delta somewhere
+
+    def test_no_dhw_schedule_delta_unchanged_from_pre_plan_d_behaviour(self, tmp_path):
+        model, forecast_df = _make_trained_model(tmp_path / "model")
+        result = model.predict_scenario(forecast_df, live_temp=5.0, schedule={})
+        assert (result["delta_kwh"] == 0.0).all()  # no appliance schedule, no dhw override -> no delta
+
+    def test_appliance_and_dhw_deltas_both_present_are_additive(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": False,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+
+        override = {"legionella": (str(forecast_df["timestamp"].iloc[5].date()), forecast_df["timestamp"].iloc[5].hour)}
+        dhw_only = model.predict_scenario(
+            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
+        )
+        combined = model.predict_scenario(
+            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
+        )
+        # same call twice (no appliance signatures learned in this fixture) should be deterministic
+        pd.testing.assert_series_equal(dhw_only["delta_kwh"], combined["delta_kwh"])
+
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
         df = _make_baseline_df(start="2024-06-01 10:00")
