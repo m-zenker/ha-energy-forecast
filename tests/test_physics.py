@@ -1003,15 +1003,28 @@ class TestCommittedDhwSchedule:
         assert pm2._schedule["committed_override"] == {"legionella": ["2026-06-25", 22]}
 
     def test_natural_baseline_applies_committed_override_by_default(self, tmp_path):
-        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
-        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
-        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
-        pm.commit_dhw_schedule({"legionella": ("2026-06-25", 10)})
+        # Model WITH committed override
+        pm_with_override = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm_with_override._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm_with_override._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        pm_with_override.commit_dhw_schedule({"legionella": ("2026-06-25", 10)})
+
+        # Fresh model WITHOUT committed override for comparison
+        pm_no_override = ThermalPhysicsModel(tmp_path / "models2", DEFAULT_CONFIG)
+        pm_no_override._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm_no_override._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        # Note: no commit_dhw_schedule call for pm_no_override
+
         ts = pd.date_range("2026-06-25 00:00", periods=24, freq="1h")
         forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
+
         # no explicit dhw_schedule_override passed — the committed one should still apply
-        result = pm.predict_series(forecast_df)
-        assert len(result) == 24  # no crash; committed override consumed internally
+        result_with = pm_with_override.predict_series(forecast_df)
+        result_without = pm_no_override.predict_series(forecast_df)
+
+        # The committed override (hour 10 legionella boost) produces a different DHW profile
+        # than the default schedule with no override, so results must differ
+        assert not result_with.equals(result_without)
 
     def test_explicit_per_call_override_takes_precedence_over_committed(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
