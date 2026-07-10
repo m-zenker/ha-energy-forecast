@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
 
+    from .physics import ThermalPhysicsModel
+
 from . import clustering
 from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
@@ -241,8 +243,17 @@ class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
     _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
-    _SPRING_BIAS_NIGHT_FRAC: float = 0.15  # fraction of nighttime candidates below which guard fires
-    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median above which guard fires
+    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median at/above which temp confidence is zero
+    _SPRING_BIAS_OUTDOOR_TEMP_FLOOR: float = 5.0  # °C outdoor median at/below which temp confidence is full
+    _SPRING_BIAS_NIGHT_FRAC_FULL: float = 0.40  # night_frac at/above which night confidence is full
+    _TAU_SAMPLE_CONF_REF: int = 3  # candidate count at/above which sample confidence is full
+    _TAU_EMA_MAX_NEW_WEIGHT: float = 0.2  # weight given to the fresh τ estimate at full confidence
+    _TAU_DRIFT_WINDOW_DAYS: int = 30  # short drift-cap window (days)
+    _TAU_MAX_DRIFT_FRAC: float = 0.35  # short drift-cap max fractional move
+    _TAU_LONG_DRIFT_WINDOW_DAYS: int = 180  # long drift-cap window (days)
+    _TAU_LONG_MAX_DRIFT_FRAC: float = 0.50  # long drift-cap max fractional move
+
+    assert _SPRING_BIAS_OUTDOOR_TEMP > _SPRING_BIAS_OUTDOOR_TEMP_FLOOR
 
     def __init__(self, model_dir: Path, model_archive_count: int = 3, timezone: str = "Europe/Zurich") -> None:
         self._model_dir = model_dir
@@ -254,11 +265,14 @@ class EnergyForecastModel:
         self.feature_cols: list[str] = _FEATURES_BASE
         self.last_trained: datetime = datetime.min
         self.last_mae: float | None = None
+        self.last_residual_mae: float | None = None  # Phase 2 only — internal diagnostic (residual scale)
         self.last_cv_mae: float | None = None  # cross-validated MAE
         self.engine: str = "not trained"
         self._feature_medians: dict = {}  # global medians — used to fill NaN at predict time
         self._feature_medians_by_how: dict = {}  # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool = False  # log1p target; False = backward compat
+        self._use_physics_residual: bool = False  # Phase 2: train on gross_kwh - physics_kwh
+        self._last_physics_kwh_series: pd.Series | None = None  # set by _prepare_prediction_X(), read by predict()
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
         self._timezone: str = timezone  # local timezone for wall-clock "now"
@@ -278,6 +292,11 @@ class EnergyForecastModel:
         self._sub_sensor_prefixes: list[str] = []
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
+        # Rolling drift-cap anchors for _tau_hours (short: 30-day/35%, long: 180-day/50%)
+        self._tau_anchor_hours: float | None = None
+        self._tau_anchor_ts: pd.Timestamp | None = None
+        self._tau_long_anchor_hours: float | None = None
+        self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
 
@@ -319,6 +338,9 @@ class EnergyForecastModel:
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
         regime_count: int = 5,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        use_physics_residual: bool = False,
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -379,6 +401,39 @@ class EnergyForecastModel:
             elif heating_active_df is None or heating_active_df.empty:
                 _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
 
+        # ── Physics-ML hybrid: calibration trigger + physics baseline series ──
+        # (Plan B Task 4). Runs before the hourly_weights computation below so
+        # open_window_flags is available to fold into it, and before the
+        # _engineer_features() call further down so physics_kwh_series /
+        # heating_buffer_temp_series can be threaded through.
+        physics_kwh_series = None
+        heating_buffer_temp_series = None
+        open_window_flags = None
+        if physics_model is not None:
+            physics_model.check_zone_boundary(list(climate_dfs.keys()) if climate_dfs else [])
+            if physics_model.calibration_stale:
+                physics_model.calibrate(
+                    energy_df,
+                    weather_df,
+                    climate_dfs,
+                    dhw_df,
+                    holdout_cutoff=energy_df["timestamp"].max()
+                    - pd.Timedelta(days=int(len(energy_df) / 24 * 0.1) or 1),
+                    heating_active_df=heating_active_df,
+                    away_df=away_df,
+                )
+            physics_model._tau_hours = self._tau_hours
+            physics_kwh_series = physics_model.predict_training_series(
+                energy_df, weather_df, climate_dfs=climate_dfs, dhw_df=dhw_df, room_areas=room_areas
+            )
+            if climate_dfs:
+                open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
+
+        if heating_buffer_temp_df is not None and not heating_buffer_temp_df.empty:
+            heating_buffer_temp_series = heating_buffer_temp_df.set_index(
+                pd.to_datetime(heating_buffer_temp_df["timestamp"])
+            )["heating_buffer_temp"]
+
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
@@ -404,6 +459,12 @@ class EnergyForecastModel:
             h_weights = np.exp(-days_ago.values * np.log(2) / weight_halflife_days)
             hourly_weights = pd.Series(h_weights, index=energy_df["timestamp"])
             daily_weights = hourly_weights.groupby(energy_df["timestamp"].dt.date).mean()
+
+        # ── Down-weight open-window hours (Plan B Task 4) ───────────────────
+        if open_window_flags is not None and hourly_weights is not None:
+            ow = open_window_flags.reindex(df["timestamp"].values if "timestamp" in df else hourly_weights.index)
+            down_weight = pd.Series(np.where(ow.fillna(False), 0.5, 1.0), index=hourly_weights.index)
+            hourly_weights = hourly_weights * down_weight
 
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes
@@ -487,6 +548,8 @@ class EnergyForecastModel:
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
             heating_active_df=heating_active_df,
+            physics_kwh_series=physics_kwh_series,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
 
         # ── Build feature list from active lags ─────────────────────────────
@@ -509,6 +572,10 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
+        if physics_kwh_series is not None:
+            base_features = [*base_features, "physics_kwh"]
+        if heating_buffer_temp_series is not None:
+            base_features = [*base_features, "heating_buffer_temp"]
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns
@@ -555,7 +622,23 @@ class EnergyForecastModel:
 
         X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
-        y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
+        self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)
+        if use_physics_residual and not self._use_physics_residual:
+            _LOGGER.warning(
+                "use_physics_residual requested but no physics_kwh_series available — falling back to Phase 1."
+            )
+
+        if self._use_physics_residual:
+            physics_aligned = physics_kwh_series.reindex(df["timestamp"])
+            n_nans = int(physics_aligned.isna().sum())
+            if n_nans > 0:
+                _LOGGER.warning(
+                    f"{n_nans} hours have no physics prediction — set to 0 in residual target (check weather data gaps)"
+                )
+            physics_vals = physics_aligned.fillna(0).values
+            y_fit = y - physics_vals  # residual target — can be negative, no log transform
+        else:
+            y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
 
         # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
@@ -602,7 +685,16 @@ class EnergyForecastModel:
                                 )
                             except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                            sweep_maes[nl] = float(mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx]))))
+                            nl_raw = m_nl.predict(X.iloc[val_idx])
+                            if self._use_physics_residual:
+                                X_val_nl = X.iloc[val_idx]
+                                physics_val_nl = (
+                                    X_val_nl["physics_kwh"].values if "physics_kwh" in X_val_nl.columns else 0.0
+                                )
+                                nl_pred = np.maximum(0, physics_val_nl + nl_raw)
+                            else:
+                                nl_pred = np.expm1(nl_raw)
+                            sweep_maes[nl] = float(mae_fn(y[val_idx], nl_pred))
                         best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
                         _LOGGER.info(
                             "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
@@ -650,8 +742,16 @@ class EnergyForecastModel:
                                 m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         else:
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                        # MAE reported in original kWh space (expm1 undoes log1p)
-                        fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
+                        # MAE reported in original kWh space (expm1 undoes log1p, or
+                        # reconstructed from physics + residual in Phase 2)
+                        fold_raw = m.predict(X.iloc[val_idx])
+                        if self._use_physics_residual:
+                            X_val = X.iloc[val_idx]
+                            physics_val = X_val["physics_kwh"].values if "physics_kwh" in X_val.columns else 0.0
+                            fold_pred = np.maximum(0, physics_val + fold_raw)
+                        else:
+                            fold_pred = np.expm1(fold_raw)
+                        fold_maes.append(float(mae_fn(y[val_idx], fold_pred)))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(
@@ -689,6 +789,7 @@ class EnergyForecastModel:
         # The final `model` is still trained on all rows for best accuracy; this
         # temporary holdout model is only for the MAE fallback used when CV is skipped.
         holdout_mae = None
+        self.last_residual_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
@@ -697,7 +798,16 @@ class EnergyForecastModel:
                     ho_model.fit(X.iloc[:split], y_fit[:split], sample_weight=sample_weight[:split])
                 else:
                     ho_model.fit(X.iloc[:split], y_fit[:split])
-                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_model.predict(X.iloc[split:])))), 4)
+
+                X_ho = X.iloc[split:]
+                ho_raw = ho_model.predict(X_ho)
+                if self._use_physics_residual:
+                    physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else 0.0
+                    gross_pred = np.maximum(0, physics_ho + ho_raw)
+                    holdout_mae = round(float(mae_fn(y[split:], gross_pred)), 4)
+                    self.last_residual_mae = round(float(mae_fn(y_fit[split:], ho_raw)), 4)
+                else:
+                    holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_raw))), 4)
             except (ValueError, IndexError):
                 pass
 
@@ -707,7 +817,7 @@ class EnergyForecastModel:
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
         self.engine = engine_name
-        self._log_transform = True
+        self._log_transform = not self._use_physics_residual
         self._canton = canton
         self._country = country
         self._sub_sensor_prefixes = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
@@ -721,6 +831,23 @@ class EnergyForecastModel:
             len(feature_cols),
             mae_str,
         )
+        if self._use_physics_residual and self.last_residual_mae is not None:
+            _LOGGER.info(
+                f"Holdout MAE (gross kWh)={holdout_mae}, residual MAE (internal diagnostic)={self.last_residual_mae}"
+            )
+
+        # ── Phase 1 physics validation diagnostic (Plan B Task 6) ────────────
+        # Read-only: reports whether physics_kwh is a top-5 SHAP feature and
+        # well-calibrated (OLS slope ~1.0) against gross_kwh on the same
+        # holdout split used for holdout_mae above. Never flips config —
+        # `self.model`/`self.engine` are already assigned above so the SHAP
+        # codepath in _validate_physics_phase1 sees the freshly trained model.
+        self.physics_phase1_diagnostic: dict | None = None
+        if physics_model is not None and "physics_kwh" in feature_cols and holdout_mae is not None:
+            X_ho = X.iloc[split:]
+            y_ho_gross = y[split:]  # gross_kwh, not log-transformed
+            physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else None
+            self.physics_phase1_diagnostic = self._validate_physics_phase1(X_ho, y_ho_gross, physics_ho)
 
         # ── Quantile models for prediction intervals (CQR) ───────────────────
         # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
@@ -772,6 +899,10 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame
+        | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
+        dhw_schedule_override: dict | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -840,6 +971,42 @@ class EnergyForecastModel:
         else:
             _extended = forecast_df
 
+        # ── Physics-ML hybrid: physics baseline series at prediction time ────
+        # (Plan B Task 5). Uses the raw climate_recent (not climate_dfs_for_features,
+        # which is the RC-ODE-projected version built for _engineer_features()'s own
+        # climate feature) — predict_series() does its own internal projection.
+        physics_kwh_series = None
+        if physics_model is not None:
+            try:
+                physics_kwh_series = physics_model.predict_series(
+                    forecast_df,
+                    climate_recent=climate_recent,
+                    dhw_recent=dhw_recent,
+                    room_areas=room_areas,
+                    heating_active_series=heating_active_series,
+                    setpoint_on=setpoint_on,
+                    setpoint_off=setpoint_off,
+                    dhw_schedule_override=dhw_schedule_override,
+                )
+            except Exception as e:
+                _LOGGER.warning(f"Physics baseline prediction failed at predict time: {e} — falling back to ML-only")
+                physics_kwh_series = None
+
+        # Stashed for predict()'s Phase 2 reconstruction step. predict() may consume
+        # a pre-built (future_hours, X) tuple via its `_prepared` param rather than
+        # calling this method directly (see energy_forecast.py's threading of
+        # _prepare_prediction_X()'s output into predict()/predict_intervals()/
+        # shap_summary()); this attribute lets it recover physics_kwh_series without
+        # widening that shared 2-tuple contract.
+        self._last_physics_kwh_series = physics_kwh_series
+
+        heating_buffer_temp_series = None
+        if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
+            # hold the most recent reading flat across the forecast horizon — same "recent" pattern
+            # used for dhw_recent/climate_recent elsewhere in this method
+            latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
+            heating_buffer_temp_series = pd.Series(latest_val, index=pd.DatetimeIndex(forecast_df["timestamp"]))
+
         feat_df = _engineer_features(
             future_df,
             _extended,
@@ -851,7 +1018,31 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
+            physics_kwh_series=physics_kwh_series,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
+
+        # ── Model-artifact portability fallback ──────────────────────────────
+        # A saved model may have physics_kwh in feature_cols (trained with physics
+        # enabled) while physics_model is None at predict time (sensor outage,
+        # config change disabling physics). Fill with 0.0 rather than raising
+        # KeyError when feat_df[self.feature_cols] is sliced below.
+        if "physics_kwh" in self.feature_cols and "physics_kwh" not in feat_df.columns:
+            feat_df["physics_kwh"] = 0.0
+            _LOGGER.warning(
+                "physics_kwh in trained feature list but physics_model disabled at predict time — filling with 0.0"
+            )
+
+        # Same portability guarantee for heating_buffer_temp: a saved model may have
+        # heating_buffer_temp in feature_cols (trained with a buffer-temp sensor available)
+        # while heating_buffer_temp_recent is None/empty at predict time (sensor outage,
+        # config change, or predict_scenario() which never supplies it). Fill with 0.0
+        # rather than raising KeyError when feat_df[self.feature_cols] is sliced below.
+        if "heating_buffer_temp" in self.feature_cols and "heating_buffer_temp" not in feat_df.columns:
+            feat_df["heating_buffer_temp"] = 0.0
+            _LOGGER.warning(
+                "heating_buffer_temp in trained feature list but sensor unavailable at predict time — filling with 0.0"
+            )
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -987,6 +1178,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        dhw_schedule_override: dict | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
@@ -1012,6 +1206,9 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
+                dhw_schedule_override=dhw_schedule_override,
             )
         if "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
@@ -1022,6 +1219,19 @@ class EnergyForecastModel:
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
+
+        if self._use_physics_residual and physics_model is not None:
+            try:
+                physics_kwh_series = self._last_physics_kwh_series
+                if physics_kwh_series is None:
+                    raise ValueError("physics baseline unavailable")
+                physics_baseline = (
+                    physics_kwh_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0).values
+                )
+                preds = physics_baseline + preds
+            except Exception as e:
+                _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
+
         preds = np.maximum(0, preds)
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
 
@@ -1098,11 +1308,16 @@ class EnergyForecastModel:
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
         room_areas: dict[str, float] | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        dhw_schedule_override: dict | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
 
         Runs the baseline predict() then overlays the appliance profiles from
-        *schedule* using the learned appliance signatures.
+        *schedule* using the learned appliance signatures. If *dhw_schedule_override*
+        and *physics_model* are both given, also folds in the DHW-schedule delta
+        (scenario vs. the natural/no-override baseline) so `delta_kwh` reflects
+        the combined signed difference of both overlays vs. the natural baseline.
 
         Raises:
             RuntimeError: if the model has not been trained yet.
@@ -1110,7 +1325,7 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        baseline_df = self.predict(
+        natural_baseline_df = self.predict(
             forecast_df,
             live_temp,
             recent_actuals,
@@ -1123,8 +1338,88 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
             room_areas=room_areas,
+            physics_model=physics_model,  # dhw_schedule_override intentionally omitted — this is the natural baseline
         )
-        return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
+
+        if dhw_schedule_override is not None and physics_model is not None:
+            scenario_baseline_df = self.predict(
+                forecast_df,
+                live_temp,
+                recent_actuals,
+                sub_sensors_recent=sub_sensors_recent,
+                away_series=away_series,
+                people_home_series=people_home_series,
+                climate_recent=climate_recent,
+                dhw_recent=dhw_recent,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+                room_areas=room_areas,
+                physics_model=physics_model,
+                dhw_schedule_override=dhw_schedule_override,
+            )
+        else:
+            scenario_baseline_df = natural_baseline_df
+
+        result = _composite_forecast(scenario_baseline_df, schedule, self._appliance_signatures)
+
+        if dhw_schedule_override is not None and physics_model is not None:
+            dhw_delta = (scenario_baseline_df["predicted_kwh"] - natural_baseline_df["predicted_kwh"]).to_numpy()
+            result["delta_kwh"] = result["delta_kwh"] + dhw_delta
+
+        return result
+
+    def _validate_physics_phase1(
+        self, X_holdout: pd.DataFrame, y_holdout_gross: np.ndarray, physics_kwh_holdout: np.ndarray | None
+    ) -> dict:
+        """Phase 1 read-only diagnostic: is `physics_kwh` a top-5 SHAP feature, well-calibrated (slope ~1.0)?
+
+        Reports whether the physics baseline is (a) among the model's top-5 most
+        important features by mean absolute SHAP contribution, and (b) linearly
+        calibrated against gross_kwh (OLS slope through the origin in [0.8, 1.2]).
+        Purely diagnostic — never flips ``use_physics_residual``. That remains a
+        manual operator decision (spec §2.1) once Phase 2 is planned.
+
+        Never raises: any missing precondition (no physics_kwh column, no
+        physics values, untrained model) yields the safe all-``None``/``False``
+        default dict.
+        """
+        import numpy as np
+        import pandas as pd
+
+        result = {"shap_rank": None, "shap_top5": False, "ols_slope": None, "calibration_good": False}
+        if "physics_kwh" not in X_holdout.columns or physics_kwh_holdout is None or self.model is None:
+            return result
+
+        if self.engine == "LightGBM":
+            contrib = self.model.predict(X_holdout, pred_contrib=True)
+            mean_abs = np.abs(contrib[:, :-1]).mean(axis=0)
+            ranked = pd.Series(mean_abs, index=X_holdout.columns).sort_values(ascending=False)
+            rank = int(ranked.index.get_loc("physics_kwh")) + 1  # 1-indexed
+            result["shap_rank"] = rank
+            result["shap_top5"] = rank <= 5
+
+        x = np.asarray(physics_kwh_holdout, dtype=float)
+        y = np.asarray(y_holdout_gross, dtype=float)
+        if np.sum(x**2) > 1e-9:
+            slope = float(np.sum(x * y) / np.sum(x**2))
+            result["ols_slope"] = slope
+            result["calibration_good"] = result["shap_top5"] and (0.8 <= slope <= 1.2)
+
+        if result["calibration_good"]:
+            _LOGGER.info(
+                "Phase 1 physics validation: PASS (shap_rank=%s, ols_slope=%.2f) — "
+                "physics signal is well-calibrated and predictive",
+                result["shap_rank"],
+                result["ols_slope"],
+            )
+        else:
+            _LOGGER.info(
+                "Phase 1 physics validation: not yet ready for Phase 2 (shap_rank=%s, ols_slope=%s)",
+                result["shap_rank"],
+                result["ols_slope"],
+            )
+        return result
 
     def shap_summary(
         self,
@@ -1141,6 +1436,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
@@ -1175,6 +1472,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -1290,11 +1589,16 @@ class EnergyForecastModel:
             "feature_medians": self._feature_medians,
             "feature_medians_by_how": self._feature_medians_by_how,
             "log_transform": self._log_transform,
+            "use_physics_residual": self._use_physics_residual,
             "canton": self._canton,
             "country": self._country,
             "likely_ev_hours": self._likely_ev_hours,
             "sub_sensor_prefixes": self._sub_sensor_prefixes,
             "tau_hours": self._tau_hours,
+            "tau_anchor_hours": self._tau_anchor_hours,
+            "tau_anchor_ts": self._tau_anchor_ts,
+            "tau_long_anchor_hours": self._tau_long_anchor_hours,
+            "tau_long_anchor_ts": self._tau_long_anchor_ts,
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
             "weather_tail": self._weather_tail,
@@ -1415,12 +1719,15 @@ class EnergyForecastModel:
         * ``solar``          — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
         * ``hour``           — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.1 daytime
 
-        A spring-bias guard is applied before selection: if fewer than 15 % of candidates
-        are nighttime AND the heating-off outdoor median exceeds 12 °C, the stored τ is
-        preserved (spring open-window data is not representative of building thermal mass).
+        The top 50 % of candidates by quality (minimum 1) are used to compute the median τ.
 
-        The top 50 % of candidates by quality (minimum 1) are used to compute the
-        median τ, which is then EMA-smoothed against the stored value.
+        A continuous confidence weight — requiring both a sufficient nighttime fraction *and*
+        a cold-enough outdoor median among the selected top-N candidates, plus enough total
+        candidates — scales how much a fresh estimate can move the stored τ in a single retrain
+        (0–20 %). A two-tier rolling cap independently bounds total movement to ±35 % over any
+        30 days and ±50 % over any 180 days, regardless of retrain frequency. See
+        `docs/superpowers/specs/2026-07-09-tau-calibration-drift-fix-design.md` §2.1–2.2 for the
+        full design rationale.
         """
         import numpy as np
         import pandas as pd
@@ -1469,6 +1776,24 @@ class EnergyForecastModel:
 
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
+
+        combined_reset = combined.reset_index().rename(columns={"index": "timestamp"})
+        passive_df = pd.DataFrame(
+            {
+                "timestamp": combined_reset["timestamp"],
+                "T_outdoor": combined_reset["T_outdoor"],
+                "T_indoor": combined_reset["T_indoor"],
+                "hp_running": combined_reset["heating_active"].astype(bool),
+                "dhw_tank_temp": np.nan,  # τ calibration has no DHW filter input today — unchanged behaviour
+            }
+        )
+        passive_idx = _find_passive_windows(passive_df, min_delta_t=0.0, min_hp_off_hours=1)
+        # block identity is computed above, on the full unfiltered timeline, so block boundaries
+        # reflect true temporal contiguity of on/off transitions. Filtering afterward only removes
+        # individual rows within already-correctly-bounded blocks (harmless with these loose
+        # min_delta_t=0.0/min_hp_off_hours=1 parameters, which add no filtering beyond off==1 given
+        # this input) — it does not merge distinct off-periods into one pseudo-block.
+        combined = combined.iloc[passive_idx].copy() if len(passive_idx) else combined.iloc[0:0]
 
         candidates: list[tuple[float, float, int]] = []  # (tau, quality, hour_start)
 
@@ -1554,28 +1879,13 @@ class EnergyForecastModel:
                 hour_start = int(group.index[s].hour)
 
                 quality = r2 * outdoor_temp_score * n_score * solar_score * hour_score
-                candidates.append((tau, quality, hour_start))
+                candidates.append((tau, quality, hour_start, sub_t_outdoor))
 
         if not candidates:
             _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
 
-        # Spring-bias guard: if almost no nighttime candidates exist and outdoor temps
-        # are warm, the estimates are dominated by open-window ventilation rather than
-        # structural thermal mass.  Preserve the stored winter τ in that case.
         old_tau = self._tau_hours
-        if old_tau is not None and old_tau > 0 and len(candidates) >= 3:
-            night_frac = sum(1 for _, _, h in candidates if h >= 22 or h < 6) / len(candidates)
-            outdoor_median = float(combined[combined["off"] == 1]["T_outdoor"].median())
-            if night_frac < self._SPRING_BIAS_NIGHT_FRAC and outdoor_median > self._SPRING_BIAS_OUTDOOR_TEMP:
-                _LOGGER.info(
-                    "τ calibration skipped — spring/summer bias (%.0f%% nighttime candidates, "
-                    "T_out median=%.1f°C); preserving stored τ=%.1f h.",
-                    night_frac * 100,
-                    outdoor_median,
-                    old_tau,
-                )
-                return old_tau
 
         # With few candidates use top-50%; with many (≥ threshold) tighten to top-25%
         # to reduce bias from lower-quality windows in data-rich retrains.
@@ -1596,21 +1906,93 @@ class EnergyForecastModel:
             max(tau_estimates),
         )
 
+        # Confidence: requires BOTH a sufficient nighttime fraction AND a cold-enough outdoor
+        # median among the SELECTED (quality-filtered) candidates -- computed over the same
+        # population tau_median comes from, not the raw candidate pool. A single good signal
+        # must not be able to rescue full trust for a window where the other signal is bad
+        # (e.g. a warm, all-night window is a textbook summer ventilation case, not safe data).
+        night_frac = sum(1 for c in selected if c[2] >= 22 or c[2] < 6) / len(selected)
+        outdoor_median = float(np.median([c[3] for c in selected]))
+
+        night_conf = min(1.0, night_frac / self._SPRING_BIAS_NIGHT_FRAC_FULL)
+        temp_conf = min(
+            1.0,
+            max(
+                0.0,
+                (self._SPRING_BIAS_OUTDOOR_TEMP - outdoor_median)
+                / (self._SPRING_BIAS_OUTDOOR_TEMP - self._SPRING_BIAS_OUTDOOR_TEMP_FLOOR),
+            ),
+        )
+        # len(candidates) (pre-selection pool size) -- sparse retrains should be trusted less.
+        sample_conf = min(1.0, len(candidates) / self._TAU_SAMPLE_CONF_REF)
+
+        # Geometric mean, not a plain product: a plain 3-way product over-penalizes moderately
+        # -good conditions (three factors of 0.7 would multiply to 0.34); the geometric mean
+        # preserves the same AND-semantics at the boundaries (any single factor at exactly 0
+        # still forces confidence to exactly 0) while being much gentler in the interior.
+        confidence = (night_conf * temp_conf * sample_conf) ** (1.0 / 3.0)
+
         tau_median = float(np.median(tau_estimates))
 
         if old_tau is not None and old_tau > 0:
-            change_frac = abs(tau_median - old_tau) / old_tau
-            if change_frac > 0.5:
-                tau_result = 0.8 * old_tau + 0.2 * tau_median
+            new_weight = confidence * self._TAU_EMA_MAX_NEW_WEIGHT
+            tau_result = (1.0 - new_weight) * old_tau + new_weight * tau_median
+            if confidence < 0.05:
                 _LOGGER.info(
-                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
+                    "τ calibration: ~0%% confidence (night_frac=%.0f%%, T_out median=%.1f°C, "
+                    "%d candidates) — preserving stored τ=%.1f h.",
+                    night_frac * 100,
+                    outdoor_median,
+                    len(candidates),
+                    old_tau,
+                )
+            else:
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, new_weight=%.0f%%, confidence=%.0f%% "
+                    "[night=%.0f%%, temp=%.0f%%, sample=%.0f%%])",
                     old_tau,
                     tau_result,
                     tau_median,
-                    change_frac * 100,
+                    new_weight * 100,
+                    confidence * 100,
+                    night_conf * 100,
+                    temp_conf * 100,
+                    sample_conf * 100,
                 )
-            else:
-                tau_result = tau_median
+
+            latest_ts = combined.index.max()
+
+            def _apply_drift_cap(anchor_h_attr, anchor_ts_attr, window_days, max_frac, result):
+                anchor_h = getattr(self, anchor_h_attr, None)
+                anchor_ts = getattr(self, anchor_ts_attr, None)
+                if anchor_h is None or anchor_ts is None or (latest_ts - anchor_ts).days >= window_days:
+                    anchor_h = old_tau
+                    setattr(self, anchor_h_attr, anchor_h)
+                    setattr(self, anchor_ts_attr, latest_ts)
+                max_drift = anchor_h * max_frac
+                lo, hi = anchor_h - max_drift, anchor_h + max_drift
+                if not (lo <= result <= hi):
+                    _LOGGER.warning(
+                        "τ drift cap (%d-day): %.1f h clamped to [%.1f, %.1f] h (anchor=%.1f h @ %s)",
+                        window_days,
+                        result,
+                        lo,
+                        hi,
+                        anchor_h,
+                        anchor_ts,
+                    )
+                return min(max(result, lo), hi)
+
+            tau_result = _apply_drift_cap(
+                "_tau_anchor_hours", "_tau_anchor_ts", self._TAU_DRIFT_WINDOW_DAYS, self._TAU_MAX_DRIFT_FRAC, tau_result
+            )
+            tau_result = _apply_drift_cap(
+                "_tau_long_anchor_hours",
+                "_tau_long_anchor_ts",
+                self._TAU_LONG_DRIFT_WINDOW_DAYS,
+                self._TAU_LONG_MAX_DRIFT_FRAC,
+                tau_result,
+            )
         else:
             tau_result = tau_median
 
@@ -1654,11 +2036,16 @@ class EnergyForecastModel:
                     self._feature_medians = meta.get("feature_medians", {})
                     self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform = meta.get("log_transform", False)
+                    self._use_physics_residual = meta.get("use_physics_residual", False)
                     self._canton = meta.get("canton", None)
                     self._country = meta.get("country", "CH")
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())
                     self._sub_sensor_prefixes = meta.get("sub_sensor_prefixes", [])
                     self._tau_hours = meta.get("tau_hours", None)
+                    self._tau_anchor_hours = meta.get("tau_anchor_hours", None)
+                    self._tau_anchor_ts = meta.get("tau_anchor_ts", None)
+                    self._tau_long_anchor_hours = meta.get("tau_long_anchor_hours", None)
+                    self._tau_long_anchor_ts = meta.get("tau_long_anchor_ts", None)
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
                     self._weather_tail = meta.get("weather_tail", None)
@@ -2336,6 +2723,37 @@ def _add_sub_sensor_lags_prediction(
     return future_df
 
 
+def _find_passive_windows(
+    df: pd.DataFrame,
+    *,
+    min_delta_t: float = 8.0,
+    min_hp_off_hours: int = 2,
+) -> pd.Index:
+    """Return the index of rows suitable for passive-cooling calibration (τ, UA_eff).
+
+    A row qualifies when: the heat pump has been off for at least
+    ``min_hp_off_hours`` consecutive hours ending at that row, ΔT = T_indoor −
+    T_outdoor ≥ ``min_delta_t``, and ``dhw_tank_temp`` is not rising into that
+    row (rising tank temp indicates an active DHW cycle, which would inflate
+    UA_eff / shorten apparent τ if included).
+    """
+    d = df.sort_values("timestamp").reset_index(drop=True)
+
+    off = (~d["hp_running"].astype(bool)).astype(int)
+    off_run_length = off.groupby((off != off.shift()).cumsum()).cumcount() + 1
+    off_run_length = off_run_length.where(off == 1, 0)
+    enough_off = off_run_length >= min_hp_off_hours
+
+    delta_t = d["T_indoor"] - d["T_outdoor"]
+    enough_delta = delta_t >= min_delta_t
+
+    dhw_rising = d["dhw_tank_temp"].diff() > 0
+    not_dhw_active = ~dhw_rising.fillna(False)
+
+    mask = enough_off & enough_delta & not_dhw_active
+    return d.index[mask]
+
+
 # ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
 
 
@@ -2431,6 +2849,8 @@ def _engineer_features(
     room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+    physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
+    heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
     import numpy as np
     import pandas as pd
@@ -2769,6 +3189,25 @@ def _engineer_features(
     if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
         delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
         df["regime_kwh"] *= 1.0 - (delta_168h / 8.0).clip(upper=1.0)
+
+    # ── Physics baseline (optional) ──────────────────────────────────────────
+    if physics_kwh_series is not None:
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(physics_kwh_series.to_frame("physics_kwh"), left_on="_ts_floor", right_index=True, how="left")
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["physics_kwh"] = df["physics_kwh"].fillna(0.0)
+
+    # ── Heating buffer temp (optional direct sensor feature) ──────────────────
+    if heating_buffer_temp_series is not None:
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(
+            heating_buffer_temp_series.to_frame("heating_buffer_temp"),
+            left_on="_ts_floor",
+            right_index=True,
+            how="left",
+        )
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["heating_buffer_temp"] = df["heating_buffer_temp"].ffill().fillna(df["heating_buffer_temp"].median())
 
     return df
 

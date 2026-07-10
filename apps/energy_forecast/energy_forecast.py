@@ -43,6 +43,7 @@ from .const import (
 )
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
+from .physics import ThermalPhysicsModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
 # Using logging.getLogger() here would produce an "AppDaemon" category in HA logs
@@ -51,6 +52,8 @@ _LOGGER = logging.getLogger("energy_forecast")
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600  # weekly
+STARTUP_RETRAIN_MIN_GAP_HOURS = 6  # skip the unconditional startup retrain if one already
+# happened this recently (e.g. a crash-loop restart)
 MIN_HISTORY_HOURS = 48
 BLOCK_SLOTS = [f"{h:02d}_{h + 3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
@@ -295,6 +298,55 @@ class EnergyForecast(hass.Hass):
         self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
 
+        # ── Physics model config (physics-ml-hybrid) ──────────────────────────
+        physics_raw = self.args.get("physics") or {}
+        if not isinstance(physics_raw, dict):
+            _LOGGER.warning("physics: config block must be a dict — ignoring")
+            physics_raw = {}
+
+        default_physics_config = {
+            "cop_sensor": None,
+            "dhw_tank_temp_sensor": None,
+            "heating_buffer_temp_sensor": None,
+            "heating_curve_sensor": None,
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+        self._physics_config: dict = {**default_physics_config, **physics_raw}
+
+        room_therm_raw = self._physics_config.get("room_thermostats") or []
+        self._room_thermostats: list[dict] = []
+        for item in room_therm_raw:
+            if not isinstance(item, dict) or "climate_entity" not in item or "temp_sensor" not in item:
+                _LOGGER.warning(
+                    f"room_thermostats: skipping invalid entry {item!r} — needs climate_entity and temp_sensor"
+                )
+                continue
+            self._room_thermostats.append(
+                {
+                    "climate_entity": str(item["climate_entity"]),
+                    "temp_sensor": str(item["temp_sensor"]),
+                    "area_m2": float(item.get("area_m2", 20.0)),
+                }
+            )
+        self._physics_config["room_thermostats"] = self._room_thermostats
+
+        physics_enabled = "physics" in self.args  # any physics: block present, even empty dict, enables the model
+        self._physics_model: ThermalPhysicsModel | None = None
+        if physics_enabled:
+            physics_model_dir = Path(__file__).parent / "models"
+            self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
+
+        # Populated by _fetch_physics_sensor_histories() (once per training cycle). Initialized
+        # here too so _update_sensors() can safely read it if it ever fires before the first
+        # _retrain() completes.
+        self._physics_heating_buffer_df: Any = None
+
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float] = {}
@@ -310,6 +362,12 @@ class EnergyForecast(hass.Hass):
         self._cached_people_home: Any = None
         self._cached_climate_recent: Any = None
         self._cached_dhw_recent: Any = None
+
+        # Physics recalibrate_physics service: the fully-processed energy/weather data from the
+        # most recent training cycle, cached so an operator-triggered recalibration doesn't need
+        # to refetch history. None until the first _retrain() completes.
+        self._cached_energy_df: Any = None
+        self._cached_weather_df: Any = None
 
         # MQTT Discovery (opt-in)
         self._mqtt_discovery: bool = bool(self.args.get("mqtt_discovery", False))
@@ -330,15 +388,19 @@ class EnergyForecast(hass.Hass):
         self._ml_model = EnergyForecastModel(
             model_dir, model_archive_count=self._model_archive_count, timezone=self._timezone
         )
+        self._seed_adaptive_cooldown()
         self._lock = threading.Lock()
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
         self.listen_event(self._rollback_model_cb, "energy_forecast_rollback_model")
         self.register_service("energy_forecast/get_scenario", self._get_scenario_cb)
+        if self._physics_model is not None:
+            self.register_service("energy_forecast/recalibrate_physics", self._recalibrate_physics_cb)
+            self.register_service("energy_forecast/set_dhw_schedule", self._set_dhw_schedule_cb)
 
         self._check_setup()
         self._publish_unavailable()
-        self.run_in(self._retrain_cb, 10)
+        self.run_in(self._maybe_startup_retrain, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
@@ -437,16 +499,19 @@ class EnergyForecast(hass.Hass):
         if self._battery_discharge_sensor:
             energy_roles.append((self._battery_discharge_sensor, "battery_discharge_sensor"))
 
-        # NOTE: physics.dhw_tank_temp_sensor, physics.heating_buffer_temp_sensor, and
-        # room_thermostats[].temp_sensor are intentionally not registered here — those
-        # config keys don't exist on this branch (they belong to the unmerged
-        # feat/physics-core-engine branch's physics config ingest). Add them here,
-        # following the exact pattern below, once that branch merges.
         temperature_roles: list[tuple[str, str]] = []
         if self._outdoor_sensor:
             temperature_roles.append((self._outdoor_sensor, "outdoor_temp_sensor"))
         if self._dhw_buffer_sensor:
             temperature_roles.append((self._dhw_buffer_sensor, "dhw_buffer_sensor"))
+        if self._physics_config.get("dhw_tank_temp_sensor"):
+            temperature_roles.append((self._physics_config["dhw_tank_temp_sensor"], "physics.dhw_tank_temp_sensor"))
+        if self._physics_config.get("heating_buffer_temp_sensor"):
+            temperature_roles.append(
+                (self._physics_config["heating_buffer_temp_sensor"], "physics.heating_buffer_temp_sensor")
+            )
+        for rt in self._room_thermostats:
+            temperature_roles.append((rt["temp_sensor"], "room_thermostats[].temp_sensor"))
 
         for entity_id, role in energy_roles:
             EnergyForecast._warn_on_sensor_mismatch(self, entity_id, role, _describe_energy_mismatch)
@@ -846,6 +911,32 @@ class EnergyForecast(hass.Hass):
             "measurement",
             json_attributes_topic=_tp_attrs_topic,
         )
+        # Physics baseline / ML adjustment sensors (only when a physics model is configured)
+        if self._physics_model is not None:
+            _physics_base_attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_physics_base_today/attributes"
+            )
+            self._mqtt_publish_discovery(
+                "energy_forecast_physics_base_today",
+                "Energy Forecast Physics Base Today",
+                "kWh",
+                "mdi:lightning-bolt-outline",
+                "energy",
+                "measurement",
+                json_attributes_topic=_physics_base_attrs_topic,
+            )
+            _ml_adjustment_attrs_topic = (
+                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_ml_adjustment_today/attributes"
+            )
+            self._mqtt_publish_discovery(
+                "energy_forecast_ml_adjustment_today",
+                "Energy Forecast ML Adjustment Today",
+                "kWh",
+                "mdi:tune-vertical",
+                "energy",
+                "measurement",
+                json_attributes_topic=_ml_adjustment_attrs_topic,
+            )
 
     def terminate(self) -> None:
         """AppDaemon lifecycle hook — publish offline availability on shutdown."""
@@ -885,12 +976,75 @@ class EnergyForecast(hass.Hass):
         finally:
             self._lock.release()
 
+    def _last_trained_local(self) -> datetime:
+        """self._ml_model.last_trained as local wall-clock time.
+
+        It's persisted via datetime.now() in model.py's train() — system/UTC time in Docker/HA,
+        per the same reasoning already documented at _maybe_adaptive_retrain's local-time
+        construction. Every retrain-cadence comparison in this file uses
+        pd.Timestamp.now(self._timezone).tz_localize(None), so this converts last_trained to the
+        same basis before any comparison — without it, comparisons are off by the UTC offset
+        (1-2h for Europe/Zurich), which lets cooldown gates expire early near their boundary.
+        """
+        import pandas as pd
+
+        last_trained = self._ml_model.last_trained
+        if last_trained == datetime.min:
+            return last_trained
+        return pd.Timestamp(last_trained).tz_localize("UTC").tz_convert(self._timezone).tz_localize(None)
+
+    def _seed_adaptive_cooldown(self) -> None:
+        """Seed the adaptive-retrain cooldown from the persisted last-trained timestamp.
+
+        Without this, self._last_adaptive_retrain starts at datetime.min on every AppDaemon
+        restart, immediately re-arming the 24h adaptive-retrain cooldown. Re-synced at the end of
+        every _retrain() too (not just here at startup) — otherwise this seed is a one-shot and
+        _last_adaptive_retrain silently drifts apart from last_trained again after the very next
+        retrain, which would only mask the bug for a single restart cycle.
+        """
+        self._last_adaptive_retrain = self._last_trained_local()
+
+    def _maybe_startup_retrain(self, event_name=None, data=None, kwargs=None) -> None:
+        """Startup retrain (run_in(..., 10)), skipped if a retrain already completed recently.
+
+        Closes the other half of defect (A): previously *every* restart forced a full retrain
+        regardless of how recently one had already happened, so a crash-loop or repeated manual
+        restart could touch τ far more often than the intended weekly cadence. A restart shortly
+        after a genuine code deploy will run on the previous model until the next
+        scheduled/adaptive retrain — an acceptable trade-off given the model changes slowly
+        week to week, and RELOAD_ENERGY_MODEL remains available for an explicit forced reload.
+        """
+        import pandas as pd
+
+        last_local = self._last_trained_local()
+        if last_local != datetime.min:
+            hours_since = (pd.Timestamp.now(self._timezone).tz_localize(None) - last_local).total_seconds() / 3600
+            if hours_since < STARTUP_RETRAIN_MIN_GAP_HOURS:
+                _LOGGER.info(
+                    "Startup retrain skipped — last retrain was %.1fh ago (< %dh gap); the "
+                    "weekly/adaptive schedule will pick up the next real update.",
+                    hours_since,
+                    STARTUP_RETRAIN_MIN_GAP_HOURS,
+                )
+                return
+        self._retrain_cb(event_name, data, kwargs)
+
     def _get_scenario_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
         """AppDaemon service callback: energy_forecast/get_scenario.
 
         Accepts kwargs:
           schedule (dict[str, str]): {prefix: "HH:MM" | "off" | None}
+          dhw_schedule (dict | None): transient physics DHW override, e.g.
+              {"legionella": ("2026-06-25", 10)} — NOT persisted. Delta is
+              computed vs. the natural (currently committed) baseline.
           publish  (bool):           if True, publish scenario sensors to HA
+
+        Caller cache contract (see spec §5.4): results computed with a non-None
+        dhw_schedule must NOT be cached by the caller unless dhw_schedule is
+        included in the cache key. The safest default is to never cache them.
+        After a successful set_dhw_schedule call, callers must flush their own
+        scenario cache — this app only invalidates its own _cached_forecast_df.
+
         Fires event "energy_forecast_scenario_result" with the forecast payload.
         """
         try:
@@ -921,6 +1075,11 @@ class EnergyForecast(hass.Hass):
                 cleaned[key] = val
             schedule = cleaned
 
+            dhw_schedule = kwargs.get("dhw_schedule")
+            if dhw_schedule is not None and not isinstance(dhw_schedule, dict):
+                _LOGGER.warning("get_scenario: dhw_schedule must be a dict — ignoring")
+                dhw_schedule = None
+
             result_df = self._ml_model.predict_scenario(
                 self._cached_forecast_df,
                 self._cached_live_temp,
@@ -932,6 +1091,8 @@ class EnergyForecast(hass.Hass):
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
                 room_areas=self._climate_room_areas or None,
+                physics_model=self._physics_model,
+                dhw_schedule_override=dhw_schedule,
             )
 
             if kwargs.get("publish", False):
@@ -1079,6 +1240,157 @@ class EnergyForecast(hass.Hass):
             self._update_sensors()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("Sensor update failed: %s", exc)
+
+    # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
+
+    def _fetch_physics_sensor_histories(self) -> None:
+        """Fetch the additional sensor histories the physics model needs.
+
+        No-op (no fetch calls at all) when self._physics_model is None, so
+        absent physics: config behaves identically to v0.11.7.
+        """
+        self._room_thermostat_temp_dfs: dict[str, Any] = {}
+        self._physics_dhw_tank_df: Any = None
+        self._physics_heating_buffer_df: Any = None
+        self._physics_cop_df: Any = None
+        self._physics_climate_dfs: dict[str, Any] = {}
+
+        if self._physics_model is None:
+            return
+
+        cfg = self._physics_config
+
+        if cfg.get("dhw_tank_temp_sensor"):
+            entity_id = cfg["dhw_tank_temp_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="buffer_temp", timezone=self._timezone
+                )
+                self._physics_dhw_tank_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics DHW tank %s history fetch failed: %s", entity_id, exc)
+
+        if cfg.get("heating_buffer_temp_sensor"):
+            entity_id = cfg["heating_buffer_temp_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_heating_buffer")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="heating_buffer_temp", timezone=self._timezone
+                )
+                self._physics_heating_buffer_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics heating buffer %s history fetch failed: %s", entity_id, exc)
+
+        if cfg.get("cop_sensor"):
+            entity_id = cfg["cop_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_cop")
+            try:
+                df = ha_data.fetch_generic_sensor_history(
+                    self, entity_id, path, column_name="cop", timezone=self._timezone
+                )
+                self._physics_cop_df = _strip_tz(df, self._timezone) if not df.empty else df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics COP %s history fetch failed: %s", entity_id, exc)
+
+        for i, rt in enumerate(self._room_thermostats):
+            temp_entity = rt["temp_sensor"]
+            climate_entity = rt["climate_entity"]
+            temp_path = self._generic_sensor_cache_path(temp_entity, prefix=f"physics_temp_{i}")
+            try:
+                temp_df = ha_data.fetch_generic_sensor_history(
+                    self, temp_entity, temp_path, column_name="current_temp", timezone=self._timezone
+                )
+                self._room_thermostat_temp_dfs[climate_entity] = (
+                    _strip_tz(temp_df, self._timezone) if not temp_df.empty else temp_df
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics room temp %s history fetch failed: %s", temp_entity, exc)
+
+            climate_path = self._climate_cache_path(climate_entity)
+            try:
+                climate_df = ha_data.fetch_climate_history(self, climate_entity, climate_path, timezone=self._timezone)
+                self._physics_climate_dfs[climate_entity] = (
+                    _strip_tz(climate_df, self._timezone) if not climate_df.empty else climate_df
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics room climate %s history fetch failed: %s", climate_entity, exc)
+
+    def _recalibrate_physics_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/recalibrate_physics`: manually trigger a physics
+        recalibration on demand, using the energy/weather data cached by the most recent
+        training cycle (see `_retrain()`)."""
+        import pandas as pd
+
+        if self._physics_model is None:
+            _LOGGER.warning("recalibrate_physics called but physics is not configured — ignoring")
+            return
+        if self._cached_energy_df is None or self._cached_weather_df is None:
+            _LOGGER.warning(
+                "recalibrate_physics called before the first training cycle has completed — "
+                "no cached energy/weather data available yet. Ignoring."
+            )
+            return
+        try:
+            self._fetch_physics_sensor_histories()
+            energy_df = self._cached_energy_df
+            weather_df = self._cached_weather_df
+            holdout_cutoff = energy_df["timestamp"].max() - pd.Timedelta(days=max(int(len(energy_df) / 24 * 0.1), 1))
+            self._physics_model.calibrate(
+                energy_df,
+                weather_df,
+                climate_dfs=self._physics_climate_dfs,
+                dhw_df=self._physics_dhw_tank_df,
+                holdout_cutoff=holdout_cutoff,
+            )
+            _LOGGER.info("Physics recalibration complete")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"recalibrate_physics failed: {exc}")
+
+    def _set_dhw_schedule_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/set_dhw_schedule`: commit a DHW schedule override
+        to the physics model and invalidate the cached forecast so the next hourly cycle
+        recomputes with the new schedule."""
+        if self._physics_model is None:
+            _LOGGER.warning("set_dhw_schedule called but physics is not configured — ignoring")
+            return
+        dhw_schedule = kwargs.get("dhw_schedule")
+        if not isinstance(dhw_schedule, dict):
+            _LOGGER.warning("set_dhw_schedule: dhw_schedule must be a dict — ignoring")
+            return
+        try:
+            self._physics_model.commit_dhw_schedule(dhw_schedule)
+            self._cached_forecast_df = None  # forces a fresh forecast on the next publish cycle
+            _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"set_dhw_schedule failed: {exc}")
+
+    def _effective_use_physics_residual(self) -> bool:
+        """Config intent AND-ed with the cold-start gate.
+
+        Passed to `EnergyForecastModel.train()` as `use_physics_residual=` to decide Phase 1
+        (physics as a feature) vs Phase 2 (residual learning).
+        """
+        requested = bool(self._physics_config.get("use_physics_residual", False)) if self._physics_model else False
+        if requested and self._physics_model.is_cold_start_gated:
+            _LOGGER.warning(
+                "use_physics_residual=true but cold-start gate not satisfied "
+                f"({self._physics_model._calib.get('n_calibration_windows_ua_eff', 0)}/30 UA_eff windows) — "
+                "holding at Phase 1"
+            )
+            return False
+        return requested
+
+    def _model_phase_attr(self) -> str | None:
+        """Which physics phase last trained the model, for display as a sensor attribute.
+
+        Returns `None` when physics isn't configured at all (no phase concept without
+        physics), otherwise "phase1" or "phase2" reflecting `self._ml_model._use_physics_residual`
+        as set during the last `train()` call.
+        """
+        if self._physics_model is None:
+            return None
+        return "phase2" if getattr(self._ml_model, "_use_physics_residual", False) else "phase1"
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
@@ -1296,6 +1608,15 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
 
+        # Physics recalibrate_physics service: cache the fully-processed training data (post
+        # EV-subtraction/target-correction for baseline_df, post-stitch for weather_df) so an
+        # on-demand recalibration doesn't need to refetch history.
+        self._cached_energy_df = baseline_df
+        self._cached_weather_df = weather_df
+
+        # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
+        self._fetch_physics_sensor_histories()
+
         self._ml_model.train(
             baseline_df,
             weather_df,
@@ -1314,8 +1635,12 @@ class EnergyForecast(hass.Hass):
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
             regime_count=self._regime_count,
+            physics_model=self._physics_model,
+            heating_buffer_temp_df=self._physics_heating_buffer_df,
+            use_physics_residual=self._effective_use_physics_residual(),
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
+        self._last_adaptive_retrain = self._last_trained_local()
 
         try:
             ha_data.fetch_energy_history_15m(
@@ -1488,6 +1813,8 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            physics_model=self._physics_model,
+            heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
 
         predictions = self._ml_model.predict(
@@ -1503,10 +1830,13 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            physics_model=self._physics_model,
+            heating_buffer_temp_recent=self._physics_heating_buffer_df,
             _prepared=_prepared,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
         self._publish_thermal_pressure()
+        self._publish_physics_sensors(predictions)
 
         intervals = self._ml_model.predict_intervals(
             forecast_df,
@@ -1604,6 +1934,8 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
+                    physics_model=self._physics_model,
+                    heating_buffer_temp_recent=self._physics_heating_buffer_df,
                     _prepared=_prepared,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1865,6 +2197,9 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_tomorrow_high",
             # Thermal pressure sensor (now served via MQTT)
             "sensor.energy_forecast_thermal_pressure_net",
+            # Physics baseline / ML adjustment sensors (now served via MQTT)
+            "sensor.energy_forecast_physics_base_today",
+            "sensor.energy_forecast_ml_adjustment_today",
             # Scenario sensors (now served via MQTT when mqtt_discovery=True)
             "sensor.energy_forecast_scenario_today",
             "sensor.energy_forecast_scenario_tomorrow",
@@ -1903,6 +2238,74 @@ class EnergyForecast(hass.Hass):
                 state=str(round(float(value), 3)),
                 attributes=attrs,
             )
+
+    def _publish_physics_sensors(self, forecast_df: pd.DataFrame) -> None:
+        """Publish the physics-only baseline and the ML adjustment on top of it.
+
+        Published whenever a physics model is configured, independent of phase:
+        the physics baseline is computable (and diagnostically useful) in Phase 1
+        too, when it's only a model *feature* rather than the residual target.
+
+        `forecast_df` is the 48h `[timestamp, predicted_kwh]` frame returned by
+        `self._ml_model.predict(...)` — the main forecast. The physics baseline
+        itself is recomputed from `self._cached_forecast_df` (the raw weather
+        forecast, which carries `temp_c`/`direct_radiation_wm2` that
+        `predict_series()` needs and that `forecast_df` does not have).
+        """
+        if self._physics_model is None or forecast_df.empty:
+            return
+        try:
+            import pandas as pd
+
+            weather_df = self._cached_forecast_df if self._cached_forecast_df is not None else forecast_df
+            physics_series = self._physics_model.predict_series(
+                weather_df,
+                climate_recent=self._physics_climate_dfs,
+                dhw_recent=self._physics_dhw_tank_df,
+                room_areas=self._climate_room_areas or None,
+            )
+            physics_vals = physics_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
+            ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
+
+            physics_attrs = {
+                "hourly_kwh": [round(float(v), 3) for v in physics_vals],
+                "unit_of_measurement": "kWh",
+                "friendly_name": "Energy Forecast Physics Base Today",
+            }
+            ml_attrs = {
+                "hourly_kwh": [round(float(v), 3) for v in ml_adjustment_vals],
+                "unit_of_measurement": "kWh",
+                "friendly_name": "Energy Forecast ML Adjustment Today",
+            }
+
+            if self._mqtt_discovery:
+                self._mqtt_set_sensor("energy_forecast_physics_base_today", physics_vals[0])
+                self._mqtt_publish_sensor_attributes("energy_forecast_physics_base_today", physics_attrs)
+                self._mqtt_set_sensor("energy_forecast_ml_adjustment_today", ml_adjustment_vals[0])
+                self._mqtt_publish_sensor_attributes("energy_forecast_ml_adjustment_today", ml_attrs)
+            else:
+                self.set_state(
+                    "sensor.energy_forecast_physics_base_today",
+                    state=str(round(float(physics_vals[0]), 3)),
+                    attributes={
+                        **physics_attrs,
+                        "unique_id": "energy_forecast_physics_base_today",
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
+                self.set_state(
+                    "sensor.energy_forecast_ml_adjustment_today",
+                    state=str(round(float(ml_adjustment_vals[0]), 3)),
+                    attributes={
+                        **ml_attrs,
+                        "unique_id": "energy_forecast_ml_adjustment_today",
+                        "attribution": ATTRIBUTION,
+                    },
+                    replace=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(f"Failed to publish physics sensors: {exc}")
 
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
@@ -1973,6 +2376,7 @@ class EnergyForecast(hass.Hass):
         # ── Forecast totals ───────────────────────────────────────────────────
         shap_features = data.get("shap_top_features") or {}
         shap_narrative = data.get("shap_narrative") or ""
+        model_phase = self._model_phase_attr()
         for key, label in [
             ("next_1h", "Next 1h"),
             ("next_3h", "Next 3h"),
@@ -1986,6 +2390,8 @@ class EnergyForecast(hass.Hass):
                     extra["shap_top_features"] = shap_features
                 if shap_narrative:
                     extra["shap_narrative"] = shap_narrative
+                if model_phase is not None:
+                    extra["model_phase"] = model_phase
                 if not extra:  # if no attributes, set to None
                     extra = None
             safe_set(
@@ -1995,13 +2401,16 @@ class EnergyForecast(hass.Hass):
                 extra_attrs=extra,
                 icon="mdi:lightning-bolt",
             )
-        # In MQTT mode, publish shap_top_features and shap_narrative as json_attributes for energy_forecast_today
-        if self._mqtt_discovery and (shap_features or shap_narrative):
+        # In MQTT mode, publish shap_top_features, shap_narrative, and model_phase as
+        # json_attributes for energy_forecast_today
+        if self._mqtt_discovery and (shap_features or shap_narrative or model_phase is not None):
             attrs = {}
             if shap_features:
                 attrs["shap_top_features"] = shap_features
             if shap_narrative:
                 attrs["shap_narrative"] = shap_narrative
+            if model_phase is not None:
+                attrs["model_phase"] = model_phase
             if attrs:
                 self._mqtt_publish_sensor_attributes(
                     "energy_forecast_today",

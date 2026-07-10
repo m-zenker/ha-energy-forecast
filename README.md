@@ -5,8 +5,8 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.11.8-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-649%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.12.0--alpha--1-blue)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-817%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
@@ -58,6 +58,7 @@ Dashboard YAML is in `dashboard/`.
 - [Occupancy / Presence](#occupancy--presence)
 - [Baseline / Passive mode](#baseline--passive-mode)
 - [Thermal & DHW modeling](#thermal--dhw-modeling)
+- [Physics-ML Hybrid (Phases 1 & 2)](#physics-ml-hybrid-phases-1--2-optional)
 - [MQTT Discovery](#mqtt-discovery-optional)
 - [Dashboard Setup](#dashboard-setup)
 - [Troubleshooting](#troubleshooting)
@@ -142,6 +143,17 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Daily Regime Clustering** (optional) — clusters historical 24-hour profiles into typical patterns (e.g. Workday, Weekend, High-Heating) and predicts the most likely regime for tomorrow; provides the model with a stable `regime_kwh` prior
 - **MQTT Discovery** (optional) — registers all sensors in the HA entity registry for area assignment, labels, and UI renaming
 
+### Stage 5 — Physics-ML Hybrid (Phases 1 & 2)
+- **Physics-driven additive features** — optional `physics_kwh` and `heating_buffer_temp` features derived from the thermal physics model; injected into LightGBM training only when sensor data is available (never a constant-zero column)
+- **Automatic physics recalibration** — `train()` recalibrates the physics model when its stored calibration is stale; holdout cutoff matches the existing MAE holdout so training and calibration windows are consistent
+- **Open-window anomaly down-weighting** — training hours flagged as single-hour open-window temperature shocks (detected from climate sensor data) are down-weighted to 0.5× their normal sample weight
+- **Phase 1 validation diagnostic** — after each retrain, logs whether `physics_kwh` ranks in the SHAP top-5 and whether its OLS calibration slope is near 1.0; informational only, does not affect predictions
+- **On-demand recalibration service** — `energy_forecast/recalibrate_physics` AppDaemon service lets you trigger physics recalibration from **Developer Tools → Services** without a full AppDaemon restart
+- **Model-artifact portability** — if a model was trained with physics features but physics is later disabled or a sensor goes offline, `predict()` fills the missing columns with `0.0` and logs a WARNING; no crashes, no stale data
+- **Phase 2 residual-target training (dormant by default)** — when `use_physics_residual: true` is set, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + ML_residual`; dormant until the cold-start gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27); promotes automatically on the next weekly retrain after the gate clears
+- **Physics-baseline diagnostic sensors** — `sensor.energy_forecast_physics_base_today` and `sensor.energy_forecast_ml_adjustment_today` published whenever `physics:` is configured (Phase 1 and Phase 2); useful for monitoring the physics-vs-ML contribution split before activating Phase 2
+- **`model_phase` attribute** — `"phase1"` or `"phase2"` on `sensor.energy_forecast_today` when physics is configured; lets automations and `ha-energy-manager` detect which training phase is active
+
 ---
 
 ## Scenario / What-If API
@@ -155,10 +167,16 @@ data:
   schedule:
     sub_dishwasher: "22:30"        # key = entity ID suffix from sub_energy_sensors
     sub_washing_machine: "off"     # "off" or null to exclude from scenario
+  dhw_schedule:                    # optional: transient physics DHW override (requires `physics:` block)
+    legionella: ["2026-06-25", 10] # [date string, hour] — NOT persisted
   publish: true                    # optional: write result to HA sensors
 ```
 
 Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after the last `.`, e.g. `sub_dishwasher` from `sensor.dishwasher_energy_kwh`. Alternatively, pass the full entity ID. Unknown keys are silently skipped.
+
+`dhw_schedule` is an optional, **transient** (non-persisted) override of the physics model's DHW/legionella schedule, shaped `{"legionella": ["YYYY-MM-DD", hour]}`. It only affects this one `get_scenario` call — it is never written to `physics_schedule.json` and does not survive past the call. When provided, `delta_kwh` reflects the **combined** appliance-schedule + dhw-schedule delta versus the natural (currently committed) baseline. To persist a DHW schedule change instead, use `energy_forecast/set_dhw_schedule` (see [Physics-ML Hybrid](#physics-ml-hybrid-phases-1--2-optional)).
+
+> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app only invalidates its internal forecast cache, not any cache kept by the caller.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
@@ -171,7 +189,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 }
 ```
 
-`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances relative to the baseline forecast — positive values mean higher consumption than baseline.
+`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline.
 
 **Published sensors** (when `publish: true`):
 
@@ -367,6 +385,28 @@ energy_forecast:
   # heating_temp_off:     18.0   # outdoor °C above which heating is projected OFF
   # heating_setpoint_on:  20.0   # climate setpoint (°C) used when heating is ON
   # heating_setpoint_off: 12.0   # climate setpoint (°C) used when heating is OFF
+
+  # Physics-ML Hybrid (Phase 1) — all optional. Omitting this block leaves behaviour
+  # identical to prior versions. Even an empty "physics: {}" activates the feature.
+  # physics:
+  #   cop_sensor: sensor.heat_pump_cop                        # live COP sensor
+  #   dhw_tank_temp_sensor: sensor.dhw_tank_temperature        # °C
+  #   heating_buffer_temp_sensor: sensor.heating_buffer_temp  # °C
+  #   heating_curve_sensor: sensor.heating_curve_setpoint      # heating curve setpoint
+  #   cop_formula: {a: 2.5, b: 0.07}                           # fallback Carnot-style COP formula (default shown)
+  #   dhw_tank_volume_l: 200                                   # DHW tank volume (litres, default shown)
+  #   dhw_power_w: 4000                                        # DHW heater power (W, default shown)
+  #   internal_gains_fraction: 0.8                             # fraction of rated power as internal gains (default shown)
+  #   heating_curve_points:                                    # outdoor→flow-temp pairs (default shown)
+  #     - [-20, 55.5]
+  #     - [-5, 46.0]
+  #     - [5, 39.5]
+  #     - [20, 25.0]
+  #   room_thermostats:                                        # dedicated room sensors for training-time accuracy
+  #     - climate_entity: climate.living_room
+  #       temp_sensor: sensor.netatmo_living_room_temp
+  #       area_m2: 35
+  #   use_physics_residual: false  # Phase 2 flag — held at Phase 1 until calibration history is sufficient
 ```
 
 > **Note:** To find your `energy_sensor` entity ID, go to **Developer Tools → States**, filter by `energy` or `kwh`, and look for your grid-import meter — a sensor whose state increases continuously and never resets to zero each day.
@@ -417,6 +457,18 @@ energy_forecast:
 | `heating_temp_off` | No | `18.0` | Outdoor temperature threshold (°C) above which heating is projected OFF. Dead-band between `heating_temp_on` and `heating_temp_off` holds the current heating state. |
 | `heating_setpoint_on` | No | `20.0` | Climate setpoint (°C) projected when heating is ON. Used to compute `thermal_pressure` for future hours. |
 | `heating_setpoint_off` | No | `12.0` | Climate setpoint (°C) projected when heating is OFF (e.g. night/summer setback). |
+| `physics` | No | — | Optional block enabling Physics-ML Hybrid features. Omitting the block entirely leaves behaviour byte-identical to prior versions. Even `physics: {}` (empty) activates the feature. See [Physics-ML Hybrid (Phase 1)](#physics-ml-hybrid-phase-1-optional). |
+| `physics.cop_sensor` | No | — | Entity ID of a live COP sensor for the heat pump. Used by the thermal physics model to compute `physics_kwh`. |
+| `physics.dhw_tank_temp_sensor` | No | — | Entity ID of a DHW tank temperature sensor (°C). Also sourced as the `buffer_temp` column used for DHW calibration and schedule inference. |
+| `physics.heating_buffer_temp_sensor` | No | — | Entity ID of a heating buffer temperature sensor (°C). Sourced as the `heating_buffer_temp` feature. |
+| `physics.heating_curve_sensor` | No | — | Entity ID of a heating-curve setpoint sensor. |
+| `physics.cop_formula` | No | `{a: 2.5, b: 0.07}` | Coefficients `{a, b}` for a fallback Carnot-style COP formula, used when `cop_sensor` is absent or unavailable. |
+| `physics.dhw_tank_volume_l` | No | `200` | DHW tank volume in litres. Used by the physics model to compute heat-loss and re-heat energy. |
+| `physics.dhw_power_w` | No | `4000` | DHW heater rated power in watts. |
+| `physics.internal_gains_fraction` | No | `0.8` | Fraction of rated heater power treated as internal thermal gains. |
+| `physics.heating_curve_points` | No | `[[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]]` | List of `[outdoor_temp_°C, flow_temp_°C]` pairs defining the heating curve. |
+| `physics.room_thermostats` | No | `[]` | List of `{climate_entity, temp_sensor, area_m2}` dicts — a dedicated, more accurate sensor per room used for training-time UA_eff calibration accuracy (separate from, and complementary to, the existing `climate_entities`/`climate_room_areas`). Entries missing `climate_entity` or `temp_sensor` are skipped with a WARNING; `area_m2` defaults to `20.0`. |
+| `physics.use_physics_residual` | No | `false` | Phase 2 flag. When `true`, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + lgbm_residual`. Remains inactive until the cold-start gate clears (≥ 30 winter UA_eff calibration windows; not expected before winter 2026/27). No config change needed when the gate clears — the next weekly retrain will promote automatically. |
 
 **`sub_energy_sensors` — dict form with `program_sensor`:**
 
@@ -452,7 +504,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features) and `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"). |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features), `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"), and `model_phase` (`"phase1"` or `"phase2"` when `physics:` is configured; absent otherwise). |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
 ### Prediction intervals (calibrated 80% coverage)
@@ -509,6 +561,13 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | Entity ID | Description |
 |-----------|-------------|
 | `binary_sensor.energy_forecast_unusual_consumption` | `on` when the latest actual consumption deviates more than `anomaly_sigma_threshold` std-deviations from the stored day-ahead prediction. `off` during cold-start (< 10 matched hours). Attributes: `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`. |
+
+### Physics diagnostics (when `physics:` is configured)
+
+| Entity ID | Description |
+|-----------|-------------|
+| `sensor.energy_forecast_physics_base_today` | Physics-model-only estimate of today's heating energy (kWh). Published from Phase 1 onward whenever `physics:` is configured. Useful for monitoring how much of the forecast originates from the physics model vs. the ML correction. |
+| `sensor.energy_forecast_ml_adjustment_today` | Net ML correction over the physics baseline today (`main_forecast − physics_base`, kWh). Negative when the ML model reduces the physics estimate. |
 
 ---
 
@@ -572,6 +631,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
 | Thermal & DHW intent | `thermal_pressure` (area-weighted HVAC setpoint − current temp; °C·h), `thermal_pressure_max` (largest per-room deficit), `thermal_pressure_std` (room temperature spread), `thermal_pressure_cop` (deficit scaled by inverse outdoor COP — electrical urgency), `thermal_pressure_net` (thermal pressure reduced by passive solar gain), `weighted_solar_gain` (direct radiation weighted by south-facing half-cosine window), `dhw_pressure` (buffer heat-loss urgency score); all zero when not configured |
 | Physics | `humidity` (relative humidity %), `infiltration_pressure` (wind speed × thermal gradient — cold-air infiltration proxy), `defrost_risk` (humidity-scaled Gaussian at +2 °C — heat-pump defrost cycle proxy) |
+| Physics-ML Hybrid | `physics_kwh` (thermal physics model estimate of heating energy in kWh), `heating_buffer_temp` (heating buffer temperature in °C); present only when `physics:` is configured and sensor data is available |
 | Autoregressive lags | `lag_1h`, `lag_2h`, `lag_6h`, `lag_12h` (short horizon); `lag_48h`, `lag_72h` (medium horizon); `lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated` (daily/weekly — temperature-delta gated to prevent over-anchoring to heating-season baselines during warm-season transition) |
 | Rolling consumption | 24 h mean, 24 h std, 7-day mean |
 | Holidays | Swiss public holiday flag; days to/since nearest holiday (capped at 3); configurable cantonal holidays |
@@ -920,6 +980,129 @@ The following features activate when the corresponding sensors are configured an
 
 ---
 
+## Physics-ML Hybrid (Phases 1 & 2) (optional)
+
+Phase 1 wires the thermal physics model (`apps/energy_forecast/physics.py`) into the LightGBM
+pipeline as optional additive input features. The physics model covers DHW schedule inference,
+heating-curve calibration, open-window anomaly detection, and zone-boundary consistency checking.
+Phase 1 exposes its outputs as two new LightGBM features without changing the training target or
+model architecture.
+
+**Enabling vs disabling:** Omitting the `physics:` block entirely is byte-identical to prior
+versions — no new code path is entered, no sensors change, no log messages appear. Adding even an
+empty `physics: {}` activates the feature.
+
+### Configuration
+
+```yaml
+  physics:
+    cop_sensor: sensor.heat_pump_cop                        # optional: live COP sensor
+    dhw_tank_temp_sensor: sensor.dhw_tank_temperature        # optional: DHW tank °C
+    heating_buffer_temp_sensor: sensor.heating_buffer_temp  # optional: buffer °C
+    room_thermostats:                                        # optional: for open-window detection + training accuracy
+      - climate_entity: climate.living_room
+        temp_sensor: sensor.netatmo_living_room_temp
+        area_m2: 35
+    dhw_tank_volume_l: 200         # optional (default shown)
+    dhw_power_w: 4000              # optional (default shown)
+    use_physics_residual: false    # Phase 2 flag — held at Phase 1 for now
+```
+
+All sub-keys are optional. See the [Parameter reference](#parameter-reference) for the full list.
+
+### What it does
+
+| Feature | Description | Requires |
+|---------|-------------|----------|
+| `physics_kwh` | Physics-model estimate of heating energy (kWh) for each training hour — gives LightGBM a physically grounded signal for heat-pump load | `physics:` block present + sensor data available |
+| `heating_buffer_temp` | Heating buffer temperature (°C) as a direct feature — captures buffer thermal state without requiring the model to infer it from lags | `heating_buffer_temp_sensor` |
+
+Features are added to the feature set only when physics is configured **and** the relevant sensor
+data is available for that training row — never constant-zero placeholders.
+
+### Automatic calibration
+
+`train()` checks whether the physics model's calibration is current. If stale (calibrated more
+than one training cycle ago), it runs a fresh calibration pass before feature engineering, using
+a holdout cutoff consistent with the existing MAE holdout. You can also trigger recalibration on
+demand via the AppDaemon service:
+
+```
+service: appdaemon/energy_forecast_recalibrate_physics
+```
+
+Call it from **Developer Tools → Services** or from an automation. Logs a WARNING if `physics:`
+is not configured.
+
+### Committing a DHW schedule override
+
+`energy_forecast/set_dhw_schedule` persists a DHW/legionella schedule override to the physics
+model, bypassing the automatic-calibration instability guard (the same guard that would otherwise
+reject a newly inferred legionella time slot that swings too far from the previous one):
+
+```yaml
+service: appdaemon/energy_forecast_set_dhw_schedule
+data:
+  dhw_schedule:
+    legionella: ["2026-06-25", 10]   # [date string, hour]
+```
+
+Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, see [Scenario / What-If API](#scenario--what-if-api)),
+this override is **committed** — it is written to `physics_schedule.json` as `committed_override`
+and persists across restarts until overwritten. Calling it also invalidates this app's internal
+forecast cache (`_cached_forecast_df`), so the next hourly cycle recomputes with the new schedule.
+It does **not** invalidate any scenario cache kept by a consuming app (see the caller cache
+contract above) — flush that separately after a successful call. Logs a WARNING and no-ops if
+`physics:` is not configured or `dhw_schedule` is not a dict.
+
+### Open-window down-weighting
+
+When `room_thermostats` are configured, the physics model's open-window detector flags training
+hours that show a single-hour temperature shock (a sharp drop followed by recovery in a single
+hour). These hours are down-weighted to **0.5×** their normal exponential sample weight — they are
+not excluded, but their influence on the model is halved so genuine open-window events do not
+distort lag-feature learning.
+
+> **Known limitation:** the detector only catches *single-hour* shocks — each hour's expected
+> temperature is re-anchored to the previous hour's actual reading, so it "forgives" itself every
+> step. A window left slightly ajar for several hours (gradual, multi-hour drift) will NOT be
+> reliably flagged, since no single hour's residual stands out from the rest. Only sharp,
+> one-hour anomalies are detected.
+
+### Phase 1 validation diagnostic
+
+After each retrain with physics enabled, the app logs a `physics_phase1_diagnostic` entry
+reporting:
+- Whether `physics_kwh` appears in the SHAP top-5 features (signal strength check)
+- The OLS regression slope of `physics_kwh` against actual `gross_kwh` (calibration check; slope
+  near 1.0 indicates good calibration)
+
+This diagnostic is purely informational. It does not change any behaviour and does not affect
+published sensors.
+
+### Model-artifact portability
+
+If a model was trained with `physics_kwh` or `heating_buffer_temp` in its feature set but
+physics is later disabled (or a sensor goes offline), prediction does not crash. The missing
+columns are filled with `0.0` and a WARNING is logged. This applies to `predict()`,
+`predict_intervals()`, and `shap_summary()`.
+
+### Known limitations
+
+- `energy_forecast/get_scenario` now always passes `physics_model` to `predict_scenario()` when
+  physics is configured, so `physics_kwh` is computed from the same real, cached sensor data
+  (`climate_recent` / `dhw_recent` / `room_areas`) used by the main forecast — it is no longer a
+  `0.0` stub, and the "physics disabled at predict time" WARNING no longer fires for `get_scenario`.
+  However, `heating_active_series` / `setpoint_on` / `setpoint_off` are still not passed from
+  `_get_scenario_cb`, so indoor-temperature-projection quality within a scenario can differ
+  slightly from the main hourly forecast, which does supply those inputs.
+- Phase 2 (`use_physics_residual: true`) is implemented but dormant — the cold-start gate blocks
+  activation until ≥ 30 winter UA_eff calibration windows have been collected. No config change is
+  needed; the next weekly retrain after the gate clears will promote automatically to Phase 2 and
+  update the `model_phase` attribute on `sensor.energy_forecast_today`.
+
+---
+
 ## MQTT Discovery (optional)
 
 > **Breaking change — entity ID format:** Enabling MQTT Discovery changes all sensor entity IDs:
@@ -981,8 +1164,9 @@ All sensors are registered at startup. The 6 prediction-interval sensors (`*_low
 | Setup status | 1 |
 | Anomaly detection (`unusual_consumption`) | 1 |
 | Thermal pressure (`thermal_pressure_net`) | 1 |
+| Physics diagnostics (`physics_base_today`, `ml_adjustment_today`) | 2 (when `physics:` configured) |
 | Prediction intervals (`*_low`/`*_high`) | 6 (lazy) |
-| **Total** | **36** |
+| **Total** | **36** (+ 2 when `physics:` is configured) |
 
 ### Availability
 

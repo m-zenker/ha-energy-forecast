@@ -16,6 +16,8 @@ Recent releases:
 
 **MAE trajectory:** 0.7 → 0.52 kWh/h (as of April). Current value readable from `sensor.ha_energy_forecast_mae_30d`.
 
+**Physics Phase 2 interval-coverage check due (post-deployment):** after Phase 2 (`use_physics_residual: true`) has been live for ≥30 days, verify empirical prediction-interval coverage on gross kWh matches the target (80% by default, per `_calibrate_intervals()`'s conformal quantile). If coverage has drifted, the CQR calibration on the residual distribution may need a wider correction — see `docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md` §5.2. Not yet applicable — Phase 2 stays dormant behind the cold-start gate until ≥30 winter UA_eff calibration windows exist (not expected before winter 2026/27).
+
 ---
 
 ## Design Decisions

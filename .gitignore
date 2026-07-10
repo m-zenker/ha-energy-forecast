@@ -34,3 +34,5 @@ data/
 CLAUDE.md
 MEMORY.md
 scripts/
+.worktrees/
+.superpowers/

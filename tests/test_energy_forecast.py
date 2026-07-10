@@ -9,7 +9,7 @@ Covers:
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -666,6 +666,17 @@ class _FakeSelf:
     def log(self, msg, level="INFO"):  # AppDaemon log stub
         pass
 
+    def _last_trained_local(self):
+        # Fix C's _seed_adaptive_cooldown/_maybe_startup_retrain call self._last_trained_local()
+        # as a sibling instance method. _FakeSelf is an unrelated class, so that attribute
+        # lookup would otherwise raise AttributeError when those methods are exercised via the
+        # EnergyForecast.<method>(fake) unbound-call pattern used throughout this file. Delegate
+        # to the real implementation (rather than duplicating its logic) so tests still exercise
+        # the actual UTC->local conversion.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._last_trained_local(self)
+
 
 class TestCallbackSignature:
     """_retrain_cb and _update_cb must accept both timer and event calling conventions."""
@@ -803,6 +814,8 @@ class _FakeSensorTypeSelf:
         self._battery_discharge_sensor: str | None = None
         self._outdoor_sensor: str | None = None
         self._dhw_buffer_sensor: str | None = None
+        self._physics_config: dict = {}
+        self._room_thermostats: list[dict] = []
         self._states: dict[str, dict] = {}
 
     def get_state(self, entity_id: str, attribute: str | None = None) -> dict | None:
@@ -877,6 +890,58 @@ class TestValidateSensorTypes:
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._validate_sensor_types(fake)
         assert any("outdoor_temp_sensor" in r.message for r in caplog.records)
+
+    def test_warns_for_physics_dhw_tank_temp_sensor_wrong_unit(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._physics_config = {"dhw_tank_temp_sensor": "sensor.dhw_tank_temp"}
+        fake._states["sensor.dhw_tank_temp"] = _state("kWh", None)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("physics.dhw_tank_temp_sensor" in r.message for r in caplog.records)
+
+    def test_warns_for_physics_heating_buffer_temp_sensor_wrong_unit(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._physics_config = {"heating_buffer_temp_sensor": "sensor.heating_buffer_temp"}
+        fake._states["sensor.heating_buffer_temp"] = _state("kWh", None)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("physics.heating_buffer_temp_sensor" in r.message for r in caplog.records)
+
+    def test_warns_for_room_thermostat_temp_sensor_wrong_unit(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        fake._room_thermostats = [
+            {"climate_entity": "climate.living_room", "temp_sensor": "sensor.netatmo_living_room"}
+        ]
+        fake._states["sensor.netatmo_living_room"] = _state("kWh", None)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert any("room_thermostats[].temp_sensor" in r.message for r in caplog.records)
+
+    def test_no_warning_when_physics_not_configured(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSensorTypeSelf()
+        fake._states["sensor.grid_import"] = _state("kWh", "total_increasing")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_sensor_types(fake)
+        assert not caplog.records
 
     def test_skips_silently_when_entity_state_unavailable(self):
         from energy_forecast.energy_forecast import EnergyForecast
@@ -979,6 +1044,7 @@ class _FakeMqttSelf:
         self._mqtt_namespace = mqtt_namespace
         self._mqtt_discovery_prefix = mqtt_discovery_prefix
         self._mqtt_intervals_discovered = False
+        self._physics_model = None
         self._publishes: list[dict] = []  # records all mqtt_publish() calls
         self._warnings: list[str] = []
         self._removed_entities: list[str] = []
@@ -1016,6 +1082,11 @@ class _FakeMqttSelf:
     def log(self, msg: str, level: str = "INFO") -> None:
         if level == "WARNING":
             self._warnings.append(msg)
+
+    def _model_phase_attr(self) -> str | None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._model_phase_attr(self)
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
@@ -2769,6 +2840,101 @@ class TestAdaptiveRetrainLock:
         assert acquired, "Lock must be released even when _retrain raises"
         fake._lock.release()
 
+    def test_seeded_cooldown_prevents_immediate_refire_after_restart(self):
+        """Regression test for the production bug: simulates a restart 2 hours after the last
+        real retrain, using the actual UTC-naive form last_trained is produced in."""
+        from datetime import datetime
+        from unittest.mock import patch
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake()
+        fake._ml_model.last_trained = datetime.now(UTC).replace(tzinfo=None) - pd.Timedelta(hours=2)
+        EnergyForecast._seed_adaptive_cooldown(fake)
+
+        retrain_calls = []
+        fake._retrain = lambda: retrain_calls.append(1)
+
+        with patch("energy_forecast.energy_forecast._compute_live_mae", return_value=(999.0, 100)):
+            EnergyForecast._maybe_adaptive_retrain(fake, pd.DataFrame(columns=["timestamp", "gross_kwh"]))
+
+        assert retrain_calls == [], "adaptive retrain must respect the cooldown seeded from last_trained"
+
+
+class TestSeedAdaptiveCooldown:
+    """Fix C: the adaptive-retrain cooldown must be seeded from the persisted last_trained
+    timestamp, converted to local time (not left UTC-naive), so a restart can't immediately
+    re-arm it and the cooldown doesn't expire early near its boundary."""
+
+    def test_seed_converts_utc_naive_last_trained_to_local(self):
+        """last_trained is UTC-naive (datetime.now() in model.py) -- this uses the actual
+        production form, not a local-tz value hand-built to look correct."""
+        from datetime import datetime
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSelf()
+        fake._timezone = "Europe/Zurich"
+        utc_now = datetime.now(UTC).replace(tzinfo=None)
+        fake._ml_model.last_trained = utc_now
+
+        EnergyForecast._seed_adaptive_cooldown(fake)
+
+        expected_local = pd.Timestamp(utc_now).tz_localize("UTC").tz_convert("Europe/Zurich").tz_localize(None)
+        assert fake._last_adaptive_retrain == expected_local
+        # In summer (CEST, UTC+2) this must differ from the naive value by ~2h -- if it
+        # doesn't, the conversion silently isn't happening.
+        assert abs((fake._last_adaptive_retrain - pd.Timestamp(utc_now)).total_seconds()) > 3000
+
+    def test_seed_with_never_trained_model_keeps_datetime_min(self):
+        """A genuinely fresh install (no meta.pkl yet) must not be blocked from its first
+        adaptive retrain -- last_trained defaults to datetime.min, same as before."""
+        from datetime import datetime
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSelf()
+        fake._ml_model.last_trained = datetime.min
+
+        EnergyForecast._seed_adaptive_cooldown(fake)
+
+        assert fake._last_adaptive_retrain == datetime.min
+
+
+class TestMaybeStartupRetrain:
+    """Fix C: the startup retrain (run_in(..., 10)) must be skipped if a retrain already
+    completed within STARTUP_RETRAIN_MIN_GAP_HOURS."""
+
+    def test_skips_when_recently_trained(self):
+        from datetime import datetime
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSelf()
+        fake._timezone = "Europe/Zurich"
+        fake._ml_model.last_trained = datetime.now(UTC).replace(tzinfo=None) - pd.Timedelta(hours=2)
+        retrain_calls = []
+        fake._retrain_cb = lambda *a, **kw: retrain_calls.append(1)
+
+        EnergyForecast._maybe_startup_retrain(fake)
+
+        assert retrain_calls == [], "a restart 2h after the last retrain must not force another one"
+
+    def test_fires_when_stale(self):
+        from datetime import datetime
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSelf()
+        fake._timezone = "Europe/Zurich"
+        fake._ml_model.last_trained = datetime.min
+        retrain_calls = []
+        fake._retrain_cb = lambda *a, **kw: retrain_calls.append(1)
+
+        EnergyForecast._maybe_startup_retrain(fake)
+
+        assert retrain_calls == [1], "a genuinely fresh/stale model must still retrain on startup"
+
 
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
 
@@ -3125,6 +3291,7 @@ class _FakeRetrain:
         self._dhw_buffer_sensor = None
         self._heating_active_entity = None
         self._ml_model = MagicMock()
+        self._ml_model.last_trained = datetime.min  # matches EnergyForecastModel's real default
         self._weight_halflife = 90.0
         self._holiday_canton = None
         self._holiday_country = "CH"
@@ -3132,9 +3299,26 @@ class _FakeRetrain:
         self._regime_count = 3
         self._climate_room_areas = None
         self._unit_multiplier = 1.0
+        self._physics_model = None
+        self._physics_heating_buffer_df = None
+        self._fetch_physics_sensor_histories = lambda: None
 
     def log(self, msg, level="INFO"):
         pass
+
+    def _last_trained_local(self):
+        # _retrain() resyncs self._last_adaptive_retrain via self._last_trained_local() (Fix C).
+        # Delegate to the real implementation for the same reason as _FakeSelf above.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._last_trained_local(self)
+
+    def _effective_use_physics_residual(self):
+        # _retrain() passes this through to self._ml_model.train(). Delegate to the real
+        # implementation; with self._physics_model = None it short-circuits to False.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._effective_use_physics_residual(self)
 
 
 def _make_energy_df(n=100):

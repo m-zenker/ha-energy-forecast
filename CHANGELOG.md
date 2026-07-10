@@ -8,6 +8,134 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.12.0-alpha-1] — 2026-07-10
+
+Physics-ML Hybrid, complete: core physics engine (Plan A), Phase 1 ML integration (Plan B),
+Phase 2 residual-target training (Plan C, dormant behind a cold-start gate), and the DHW
+scenario/commit API (Plan D). Also includes the unrelated τ-calibration-drift-fix. Consolidates
+all physics-branch work developed since `v0.11.7`; supersedes this branch's own prior (never
+publicly released) `0.11.8` heading below, which predates `dev`'s actual `v0.11.8` release.
+
+### Added
+- `apps/energy_forecast/model.py` — `train()` accepts a new `use_physics_residual: bool = False`
+  parameter. When `True` and a physics model with `physics_kwh` data is available, LightGBM trains
+  on `gross_kwh − physics_kwh` instead of raw consumption; the log1p transform is disabled because
+  residuals can be negative. Predictions are reconstructed as
+  `(physics_kwh + lgbm_residual).clip(lower=0)`; Phase 1 continues to use
+  `lgbm_raw.clip(lower=0)`. Any exception from the physics predictor at inference time falls back
+  silently to ML-only output — two independent `try/except` layers ensure a physics error never
+  crashes a forecast cycle. `last_mae` (the HA-facing metric) always reports gross-kWh MAE across
+  all three computation sites (holdout, CV hyperparameter sweep, and CV-fold loop); a new
+  `last_residual_mae` attribute carries the Phase 2 residual MAE as an internal diagnostic only
+  (not published to any HA sensor). The cold-start gate (`_effective_use_physics_residual()`)
+  keeps Phase 2 dormant until ≥ 30 winter UA_eff calibration windows have been collected — not
+  expected before winter 2026/27. No config change is needed when the gate clears; the next
+  scheduled weekly retrain promotes automatically.
+- `apps/energy_forecast/energy_forecast.py` — Two new sensors published whenever `physics:` is
+  configured, active in both Phase 1 and Phase 2: `sensor.energy_forecast_physics_base_today`
+  (physics-model-only hourly kWh estimate for today) and
+  `sensor.energy_forecast_ml_adjustment_today` (net ML correction over the physics baseline,
+  `main_forecast − physics_base` kWh; negative when the ML model corrects the physics estimate
+  downward). Both sensors respect `mqtt_discovery` (full MQTT discovery-config registration with
+  state and attribute publish parity matching existing sensors) and are registered in
+  `_cleanup_legacy_states()` so no ghost entities persist when switching between MQTT and
+  `set_state` modes.
+- `apps/energy_forecast/energy_forecast.py` — `model_phase` attribute (`"phase1"` or `"phase2"`)
+  added to `sensor.energy_forecast_today` whenever `physics:` is configured; absent entirely when
+  `physics:` is omitted. Allows `ha-energy-manager` to detect which training phase is active
+  without polling a separate sensor.
+- `ROADMAP.md` — Operator reminder to verify empirical prediction-interval coverage on gross kWh
+  once Phase 2 has been live for ≥ 30 days, following the existing "SHAP check due" convention.
+- `apps/energy_forecast/physics.py` — `ThermalPhysicsModel.commit_dhw_schedule(override: dict)`
+  persists a confirmed DHW schedule override to `physics_schedule.json`. Because an
+  operator-confirmed reschedule is not unexpected drift, the legionella instability guard is
+  bypassed; the committed schedule becomes the new natural baseline for every subsequent prediction
+  until superseded by another commit.
+- `apps/energy_forecast/model.py` — `predict()` and `predict_scenario()` accept a new optional
+  `dhw_schedule_override` dict (e.g. `{"legionella": ["2026-01-16", 10]}`). A per-call override
+  takes precedence over the committed baseline for that call only, leaving the persisted schedule
+  untouched. `predict_scenario()`'s `delta_kwh` now reflects the combined signed difference of
+  both appliance-schedule and DHW-schedule overlays vs. the currently-committed natural baseline —
+  never vs. zero, never vs. the scenario's own override.
+- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` extended with an
+  optional `dhw_schedule` kwarg (transient per-call DHW schedule override, e.g.
+  `{"legionella": ["2026-01-16", 10]}`). Designed for "what if DHW/legionella ran at a different
+  time?" queries from `ha-energy-manager`. A `dhw_schedule` supplied here overrides the committed
+  baseline for that call only and does not persist.
+- `apps/energy_forecast/energy_forecast.py` — New AppDaemon service
+  `energy_forecast/set_dhw_schedule`. Commits a DHW schedule override persistently: writes
+  `physics_schedule.json` and immediately invalidates the forecast cache so the next scheduled
+  cycle reflects the new baseline. Requires `physics:` to be configured; logs a WARNING if the
+  physics model is unavailable. **Caller-cache contract for `ha-energy-manager`**: flush your own
+  scenario cache after calling this service — any cached `get_scenario` result keyed without
+  `dhw_schedule` is stale after a commit.
+- `apps/energy_forecast/energy_forecast.py` — New optional `physics:` block in `apps.yaml`.
+  When present (even as an empty `physics: {}`), the app instantiates the thermal physics model and
+  fetches sensor histories for COP, DHW tank temperature, heating buffer temperature, and configured
+  room thermostats before each retrain. Supported sub-keys: `cop_sensor`, `dhw_tank_temp_sensor`,
+  `heating_buffer_temp_sensor`, `heating_curve_sensor`, `cop_formula`, `dhw_tank_volume_l`, `dhw_power_w`,
+  `internal_gains_fraction`, `heating_curve_points`, `room_thermostats`, `use_physics_residual`.
+  Absent the block, no code paths change.
+- `apps/energy_forecast/energy_forecast.py` — New AppDaemon service
+  `energy_forecast/recalibrate_physics`. Call it from **Developer Tools → Services** to trigger
+  physics model recalibration on demand without waiting for the next scheduled weekly retrain.
+  Logs a WARNING if `physics:` is not configured.
+- `apps/energy_forecast/model.py` — Two new LightGBM features added to the trained feature set when
+  physics is configured and sensor data is available: `physics_kwh` (physics-model estimate of
+  heating energy in kWh for that training hour) and `heating_buffer_temp` (°C). These are never
+  constant-zero filler columns — they are omitted entirely when the underlying data is absent.
+  LightGBM still trains on `gross_kwh` (log1p-transformed) unchanged; this is a purely additive
+  input feature, not a target or architecture change.
+- `apps/energy_forecast/model.py` — `train()` now triggers physics model calibration automatically
+  when its stored calibration is stale, using a holdout cutoff consistent with the existing MAE
+  holdout. Training hours flagged as single-hour open-window shocks (by the physics model's
+  open-window detector, when climate sensors are configured) are down-weighted to 0.5× their normal
+  exponential sample weight.
+- `apps/energy_forecast/model.py` — Phase 1 physics validation diagnostic
+  (`physics_phase1_diagnostic`). After each retrain with physics enabled, logs whether `physics_kwh`
+  ranks in the SHAP top-5 features and whether a through-origin OLS slope of `physics_kwh` against
+  actual `gross_kwh` falls in the well-calibrated range 0.8–1.2. Purely informational — does not change any behaviour;
+  used to assess readiness for a future Phase 2 (residual-target training, a separate not-yet-built
+  plan).
+- `apps/energy_forecast/model.py` — Model-artifact portability for `physics_kwh` and
+  `heating_buffer_temp`. If a saved model artifact contains these features but physics is disabled
+  or a sensor is unavailable at prediction time, the missing columns are filled with `0.0` and a
+  WARNING is logged. Applies to `predict()`, `predict_intervals()`, and `shap_summary()` via the
+  shared `_prepare_prediction_X()` path — prediction never crashes on a physics-trained artifact.
+
+### Fixed
+- `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
+- `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.
+- `apps/energy_forecast/energy_forecast.py` — Two defects allowed an AppDaemon restart to fire two uncapped τ retrains in rapid succession: `_last_adaptive_retrain` was reset to `datetime.min` on every restart instead of being seeded from the persisted `last_trained` timestamp (also fixing a UTC-vs-local timezone mismatch in that seeding); and the unconditional startup retrain now skips if a retrain completed within the last 6 hours (`STARTUP_RETRAIN_MIN_GAP_HOURS`).
+- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` never passed the
+  instantiated physics model to the scenario path, causing every scenario call when `physics:` was
+  configured to fall back to `physics_kwh=0.0` with a WARNING. The physics model is now always
+  forwarded, so scenario calls use real cached sensor data — identical to the main forecast path.
+- `apps/energy_forecast/ha_data.py` — DHW tank physics sensor history was fetched under the wrong
+  column name, causing a `KeyError` when the physics model attempted to read buffer temperature from
+  the returned DataFrame. Fixed the internal column label to `buffer_temp`.
+- `apps/energy_forecast/model.py` — `heating_buffer_temp` was missing its portability fallback,
+  unlike `physics_kwh` which already had one. A saved model trained with `heating_buffer_temp` would
+  crash `predict()` if the sensor was later removed from config. Fixed to apply the same 0.0-fill +
+  WARNING path.
+- `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` was never
+  actually called from `_retrain()`, so physics sensor data (DHW tank, heating buffer, COP, room
+  thermostats) was never populated during any real training cycle regardless of config — only
+  exercised in isolation by its own unit tests. Wired the call into `_retrain()` before
+  `train()` is invoked.
+
+### Notes
+- `use_physics_residual: true` in the `physics:` block is accepted but held dormant behind a
+  cold-start gate (`_effective_use_physics_residual()`, wired into `train()` — see Plan C): it
+  requires ≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27. No config
+  change is needed when the gate clears; the next scheduled weekly retrain promotes automatically.
+
+### Tests
+- 817 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
+  threading, train/predict wiring, portability fallbacks, open-window down-weighting, the Phase 1
+  validation diagnostic, the `recalibrate_physics` service, Phase 2 residual-target training +
+  reconstruction, and the DHW scenario/commit API).
+
 ## [0.11.8] - 2026-07-07
 
 ### Added
