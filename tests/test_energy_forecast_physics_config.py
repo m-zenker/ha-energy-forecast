@@ -499,3 +499,69 @@ class TestModelPhaseAttribute:
         app.initialize()
         app._ml_model._use_physics_residual = True
         assert app._model_phase_attr() == "phase2"
+
+
+class TestGetScenarioDhwSchedule:
+    def test_dhw_schedule_forwarded_as_override(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._get_scenario_cb = EnergyForecast._get_scenario_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-01-15", periods=48, freq="1h"), "temp_c": [5.0] * 48}
+        )
+        app._cached_live_temp = 5.0
+        app.fire_event = MagicMock()
+
+        received = {}
+
+        def _fake_predict_scenario(*args, **kwargs):
+            received.update(kwargs)
+            return pd.DataFrame(
+                {
+                    "timestamp": app._cached_forecast_df["timestamp"],
+                    "predicted_kwh": [1.0] * 48,
+                    "delta_kwh": [0.0] * 48,
+                }
+            )
+
+        app._ml_model.predict_scenario = _fake_predict_scenario
+
+        app._get_scenario_cb(
+            "default",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "dhw_schedule": {"legionella": ["2026-01-16", 10]}},
+        )
+        assert received.get("dhw_schedule_override") == {"legionella": ["2026-01-16", 10]}
+        assert received.get("physics_model") is app._physics_model
+
+    def test_no_dhw_schedule_key_forwards_none(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._get_scenario_cb = EnergyForecast._get_scenario_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-01-15", periods=48, freq="1h"), "temp_c": [5.0] * 48}
+        )
+        app._cached_live_temp = 5.0
+        app.fire_event = MagicMock()
+
+        received = {}
+
+        def _fake_predict_scenario(*args, **kwargs):
+            received.update(kwargs)
+            return pd.DataFrame(
+                {
+                    "timestamp": app._cached_forecast_df["timestamp"],
+                    "predicted_kwh": [1.0] * 48,
+                    "delta_kwh": [0.0] * 48,
+                }
+            )
+
+        app._ml_model.predict_scenario = _fake_predict_scenario
+
+        app._get_scenario_cb("default", "energy_forecast", "get_scenario", {"schedule": {}})
+        assert received.get("dhw_schedule_override") is None

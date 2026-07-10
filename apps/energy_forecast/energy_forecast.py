@@ -961,6 +961,11 @@ class EnergyForecast(hass.Hass):
                 cleaned[key] = val
             schedule = cleaned
 
+            dhw_schedule = kwargs.get("dhw_schedule")
+            if dhw_schedule is not None and not isinstance(dhw_schedule, dict):
+                _LOGGER.warning("get_scenario: dhw_schedule must be a dict — ignoring")
+                dhw_schedule = None
+
             result_df = self._ml_model.predict_scenario(
                 self._cached_forecast_df,
                 self._cached_live_temp,
@@ -972,6 +977,8 @@ class EnergyForecast(hass.Hass):
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
                 room_areas=self._climate_room_areas or None,
+                physics_model=self._physics_model,
+                dhw_schedule_override=dhw_schedule,
             )
 
             if kwargs.get("publish", False):
