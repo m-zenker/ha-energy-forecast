@@ -3487,6 +3487,153 @@ class TestCompositeForecast:
         )
         assert "delta_kwh" in result.columns
 
+    def test_next_day_time_string(self):
+        """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        # today 02:00 < 10:00 → tomorrow 02:00 → offset = 16h
+        result = _composite_forecast(df, {"sub_wp": "02:00"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
+        for i, v in enumerate(wp_profile):
+            assert result["delta_kwh"].iloc[16 + i] == pytest.approx(v)
+        # hour 15 and before: no delta
+        assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
+
+    def test_half_hour_time_floors_to_start_hour(self):
+        """'15:30' with forecast_start 14:00 → offset 1 (floor), not 2 (round).
+
+        round(1.5) == 2 under Python banker's rounding, so this would schedule
+        the appliance one hour late without the int() floor fix.
+        """
+        df = _make_baseline_df(start="2024-06-01 14:00")
+        result = _composite_forecast(df, {"sub_wp": "15:30"}, _DUMMY_SIGS)
+        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]  # len=3
+        # offset_h must be 1 (floor(1.5)), not 2 (round(1.5))
+        assert result["delta_kwh"].iloc[1] == pytest.approx(wp_profile[0])
+        assert result["delta_kwh"].iloc[2] == pytest.approx(wp_profile[1])
+        assert result["delta_kwh"].iloc[3] == pytest.approx(wp_profile[2])
+        # hour 0 must be untouched
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
+    def test_malformed_time_string_skipped(self):
+        """Unparseable time string → warning logged (implicitly), delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:99"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_non_string_time_skipped(self):
+        """Non-string schedule value (int) → treated as invalid, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": 1400}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    def test_out_of_range_hour_skipped(self):
+        """Hour > 23 → ValueError raised internally, skipped, delta_kwh all zero."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
+        assert (result["delta_kwh"] == 0.0).all()
+
+    # ── Program-type schedule (dict form) ────────────────────────────────────
+
+    def test_program_schedule_uses_program_profile(self):
+        """Dict schedule with known program uses per-program hourly_profile."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": eco_profile,
+                        "std_profile": [0.0, 0.0, 0.0],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(eco_profile):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
+
+    def test_program_fallback_when_program_unknown(self):
+        """Unknown program label → falls back to combined hourly_profile."""
+        combined = [1.0, 2.0, 1.5, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": [0.5, 1.0, 0.5],
+                        "std_profile": [],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    }
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
+
+    def test_program_fallback_when_no_programs_key(self):
+        """Sig without 'programs' key → falls back to hourly_profile, no error."""
+        combined = [1.0, 2.0]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": combined,
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "12:00", "program": "eco"}}, sigs)
+        for i, v in enumerate(combined):
+            assert result["delta_kwh"].iloc[2 + i] == pytest.approx(v)
+
+    def test_legacy_string_schedule_unchanged(self):
+        """Plain 'HH:MM' string alongside sigs with programs → identical to pre-feature result."""
+        eco_profile = [0.5, 1.0, 0.5]
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {"hourly_profile": eco_profile, "std_profile": [], "total_kwh": 2.0, "n_cycles": 3}
+                },
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result_str = _composite_forecast(df, {"sub_dw": "14:00"}, sigs)
+        # Must use the combined profile, not eco
+        assert result_str["delta_kwh"].iloc[4] == pytest.approx(1.0)
+        assert result_str["delta_kwh"].iloc[5] == pytest.approx(2.0)
+
+    def test_program_off_start_skipped(self):
+        """Dict schedule with start='off' → no delta."""
+        sigs = {
+            "sub_dw": {
+                "hourly_profile": [1.0, 2.0],
+                "total_kwh": 3.0,
+                "peak_hour": 1,
+                "n_cycles": 4,
+                "programs": {"eco": {"hourly_profile": [0.5, 0.5], "std_profile": [], "total_kwh": 1.0, "n_cycles": 2}},
+            }
+        }
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "off", "program": "eco"}}, sigs)
+        assert (result["delta_kwh"] == 0.0).all()
+
 
 class TestScenarioDhwDelta:
     def test_delta_kwh_reflects_dhw_shift_vs_natural_baseline(self, tmp_path):
@@ -3689,153 +3836,6 @@ class TestScenarioDhwDelta:
         # Sanity: the real delta must actually be nonzero somewhere, else both
         # assertions above would hold vacuously.
         assert scenario_b["delta_kwh"].abs().sum() > 0
-
-    def test_next_day_time_string(self):
-        """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        # today 02:00 < 10:00 → tomorrow 02:00 → offset = 16h
-        result = _composite_forecast(df, {"sub_wp": "02:00"}, _DUMMY_SIGS)
-        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]
-        for i, v in enumerate(wp_profile):
-            assert result["delta_kwh"].iloc[16 + i] == pytest.approx(v)
-        # hour 15 and before: no delta
-        assert result["delta_kwh"].iloc[15] == pytest.approx(0.0)
-
-    def test_half_hour_time_floors_to_start_hour(self):
-        """'15:30' with forecast_start 14:00 → offset 1 (floor), not 2 (round).
-
-        round(1.5) == 2 under Python banker's rounding, so this would schedule
-        the appliance one hour late without the int() floor fix.
-        """
-        df = _make_baseline_df(start="2024-06-01 14:00")
-        result = _composite_forecast(df, {"sub_wp": "15:30"}, _DUMMY_SIGS)
-        wp_profile = _DUMMY_SIGS["sub_wp"]["hourly_profile"]  # len=3
-        # offset_h must be 1 (floor(1.5)), not 2 (round(1.5))
-        assert result["delta_kwh"].iloc[1] == pytest.approx(wp_profile[0])
-        assert result["delta_kwh"].iloc[2] == pytest.approx(wp_profile[1])
-        assert result["delta_kwh"].iloc[3] == pytest.approx(wp_profile[2])
-        # hour 0 must be untouched
-        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
-
-    def test_malformed_time_string_skipped(self):
-        """Unparseable time string → warning logged (implicitly), delta_kwh all zero."""
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dishwasher": "25:99"}, _DUMMY_SIGS)
-        assert (result["delta_kwh"] == 0.0).all()
-
-    def test_non_string_time_skipped(self):
-        """Non-string schedule value (int) → treated as invalid, delta_kwh all zero."""
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dishwasher": 1400}, _DUMMY_SIGS)
-        assert (result["delta_kwh"] == 0.0).all()
-
-    def test_out_of_range_hour_skipped(self):
-        """Hour > 23 → ValueError raised internally, skipped, delta_kwh all zero."""
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dishwasher": "25:00"}, _DUMMY_SIGS)
-        assert (result["delta_kwh"] == 0.0).all()
-
-    # ── Program-type schedule (dict form) ────────────────────────────────────
-
-    def test_program_schedule_uses_program_profile(self):
-        """Dict schedule with known program uses per-program hourly_profile."""
-        eco_profile = [0.5, 1.0, 0.5]
-        sigs = {
-            "sub_dw": {
-                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
-                "total_kwh": 5.0,
-                "peak_hour": 1,
-                "n_cycles": 5,
-                "programs": {
-                    "eco": {
-                        "hourly_profile": eco_profile,
-                        "std_profile": [0.0, 0.0, 0.0],
-                        "total_kwh": 2.0,
-                        "n_cycles": 3,
-                    }
-                },
-            }
-        }
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, sigs)
-        for i, v in enumerate(eco_profile):
-            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
-        assert result["delta_kwh"].iloc[0] == pytest.approx(0.0)
-
-    def test_program_fallback_when_program_unknown(self):
-        """Unknown program label → falls back to combined hourly_profile."""
-        combined = [1.0, 2.0, 1.5, 0.5]
-        sigs = {
-            "sub_dw": {
-                "hourly_profile": combined,
-                "total_kwh": 5.0,
-                "peak_hour": 1,
-                "n_cycles": 5,
-                "programs": {
-                    "eco": {
-                        "hourly_profile": [0.5, 1.0, 0.5],
-                        "std_profile": [],
-                        "total_kwh": 2.0,
-                        "n_cycles": 3,
-                    }
-                },
-            }
-        }
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, sigs)
-        for i, v in enumerate(combined):
-            assert result["delta_kwh"].iloc[4 + i] == pytest.approx(v)
-
-    def test_program_fallback_when_no_programs_key(self):
-        """Sig without 'programs' key → falls back to hourly_profile, no error."""
-        combined = [1.0, 2.0]
-        sigs = {
-            "sub_dw": {
-                "hourly_profile": combined,
-                "total_kwh": 3.0,
-                "peak_hour": 1,
-                "n_cycles": 4,
-            }
-        }
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dw": {"start": "12:00", "program": "eco"}}, sigs)
-        for i, v in enumerate(combined):
-            assert result["delta_kwh"].iloc[2 + i] == pytest.approx(v)
-
-    def test_legacy_string_schedule_unchanged(self):
-        """Plain 'HH:MM' string alongside sigs with programs → identical to pre-feature result."""
-        eco_profile = [0.5, 1.0, 0.5]
-        sigs = {
-            "sub_dw": {
-                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
-                "total_kwh": 5.0,
-                "peak_hour": 1,
-                "n_cycles": 5,
-                "programs": {
-                    "eco": {"hourly_profile": eco_profile, "std_profile": [], "total_kwh": 2.0, "n_cycles": 3}
-                },
-            }
-        }
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result_str = _composite_forecast(df, {"sub_dw": "14:00"}, sigs)
-        # Must use the combined profile, not eco
-        assert result_str["delta_kwh"].iloc[4] == pytest.approx(1.0)
-        assert result_str["delta_kwh"].iloc[5] == pytest.approx(2.0)
-
-    def test_program_off_start_skipped(self):
-        """Dict schedule with start='off' → no delta."""
-        sigs = {
-            "sub_dw": {
-                "hourly_profile": [1.0, 2.0],
-                "total_kwh": 3.0,
-                "peak_hour": 1,
-                "n_cycles": 4,
-                "programs": {"eco": {"hourly_profile": [0.5, 0.5], "std_profile": [], "total_kwh": 1.0, "n_cycles": 2}},
-            }
-        }
-        df = _make_baseline_df(start="2024-06-01 10:00")
-        result = _composite_forecast(df, {"sub_dw": {"start": "off", "program": "eco"}}, sigs)
-        assert (result["delta_kwh"] == 0.0).all()
 
 
 # ── Program signatures in _learn_appliance_signatures ────────────────────────
