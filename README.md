@@ -981,11 +981,11 @@ The following features activate when the corresponding sensors are configured an
 
 ## Physics-ML Hybrid (Phases 1 & 2) (optional)
 
-Phase 1 wires the thermal physics model into the LightGBM pipeline as optional additive input
-features. The physics model is built on the `feat/physics-core-engine` branch and covers DHW
-schedule inference, heating-curve calibration, open-window anomaly detection, and zone-boundary
-consistency checking. Phase 1 exposes its outputs as two new LightGBM features without changing
-the training target or model architecture.
+Phase 1 wires the thermal physics model (`apps/energy_forecast/physics.py`) into the LightGBM
+pipeline as optional additive input features. The physics model covers DHW schedule inference,
+heating-curve calibration, open-window anomaly detection, and zone-boundary consistency checking.
+Phase 1 exposes its outputs as two new LightGBM features without changing the training target or
+model architecture.
 
 **Enabling vs disabling:** Omitting the `physics:` block entirely is byte-identical to prior
 versions — no new code path is entered, no sensors change, no log messages appear. Adding even an
