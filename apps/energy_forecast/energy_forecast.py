@@ -355,6 +355,7 @@ class EnergyForecast(hass.Hass):
         self.register_service("energy_forecast/get_scenario", self._get_scenario_cb)
         if self._physics_model is not None:
             self.register_service("energy_forecast/recalibrate_physics", self._recalibrate_physics_cb)
+            self.register_service("energy_forecast/set_dhw_schedule", self._set_dhw_schedule_cb)
 
         self._check_setup()
         self._publish_unavailable()
@@ -1232,6 +1233,24 @@ class EnergyForecast(hass.Hass):
             _LOGGER.info("Physics recalibration complete")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(f"recalibrate_physics failed: {exc}")
+
+    def _set_dhw_schedule_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/set_dhw_schedule`: commit a DHW schedule override
+        to the physics model and invalidate the cached forecast so the next hourly cycle
+        recomputes with the new schedule."""
+        if self._physics_model is None:
+            _LOGGER.warning("set_dhw_schedule called but physics is not configured — ignoring")
+            return
+        dhw_schedule = kwargs.get("dhw_schedule")
+        if not isinstance(dhw_schedule, dict):
+            _LOGGER.warning("set_dhw_schedule: dhw_schedule must be a dict — ignoring")
+            return
+        try:
+            self._physics_model.commit_dhw_schedule(dhw_schedule)
+            self._cached_forecast_df = None  # forces a fresh forecast on the next publish cycle
+            _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"set_dhw_schedule failed: {exc}")
 
     def _effective_use_physics_residual(self) -> bool:
         """Config intent AND-ed with the cold-start gate.

@@ -565,3 +565,57 @@ class TestGetScenarioDhwSchedule:
 
         app._get_scenario_cb("default", "energy_forecast", "get_scenario", {"schedule": {}})
         assert received.get("dhw_schedule_override") is None
+
+
+class TestSetDhwScheduleService:
+    def test_service_registered_when_physics_enabled(self):
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        calls = [c.args[0] for c in app.register_service.call_args_list]
+        assert "energy_forecast/set_dhw_schedule" in calls
+
+    def test_commits_schedule_and_invalidates_cache(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+
+        with patch.object(app._physics_model, "commit_dhw_schedule") as mock_commit:
+            app._set_dhw_schedule_cb(
+                "default",
+                "energy_forecast",
+                "set_dhw_schedule",
+                {"dhw_schedule": {"legionella": ["2026-01-16", 10]}},
+            )
+            mock_commit.assert_called_once_with({"legionella": ["2026-01-16", 10]})
+        assert app._cached_forecast_df is None
+
+    def test_missing_dhw_schedule_kwarg_logs_warning_no_crash(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app._set_dhw_schedule_cb("default", "energy_forecast", "set_dhw_schedule", {})
+        assert any("dhw_schedule" in r.message.lower() for r in caplog.records)
+
+    def test_physics_disabled_logs_warning_no_crash(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import"})
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app._set_dhw_schedule_cb(
+                "default", "energy_forecast", "set_dhw_schedule", {"dhw_schedule": {"legionella": ["2026-01-16", 10]}}
+            )
+        assert any("physics" in r.message.lower() for r in caplog.records)
