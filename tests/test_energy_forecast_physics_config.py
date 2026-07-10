@@ -446,6 +446,36 @@ class TestPhysicsSensors:
         assert "energy_forecast_ml_adjustment_today" in attr_ids
         app.set_state.assert_not_called()
 
+    def test_physics_history_attrs_defensively_initialized_before_first_retrain(self):
+        """initialize() must set all _fetch_physics_sensor_histories() output attributes to
+        their safe defaults immediately — not just _physics_heating_buffer_df — so
+        _publish_physics_sensors() (called every hourly update cycle) never raises
+        AttributeError if it fires before the first _retrain() has ever completed (e.g. right
+        after physics: is newly enabled and the weekly retrain hasn't run yet)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        # Real (non-mocked) attribute assignments from initialize() are distinguishable from
+        # MagicMock's auto-vivified attributes: an unset attribute would return a fresh MagicMock
+        # on access, not `{}`/`None`, so these assertions genuinely fail without the fix.
+        assert app._physics_climate_dfs == {}
+        assert app._physics_dhw_tank_df is None
+        assert app._physics_cop_df is None
+        assert app._room_thermostat_temp_dfs == {}
+        assert app._physics_heating_buffer_df is None
+
+        # Real predict_series (not monkeypatched away) must run without raising even though
+        # _fetch_physics_sensor_histories() was never called.
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
+        app._cached_forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 48})
+        app._publish_physics_sensors(forecast_df)  # must not raise AttributeError
+        published_entities = [c.args[0] for c in app.set_state.call_args_list]
+        assert "sensor.energy_forecast_physics_base_today" in published_entities
+
 
 class TestPhysicsMqttDiscoveryRegistration:
     """initialize() must register MQTT Discovery config for the physics sensors (follow-up to d12cfda).

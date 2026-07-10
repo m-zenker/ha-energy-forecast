@@ -343,9 +343,13 @@ class EnergyForecast(hass.Hass):
             self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
 
         # Populated by _fetch_physics_sensor_histories() (once per training cycle). Initialized
-        # here too so _update_sensors() can safely read it if it ever fires before the first
-        # _retrain() completes.
+        # here too so _update_sensors()/_publish_physics_sensors() can safely read them if either
+        # ever fires before the first _retrain() completes.
         self._physics_heating_buffer_df: Any = None
+        self._physics_dhw_tank_df: Any = None
+        self._physics_cop_df: Any = None
+        self._physics_climate_dfs: dict[str, Any] = {}
+        self._room_thermostat_temp_dfs: dict[str, Any] = {}
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
