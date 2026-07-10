@@ -8,6 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.12.0-alpha-1] — 2026-07-10
+
+Physics-ML Hybrid, complete: core physics engine (Plan A), Phase 1 ML integration (Plan B),
+Phase 2 residual-target training (Plan C, dormant behind a cold-start gate), and the DHW
+scenario/commit API (Plan D). Also includes the unrelated τ-calibration-drift-fix. Consolidates
+all physics-branch work developed since `v0.11.7`; supersedes this branch's own prior (never
+publicly released) `0.11.8` heading below, which predates `dev`'s actual `v0.11.8` release.
+
 ### Added
 - `apps/energy_forecast/model.py` — `train()` accepts a new `use_physics_residual: bool = False`
   parameter. When `True` and a physics model with `physics_kwh` data is available, LightGBM trains
@@ -61,24 +69,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   physics model is unavailable. **Caller-cache contract for `ha-energy-manager`**: flush your own
   scenario cache after calling this service — any cached `get_scenario` result keyed without
   `dhw_schedule` is stale after a commit.
-
-### Fixed
-- `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
-- `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.
-- `apps/energy_forecast/energy_forecast.py` — Two defects allowed an AppDaemon restart to fire two uncapped τ retrains in rapid succession: `_last_adaptive_retrain` was reset to `datetime.min` on every restart instead of being seeded from the persisted `last_trained` timestamp (also fixing a UTC-vs-local timezone mismatch in that seeding); and the unconditional startup retrain now skips if a retrain completed within the last 6 hours (`STARTUP_RETRAIN_MIN_GAP_HOURS`).
-- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` never passed the
-  instantiated physics model to the scenario path, causing every scenario call when `physics:` was
-  configured to fall back to `physics_kwh=0.0` with a WARNING. The physics model is now always
-  forwarded, so scenario calls use real cached sensor data — identical to the main forecast path.
-
-## [0.11.8] — 2026-07-03
-
-Physics-ML Hybrid Phase 1: wires the thermal physics model (from the `feat/physics-core-engine`
-branch) into the LightGBM training and prediction pipeline as optional additive features. The
-`physics:` config block is the sole enablement gate — omitting it leaves behaviour byte-identical
-to v0.11.7.
-
-### Added
 - `apps/energy_forecast/energy_forecast.py` — New optional `physics:` block in `apps.yaml`.
   When present (even as an empty `physics: {}`), the app instantiates the thermal physics model and
   fetches sensor histories for COP, DHW tank temperature, heating buffer temperature, and configured
@@ -114,6 +104,13 @@ to v0.11.7.
   shared `_prepare_prediction_X()` path — prediction never crashes on a physics-trained artifact.
 
 ### Fixed
+- `apps/energy_forecast/model.py` — `_calibrate_tau()` had a binary spring-bias guard that could allow a single qualifying nighttime window (e.g. all-night but still warm) to fully rescue trust in a bad τ estimate, producing unconstrained drift toward a biased value during spring/summer transitions. Replaced with a continuous confidence weight (0–100%) that requires both a sufficient nighttime fraction and a cold-enough outdoor median among quality-selected candidates (geometric-mean-composed with a sample-size term), capping how much a single retrain can shift the stored τ to at most 20% of the gap to the new estimate.
+- `apps/energy_forecast/model.py` — Added a two-tier rolling drift cap to bound cumulative τ movement to ±35% over any 30-day window and ±50% over any 180-day window. Per-update damping from the confidence-weight fix above slows convergence to a biased value but cannot prevent it over many retrains; this cap makes the bound absolute and independent of retrain frequency or per-step confidence.
+- `apps/energy_forecast/energy_forecast.py` — Two defects allowed an AppDaemon restart to fire two uncapped τ retrains in rapid succession: `_last_adaptive_retrain` was reset to `datetime.min` on every restart instead of being seeded from the persisted `last_trained` timestamp (also fixing a UTC-vs-local timezone mismatch in that seeding); and the unconditional startup retrain now skips if a retrain completed within the last 6 hours (`STARTUP_RETRAIN_MIN_GAP_HOURS`).
+- `apps/energy_forecast/energy_forecast.py` — `energy_forecast/get_scenario` never passed the
+  instantiated physics model to the scenario path, causing every scenario call when `physics:` was
+  configured to fall back to `physics_kwh=0.0` with a WARNING. The physics model is now always
+  forwarded, so scenario calls use real cached sensor data — identical to the main forecast path.
 - `apps/energy_forecast/ha_data.py` — DHW tank physics sensor history was fetched under the wrong
   column name, causing a `KeyError` when the physics model attempted to read buffer temperature from
   the returned DataFrame. Fixed the internal column label to `buffer_temp`.
@@ -128,18 +125,38 @@ to v0.11.7.
   `train()` is invoked.
 
 ### Notes
-- `use_physics_residual: true` in the `physics:` block is accepted but held at Phase 1: a
-  cold-start-gate check (`_effective_use_physics_residual()`) exists and logs a WARNING when the
-  gate isn't satisfied, but nothing in Phase 1 calls it yet — activating Phase 2 (residual-target
-  training) and wiring this gate into the training loop is a separate future plan.
-- `predict_scenario()` / the `energy_forecast/get_scenario` service logs one WARNING per call when
-  physics is configured, because it does not supply live physics sensor data — both `physics_kwh`
-  and `heating_buffer_temp` fall back to 0.0 each time. This is a documented Phase 1 limitation.
+- `use_physics_residual: true` in the `physics:` block is accepted but held dormant behind a
+  cold-start gate (`_effective_use_physics_residual()`, wired into `train()` — see Plan C): it
+  requires ≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27. No config
+  change is needed when the gate clears; the next scheduled weekly retrain promotes automatically.
 
 ### Tests
-- 766 passing (up from 649 in v0.11.7; +117 new tests covering physics config ingest, sensor fetch,
-  feature threading, train/predict wiring, portability fallbacks, open-window down-weighting,
-  validation diagnostic, and the recalibrate service).
+- 817 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
+  threading, train/predict wiring, portability fallbacks, open-window down-weighting, the Phase 1
+  validation diagnostic, the `recalibrate_physics` service, Phase 2 residual-target training +
+  reconstruction, and the DHW scenario/commit API).
+
+## [0.11.8] - 2026-07-07
+
+### Added
+- `apps/energy_forecast/const.py` — new `resolve_timezone()` shared helper used by both the main
+  app and the backfill tool. Precedence: explicit `timezone:` key in `apps.yaml` → Home Assistant's
+  configured timezone → `Europe/Zurich`. Logs a startup WARNING when `timezone:` is set but
+  differs from HA's own timezone; a mismatch shifts every historical timestamp by the UTC-offset
+  difference between the two zones (daytime consumption appears to occur at night). ([#15])
+- `apps/energy_forecast/energy_forecast.py` — sensor-type validation runs once at startup and logs
+  a WARNING for each configured sensor whose live `unit_of_measurement` or `state_class` does not
+  match its role. Energy sensors (`energy_sensor`, `ev_charging_sensor`, `sub_energy_sensors`, and
+  the solar/grid/battery correction sensors) must be cumulative `total_increasing` kWh/Wh/MWh
+  meters; `outdoor_temp_sensor` and `dhw_buffer_sensor` must report in °C/°F. Directly surfaces the
+  "power sensor configured where an energy sensor was required" class of misconfiguration from
+  discussion #15, which previously only appeared as a downstream forecast-quality symptom. ([#15])
+
+### Fixed
+- `apps/energy_forecast/energy_history_backfill.py` — backfill timestamps were computed in
+  `Europe/Zurich` regardless of the user's actual HA timezone, silently shifting all backfilled
+  historical data for non-CH-timezone users (daytime consumption appeared to occur at night). The
+  tool now calls `resolve_timezone()` with the same precedence as the main app. ([#15])
 
 ## [0.11.7] - 2026-06-30
 
