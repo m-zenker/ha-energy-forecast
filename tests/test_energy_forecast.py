@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -3320,6 +3321,13 @@ class _FakeRetrain:
 
         return EnergyForecast._effective_use_physics_residual(self)
 
+    def _ev_charging_cache_path(self):
+        # _retrain() calls this when self._ev_charging_sensor is set. Delegate to the
+        # real implementation for the same reason as _last_trained_local above.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._ev_charging_cache_path(self)
+
 
 def _make_energy_df(n=100):
     ts = pd.date_range("2024-01-01", periods=n, freq="1h")
@@ -3375,6 +3383,65 @@ class TestFifteenMinCache:
 
         stub = _FakeRetrain(tmp_path / "energy_history.csv")
         EnergyForecast._retrain(stub)  # must not raise
+
+
+class TestRetrainEvCachePathBug:
+    """Regression test for GitHub discussion #15 (2026-07-10): configuring
+    ev_charging_sensor crashed _retrain() with
+    AttributeError: 'function' object has no attribute 'exists', because
+    self._ev_charging_cache_path (the bound method) was passed to
+    fetch_sub_sensor_history instead of self._ev_charging_cache_path() (the
+    Path it returns).
+    """
+
+    def test_retrain_passes_a_path_to_fetch_sub_sensor_history(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        ha_data_mod = TestFifteenMinCache()._patch_retrain_deps(monkeypatch)
+
+        captured = {}
+
+        def _fake_fetch_sub_sensor_history(app, entity_id, cache_path, **kwargs):
+            captured["cache_path"] = cache_path
+            return pd.DataFrame(columns=["timestamp", "kwh"])
+
+        monkeypatch.setattr(ha_data_mod, "fetch_sub_sensor_history", _fake_fetch_sub_sensor_history)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._ev_charging_sensor = "sensor.wallbox_total_energy"
+
+        EnergyForecast._retrain(stub)
+
+        assert isinstance(captured["cache_path"], Path), (
+            f"fetch_sub_sensor_history received {captured['cache_path']!r} "
+            "(a bound method) instead of a Path — this crashes with "
+            "AttributeError: 'function' object has no attribute 'exists' "
+            "as soon as fetch_sub_sensor_history calls cache_path.exists()"
+        )
+
+
+class TestEvChargingCachePathAlwaysInvoked:
+    """self._ev_charging_cache_path is a plain method, not a @property — every
+    call site must invoke it with (). Passing the bound method itself (as
+    happened at two call sites, see TestRetrainEvCachePathBug) silently hands
+    a function object to code expecting a Path and crashes on cache_path.exists().
+    """
+
+    def test_retrain_and_update_sensors_call_it_with_parens(self):
+        import inspect
+        import re
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        for method in (EnergyForecast._retrain, EnergyForecast._update_sensors):
+            source = inspect.getsource(method)
+            for match in re.finditer(r"self\._ev_charging_cache_path\b(\()?", source):
+                assert match.group(1) == "(", (
+                    f"{method.__name__} references self._ev_charging_cache_path "
+                    "without calling it — this passes a bound method instead of "
+                    "a Path and crashes downstream with AttributeError: "
+                    "'function' object has no attribute 'exists'"
+                )
 
 
 # ── Timezone alignment warning (initialize()) ────────────────────────────────

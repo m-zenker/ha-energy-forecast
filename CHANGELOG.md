@@ -8,6 +8,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_retrain()` and `_update_sensors()` passed the
+  bound method `self._ev_charging_cache_path` (instead of calling it) to
+  `fetch_sub_sensor_history()` / `fetch_recent_sub_sensor()` whenever `ev_charging_sensor` was
+  configured, crashing retraining with `AttributeError: 'function' object has no attribute
+  'exists'`. Reported in GitHub discussion #15.
+
 ## [0.12.0-alpha-1] — 2026-07-10
 
 Physics-ML Hybrid, complete: core physics engine (Plan A), Phase 1 ML integration (Plan B),
