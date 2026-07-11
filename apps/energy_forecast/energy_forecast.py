@@ -1104,7 +1104,7 @@ class EnergyForecast(hass.Hass):
         if self._ev_charging_sensor:
             try:
                 _ev_hist = ha_data.fetch_sub_sensor_history(
-                    self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
+                    self, self._ev_charging_sensor, self._ev_charging_cache_path(), timezone=self._timezone
                 )
                 _ev_hist_stripped = _strip_tz(_ev_hist, self._timezone)
                 if _ev_hist_stripped.empty:
@@ -1360,7 +1360,7 @@ class EnergyForecast(hass.Hass):
             # doesn't inflate tomorrow's baseline prediction.
             if self._ev_charging_sensor:
                 _ev_recent = ha_data.fetch_recent_sub_sensor(
-                    self, self._ev_charging_sensor, self._ev_charging_cache_path, timezone=self._timezone
+                    self, self._ev_charging_sensor, self._ev_charging_cache_path(), timezone=self._timezone
                 )
                 _ev_actuals_df = _strip_tz(_ev_recent, self._timezone)
                 if not _ev_actuals_df.empty:
