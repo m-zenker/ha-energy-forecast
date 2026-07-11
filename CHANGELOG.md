@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-07-11
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_retrain()` and `_update_sensors()` passed the
+  bound method `self._ev_charging_cache_path` (instead of calling it) to
+  `fetch_sub_sensor_history()` / `fetch_recent_sub_sensor()` whenever `ev_charging_sensor` was
+  configured, crashing retraining with `AttributeError: 'function' object has no attribute
+  'exists'`. Reported in GitHub discussion #15.
+
 ## [0.11.8] - 2026-07-07
 
 ### Added
