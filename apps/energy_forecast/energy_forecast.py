@@ -1105,6 +1105,7 @@ class EnergyForecast(hass.Hass):
             self.fire_event(
                 "energy_forecast_scenario_result",
                 forecast=result_df.to_dict("records"),
+                request_id=kwargs.get("request_id"),
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("get_scenario failed: %s", exc)

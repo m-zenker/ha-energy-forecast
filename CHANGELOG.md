@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb`'s `energy_forecast_scenario_result`
+  event never echoed back a caller-supplied `request_id`, even though the service accepts one.
+  Callers with more than one `get_scenario` request potentially in flight at once (e.g.
+  `ha-energy-manager`'s `ScenarioScorer`, used by both its appliance scheduler and its legionella
+  DHW-schedule gate) had no way to tell which in-flight request a given response event answered,
+  and had started rejecting every response as uncorrelated. `request_id` (or `None`, if the caller
+  didn't send one) is now echoed back verbatim in the fired event.
 - `apps/energy_forecast/energy_forecast.py` — `_retrain()` and `_update_sensors()` passed the
   bound method `self._ev_charging_cache_path` (instead of calling it) to
   `fetch_sub_sensor_history()` / `fetch_recent_sub_sensor()` whenever `ev_charging_sensor` was

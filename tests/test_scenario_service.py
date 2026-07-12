@@ -85,6 +85,59 @@ class TestGetScenarioCb:
         assert isinstance(records, list)
         assert len(records) == 48
 
+    def test_echoes_request_id_when_caller_supplies_one(self):
+        """A caller-supplied request_id must be echoed back verbatim in the
+        result event, so concurrent callers can correlate their own request
+        with the right response (ha-energy-manager's ScenarioScorer rejects
+        any response it can't correlate — see this plan's docstring)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False, "request_id": "abc-123"},
+        )
+
+        app.fire_event.assert_called_once()
+        _event_name, kwargs = app.fire_event.call_args[0][0], app.fire_event.call_args[1]
+        assert kwargs["request_id"] == "abc-123"
+
+    def test_request_id_is_none_when_caller_omits_it(self):
+        """Backward compatibility: a caller that never sends request_id (e.g.
+        an older integration, or a manual service call from HA's UI) must
+        keep working exactly as before — no request_id key required in the
+        call, and the response carries request_id=None rather than raising
+        or omitting the key inconsistently."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False},
+        )
+
+        app.fire_event.assert_called_once()
+        _event_name, kwargs = app.fire_event.call_args[0][0], app.fire_event.call_args[1]
+        assert kwargs["request_id"] is None
+
     def test_room_areas_forwarded_to_predict_scenario(self):
         """_get_scenario_cb must pass _climate_room_areas to predict_scenario."""
         from energy_forecast.energy_forecast import EnergyForecast
