@@ -6,7 +6,7 @@
 *Know your electricity bill before the day begins.*
 
 ![Version](https://img.shields.io/badge/version-v0.12.0--alpha--1-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-817%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-832%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
@@ -153,6 +153,14 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Phase 2 residual-target training (dormant by default)** — when `use_physics_residual: true` is set, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + ML_residual`; dormant until the cold-start gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27); promotes automatically on the next weekly retrain after the gate clears
 - **Physics-baseline diagnostic sensors** — `sensor.energy_forecast_physics_base_today` and `sensor.energy_forecast_ml_adjustment_today` published whenever `physics:` is configured (Phase 1 and Phase 2); useful for monitoring the physics-vs-ML contribution split before activating Phase 2
 - **`model_phase` attribute** — `"phase1"` or `"phase2"` on `sensor.energy_forecast_today` when physics is configured; lets automations and `ha-energy-manager` detect which training phase is active
+- **Persisted DHW schedule commits** — `energy_forecast/set_dhw_schedule` AppDaemon service (registered only when `physics:` is configured), e.g.:
+  ```yaml
+  service: appdaemon/energy_forecast_set_dhw_schedule
+  data:
+    dhw_schedule:
+      legionella: ["2026-06-25", 10]  # [date string, hour]
+  ```
+  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model and invalidates the cached forecast so the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
 
 ---
 
@@ -170,6 +178,7 @@ data:
   dhw_schedule:                    # optional: transient physics DHW override (requires `physics:` block)
     legionella: ["2026-06-25", 10] # [date string, hour] — NOT persisted
   publish: true                    # optional: write result to HA sensors
+  request_id: "any-string-you-choose"  # optional: echoed back verbatim in the result event
 ```
 
 Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after the last `.`, e.g. `sub_dishwasher` from `sensor.dishwasher_energy_kwh`. Alternatively, pass the full entity ID. Unknown keys are silently skipped.
@@ -185,11 +194,14 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
     {"timestamp": "2024-06-01T00:00:00+02:00", "predicted_kwh": 0.42, "delta_kwh": 0.0},
     {"timestamp": "2024-06-01T01:00:00+02:00", "predicted_kwh": 0.38, "delta_kwh": 0.0},
     "..."
-  ]
+  ],
+  "request_id": "any-string-you-choose"
 }
 ```
 
 `timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline.
+
+> **Correlating requests with responses:** pass `request_id` (any string, e.g. a UUID) in the service call and it is echoed back verbatim in the result event's `request_id` field — `null` if you didn't send one. This exists so a caller with more than one `get_scenario` request potentially in flight at once (e.g. two independent AppDaemon apps both calling this service around the same time) can tell which event answers which request, rather than assuming the next fired event is theirs.
 
 **Published sensors** (when `publish: true`):
 
