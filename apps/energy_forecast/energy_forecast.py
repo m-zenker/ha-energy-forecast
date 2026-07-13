@@ -1248,78 +1248,97 @@ class EnergyForecast(hass.Hass):
 
     # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
 
-    def _fetch_physics_sensor_histories(self) -> None:
-        """Fetch the additional sensor histories the physics model needs.
+    def _fetch_physics_sensor_histories(self, recent_only: bool = False) -> None:
+        """Fetch (or, hourly, lightly refresh) the additional sensor histories the
+        physics model needs.
 
-        No-op (no fetch calls at all) when self._physics_model is None, so
-        absent physics: config behaves identically to v0.11.7.
+        `recent_only=False` (the default, called once per cycle from `_retrain()`)
+        does a full 30-day fetch and resets every attribute first — this is the
+        authoritative refresh after a training cycle; a no-op when
+        `self._physics_model` is None, so absent `physics:` config behaves
+        identically to v0.11.7.
+
+        `recent_only=True` is called every hourly `_update_sensors()` cycle, mirroring
+        the existing `dhw_buffer_sensor`/`climate_entities` hourly-refresh pattern.
+        Without it, these attributes are populated only inside a training cycle
+        (weekly, or gated behind adaptive-retrain's 24h cooldown + MAE threshold);
+        an AppDaemon restart resets them all to None/empty in initialize(), and they
+        stay that way until the next retrain completes — which can be up to a week
+        away. Every hourly predict cycle during that gap hits the model-artifact
+        portability fallback and silently fills the corresponding feature with a
+        constant 0.0, drifting the model off the feature distribution it was trained
+        on. A failed or empty recent fetch never regresses an already-good value —
+        it just leaves the attribute unchanged for this cycle.
         """
-        self._room_thermostat_temp_dfs: dict[str, Any] = {}
-        self._physics_dhw_tank_df: Any = None
-        self._physics_heating_buffer_df: Any = None
-        self._physics_cop_df: Any = None
-        self._physics_climate_dfs: dict[str, Any] = {}
+        if not recent_only:
+            self._room_thermostat_temp_dfs: dict[str, Any] = {}
+            self._physics_dhw_tank_df: Any = None
+            self._physics_heating_buffer_df: Any = None
+            self._physics_cop_df: Any = None
+            self._physics_climate_dfs: dict[str, Any] = {}
 
         if self._physics_model is None:
             return
 
         cfg = self._physics_config
+        generic_fetch = ha_data.fetch_recent_generic_sensor if recent_only else ha_data.fetch_generic_sensor_history
+        climate_fetch = ha_data.fetch_recent_climate if recent_only else ha_data.fetch_climate_history
+        verb = "recent" if recent_only else "history"
+
+        def _keep_or_replace(current: Any, df: Any) -> Any:
+            if df.empty:
+                return current if recent_only else df
+            return _strip_tz(df, self._timezone)
 
         if cfg.get("dhw_tank_temp_sensor"):
             entity_id = cfg["dhw_tank_temp_sensor"]
             path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
             try:
-                df = ha_data.fetch_generic_sensor_history(
-                    self, entity_id, path, column_name="buffer_temp", timezone=self._timezone
-                )
-                self._physics_dhw_tank_df = _strip_tz(df, self._timezone) if not df.empty else df
+                df = generic_fetch(self, entity_id, path, column_name="buffer_temp", timezone=self._timezone)
+                self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, df)
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics DHW tank %s history fetch failed: %s", entity_id, exc)
+                _LOGGER.warning("Physics DHW tank %s %s fetch failed: %s", entity_id, verb, exc)
 
         if cfg.get("heating_buffer_temp_sensor"):
             entity_id = cfg["heating_buffer_temp_sensor"]
             path = self._generic_sensor_cache_path(entity_id, prefix="physics_heating_buffer")
             try:
-                df = ha_data.fetch_generic_sensor_history(
-                    self, entity_id, path, column_name="heating_buffer_temp", timezone=self._timezone
-                )
-                self._physics_heating_buffer_df = _strip_tz(df, self._timezone) if not df.empty else df
+                df = generic_fetch(self, entity_id, path, column_name="heating_buffer_temp", timezone=self._timezone)
+                self._physics_heating_buffer_df = _keep_or_replace(self._physics_heating_buffer_df, df)
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics heating buffer %s history fetch failed: %s", entity_id, exc)
+                _LOGGER.warning("Physics heating buffer %s %s fetch failed: %s", entity_id, verb, exc)
 
         if cfg.get("cop_sensor"):
             entity_id = cfg["cop_sensor"]
             path = self._generic_sensor_cache_path(entity_id, prefix="physics_cop")
             try:
-                df = ha_data.fetch_generic_sensor_history(
-                    self, entity_id, path, column_name="cop", timezone=self._timezone
-                )
-                self._physics_cop_df = _strip_tz(df, self._timezone) if not df.empty else df
+                df = generic_fetch(self, entity_id, path, column_name="cop", timezone=self._timezone)
+                self._physics_cop_df = _keep_or_replace(self._physics_cop_df, df)
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics COP %s history fetch failed: %s", entity_id, exc)
+                _LOGGER.warning("Physics COP %s %s fetch failed: %s", entity_id, verb, exc)
 
         for i, rt in enumerate(self._room_thermostats):
             temp_entity = rt["temp_sensor"]
             climate_entity = rt["climate_entity"]
             temp_path = self._generic_sensor_cache_path(temp_entity, prefix=f"physics_temp_{i}")
             try:
-                temp_df = ha_data.fetch_generic_sensor_history(
+                temp_df = generic_fetch(
                     self, temp_entity, temp_path, column_name="current_temp", timezone=self._timezone
                 )
-                self._room_thermostat_temp_dfs[climate_entity] = (
-                    _strip_tz(temp_df, self._timezone) if not temp_df.empty else temp_df
+                self._room_thermostat_temp_dfs[climate_entity] = _keep_or_replace(
+                    self._room_thermostat_temp_dfs.get(climate_entity), temp_df
                 )
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics room temp %s history fetch failed: %s", temp_entity, exc)
+                _LOGGER.warning("Physics room temp %s %s fetch failed: %s", temp_entity, verb, exc)
 
             climate_path = self._climate_cache_path(climate_entity)
             try:
-                climate_df = ha_data.fetch_climate_history(self, climate_entity, climate_path, timezone=self._timezone)
-                self._physics_climate_dfs[climate_entity] = (
-                    _strip_tz(climate_df, self._timezone) if not climate_df.empty else climate_df
+                climate_df = climate_fetch(self, climate_entity, climate_path, timezone=self._timezone)
+                self._physics_climate_dfs[climate_entity] = _keep_or_replace(
+                    self._physics_climate_dfs.get(climate_entity), climate_df
                 )
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics room climate %s history fetch failed: %s", climate_entity, exc)
+                _LOGGER.warning("Physics room climate %s %s fetch failed: %s", climate_entity, verb, exc)
 
     def _recalibrate_physics_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
         """AppDaemon service `energy_forecast/recalibrate_physics`: manually trigger a physics
@@ -1786,6 +1805,10 @@ class EnergyForecast(hass.Hass):
                 )
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s recent fetch failed: %s", self._heating_active_entity, exc)
+
+        # ── Physics: keep DHW tank / heating buffer / COP / room-thermostat data
+        # fresh every hourly cycle, independent of the weekly/adaptive retrain ──
+        self._fetch_physics_sensor_histories(recent_only=True)
 
         # ── Heating active projection (setpoint hysteresis) ──────────────────
         heating_active_series = None

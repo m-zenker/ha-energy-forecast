@@ -172,6 +172,126 @@ class TestPhysicsSensorFetch:
         assert dhw_call.kwargs["column_name"] == "buffer_temp"
 
 
+class TestPhysicsSensorRecentFetch:
+    """recent_only=True: the hourly refresh path that keeps physics sensor data fresh
+    between retrains (weekly, or adaptive-retrain-gated), instead of it staying
+    None/empty — from initialize()'s defensive reset — until the next training cycle,
+    which can be up to a week away after any AppDaemon restart."""
+
+    def _configured_app(self, monkeypatch):
+        from energy_forecast import ha_data as hd
+
+        fetch_recent_generic = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "value"]))
+        fetch_recent_climate = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"]))
+        fetch_generic = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "value"]))
+        fetch_climate = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"]))
+        monkeypatch.setattr(hd, "fetch_recent_generic_sensor", fetch_recent_generic)
+        monkeypatch.setattr(hd, "fetch_recent_climate", fetch_recent_climate)
+        monkeypatch.setattr(hd, "fetch_generic_sensor_history", fetch_generic)
+        monkeypatch.setattr(hd, "fetch_climate_history", fetch_climate)
+
+        app = _make_app(
+            {
+                "energy_sensor": "sensor.grid_import",
+                "physics": {
+                    "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
+                    "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
+                    "cop_sensor": "sensor.kermi_cop",
+                    "room_thermostats": [
+                        {
+                            "climate_entity": "climate.living_room",
+                            "temp_sensor": "sensor.netatmo_living_room_temp",
+                            "area_m2": 35,
+                        }
+                    ],
+                },
+            }
+        )
+        app.initialize()
+        return app, fetch_recent_generic, fetch_recent_climate, fetch_generic, fetch_climate
+
+    def test_recent_only_uses_recent_variants_not_full_history(self, monkeypatch):
+        app, fetch_recent_generic, fetch_recent_climate, fetch_generic, fetch_climate = self._configured_app(
+            monkeypatch
+        )
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        assert fetch_recent_generic.call_count == 4  # dhw_tank, heating_buffer, cop, room temp_sensor
+        fetch_recent_climate.assert_called_once()
+        fetch_generic.assert_not_called()
+        fetch_climate.assert_not_called()
+
+    def test_recent_only_populates_attrs_without_any_retrain_having_run(self, monkeypatch):
+        """Reproduces the bug: right after initialize() (simulating a fresh AppDaemon
+        restart), every physics history attribute is None/empty — _retrain() has never
+        run. A single recent_only=True refresh must populate them from HA history
+        directly, without waiting for the next (possibly week-away) retrain."""
+        import pandas as pd
+
+        app, fetch_recent_generic, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+        fetch_recent_generic.return_value = pd.DataFrame({"timestamp": ["2026-07-13 10:00:00"], "value": [27.3]})
+        fetch_recent_climate.return_value = pd.DataFrame(
+            {"timestamp": ["2026-07-13 10:00:00"], "current_temp": [21.0], "setpoint": [20.0]}
+        )
+
+        assert app._physics_heating_buffer_df is None
+        assert app._physics_dhw_tank_df is None
+        assert app._physics_cop_df is None
+        assert app._room_thermostat_temp_dfs == {}
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        assert app._physics_heating_buffer_df is not None and not app._physics_heating_buffer_df.empty
+        assert app._physics_dhw_tank_df is not None and not app._physics_dhw_tank_df.empty
+        assert app._physics_cop_df is not None and not app._physics_cop_df.empty
+        assert not app._room_thermostat_temp_dfs["climate.living_room"].empty
+
+    def test_recent_only_empty_fetch_preserves_existing_value(self, monkeypatch):
+        """A transient failure (empty result) during the hourly refresh must not
+        regress an already-good value — e.g. one just populated by a retrain — back
+        to empty/None."""
+        import pandas as pd
+
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+        good_df = pd.DataFrame({"timestamp": ["2026-07-13 09:00:00"], "heating_buffer_temp": [28.7]})
+        app._physics_heating_buffer_df = good_df
+        fetch_recent_generic.return_value = pd.DataFrame(columns=["timestamp", "value"])  # empty this cycle
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        assert app._physics_heating_buffer_df is good_df  # unchanged, not clobbered by the empty result
+
+    def test_full_history_fetch_still_resets_and_replaces_on_empty(self, monkeypatch):
+        """recent_only=False (retrain path) keeps its original v0.11.7 behaviour: always
+        reset first, and always assign the fetch result even when empty."""
+        import pandas as pd
+
+        app, _, _, fetch_generic, _ = self._configured_app(monkeypatch)
+        app._physics_heating_buffer_df = pd.DataFrame({"timestamp": ["2026-07-06 09:00:00"], "value": [26.0]})
+        fetch_generic.return_value = pd.DataFrame(columns=["timestamp", "value"])  # empty this retrain
+
+        app._fetch_physics_sensor_histories()  # recent_only defaults to False
+
+        assert app._physics_heating_buffer_df.empty
+
+
+class TestUpdateSensorsCallsPhysicsRecentFetch:
+    """_update_sensors() must call _fetch_physics_sensor_histories(recent_only=True)
+    every hourly cycle — the same wiring gap class as the EV cache-path bug
+    (TestEvChargingCachePathAlwaysInvoked in test_energy_forecast.py): source-level
+    verification, since exercising the full _update_sensors() pipeline requires
+    mocking weather/HA history fetches unrelated to this fix."""
+
+    def test_update_sensors_calls_recent_only_refresh(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._update_sensors)
+        assert "self._fetch_physics_sensor_histories(recent_only=True)" in source
+
+
 class TestRetrainCallsPhysicsFetch:
     """Task 2 gap fix: _retrain() must call _fetch_physics_sensor_histories() once per cycle."""
 
