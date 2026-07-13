@@ -8,6 +8,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `README.md` — Phase 2 (`use_physics_residual: true`) is now marked **experimental and not
+  recommended for active use** in three locations: the Stage 5 feature-list bullet, the
+  `physics.use_physics_residual` config-table row, and a new blockquote callout in the Physics-ML
+  Hybrid prose section. All three make explicit that Phase 2 is the same codebase as Phase 1
+  behind a single config flag with no field validation yet — treat it as observation-only until the
+  post-activation 30-day prediction-interval coverage check (see ROADMAP.md) has passed.
+- `apps/energy_forecast/energy_forecast.py` — `_effective_use_physics_residual()` now logs an
+  AppDaemon WARNING on every retrain while Phase 2 is **active** (cold-start gate cleared and
+  `use_physics_residual: true`), complementing the existing WARNING that fires while the gate is
+  still blocking activation. The message identifies the code path as experimental and unvalidated,
+  serving as a standing reminder until the post-activation interval-coverage check passes.
+
 ### Fixed
 - `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb`'s `energy_forecast_scenario_result`
   event never echoed back a caller-supplied `request_id`, even though the service accepts one.

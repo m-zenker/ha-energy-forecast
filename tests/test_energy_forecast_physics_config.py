@@ -379,6 +379,24 @@ class TestRecalibratePhysicsService:
             app._effective_use_physics_residual()
         assert any("cold-start" in r.message.lower() or "cold start" in r.message.lower() for r in caplog.records)
 
+    def test_phase2_activation_logs_experimental_warning_when_gate_clear(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
+        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
+        app.initialize()
+        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
+        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
+        assert app._physics_model.is_cold_start_gated is False
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = app._effective_use_physics_residual()
+
+        assert result is True
+        assert any("experimental" in r.message.lower() and "phase 2" in r.message.lower() for r in caplog.records)
+
 
 class TestPhysicsSensors:
     def test_physics_sensors_published_when_physics_configured(self, monkeypatch):

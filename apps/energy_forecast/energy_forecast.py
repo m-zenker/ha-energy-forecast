@@ -1384,6 +1384,12 @@ class EnergyForecast(hass.Hass):
                 "holding at Phase 1"
             )
             return False
+        if requested:
+            _LOGGER.warning(
+                "use_physics_residual=true: Phase 2 (residual training) is ACTIVE. This is an "
+                "experimental, unvalidated code path — not recommended for production use until "
+                "the post-activation 30-day interval-coverage check has passed."
+            )
         return requested
 
     def _model_phase_attr(self) -> str | None:

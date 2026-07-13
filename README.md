@@ -150,7 +150,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Phase 1 validation diagnostic** — after each retrain, logs whether `physics_kwh` ranks in the SHAP top-5 and whether its OLS calibration slope is near 1.0; informational only, does not affect predictions
 - **On-demand recalibration service** — `energy_forecast/recalibrate_physics` AppDaemon service lets you trigger physics recalibration from **Developer Tools → Services** without a full AppDaemon restart
 - **Model-artifact portability** — if a model was trained with physics features but physics is later disabled or a sensor goes offline, `predict()` fills the missing columns with `0.0` and logs a WARNING; no crashes, no stale data
-- **Phase 2 residual-target training (dormant by default)** — when `use_physics_residual: true` is set, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + ML_residual`; dormant until the cold-start gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27); promotes automatically on the next weekly retrain after the gate clears
+- **Phase 2 residual-target training (dormant by default, experimental)** — ⚠️ **not recommended for active use.** When `use_physics_residual: true` is set, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + ML_residual`; dormant until the cold-start gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27); promotes automatically on the next weekly retrain after the gate clears. This is the same codebase as Phase 1 behind a single config flag — it has no field validation yet. Wait for the post-activation 30-day interval-coverage check (see ROADMAP.md) to pass before relying on it for anything but observation.
 - **Physics-baseline diagnostic sensors** — `sensor.energy_forecast_physics_base_today` and `sensor.energy_forecast_ml_adjustment_today` published whenever `physics:` is configured (Phase 1 and Phase 2); useful for monitoring the physics-vs-ML contribution split before activating Phase 2
 - **`model_phase` attribute** — `"phase1"` or `"phase2"` on `sensor.energy_forecast_today` when physics is configured; lets automations and `ha-energy-manager` detect which training phase is active
 - **Persisted DHW schedule commits** — `energy_forecast/set_dhw_schedule` AppDaemon service (registered only when `physics:` is configured), e.g.:
@@ -480,7 +480,7 @@ energy_forecast:
 | `physics.internal_gains_fraction` | No | `0.8` | Fraction of rated heater power treated as internal thermal gains. |
 | `physics.heating_curve_points` | No | `[[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]]` | List of `[outdoor_temp_°C, flow_temp_°C]` pairs defining the heating curve. |
 | `physics.room_thermostats` | No | `[]` | List of `{climate_entity, temp_sensor, area_m2}` dicts — a dedicated, more accurate sensor per room used for training-time UA_eff calibration accuracy (separate from, and complementary to, the existing `climate_entities`/`climate_room_areas`). Entries missing `climate_entity` or `temp_sensor` are skipped with a WARNING; `area_m2` defaults to `20.0`. |
-| `physics.use_physics_residual` | No | `false` | Phase 2 flag. When `true`, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + lgbm_residual`. Remains inactive until the cold-start gate clears (≥ 30 winter UA_eff calibration windows; not expected before winter 2026/27). No config change needed when the gate clears — the next weekly retrain will promote automatically. |
+| `physics.use_physics_residual` | No | `false` | Phase 2 flag. **⚠️ Experimental — not recommended for active use.** When `true`, LightGBM trains on `gross_kwh − physics_kwh` and predictions are reconstructed as `physics_kwh + lgbm_residual`. Remains inactive until the cold-start gate clears (≥ 30 winter UA_eff calibration windows; not expected before winter 2026/27). No config change needed when the gate clears — the next weekly retrain will promote automatically, and an AppDaemon WARNING is logged on every retrain while active. Unvalidated in production until the post-activation 30-day interval-coverage check passes. |
 
 **`sub_energy_sensors` — dict form with `program_sensor`:**
 
@@ -999,6 +999,14 @@ pipeline as optional additive input features. The physics model covers DHW sched
 heating-curve calibration, open-window anomaly detection, and zone-boundary consistency checking.
 Phase 1 exposes its outputs as two new LightGBM features without changing the training target or
 model architecture.
+
+> **⚠️ Phase 2 (`use_physics_residual: true`) is experimental and not recommended for active use.**
+> It is the same codebase as Phase 1 behind a single config flag, not a separately released feature
+> — flipping the flag has no field validation behind it yet. It stays inactive until the cold-start
+> gate clears (≥ 30 winter UA_eff calibration windows, not expected before winter 2026/27), and even
+> once it does activate automatically, treat it as observation-only until the post-activation 30-day
+> prediction-interval coverage check (see ROADMAP.md) has passed. An AppDaemon WARNING is logged on
+> every retrain while Phase 2 is active, as a standing reminder.
 
 **Enabling vs disabling:** Omitting the `physics:` block entirely is byte-identical to prior
 versions — no new code path is entered, no sensors change, no log messages appear. Adding even an
