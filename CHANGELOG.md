@@ -26,6 +26,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serving as a standing reminder until the post-activation interval-coverage check passes.
 
 ### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` only ever ran
+  once per training cycle (weekly, or gated behind adaptive-retrain's 24h cooldown + MAE
+  threshold), so DHW tank / heating buffer / COP / room-thermostat data populated by
+  `initialize()`'s defensive reset (`None`/`{}`) stayed that way for up to a week after any
+  AppDaemon restart. Every hourly predict cycle during that gap hit the model-artifact
+  portability fallback and silently filled the corresponding feature with a constant `0.0`,
+  drifting predictions off the distribution the model was actually trained on. Added a
+  `recent_only: bool = False` parameter — mirroring the existing `dhw_buffer_sensor`/
+  `climate_entities` hourly-refresh pattern — and wired `_update_sensors()` to call
+  `_fetch_physics_sensor_histories(recent_only=True)` every hourly cycle using the lighter
+  `fetch_recent_generic_sensor`/`fetch_recent_climate` helpers. A failed or empty recent fetch
+  now leaves the attribute unchanged for that cycle rather than clobbering an already-good value
+  from a prior retrain; the full `recent_only=False` retrain path is unchanged and still always
+  resets first and replaces on empty.
 - `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb`'s `energy_forecast_scenario_result`
   event never echoed back a caller-supplied `request_id`, even though the service accepts one.
   Callers with more than one `get_scenario` request potentially in flight at once (e.g.
@@ -170,10 +184,11 @@ publicly released) `0.11.8` heading below, which predates `dev`'s actual `v0.11.
   change is needed when the gate clears; the next scheduled weekly retrain promotes automatically.
 
 ### Tests
-- 817 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
+- 861 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
   threading, train/predict wiring, portability fallbacks, open-window down-weighting, the Phase 1
   validation diagnostic, the `recalibrate_physics` service, Phase 2 residual-target training +
-  reconstruction, and the DHW scenario/commit API).
+  reconstruction, the DHW scenario/commit API, and the hourly physics-sensor refresh fix
+  (`TestPhysicsSensorRecentFetch`, `TestUpdateSensorsCallsPhysicsRecentFetch`)).
 
 ## [0.11.8] - 2026-07-07
 
