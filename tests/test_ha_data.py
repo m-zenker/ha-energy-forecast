@@ -124,6 +124,40 @@ class TestClimateAndGenericHistory:
         assert df.iloc[0]["buffer_temp"] == 54.5
         assert cache_file.exists()
 
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_recent_generic_sensor_warns_by_default_on_empty(self, mock_fetch, mock_app, tmp_path, caplog):
+        """No cache, no HA data: defaults to a WARNING (unchanged prior behaviour)."""
+        mock_fetch.return_value = pd.DataFrame(columns=["timestamp", "value"])
+        cache_file = tmp_path / "empty_sensor.csv"
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            df = ha_data.fetch_recent_generic_sensor(mock_app, "sensor.kermi_cop", cache_file, column_name="cop")
+
+        assert df.empty
+        assert any("No recent data for sensor sensor.kermi_cop" in r.message for r in caplog.records)
+        assert all(r.levelno == logging.WARNING for r in caplog.records if "No recent data" in r.message)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_recent_generic_sensor_quiet_if_empty_logs_debug_not_warning(
+        self, mock_fetch, mock_app, tmp_path, caplog
+    ):
+        """quiet_if_empty=True: same empty result, but logged at DEBUG — for sensors with
+        a known, expected idle period (e.g. a heat pump's live COP sensor, only reporting
+        while actively heating) so an hourly empty result doesn't read as an error."""
+        mock_fetch.return_value = pd.DataFrame(columns=["timestamp", "value"])
+        cache_file = tmp_path / "empty_sensor.csv"
+
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
+            df = ha_data.fetch_recent_generic_sensor(
+                mock_app, "sensor.kermi_cop", cache_file, column_name="cop", quiet_if_empty=True
+            )
+
+        assert df.empty
+        no_data_records = [r for r in caplog.records if "No recent data for sensor sensor.kermi_cop" in r.message]
+        assert no_data_records, "expected the message to still be logged, just at DEBUG"
+        assert all(r.levelno == logging.DEBUG for r in no_data_records)
+        assert not any(r.levelno == logging.WARNING for r in no_data_records)
+
     def test_fetch_history_boolean_states(self, mock_app):
         """_fetch_history maps 'on'→1.0 and 'off'→0.0 for input_boolean entities."""
         states = [

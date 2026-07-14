@@ -758,8 +758,15 @@ def fetch_recent_generic_sensor(
     cache_path: Path,
     column_name: str = "value",
     timezone: str = "Europe/Zurich",
+    quiet_if_empty: bool = False,
 ) -> pd.DataFrame:
-    """Lightweight update for generic absolute sensor hourly refreshes."""
+    """Lightweight update for generic absolute sensor hourly refreshes.
+
+    `quiet_if_empty` logs the "no recent data" case at DEBUG instead of WARNING —
+    for sensors with a known, expected idle period (e.g. a heat pump's live COP
+    sensor, which only reports while actively heating) an empty result every hour
+    is normal, not something to page-noise on.
+    """
     import pandas as pd
 
     df_cache = pd.DataFrame(columns=["timestamp", column_name])
@@ -776,7 +783,8 @@ def fetch_recent_generic_sensor(
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        _LOGGER.warning(f"No recent data for sensor {entity_id}.")
+        log = _LOGGER.debug if quiet_if_empty else _LOGGER.warning
+        log(f"No recent data for sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
