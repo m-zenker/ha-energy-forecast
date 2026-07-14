@@ -26,6 +26,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serving as a standing reminder until the post-activation interval-coverage check passes.
 
 ### Fixed
+- `apps/energy_forecast/ha_data.py` — `fetch_recent_generic_sensor()` gained a `quiet_if_empty`
+  parameter (default `False`, unchanged behaviour), and `_fetch_physics_sensor_histories()` now
+  passes it for `cop_sensor`'s hourly `recent_only` fetch only. A heat pump's live COP sensor only
+  reports while actively heating, so "no recent data" is an expected, seasonal condition (e.g. all
+  summer) rather than an error — a side effect of the hourly-refresh fix below, which made that
+  fetch run every cycle instead of only at retrain. Logged at DEBUG instead of WARNING for that one
+  call site; the other three physics sensors and the weekly full-history fetch are unaffected and
+  keep their normal WARNING.
 - `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` only ever ran
   once per training cycle (weekly, or gated behind adaptive-retrain's 24h cooldown + MAE
   threshold), so DHW tank / heating buffer / COP / room-thermostat data populated by
@@ -184,11 +192,12 @@ publicly released) `0.11.8` heading below, which predates `dev`'s actual `v0.11.
   change is needed when the gate clears; the next scheduled weekly retrain promotes automatically.
 
 ### Tests
-- 861 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
+- 865 passing (up from 649 in v0.11.7; new tests cover physics config ingest, sensor fetch, feature
   threading, train/predict wiring, portability fallbacks, open-window down-weighting, the Phase 1
   validation diagnostic, the `recalibrate_physics` service, Phase 2 residual-target training +
-  reconstruction, the DHW scenario/commit API, and the hourly physics-sensor refresh fix
-  (`TestPhysicsSensorRecentFetch`, `TestUpdateSensorsCallsPhysicsRecentFetch`)).
+  reconstruction, the DHW scenario/commit API, the hourly physics-sensor refresh fix
+  (`TestPhysicsSensorRecentFetch`, `TestUpdateSensorsCallsPhysicsRecentFetch`), and the cop_sensor
+  quiet-if-empty fix).
 
 ## [0.11.8] - 2026-07-07
 
