@@ -275,6 +275,33 @@ class TestPhysicsSensorRecentFetch:
 
         assert app._physics_heating_buffer_df.empty
 
+    def test_recent_only_quiets_only_cop_sensor_no_data_warning(self, monkeypatch):
+        """A heat pump's live COP sensor only reports while actively heating — an empty
+        hourly recent-fetch is expected (not an error) for long idle stretches (e.g. all
+        summer), so only its recent_only fetch should pass quiet_if_empty=True. The other
+        three physics sensors (heating_buffer_temp, dhw_tank, room-thermostat temp) have
+        no such seasonal excuse and must keep the default (noisy-on-empty) behaviour."""
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        calls_by_entity = {call.args[1]: call for call in fetch_recent_generic.call_args_list}
+        assert calls_by_entity["sensor.kermi_cop"].kwargs.get("quiet_if_empty") is True
+        assert calls_by_entity["sensor.kermi_dhw_buffer_temp"].kwargs.get("quiet_if_empty") is not True
+        assert calls_by_entity["sensor.kermi_heating_buffer"].kwargs.get("quiet_if_empty") is not True
+        assert calls_by_entity["sensor.netatmo_living_room_temp"].kwargs.get("quiet_if_empty") is not True
+
+    def test_full_history_fetch_never_quiets_cop_sensor(self, monkeypatch):
+        """recent_only=False (retrain path): cop_sensor's weekly full-history fetch keeps
+        its normal WARNING — only the hourly recent fetch is quieted, since the weekly
+        fetch isn't the one that got noisy from this fix."""
+        app, _, _, fetch_generic, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories()  # recent_only defaults to False
+
+        cop_call = next(call for call in fetch_generic.call_args_list if call.args[1] == "sensor.kermi_cop")
+        assert "quiet_if_empty" not in cop_call.kwargs
+
 
 class TestUpdateSensorsCallsPhysicsRecentFetch:
     """_update_sensors() must call _fetch_physics_sensor_histories(recent_only=True)

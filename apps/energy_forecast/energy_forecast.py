@@ -1312,7 +1312,12 @@ class EnergyForecast(hass.Hass):
             entity_id = cfg["cop_sensor"]
             path = self._generic_sensor_cache_path(entity_id, prefix="physics_cop")
             try:
-                df = generic_fetch(self, entity_id, path, column_name="cop", timezone=self._timezone)
+                # A heat pump's live COP sensor only reports while actively heating —
+                # "no recent data" is expected (not an error) for long idle stretches
+                # (e.g. all summer), so only the hourly recent_only fetch is quieted;
+                # the full-history retrain-time fetch keeps its normal WARNING.
+                extra_kwargs = {"quiet_if_empty": True} if recent_only else {}
+                df = generic_fetch(self, entity_id, path, column_name="cop", timezone=self._timezone, **extra_kwargs)
                 self._physics_cop_df = _keep_or_replace(self._physics_cop_df, df)
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Physics COP %s %s fetch failed: %s", entity_id, verb, exc)
