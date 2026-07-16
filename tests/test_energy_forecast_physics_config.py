@@ -318,6 +318,41 @@ class TestPhysicsSensorRecentFetch:
         assert "sensor.netatmo_living_room_temp" not in fetched_entities
         assert not (tmp_path / "physics_temp_0_sensor.netatmo_living_room_temp.csv").exists()
 
+    def test_climate_dfs_kwarg_reuses_already_fetched_data_for_room_thermostat(self, monkeypatch):
+        """#89: when the caller (_retrain()/_update_sensors()) already fetched the room's
+        climate_entity this cycle, physics must reuse that DataFrame instead of an
+        independent second HA history fetch of the same entity."""
+        import pandas as pd
+
+        app, _, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+        already_fetched = pd.DataFrame(
+            {"timestamp": ["2026-07-16 08:00:00"], "current_temp": [19.5], "setpoint": [21.0]}
+        )
+
+        app._fetch_physics_sensor_histories(recent_only=True, climate_dfs={"climate.living_room": already_fetched})
+
+        fetch_recent_climate.assert_not_called()
+        assert app._physics_climate_dfs["climate.living_room"]["current_temp"].iloc[0] == 19.5
+
+    def test_climate_dfs_kwarg_falls_back_to_independent_fetch_when_entity_not_present(self, monkeypatch):
+        """A room_thermostats[].climate_entity that ISN'T among the caller's already-fetched
+        climate_dfs keys (e.g. genuinely physics-only room in some other install) must still
+        get its own independent fetch — the reuse path is opportunistic, not a hard cutover."""
+        app, _, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories(recent_only=True, climate_dfs={"climate.some_other_room": None})
+
+        fetch_recent_climate.assert_called_once()
+
+    def test_climate_dfs_kwarg_omitted_keeps_old_independent_fetch_behavior(self, monkeypatch):
+        """Callers that don't pass climate_dfs (e.g. _recalibrate_physics_cb's on-demand
+        service, or this test) must be unaffected — full backward compatibility."""
+        app, _, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        fetch_recent_climate.assert_called_once()
+
 
 class TestUpdateSensorsCallsPhysicsRecentFetch:
     """_update_sensors() must call _fetch_physics_sensor_histories(recent_only=True)
