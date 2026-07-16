@@ -2373,6 +2373,93 @@ class TestTargetCorrection:
         assert df["gross_kwh"].tolist() == pytest.approx([2.0] * 10)
 
 
+# ── _fetch_correction_dfs ───────────────────────────────────────────────────
+
+
+class TestFetchCorrectionDfs:
+    """Tests for _fetch_correction_dfs — shared correction-sensor fetch logic
+    used by both _retrain() (full 30-day history) and _update_sensors()
+    (lightweight 2-day recent fetch), extracted so the two call sites can't
+    drift out of sync (found 2026-07-16: _update_sensors() never got this
+    correction wired in at all — see TestUpdateSensorsAppliesTargetCorrection).
+    """
+
+    def test_fetches_all_four_when_configured(self, tmp_path):
+        from energy_forecast.energy_forecast import _fetch_correction_dfs
+
+        calls = []
+
+        def fake_fetch(app, entity_id, cache_path, timezone):
+            calls.append((entity_id, cache_path, timezone))
+            return _make_corr_df(pd.date_range("2026-06-01", periods=3, freq="1h"), [1.0, 2.0, 3.0])
+
+        result = _fetch_correction_dfs(
+            app="fake-app",
+            solar_sensor="sensor.solar",
+            grid_export_sensor="sensor.export",
+            battery_charge_sensor="sensor.charge",
+            battery_discharge_sensor="sensor.discharge",
+            cache_dir=tmp_path,
+            timezone="Europe/Zurich",
+            fetch_fn=fake_fetch,
+        )
+
+        assert set(result.keys()) == {
+            "solar_production.csv",
+            "grid_export.csv",
+            "battery_charge.csv",
+            "battery_discharge.csv",
+        }
+        assert all(df is not None for df in result.values())
+        assert len(calls) == 4
+        entities = {c[0] for c in calls}
+        assert entities == {"sensor.solar", "sensor.export", "sensor.charge", "sensor.discharge"}
+        for _, cache_path, timezone in calls:
+            assert isinstance(cache_path, Path)
+            assert cache_path.parent == tmp_path
+            assert timezone == "Europe/Zurich"
+
+    def test_returns_none_for_unconfigured_sensors(self, tmp_path):
+        from energy_forecast.energy_forecast import _fetch_correction_dfs
+
+        result = _fetch_correction_dfs(
+            app="fake-app",
+            solar_sensor="sensor.solar",
+            grid_export_sensor=None,
+            battery_charge_sensor=None,
+            battery_discharge_sensor=None,
+            cache_dir=tmp_path,
+            timezone="Europe/Zurich",
+            fetch_fn=lambda *a, **k: _make_corr_df(pd.date_range("2026-06-01", periods=1, freq="1h"), [1.0]),
+        )
+        assert result["solar_production.csv"] is not None
+        assert result["grid_export.csv"] is None
+        assert result["battery_charge.csv"] is None
+        assert result["battery_discharge.csv"] is None
+
+    def test_fetch_failure_returns_none_and_does_not_raise(self, tmp_path, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import _fetch_correction_dfs
+
+        def failing_fetch(app, entity_id, cache_path, timezone):
+            raise OSError("HA unreachable")
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = _fetch_correction_dfs(
+                app="fake-app",
+                solar_sensor="sensor.solar",
+                grid_export_sensor=None,
+                battery_charge_sensor=None,
+                battery_discharge_sensor=None,
+                cache_dir=tmp_path,
+                timezone="Europe/Zurich",
+                fetch_fn=failing_fetch,
+            )
+        assert result["solar_production.csv"] is None
+        assert any("solar_production.csv" in r.message for r in caplog.records)
+
+
 # ── Prediction history persistence ────────────────────────────────────────────
 
 

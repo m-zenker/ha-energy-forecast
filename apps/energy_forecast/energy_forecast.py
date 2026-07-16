@@ -1518,24 +1518,16 @@ class EnergyForecast(hass.Hass):
         # ── Solar / grid-export / battery target correction ───────────────────
         # Corrects gross_kwh (grid import) to total household consumption.
         # Each sensor is optional; any combination is valid.
-        _correction_specs = [
-            (self._solar_sensor, "solar_production.csv"),
-            (self._grid_export_sensor, "grid_export.csv"),
-            (self._battery_charge_sensor, "battery_charge.csv"),
-            (self._battery_discharge_sensor, "battery_discharge.csv"),
-        ]
-        correction_dfs: dict[str, Any] = {}
-        for sensor, cache_name in _correction_specs:
-            if sensor:
-                cache = self._cache_path.parent / cache_name
-                try:
-                    cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache, timezone=self._timezone)
-                    correction_dfs[cache_name] = _strip_tz(cdf, self._timezone)
-                except (OSError, KeyError, ValueError) as exc:
-                    _LOGGER.warning("Target correction fetch failed (%s): %s", cache_name, exc)
-                    correction_dfs[cache_name] = None
-            else:
-                correction_dfs[cache_name] = None
+        correction_dfs = _fetch_correction_dfs(
+            self,
+            self._solar_sensor,
+            self._grid_export_sensor,
+            self._battery_charge_sensor,
+            self._battery_discharge_sensor,
+            self._cache_path.parent,
+            self._timezone,
+            ha_data.fetch_sub_sensor_history,
+        )
 
         if any(v is not None for v in correction_dfs.values()):
             baseline_df = _apply_target_correction(
@@ -2994,6 +2986,49 @@ def _apply_target_correction(
 
     df["gross_kwh"] = (df["gross_kwh"] + delta.values).clip(lower=0.0)
     return df
+
+
+def _fetch_correction_dfs(
+    app: Any,
+    solar_sensor: str | None,
+    grid_export_sensor: str | None,
+    battery_charge_sensor: str | None,
+    battery_discharge_sensor: str | None,
+    cache_dir: Path,
+    timezone: str,
+    fetch_fn: Any,
+) -> dict[str, Any]:
+    """Fetch the four optional solar/battery correction sensors via fetch_fn.
+
+    fetch_fn is ha_data.fetch_sub_sensor_history (full 30-day history, for
+    _retrain) or ha_data.fetch_recent_sub_sensor (lightweight 2-day, for
+    _update_sensors) — both accept (app, entity_id, cache_path, timezone=...).
+    Shared between both call sites so they can't drift out of sync on which
+    correction sensors are fetched or which cache files they use.
+
+    Returns a dict keyed by cache filename -> DataFrame|None, ready to pass
+    into _apply_target_correction's solar_df/grid_export_df/battery_charge_df/
+    battery_discharge_df kwargs.
+    """
+    _correction_specs = [
+        (solar_sensor, "solar_production.csv"),
+        (grid_export_sensor, "grid_export.csv"),
+        (battery_charge_sensor, "battery_charge.csv"),
+        (battery_discharge_sensor, "battery_discharge.csv"),
+    ]
+    correction_dfs: dict[str, Any] = {}
+    for sensor, cache_name in _correction_specs:
+        if sensor:
+            cache = cache_dir / cache_name
+            try:
+                cdf = fetch_fn(app, sensor, cache, timezone=timezone)
+                correction_dfs[cache_name] = _strip_tz(cdf, timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Target correction fetch failed (%s): %s", cache_name, exc)
+                correction_dfs[cache_name] = None
+        else:
+            correction_dfs[cache_name] = None
+    return correction_dfs
 
 
 def _subtract_sub_sensors(
