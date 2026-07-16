@@ -353,6 +353,17 @@ class TestPhysicsSensorRecentFetch:
 
         fetch_recent_climate.assert_called_once()
 
+    def test_climate_dfs_kwarg_reuse_failure_does_not_abort_the_cycle(self, monkeypatch):
+        """The reuse branch must match the function's stated resilience contract
+        (docstring: 'a failed... fetch never regresses an already-good value') —
+        a malformed climate_dfs entry must not raise and abort the whole call."""
+        app, _, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories(recent_only=True, climate_dfs={"climate.living_room": None})  # malformed
+
+        # must not raise; must not have fallen through to the independent fetch either
+        fetch_recent_climate.assert_not_called()
+
 
 class TestUpdateSensorsCallsPhysicsRecentFetch:
     """_update_sensors() must call _fetch_physics_sensor_histories(recent_only=True)

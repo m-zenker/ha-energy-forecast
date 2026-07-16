@@ -1248,7 +1248,7 @@ class EnergyForecast(hass.Hass):
     # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
 
     def _fetch_physics_sensor_histories(
-        self, recent_only: bool = False, climate_dfs: dict[str, Any] | None = None, dhw_df: Any = None
+        self, recent_only: bool = False, climate_dfs: dict[str, Any] | None = None
     ) -> None:
         """Fetch (or, hourly, lightly refresh) the additional sensor histories the
         physics model needs.
@@ -1271,12 +1271,12 @@ class EnergyForecast(hass.Hass):
         on. A failed or empty recent fetch never regresses an already-good value —
         it just leaves the attribute unchanged for this cycle.
 
-        `climate_dfs`/`dhw_df`: the caller's already-fetched data for this cycle
-        (`_retrain()`'s `climate_dfs`/`dhw_df` locals, or `_update_sensors()`'s
-        `climate_recent`/`dhw_recent`). When the physics-configured entity is the same
-        HA entity already fetched there, reuse it instead of a second independent HA
-        history fetch + on-disk cache file (#89). Omit (or pass an entity not present)
-        to fall back to the original independent-fetch behavior — used by
+        `climate_dfs`: the caller's already-fetched climate data for this cycle
+        (`_retrain()`'s `climate_dfs` local, or `_update_sensors()`'s
+        `climate_recent`). When a room_thermostats[].climate_entity is a key in
+        this dict, reuse it instead of a second independent HA history fetch +
+        on-disk cache file (#89). Omit (or pass a dict missing the entity) to
+        fall back to the original independent-fetch behavior — used by
         `_recalibrate_physics_cb`'s on-demand service call, which has no such
         already-fetched data available.
         """
@@ -1334,9 +1334,12 @@ class EnergyForecast(hass.Hass):
         for rt in self._room_thermostats:
             climate_entity = rt["climate_entity"]
             if climate_dfs is not None and climate_entity in climate_dfs:
-                self._physics_climate_dfs[climate_entity] = _keep_or_replace(
-                    self._physics_climate_dfs.get(climate_entity), climate_dfs[climate_entity]
-                )
+                try:
+                    self._physics_climate_dfs[climate_entity] = _keep_or_replace(
+                        self._physics_climate_dfs.get(climate_entity), climate_dfs[climate_entity]
+                    )
+                except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
+                    _LOGGER.warning("Physics room climate %s reuse failed: %s", climate_entity, exc)
                 continue
             climate_path = self._climate_cache_path(climate_entity)
             try:
