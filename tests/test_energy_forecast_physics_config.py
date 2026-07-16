@@ -425,7 +425,23 @@ class TestUpdateSensorsCallsPhysicsRecentFetch:
         from energy_forecast.energy_forecast import EnergyForecast
 
         source = inspect.getsource(EnergyForecast._update_sensors)
-        assert "self._fetch_physics_sensor_histories(recent_only=True)" in source
+        assert "recent_only=True" in source
+        assert "self._fetch_physics_sensor_histories" in source
+
+
+class TestUpdateSensorsPassesRecentDataToPhysicsFetch:
+    """#89: _update_sensors() already fetches climate_recent/dhw_recent for the ML
+    pipeline (energy_forecast.py ~1780-1799) before calling
+    _fetch_physics_sensor_histories(recent_only=True) — it must hand that data in too."""
+
+    def test_update_sensors_passes_climate_recent_and_dhw_recent(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._update_sensors)
+        assert "climate_dfs=climate_recent" in source
+        assert "dhw_df=dhw_recent" in source
 
 
 class TestRetrainCallsPhysicsFetch:
@@ -491,6 +507,28 @@ class TestRetrainCallsPhysicsFetch:
         assert app._physics_dhw_tank_df is None
         assert app._physics_heating_buffer_df is None
         assert app._physics_cop_df is None
+
+    def test_retrain_passes_its_climate_dfs_and_dhw_df_to_physics_fetch(self, monkeypatch):
+        """#89: _retrain() already fetches climate_dfs/dhw_df for the ML pipeline
+        (energy_forecast.py ~1607-1627) — it must hand that data to
+        _fetch_physics_sensor_histories() rather than let physics re-fetch it."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_retrain_deps(monkeypatch)
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        assert app._physics_model is not None
+
+        app._ml_model = MagicMock()
+        app._fetch_physics_sensor_histories = MagicMock()
+        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
+
+        app._retrain()
+
+        call_kwargs = app._fetch_physics_sensor_histories.call_args.kwargs
+        assert "climate_dfs" in call_kwargs
+        assert "dhw_df" in call_kwargs
 
 
 class TestRetrainWiresUsePhysicsResidual:

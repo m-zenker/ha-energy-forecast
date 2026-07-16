@@ -1667,7 +1667,7 @@ class EnergyForecast(hass.Hass):
         self._cached_weather_df = weather_df
 
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
-        self._fetch_physics_sensor_histories()
+        self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
 
         self._ml_model.train(
             baseline_df,
@@ -1830,7 +1830,7 @@ class EnergyForecast(hass.Hass):
 
         # ── Physics: keep DHW tank / heating buffer / COP / room-thermostat data
         # fresh every hourly cycle, independent of the weekly/adaptive retrain ──
-        self._fetch_physics_sensor_histories(recent_only=True)
+        self._fetch_physics_sensor_histories(recent_only=True, climate_dfs=climate_recent, dhw_df=dhw_recent)
 
         # ── Heating active projection (setpoint hysteresis) ──────────────────
         heating_active_series = None
