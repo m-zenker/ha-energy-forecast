@@ -1248,7 +1248,7 @@ class EnergyForecast(hass.Hass):
     # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
 
     def _fetch_physics_sensor_histories(
-        self, recent_only: bool = False, climate_dfs: dict[str, Any] | None = None
+        self, recent_only: bool = False, climate_dfs: dict[str, Any] | None = None, dhw_df: Any = None
     ) -> None:
         """Fetch (or, hourly, lightly refresh) the additional sensor histories the
         physics model needs.
@@ -1279,6 +1279,12 @@ class EnergyForecast(hass.Hass):
         fall back to the original independent-fetch behavior — used by
         `_recalibrate_physics_cb`'s on-demand service call, which has no such
         already-fetched data available.
+
+        `dhw_df`: the caller's already-fetched DHW DataFrame (`_retrain()`'s `dhw_df`
+        local, or `_update_sensors()`'s `dhw_recent`). When `physics.dhw_tank_temp_sensor`
+        equals `self._dhw_buffer_sensor` (the same entity), reuse it instead of a second
+        independent HA history fetch + on-disk cache file (#89). Falls back to independent
+        fetch otherwise, or when omitted (e.g. `_recalibrate_physics_cb`'s on-demand call).
         """
         if not recent_only:
             self._physics_dhw_tank_df: Any = None
@@ -1301,12 +1307,18 @@ class EnergyForecast(hass.Hass):
 
         if cfg.get("dhw_tank_temp_sensor"):
             entity_id = cfg["dhw_tank_temp_sensor"]
-            path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
-            try:
-                df = generic_fetch(self, entity_id, path, column_name="buffer_temp", timezone=self._timezone)
-                self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, df)
-            except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics DHW tank %s %s fetch failed: %s", entity_id, verb, exc)
+            if dhw_df is not None and entity_id == self._dhw_buffer_sensor:
+                try:
+                    self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, dhw_df)
+                except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
+                    _LOGGER.warning("Physics DHW tank %s reuse failed: %s", entity_id, exc)
+            else:
+                path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
+                try:
+                    df = generic_fetch(self, entity_id, path, column_name="buffer_temp", timezone=self._timezone)
+                    self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, df)
+                except (OSError, KeyError, ValueError) as exc:
+                    _LOGGER.warning("Physics DHW tank %s %s fetch failed: %s", entity_id, verb, exc)
 
         if cfg.get("heating_buffer_temp_sensor"):
             entity_id = cfg["heating_buffer_temp_sensor"]

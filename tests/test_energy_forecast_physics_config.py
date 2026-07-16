@@ -364,6 +364,53 @@ class TestPhysicsSensorRecentFetch:
         # must not raise; must not have fallen through to the independent fetch either
         fetch_recent_climate.assert_not_called()
 
+    def test_dhw_df_kwarg_reuses_already_fetched_data_when_entity_matches(self, monkeypatch):
+        """#89: when physics.dhw_tank_temp_sensor == the top-level dhw_buffer_sensor (the
+        same entity, e.g. sensor.em_kermi_bridge_kermi_hot_water_temperature on the live
+        instance), physics must reuse the ML pipeline's already-fetched DHW DataFrame
+        instead of an independent second HA history fetch of the same entity."""
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+        app._dhw_buffer_sensor = "sensor.kermi_dhw_buffer_temp"  # matches physics.dhw_tank_temp_sensor in fixture
+        already_fetched = pd.DataFrame({"timestamp": ["2026-07-16 08:00:00"], "buffer_temp": [52.3]})
+
+        app._fetch_physics_sensor_histories(recent_only=True, dhw_df=already_fetched)
+
+        dhw_calls = [c for c in fetch_recent_generic.call_args_list if c.args[1] == "sensor.kermi_dhw_buffer_temp"]
+        assert dhw_calls == []
+        assert app._physics_dhw_tank_df["buffer_temp"].iloc[0] == 52.3
+
+    def test_dhw_df_kwarg_falls_back_when_entity_differs(self, monkeypatch):
+        """physics.dhw_tank_temp_sensor pointed at a genuinely different entity than
+        dhw_buffer_sensor must keep its own independent fetch — reuse is opportunistic,
+        gated on entity equality, never assumed."""
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+        app._dhw_buffer_sensor = "sensor.some_other_dhw_sensor"  # does NOT match fixture's dhw_tank_temp_sensor
+
+        app._fetch_physics_sensor_histories(recent_only=True, dhw_df=None)
+
+        dhw_calls = [c for c in fetch_recent_generic.call_args_list if c.args[1] == "sensor.kermi_dhw_buffer_temp"]
+        assert len(dhw_calls) == 1
+
+    def test_dhw_df_kwarg_omitted_keeps_old_independent_fetch_behavior(self, monkeypatch):
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        dhw_calls = [c for c in fetch_recent_generic.call_args_list if c.args[1] == "sensor.kermi_dhw_buffer_temp"]
+        assert len(dhw_calls) == 1
+
+    def test_dhw_df_kwarg_reuse_failure_does_not_abort_the_cycle(self, monkeypatch):
+        """The reuse branch must match the function's stated resilience contract —
+        a malformed dhw_df must not raise and abort the whole call."""
+        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
+        app._dhw_buffer_sensor = "sensor.kermi_dhw_buffer_temp"  # matches physics.dhw_tank_temp_sensor in fixture
+
+        app._fetch_physics_sensor_histories(recent_only=True, dhw_df={"not": "a dataframe"})  # malformed
+
+        # must not raise; must not have fallen through to the independent fetch either
+        dhw_calls = [c for c in fetch_recent_generic.call_args_list if c.args[1] == "sensor.kermi_dhw_buffer_temp"]
+        assert dhw_calls == []
+
 
 class TestUpdateSensorsCallsPhysicsRecentFetch:
     """_update_sensors() must call _fetch_physics_sensor_histories(recent_only=True)
