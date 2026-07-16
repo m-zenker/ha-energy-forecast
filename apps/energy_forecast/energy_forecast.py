@@ -1310,6 +1310,8 @@ class EnergyForecast(hass.Hass):
             if dhw_df is not None and entity_id == self._dhw_buffer_sensor:
                 try:
                     self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, dhw_df)
+                # Broader except than the fetch path below: reused data is arbitrary
+                # caller-supplied input (could be None/malformed), not a guaranteed DataFrame.
                 except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
                     _LOGGER.warning("Physics DHW tank %s reuse failed: %s", entity_id, exc)
             else:
@@ -1350,6 +1352,8 @@ class EnergyForecast(hass.Hass):
                     self._physics_climate_dfs[climate_entity] = _keep_or_replace(
                         self._physics_climate_dfs.get(climate_entity), climate_dfs[climate_entity]
                     )
+                # Broader except than the fetch path below: reused data is arbitrary
+                # caller-supplied input (could be None/malformed), not a guaranteed DataFrame.
                 except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
                     _LOGGER.warning("Physics room climate %s reuse failed: %s", climate_entity, exc)
                 continue
