@@ -1372,6 +1372,40 @@ class EnergyForecast(hass.Hass):
             full_actuals = None
             ev_detected = None
 
+        # ── Solar / grid-export / battery target correction ───────────────────
+        # Mirrors _retrain()'s correction so recent_actuals (lag features) and
+        # full_actuals (-> _actuals_history -> anomaly detector + MAE sensors)
+        # use the same "true household consumption" definition the model was
+        # trained on, instead of raw grid import (found 2026-07-16: battery
+        # charging inflated raw grid import, causing false anomaly alerts and
+        # forecasts that chased battery-charging draw as rising consumption).
+        if full_actuals is not None and not full_actuals.empty:
+            correction_dfs = _fetch_correction_dfs(
+                self,
+                self._solar_sensor,
+                self._grid_export_sensor,
+                self._battery_charge_sensor,
+                self._battery_discharge_sensor,
+                self._cache_path.parent,
+                self._timezone,
+                ha_data.fetch_recent_sub_sensor,
+            )
+            if any(v is not None for v in correction_dfs.values()):
+                recent_actuals = _apply_target_correction(
+                    recent_actuals,
+                    solar_df=correction_dfs["solar_production.csv"],
+                    grid_export_df=correction_dfs["grid_export.csv"],
+                    battery_charge_df=correction_dfs["battery_charge.csv"],
+                    battery_discharge_df=correction_dfs["battery_discharge.csv"],
+                )
+                full_actuals = _apply_target_correction(
+                    full_actuals,
+                    solar_df=correction_dfs["solar_production.csv"],
+                    grid_export_df=correction_dfs["grid_export.csv"],
+                    battery_charge_df=correction_dfs["battery_charge.csv"],
+                    battery_discharge_df=correction_dfs["battery_discharge.csv"],
+                )
+
         ev_hour_set: set = set()
         if ev_detected is not None and not ev_detected.empty:
             ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))

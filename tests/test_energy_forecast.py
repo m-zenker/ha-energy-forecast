@@ -3347,6 +3347,62 @@ class TestEvChargingCachePathAlwaysInvoked:
                 )
 
 
+class TestUpdateSensorsAppliesTargetCorrection:
+    """Regression test (found 2026-07-16, first day of live SolarEdge hardware):
+    solar/grid-export/battery target correction was only ever wired into
+    _retrain()'s training path, never into _update_sensors()'s live
+    recent_actuals/full_actuals path. recent_actuals feeds the model's lag
+    features; full_actuals feeds _actuals_history, which drives the anomaly
+    detector and MAE sensors. Both were comparing raw, uncorrected grid
+    import (inflated by battery charging — real grid draw, not household
+    consumption) against a model whose target IS corrected, firing false
+    "unusual consumption" alerts and pushing forecasts up during every
+    battery charge cycle. Fixed by calling _fetch_correction_dfs(...,
+    ha_data.fetch_recent_sub_sensor) from _update_sensors() too, mirroring
+    how EV-charging correction is already wired into this same method.
+    """
+
+    def test_update_sensors_calls_fetch_correction_dfs_with_recent_fetch_fn(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._update_sensors)
+        assert "_fetch_correction_dfs(" in source, (
+            "_update_sensors() must call _fetch_correction_dfs so recent_actuals/"
+            "full_actuals get the same solar/grid-export/battery correction as "
+            "the training target — otherwise the anomaly detector and lag "
+            "features compare against raw, uncorrected grid import."
+        )
+        assert "ha_data.fetch_recent_sub_sensor" in source, (
+            "_update_sensors() must pass the lightweight fetch_recent_sub_sensor, "
+            "not fetch_sub_sensor_history (30-day fetch) — the hourly callback "
+            "has a 10s AppDaemon budget, per the existing recent_actuals comment "
+            "at the top of _update_sensors()."
+        )
+
+    def test_update_sensors_applies_correction_to_both_recent_and_full_actuals(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._update_sensors)
+        # Both variables must be reassigned from _apply_target_correction(...) —
+        # applying it to only one would leave lag features and the anomaly
+        # baseline using two different (inconsistent) notions of consumption.
+        assert "recent_actuals = _apply_target_correction(" in source
+        assert "full_actuals = _apply_target_correction(" in source
+
+    def test_retrain_still_calls_fetch_correction_dfs_with_full_fetch_fn(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._retrain)
+        assert "_fetch_correction_dfs(" in source
+        assert "ha_data.fetch_sub_sensor_history" in source
+
+
 # ── Timezone alignment warning (initialize()) ────────────────────────────────
 
 
