@@ -26,6 +26,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serving as a standing reminder until the post-activation interval-coverage check passes.
 
 ### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` independently
+  re-fetched and re-cached HA history for entities the ML pipeline (`_retrain()` /
+  `_update_sensors()`) had already fetched moments earlier in the same cycle, for both DHW tank
+  temp and every configured room thermostat's temperature. `physics.dhw_tank_temp_sensor` and the
+  top-level `dhw_buffer_sensor` were confirmed both pointing at the same live entity
+  (`sensor.em_kermi_bridge_kermi_hot_water_temperature`), yet the physics side wrote a second,
+  shorter-history CSV (`physics_dhw_tank_*.csv`) for it. Two new optional parameters, `climate_dfs`
+  and `dhw_df`, now let the caller pass in its already-fetched DataFrames; when the
+  physics-configured entity matches the ML pipeline's entity, the physics side reuses that data
+  instead of re-fetching — falling back to the original independent fetch when the entities differ
+  or no shared data is available (e.g. `_recalibrate_physics_cb`'s on-demand service call, which has
+  no such data to share). Separately, the room-thermostat `temp_sensor` fetch and its
+  `self._room_thermostat_temp_dfs` attribute were deleted outright: a repo-wide grep confirmed
+  nothing downstream ever reads it — `physics.py` only ever consumes `self._physics_climate_dfs`,
+  which already carries the same Netatmo-bridge-republished temperature via `climate_dfs`/
+  `climate_entities`. Once deployed, this stops 11 orphaned CSV cache files (1 DHW + 10 room-temp,
+  ~107 KB total) from being written and eliminates 11+10 redundant HA Recorder history API calls
+  per retrain/hourly cycle, with no change to forecast output. (#89)
 - `apps/energy_forecast/ha_data.py` — `fetch_recent_generic_sensor()` gained a `quiet_if_empty`
   parameter (default `False`, unchanged behaviour), and `_fetch_physics_sensor_histories()` now
   passes it for `cop_sensor`'s hourly `recent_only` fetch only. A heat pump's live COP sensor only
