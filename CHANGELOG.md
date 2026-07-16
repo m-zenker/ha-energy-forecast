@@ -78,6 +78,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `fetch_sub_sensor_history()` / `fetch_recent_sub_sensor()` whenever `ev_charging_sensor` was
   configured, crashing retraining with `AttributeError: 'function' object has no attribute
   'exists'`. Reported in GitHub discussion #15.
+- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` never applied the solar/grid-export/battery target correction that `_retrain()` uses to convert raw grid import into true household consumption. On the first day correction sensors go live (e.g. commissioning a SolarEdge inverter + battery), every battery charge cycle inflated raw grid import in `recent_actuals` (which feeds the model's lag features) and `full_actuals` (which drives the anomaly detector and MAE sensors), causing false "unusual consumption" alerts and forecasts that chased battery-charging draw as if it were rising real consumption. The correction-sensor fetch loop has been extracted from `_retrain()` into a new shared function `_fetch_correction_dfs()` — parameterized by fetch function (`fetch_sub_sensor_history` for training, the lighter `fetch_recent_sub_sensor` for the hourly live path) — and wired into `_update_sensors()` so both `recent_actuals` and `full_actuals` now use the same "true household consumption" definition the model was trained on.
 
 ## [0.12.0-alpha-1] — 2026-07-10
 
