@@ -349,7 +349,6 @@ class EnergyForecast(hass.Hass):
         self._physics_dhw_tank_df: Any = None
         self._physics_cop_df: Any = None
         self._physics_climate_dfs: dict[str, Any] = {}
-        self._room_thermostat_temp_dfs: dict[str, Any] = {}
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
@@ -1271,7 +1270,6 @@ class EnergyForecast(hass.Hass):
         it just leaves the attribute unchanged for this cycle.
         """
         if not recent_only:
-            self._room_thermostat_temp_dfs: dict[str, Any] = {}
             self._physics_dhw_tank_df: Any = None
             self._physics_heating_buffer_df: Any = None
             self._physics_cop_df: Any = None
@@ -1322,20 +1320,8 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Physics COP %s %s fetch failed: %s", entity_id, verb, exc)
 
-        for i, rt in enumerate(self._room_thermostats):
-            temp_entity = rt["temp_sensor"]
+        for rt in self._room_thermostats:
             climate_entity = rt["climate_entity"]
-            temp_path = self._generic_sensor_cache_path(temp_entity, prefix=f"physics_temp_{i}")
-            try:
-                temp_df = generic_fetch(
-                    self, temp_entity, temp_path, column_name="current_temp", timezone=self._timezone
-                )
-                self._room_thermostat_temp_dfs[climate_entity] = _keep_or_replace(
-                    self._room_thermostat_temp_dfs.get(climate_entity), temp_df
-                )
-            except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Physics room temp %s %s fetch failed: %s", temp_entity, verb, exc)
-
             climate_path = self._climate_cache_path(climate_entity)
             try:
                 climate_df = climate_fetch(self, climate_entity, climate_path, timezone=self._timezone)

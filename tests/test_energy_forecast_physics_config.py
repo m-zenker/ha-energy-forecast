@@ -160,7 +160,7 @@ class TestPhysicsSensorFetch:
         )
         app.initialize()
         app._fetch_physics_sensor_histories()
-        assert fetch_generic.call_count == 4  # dhw_tank, heating_buffer, cop, and the one room temp_sensor
+        assert fetch_generic.call_count == 3  # dhw_tank, heating_buffer, cop
         fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection
 
         # Regression guard: physics.py's ThermalPhysicsModel hard-codes "buffer_temp"
@@ -217,7 +217,7 @@ class TestPhysicsSensorRecentFetch:
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
-        assert fetch_recent_generic.call_count == 4  # dhw_tank, heating_buffer, cop, room temp_sensor
+        assert fetch_recent_generic.call_count == 3  # dhw_tank, heating_buffer, cop
         fetch_recent_climate.assert_called_once()
         fetch_generic.assert_not_called()
         fetch_climate.assert_not_called()
@@ -238,14 +238,12 @@ class TestPhysicsSensorRecentFetch:
         assert app._physics_heating_buffer_df is None
         assert app._physics_dhw_tank_df is None
         assert app._physics_cop_df is None
-        assert app._room_thermostat_temp_dfs == {}
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
         assert app._physics_heating_buffer_df is not None and not app._physics_heating_buffer_df.empty
         assert app._physics_dhw_tank_df is not None and not app._physics_dhw_tank_df.empty
         assert app._physics_cop_df is not None and not app._physics_cop_df.empty
-        assert not app._room_thermostat_temp_dfs["climate.living_room"].empty
 
     def test_recent_only_empty_fetch_preserves_existing_value(self, monkeypatch):
         """A transient failure (empty result) during the hourly refresh must not
@@ -279,8 +277,8 @@ class TestPhysicsSensorRecentFetch:
         """A heat pump's live COP sensor only reports while actively heating — an empty
         hourly recent-fetch is expected (not an error) for long idle stretches (e.g. all
         summer), so only its recent_only fetch should pass quiet_if_empty=True. The other
-        three physics sensors (heating_buffer_temp, dhw_tank, room-thermostat temp) have
-        no such seasonal excuse and must keep the default (noisy-on-empty) behaviour."""
+        two physics sensors (heating_buffer_temp, dhw_tank) have no such seasonal excuse
+        and must keep the default (noisy-on-empty) behaviour."""
         app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
 
         app._fetch_physics_sensor_histories(recent_only=True)
@@ -289,7 +287,6 @@ class TestPhysicsSensorRecentFetch:
         assert calls_by_entity["sensor.kermi_cop"].kwargs.get("quiet_if_empty") is True
         assert calls_by_entity["sensor.kermi_dhw_buffer_temp"].kwargs.get("quiet_if_empty") is not True
         assert calls_by_entity["sensor.kermi_heating_buffer"].kwargs.get("quiet_if_empty") is not True
-        assert calls_by_entity["sensor.netatmo_living_room_temp"].kwargs.get("quiet_if_empty") is not True
 
     def test_full_history_fetch_never_quiets_cop_sensor(self, monkeypatch):
         """recent_only=False (retrain path): cop_sensor's weekly full-history fetch keeps
@@ -301,6 +298,21 @@ class TestPhysicsSensorRecentFetch:
 
         cop_call = next(call for call in fetch_generic.call_args_list if call.args[1] == "sensor.kermi_cop")
         assert "quiet_if_empty" not in cop_call.kwargs
+
+    def test_room_thermostat_temp_sensor_is_not_independently_fetched(self, monkeypatch, tmp_path):
+        """#89: room_thermostats[].temp_sensor duplicates data already available from
+        climate_entity (same Netatmo bridge poll, republished under two entity IDs) and
+        was never consumed by physics.py — only climate_dfs/climate_recent is. Confirms
+        the dead fetch + its on-disk cache file are both gone."""
+        app, fetch_recent_generic, fetch_recent_climate, _, _ = self._configured_app(monkeypatch)
+        app._cache_path = tmp_path / "energy_history.csv"  # cache paths derive from this
+
+        app._fetch_physics_sensor_histories(recent_only=True)
+
+        # Verify room temp sensor was not fetched (climate_entity provides the data instead)
+        fetched_entities = {call.args[1] for call in fetch_recent_generic.call_args_list}
+        assert "sensor.netatmo_living_room_temp" not in fetched_entities
+        assert not (tmp_path / "physics_temp_0_sensor.netatmo_living_room_temp.csv").exists()
 
 
 class TestUpdateSensorsCallsPhysicsRecentFetch:
@@ -382,7 +394,6 @@ class TestRetrainCallsPhysicsFetch:
         assert app._physics_dhw_tank_df is None
         assert app._physics_heating_buffer_df is None
         assert app._physics_cop_df is None
-        assert app._room_thermostat_temp_dfs == {}
 
 
 class TestRetrainWiresUsePhysicsResidual:
@@ -627,7 +638,6 @@ class TestPhysicsSensors:
         assert app._physics_climate_dfs == {}
         assert app._physics_dhw_tank_df is None
         assert app._physics_cop_df is None
-        assert app._room_thermostat_temp_dfs == {}
         assert app._physics_heating_buffer_df is None
 
         # Real predict_series (not monkeypatched away) must run without raising even though
