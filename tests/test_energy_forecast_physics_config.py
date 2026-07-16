@@ -309,6 +309,10 @@ class TestPhysicsSensorRecentFetch:
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
+        # Verify the dead attribute was never assigned to the instance (distinguishes real
+        # attribute assignments from MagicMock's auto-vivified attributes; see comment at
+        # test_physics_history_attrs_defensively_initialized_before_first_retrain)
+        assert "_room_thermostat_temp_dfs" not in app.__dict__
         # Verify room temp sensor was not fetched (climate_entity provides the data instead)
         fetched_entities = {call.args[1] for call in fetch_recent_generic.call_args_list}
         assert "sensor.netatmo_living_room_temp" not in fetched_entities
