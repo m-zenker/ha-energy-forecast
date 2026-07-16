@@ -1947,8 +1947,8 @@ class EnergyForecast(hass.Hass):
 
         # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
-        # Use full_actuals (pre-split, pre-sub-sensor-subtraction) so stored kWh
-        # matches the training target (raw gross_kwh on non-EV hours).
+        # Use full_actuals (pre-split, pre-sub-sensor-subtraction, but target-corrected)
+        # so stored kWh matches the training target on non-EV hours.
         if full_actuals is not None and not full_actuals.empty:
             completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
             # Retroactively evict EV hours + neighbors already in actuals_history.
