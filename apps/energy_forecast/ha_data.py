@@ -59,7 +59,7 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
     Three checks:
       1. Non-monotonic timestamps — rows where timestamp decreases.
       2. Gaps > 2h between consecutive rows (includes DST spring-forward).
-      3. Out-of-range gross_kwh: values outside (0, MAX_HOURLY_KWH].
+      3. Out-of-range gross_kwh: values outside [0, MAX_HOURLY_KWH].
     """
     import pandas as pd
 
@@ -95,12 +95,12 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
 
         # Check 3: out-of-range gross_kwh values
         if "gross_kwh" in df.columns:
-            bad_mask = ~((df["gross_kwh"] > 0) & (df["gross_kwh"] <= MAX_HOURLY_KWH))
+            bad_mask = ~((df["gross_kwh"] >= 0) & (df["gross_kwh"] <= MAX_HOURLY_KWH))
             n_bad_vals = int(bad_mask.sum())
             if n_bad_vals:
                 example_val = df.loc[bad_mask, "gross_kwh"].iloc[0]
                 logger.warning(
-                    "Cache health: %d row(s) with gross_kwh outside (0, %.1f] "
+                    "Cache health: %d row(s) with gross_kwh outside [0, %.1f] "
                     "(e.g. %.4f). Spike filter may have missed these.",
                     n_bad_vals,
                     MAX_HOURLY_KWH,
@@ -156,7 +156,9 @@ def _raw_to_kwh_diff(
                          1.0 for kWh sensors, 1000.0 for MWh, 0.001 for Wh.
 
     Returns:
-        DataFrame with columns [timestamp (naive local), gross_kwh], positive values only.
+        DataFrame with columns [timestamp (naive local), gross_kwh], non-negative
+        values only. A diff of exactly 0.0 is a real reading (e.g. solar covering
+        100% of household load for that hour) and is kept, not dropped.
     """
     import pandas as pd
 
@@ -169,7 +171,7 @@ def _raw_to_kwh_diff(
         diff["gross_kwh"] = diff["gross_kwh"] * unit_multiplier
     if diff["timestamp"].dt.tz is not None:
         diff["timestamp"] = diff["timestamp"].dt.tz_convert(timezone).dt.tz_localize(None)
-    return diff[(diff["gross_kwh"] > 0) & (diff["gross_kwh"] < max_kwh)].copy()
+    return diff[(diff["gross_kwh"] >= 0) & (diff["gross_kwh"] < max_kwh)].copy()
 
 
 def fetch_energy_history(

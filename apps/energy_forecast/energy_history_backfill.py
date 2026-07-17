@@ -158,7 +158,7 @@ class EnergyHistoryBackfill(hass.Hass):
         # Diff cumulative sum → per-hour kWh; clip negatives (meter resets); apply unit conversion
         df["gross_kwh"] = df["cumsum"].diff().clip(lower=0) * unit_multiplier
         df = df.dropna(subset=["gross_kwh"])
-        df = df[(df["gross_kwh"] > 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)]
+        df = df[(df["gross_kwh"] >= 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)]
 
         df_new = df[["timestamp", "gross_kwh"]].reset_index(drop=True)
         _LOGGER.info("After diff & filtering: %d clean hourly rows.", len(df_new))
