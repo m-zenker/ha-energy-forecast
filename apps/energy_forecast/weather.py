@@ -71,7 +71,10 @@ def fetch_historical_weather(
     import pandas as pd
     import requests
 
-    tz_encoded = urllib.parse.quote(timezone, safe="")
+    # Coerce defensively: AppDaemon's get_timezone() is type-hinted -> str but
+    # can return a pytz tzinfo object at runtime (GitHub Discussion #15) --
+    # str() recovers the IANA zone key from both pytz and zoneinfo objects.
+    tz_encoded = urllib.parse.quote(str(timezone), safe="")
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}"
@@ -279,7 +282,10 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich", pa
     import pandas as pd
     import requests
 
-    tz_encoded = urllib.parse.quote(timezone, safe="")
+    # Coerce defensively: AppDaemon's get_timezone() is type-hinted -> str but
+    # can return a pytz tzinfo object at runtime (GitHub Discussion #15) --
+    # str() recovers the IANA zone key from both pytz and zoneinfo objects.
+    tz_encoded = urllib.parse.quote(str(timezone), safe="")
     url = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,precipitation,sunshine_duration,windspeed_10m"

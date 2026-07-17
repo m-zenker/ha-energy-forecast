@@ -189,6 +189,17 @@ class TestFetchOpenMeteo:
         }
         assert expected <= set(df.columns)
 
+    def test_non_str_timezone_object_does_not_crash(self):
+        """Regression (GitHub Discussion #15): see identical test in
+        TestFetchHistoricalWeather -- same bug, same fix, other fetch fn.
+        """
+        from zoneinfo import ZoneInfo
+
+        hourly = _base_hourly(3)
+        with patch("requests.get", return_value=_make_response(hourly)):
+            df = weather.fetch_open_meteo(47.0, 8.0, timezone=ZoneInfo("Europe/Zurich"))
+        assert not df.empty
+
 
 # ── fetch_historical_weather ──────────────────────────────────────────────────
 
@@ -237,6 +248,22 @@ class TestFetchHistoricalWeather:
         # Fallback is NaN (not 0) so _engineer_features can substitute a sensible median.
         assert df["cloud_cover_pct"].isna().all()
         assert df["direct_radiation_wm2"].isna().all()
+
+    def test_non_str_timezone_object_does_not_crash(self):
+        """Regression (GitHub Discussion #15): a non-str timezone object
+        (e.g. AppDaemon's get_timezone() returning a pytz tzinfo instead of
+        str) must not reach urllib.parse.quote() raw -- it raises
+        'TypeError: quote_from_bytes() expected bytes'. zoneinfo.ZoneInfo
+        stands in for pytz's tzinfo (stdlib, same non-str/str() behavior).
+        """
+        from datetime import date
+        from zoneinfo import ZoneInfo
+
+        with patch("requests.get", return_value=self._make_archive_response()):
+            df = weather.fetch_historical_weather(
+                47.0, 8.0, date(2026, 1, 1), date(2026, 1, 1), timezone=ZoneInfo("Europe/Zurich")
+            )
+        assert not df.empty
 
 
 # ── _supplement_from_open_meteo ───────────────────────────────────────────────
