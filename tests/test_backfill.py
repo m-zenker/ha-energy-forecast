@@ -97,6 +97,25 @@ class TestBackfillUnitMultiplier:
         assert any(abs(v - 1.5) < 1e-6 for v in df["gross_kwh"])
 
 
+class TestBackfillZeroConsumptionKept:
+    """gross_kwh == 0 (e.g. solar covering 100% of load for an hour) is a real
+    reading and must be kept as a row, not silently dropped like a bad reading."""
+
+    def test_zero_diff_hour_kept_not_dropped(self, tmp_path):
+        base = 1705312800.0  # 2024-01-15 09:00 UTC
+        rows = [
+            (base, 0.0),
+            (base + 3600, 1.5),  # diff 1.5
+            (base + 7200, 1.5),  # diff 0.0 — flat hour, e.g. solar covered the load
+            (base + 10800, 3.0),  # diff 1.5
+        ]
+        df = _run_backfill("kWh", rows, tmp_path)
+        # First row's diff is NaN (no prior reading) and is correctly dropped —
+        # the other three diffs (1.5, 0.0, 1.5) must all be kept.
+        assert len(df) == 3
+        assert any(abs(v - 0.0) < 1e-9 for v in df["gross_kwh"])
+
+
 class TestBackfillTimezone:
     """_backfill() must honour timezone/get_timezone() instead of hardcoding Europe/Zurich."""
 
