@@ -3565,17 +3565,32 @@ class TestUpdateSensorsAppliesTargetCorrection:
             "at the top of _update_sensors()."
         )
 
-    def test_update_sensors_applies_correction_to_both_recent_and_full_actuals(self):
+    def test_update_sensors_applies_correction_before_ev_split(self):
+        """Regression test (found 2026-07-17): _update_sensors() ran
+        split_ev_charging() on raw full_actuals before _apply_target_correction(),
+        so EV-charging hours partly/fully covered by solar (raw grid import
+        under threshold, corrected consumption over threshold) were never
+        added to ev_hour_set/ev_mae_excluded — they leaked into
+        _actuals_history and fired false "unusual consumption" anomaly alerts.
+        Fixed by correcting full_actuals first, then running EV detection
+        (threshold or wallbox-sensor-based) on the corrected values;
+        recent_actuals is derived from the corrected full_actuals via the EV
+        split, so it no longer needs a second, separate
+        _apply_target_correction() call.
+        """
         import inspect
 
         from energy_forecast.energy_forecast import EnergyForecast
 
         source = inspect.getsource(EnergyForecast._update_sensors)
-        # Both variables must be reassigned from _apply_target_correction(...) —
-        # applying it to only one would leave lag features and the anomaly
-        # baseline using two different (inconsistent) notions of consumption.
-        assert "recent_actuals = _apply_target_correction(" in source
         assert "full_actuals = _apply_target_correction(" in source
+        correction_pos = source.index("full_actuals = _apply_target_correction(")
+        ev_split_pos = source.index("ha_data.split_ev_charging(")
+        assert correction_pos < ev_split_pos, (
+            "_update_sensors() must apply target correction to full_actuals "
+            "before running EV detection on it, otherwise the raw-grid-import "
+            "threshold check misses EV hours that solar partly or fully covers."
+        )
 
     def test_retrain_still_calls_fetch_correction_dfs_with_full_fetch_fn(self):
         import inspect

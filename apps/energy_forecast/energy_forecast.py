@@ -1737,6 +1737,41 @@ class EnergyForecast(hass.Hass):
                 unit_multiplier=self._unit_multiplier,
             )
             full_actuals = _strip_tz(full_actuals, self._timezone)
+
+            # ── Solar / grid-export / battery target correction ───────────────
+            # Mirrors _retrain()'s correction so recent_actuals (lag features) and
+            # full_actuals (-> _actuals_history -> anomaly detector + MAE sensors)
+            # use the same "true household consumption" definition the model was
+            # trained on, instead of raw grid import (found 2026-07-16: battery
+            # charging inflated raw grid import, causing false anomaly alerts).
+            #
+            # Must run BEFORE EV threshold detection below: once solar covers
+            # part of the household load, raw grid-import gross_kwh during an
+            # EV-charging hour can fall under ev_charging_threshold_kwh even
+            # though corrected total consumption stays well above it (found
+            # 2026-07-17). Detecting on corrected gross_kwh keeps such hours out
+            # of _actuals_history regardless of how much of the charge came
+            # from solar vs. grid.
+            if not full_actuals.empty:
+                correction_dfs = _fetch_correction_dfs(
+                    self,
+                    self._solar_sensor,
+                    self._grid_export_sensor,
+                    self._battery_charge_sensor,
+                    self._battery_discharge_sensor,
+                    self._cache_path.parent,
+                    self._timezone,
+                    ha_data.fetch_recent_sub_sensor,
+                )
+                if any(v is not None for v in correction_dfs.values()):
+                    full_actuals = _apply_target_correction(
+                        full_actuals,
+                        solar_df=correction_dfs["solar_production.csv"],
+                        grid_export_df=correction_dfs["grid_export.csv"],
+                        battery_charge_df=correction_dfs["battery_charge.csv"],
+                        battery_discharge_df=correction_dfs["battery_discharge.csv"],
+                    )
+
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
             if self._ev_charging_sensor:
@@ -1760,40 +1795,6 @@ class EnergyForecast(hass.Hass):
             recent_actuals = None
             full_actuals = None
             ev_detected = None
-
-        # ── Solar / grid-export / battery target correction ───────────────────
-        # Mirrors _retrain()'s correction so recent_actuals (lag features) and
-        # full_actuals (-> _actuals_history -> anomaly detector + MAE sensors)
-        # use the same "true household consumption" definition the model was
-        # trained on, instead of raw grid import (found 2026-07-16: battery
-        # charging inflated raw grid import, causing false anomaly alerts and
-        # forecasts that chased battery-charging draw as rising consumption).
-        if full_actuals is not None and not full_actuals.empty:
-            correction_dfs = _fetch_correction_dfs(
-                self,
-                self._solar_sensor,
-                self._grid_export_sensor,
-                self._battery_charge_sensor,
-                self._battery_discharge_sensor,
-                self._cache_path.parent,
-                self._timezone,
-                ha_data.fetch_recent_sub_sensor,
-            )
-            if any(v is not None for v in correction_dfs.values()):
-                recent_actuals = _apply_target_correction(
-                    recent_actuals,
-                    solar_df=correction_dfs["solar_production.csv"],
-                    grid_export_df=correction_dfs["grid_export.csv"],
-                    battery_charge_df=correction_dfs["battery_charge.csv"],
-                    battery_discharge_df=correction_dfs["battery_discharge.csv"],
-                )
-                full_actuals = _apply_target_correction(
-                    full_actuals,
-                    solar_df=correction_dfs["solar_production.csv"],
-                    grid_export_df=correction_dfs["grid_export.csv"],
-                    battery_charge_df=correction_dfs["battery_charge.csv"],
-                    battery_discharge_df=correction_dfs["battery_discharge.csv"],
-                )
 
         ev_hour_set: set = set()
         if ev_detected is not None and not ev_detected.empty:
