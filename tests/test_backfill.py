@@ -115,6 +115,21 @@ class TestBackfillZeroConsumptionKept:
         assert len(df) == 3
         assert any(abs(v - 0.0) < 1e-9 for v in df["gross_kwh"])
 
+    def test_meter_reset_dropped_not_fabricated_as_zero(self, tmp_path):
+        """A meter reset (negative raw diff) must be dropped, not recorded as a
+        fabricated gross_kwh=0.0 — true consumption during a reset is unknown,
+        unlike a genuinely flat hour where the raw diff really is 0."""
+        base = 1705312800.0  # 2024-01-15 09:00 UTC
+        rows = [
+            (base, 100.0),
+            (base + 3600, 99.0),  # meter reset: raw diff -1.0
+            (base + 7200, 101.0),  # diff 2.0 → kept normally
+        ]
+        df = _run_backfill("kWh", rows, tmp_path)
+        # Only the h2 diff (2.0) should survive; the reset hour is dropped, not zeroed.
+        assert len(df) == 1
+        assert abs(df["gross_kwh"].iloc[0] - 2.0) < 1e-6
+
 
 class TestBackfillTimezone:
     """_backfill() must honour timezone/get_timezone() instead of hardcoding Europe/Zurich."""
