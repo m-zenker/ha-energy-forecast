@@ -998,17 +998,26 @@ class TestValidateEnergyCache:
         assert any("DST" in r.message for r in caplog.records)
 
     def test_out_of_range_value_warns(self, caplog):
-        """gross_kwh outside (0, MAX_HOURLY_KWH] triggers WARNING."""
+        """gross_kwh outside [0, MAX_HOURLY_KWH] triggers WARNING."""
         ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
         df_over = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 60.0]})  # 60 > 50
-        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})  # 0 not positive
+        df_negative = pd.DataFrame({"timestamp": ts, "gross_kwh": [-1.0, 1.0]})  # negative
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df_over, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            validate_energy_cache(df_zero, _LOGGER)
+            validate_energy_cache(df_negative, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
+
+    def test_zero_value_does_not_warn(self, caplog):
+        """gross_kwh == 0 is a real reading (e.g. solar covering 100% of load)
+        and must NOT be flagged as out-of-range."""
+        ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
+        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            validate_energy_cache(df_zero, _LOGGER)
+        assert not any("gross_kwh" in r.message for r in caplog.records)
 
     def test_no_raise_on_missing_column(self, caplog):
         """DataFrame without gross_kwh column must not raise."""
@@ -1773,14 +1782,31 @@ class TestRawToKwhDiff:
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
         assert result.empty  # filtered out
 
-    def test_negative_diff_clipped_to_zero(self):
+    def test_negative_diff_dropped_not_fabricated_as_zero(self):
+        """A meter reset (negative raw diff) must be dropped, not recorded as a
+        fabricated gross_kwh=0.0 — true consumption during a reset is unknown,
+        unlike a genuinely flat hour where the raw diff really is 0."""
         raw = self._make_raw(
             ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
-            [100.0, 99.0, 101.0],  # meter reset between h0 and h1
+            [100.0, 99.0, 101.0],  # meter reset between h0 and h1 (raw diff -1)
         )
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
-        # h1: diff = -1 → clipped to 0 → filtered (not > 0). h2: diff = 2 → kept.
-        assert all(result["gross_kwh"] > 0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index
+        # h2: diff = 2 → kept normally.
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
+
+    def test_zero_diff_hour_kept_not_dropped(self):
+        """A flat hour (e.g. solar fully covering household load) is a real
+        gross_kwh=0.0 reading and must not be dropped like a bad/missing row."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00", "2024-01-01 03:00"],
+            [100.0, 101.0, 101.0, 102.5],  # h2: no change → diff 0.0
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 02:00") in kwh.index
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
 
 
 class TestFetchEnergyHistory15m:

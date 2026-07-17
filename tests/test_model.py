@@ -939,6 +939,43 @@ class TestLogTransform:
 # ── _build_model n_estimators override (#6) ───────────────────────────────────
 
 
+class TestZeroConsumptionRowsKeptInTraining:
+    """gross_kwh == 0 is a real reading (e.g. solar fully covering household load)
+    and must not be excluded from training the same way negative/corrupt rows are."""
+
+    def test_zero_consumption_rows_not_dropped_from_training(self, tmp_path, caplog):
+        import logging
+
+        rng = np.random.default_rng(0)
+        n = 250
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        gross_kwh = rng.uniform(0.5, 5.0, size=n)
+        # Zero out 100 hours well past the lag warm-up window (active_lags maxes
+        # out at 72h for n=250) to simulate solar covering 100% of load those hours.
+        gross_kwh[100:200] = 0.0
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": gross_kwh})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        m = EnergyForecastModel(tmp_path, timezone="Europe/Zurich")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+
+        assert not any("skipping" in r.message.lower() for r in caplog.records), (
+            "Zero-consumption hours (real solar/grid-export readings) were dropped "
+            "from training instead of being kept as valid gross_kwh=0 examples."
+        )
+        assert m.model is not None
+
+
 class TestBuildModel:
     def _gbr(self):
         from sklearn.ensemble import GradientBoostingRegressor
