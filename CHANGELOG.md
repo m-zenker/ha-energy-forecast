@@ -26,6 +26,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serving as a standing reminder until the post-activation interval-coverage check passes.
 
 ### Fixed
+- `apps/energy_forecast/const.py` — `resolve_timezone()` now coerces `ha_timezone` to `str`
+  before comparing or returning it. AppDaemon's `get_timezone()` is type-hinted as `-> str`,
+  but the installed runtime validates `AppDaemonConfig.time_zone` through `pytz.timezone(...)`
+  and returns a `pytz.tzinfo` object instead of a plain string when no explicit `timezone:`
+  override is set in `apps.yaml`. That object flowed straight into `urllib.parse.quote()` in
+  `weather.py`, crashing every `_retrain()` call with
+  `TypeError: quote_from_bytes() expected bytes` and leaving the model stuck on stale data —
+  reported as "forecast keeps climbing" in GitHub Discussion #15. As a side effect, a spurious
+  "configured timezone doesn't match HA's" startup WARNING that fired on every launch is also
+  fixed: the old `tzinfo_object != str` comparison always evaluated `True` across types, even
+  when both represented the same zone.
+- `apps/energy_forecast/weather.py` — `fetch_historical_weather()` and `fetch_open_meteo()` now
+  coerce their `timezone` argument to `str` before passing it to `urllib.parse.quote()`.
+  Defense-in-depth for the same Discussion #15 crash: both functions are public and independently
+  callable, so they should not rely on callers having gone through `resolve_timezone()` first.
 - `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` independently
   re-fetched and re-cached HA history for entities the ML pipeline (`_retrain()` /
   `_update_sensors()`) had already fetched moments earlier in the same cycle, for both DHW tank
