@@ -1748,14 +1748,19 @@ class TestRawToKwhDiff:
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
         assert result.empty  # filtered out
 
-    def test_negative_diff_clipped_to_zero(self):
+    def test_negative_diff_dropped_not_fabricated_as_zero(self):
+        """A meter reset (negative raw diff) must be dropped, not recorded as a
+        fabricated gross_kwh=0.0 — true consumption during a reset is unknown,
+        unlike a genuinely flat hour where the raw diff really is 0."""
         raw = self._make_raw(
             ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
-            [100.0, 99.0, 101.0],  # meter reset between h0 and h1
+            [100.0, 99.0, 101.0],  # meter reset between h0 and h1 (raw diff -1)
         )
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
-        # h1: diff = -1 → clipped to 0 → kept as a real 0.0 reading. h2: diff = 2 → kept.
-        assert all(result["gross_kwh"] >= 0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index
+        # h2: diff = 2 → kept normally.
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
 
     def test_zero_diff_hour_kept_not_dropped(self):
         """A flat hour (e.g. solar fully covering household load) is a real

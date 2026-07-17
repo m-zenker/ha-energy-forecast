@@ -158,20 +158,24 @@ def _raw_to_kwh_diff(
     Returns:
         DataFrame with columns [timestamp (naive local), gross_kwh], non-negative
         values only. A diff of exactly 0.0 is a real reading (e.g. solar covering
-        100% of household load for that hour) and is kept, not dropped.
+        100% of household load for that hour) and is kept. A *negative* raw diff
+        (meter reset) is dropped rather than clipped-and-kept — true consumption
+        during a reset is unknown, unlike a genuinely flat hour.
     """
     import pandas as pd
 
     if raw_ha.empty:
         return pd.DataFrame(columns=["timestamp", "gross_kwh"])
     slotted = raw_ha.set_index("timestamp")["value"].resample(resolution).last().ffill()
-    diff = slotted.diff().clip(lower=0).reset_index()
+    raw_diff = slotted.diff()
+    diff = raw_diff.clip(lower=0).reset_index()
     diff.columns = ["timestamp", "gross_kwh"]
     if unit_multiplier != 1.0:
         diff["gross_kwh"] = diff["gross_kwh"] * unit_multiplier
     if diff["timestamp"].dt.tz is not None:
         diff["timestamp"] = diff["timestamp"].dt.tz_convert(timezone).dt.tz_localize(None)
-    return diff[(diff["gross_kwh"] >= 0) & (diff["gross_kwh"] < max_kwh)].copy()
+    keep = (raw_diff.to_numpy() >= 0) & (diff["gross_kwh"] < max_kwh)
+    return diff[keep].copy()
 
 
 def fetch_energy_history(
