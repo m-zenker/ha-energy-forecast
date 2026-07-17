@@ -3587,6 +3587,42 @@ class TestUpdateSensorsAppliesTargetCorrection:
         assert "ha_data.fetch_sub_sensor_history" in source
 
 
+class TestRetrainCorrectsBeforeEvSplit:
+    """Regression test (found 2026-07-17): _retrain() called split_ev_charging()
+    on raw grid-import gross_kwh, before _apply_target_correction() ran. Once
+    solar covers part of an EV-charging hour's load, raw grid import can fall
+    under ev_charging_threshold_kwh even though corrected total consumption
+    stays well above it — the hour then silently trains into the model as
+    baseline (non-EV) load instead of being excluded. Fixed by applying target
+    correction to energy_df before running EV detection on it.
+    """
+
+    def test_retrain_applies_correction_before_ev_split(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._retrain)
+        correction_pos = source.index("energy_df = _apply_target_correction(")
+        ev_split_pos = source.index("ha_data.split_ev_charging(")
+        assert correction_pos < ev_split_pos, (
+            "_retrain() must apply solar/grid-export/battery target correction "
+            "to energy_df before calling split_ev_charging on it — otherwise "
+            "EV hours partly or fully covered by solar aren't detected by the "
+            "raw grid-import threshold and leak into baseline training data."
+        )
+
+    def test_retrain_ev_split_operates_on_corrected_energy_df(self):
+        import inspect
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        source = inspect.getsource(EnergyForecast._retrain)
+        assert "ha_data.split_ev_charging(\n                energy_df, self._ev_threshold" in source, (
+            "split_ev_charging must be called with the (by-then corrected) energy_df, not a pre-correction snapshot."
+        )
+
+
 # ── Timezone alignment warning (initialize()) ────────────────────────────────
 
 
