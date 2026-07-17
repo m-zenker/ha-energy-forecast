@@ -41,7 +41,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   coerce their `timezone` argument to `str` before passing it to `urllib.parse.quote()`.
   Defense-in-depth for the same Discussion #15 crash: both functions are public and independently
   callable, so they should not rely on callers having gone through `resolve_timezone()` first.
-  ([#15])
 - `apps/energy_forecast/energy_forecast.py` — `_fetch_physics_sensor_histories()` independently
   re-fetched and re-cached HA history for entities the ML pipeline (`_retrain()` /
   `_update_sensors()`) had already fetched moments earlier in the same cycle, for both DHW tank
