@@ -1245,21 +1245,34 @@ class TestFetchRecentEnergyTailRead:
         base = pd.Timestamp("2024-01-01 00:00")
         self._make_large_cache(cache_path, n_rows=600, base=base)
 
-        # HA provides 2 new rows just after the cache window
+        # HA provides 2 new rows just after the cache window. cache_end_ts is a
+        # naive-local timestamp (same convention as `base` / the rest of this
+        # class). Localize it to Europe/Zurich before converting to UTC for
+        # make_ha_raw — mirroring test_trailing_sensor_silence_backfilled_through_now
+        # above — rather than treating the naive value as if it were already UTC.
         cache_end_ts = base + pd.Timedelta(hours=599)
+        cache_end_ts_local = cache_end_ts.tz_localize("Europe/Zurich")
         ha_raw = make_ha_raw(
             [
-                (cache_end_ts + pd.Timedelta(hours=1)).tz_localize("UTC").isoformat(),
-                (cache_end_ts + pd.Timedelta(hours=2)).tz_localize("UTC").isoformat(),
+                (cache_end_ts_local + pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                (cache_end_ts_local + pd.Timedelta(hours=2)).tz_convert("UTC").isoformat(),
             ],
             [100.0, 101.5],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
-        # At least 1 new kwh row (diff of ha values) must be present
-        tail_ts = result["timestamp"].max()
-        assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)
+        # The two raw HA cumulative readings diff to a genuine 1.5 kWh row at
+        # cache_end_ts + 2h. (The +1h reading's diff is NaN — no prior reading
+        # to diff against — so it's correctly dropped, same as the leading edge
+        # of any diff-based series.) Assert the exact merged value via a
+        # timestamp lookup so this test actually fails if new-HA-row merging
+        # breaks, rather than only checking that the tail timestamp is "large"
+        # (which passed trivially once end_time extended the reindex to ~now).
+        by_ts = result.set_index("timestamp")["gross_kwh"]
+        merged_ts = cache_end_ts + pd.Timedelta(hours=2)
+        assert merged_ts in by_ts.index, f"{merged_ts} missing — new HA rows weren't merged"
+        assert by_ts.loc[merged_ts] == pytest.approx(1.5)
 
 
 # ── fetch_program_sensor_history ─────────────────────────────────────────────
