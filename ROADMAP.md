@@ -157,6 +157,22 @@ A full HA custom component with UI-driven setup wizard (entity picker, lat/lon a
 
 ---
 
+### #91 — Daily Update-Check + Notification
+
+**Context:** Other users are expected to stay on `main`, which only receives stable releases (merged from `dev` after a local test period) — so a GitHub-release-based check gives them a quiet, reliable "you're behind" signal without needing to watch the repo themselves.
+
+**Design:**
+- Daily `run_daily()` hook (new, added in `initialize()`) hits the unauthenticated GitHub API: `GET https://api.github.com/repos/m-zenker/ha-energy-forecast/releases/latest`. 1 req/day is negligible against the 60/hr unauth rate limit — no token needed.
+- Parses `tag_name`, compares against local `__version__` (`apps/energy_forecast/__init__.py`).
+- **Pre-release guard:** skip the check entirely when local `__version__` contains `-alpha`/`-beta` — the maintainer's own dev system runs ahead of `main` and shouldn't nag itself; this is purely for main-track users.
+- **Dedup:** persists `{"last_notified_tag": ...}` in a small JSON file next to the existing `pred_history.json` (reusing `self._cache_path`), so a version triggers at most one notification, not a daily repeat.
+- **Notify:** `self.call_service("persistent_notification/create", title=..., message=..., notification_id="hef_update_available")` — fixed `notification_id` means a later check replaces rather than stacks.
+- **Failure handling:** network/parse errors log a warning and skip silently; retried on the next daily run. No new dependency (`requests` already used by `weather.py`).
+
+**Effort:** ~1–1.5 h. **Impact:** distribution/UX, same bucket as #16.
+
+---
+
 ### #87 — Recent Consumption Trend Feature (`trend_deviation`)
 
 **Priority:** Low-Medium — standalone, no prerequisites.
@@ -271,6 +287,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
+| 91 | Daily update-check + notification | distribution/UX | 1–1.5 h | ready |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
