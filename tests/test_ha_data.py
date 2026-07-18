@@ -1986,3 +1986,28 @@ class TestFetchRecentEnergy15m:
         cache = tmp_path / "energy_history_15m.csv"
 
         ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the recent-fetch
+        15-minute cache updater (fire-and-forget from _update_sensors())."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        saved = pd.read_csv(cache)
+        saved_ts = set(pd.to_datetime(saved["timestamp"]))
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
