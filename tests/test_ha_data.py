@@ -285,8 +285,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 1
-        assert result.iloc[0]["gross_kwh"] == pytest.approx(1.0)
+        # NB: end_time now extends the reindex through "now", so the total row
+        # count also includes trailing zero-kwh backfill hours between this
+        # 2024 fixture and today — assert on the specific hour instead of len().
+        row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_cache_only_empty_ha(self, mock_app, tmp_path):
         """HA returns nothing: existing cache is returned."""
@@ -356,7 +360,13 @@ class TestFetchEnergyHistory:
 
         assert cache_path.exists()
         saved = pd.read_csv(cache_path)
-        assert len(saved) == 1
+        saved["timestamp"] = pd.to_datetime(saved["timestamp"])
+        # NB: end_time now extends the reindex through "now", so the saved CSV
+        # also includes trailing zero-kwh backfill hours between this 2024
+        # fixture and today — assert the real row was written, not len().
+        row_10 = saved[saved["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_spikes_filtered_out(self, mock_app, tmp_path):
         """Hourly values >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
@@ -370,7 +380,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 0
+        # NB: end_time now extends the reindex through "now", so trailing
+        # zero-kwh backfill hours between this 2024 fixture and today are
+        # legitimately present — assert the spike hour specifically is
+        # filtered out, rather than asserting the whole result is empty.
+        spike_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert spike_row.empty, "Spike hour must be filtered out, not backfilled with the spike value"
 
     def test_excludes_current_partial_hour(self, mock_app, tmp_path):
         """fetch_energy_history must not return the current (incomplete) hourly bucket.
@@ -396,6 +411,27 @@ class TestFetchEnergyHistory:
         result_ts = set(result["timestamp"])
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
+
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Same trailing-silence bug as fetch_recent_energy, on the weekly
+        full-resync path used by _retrain()."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
 
 
 # ── fetch_recent_energy ───────────────────────────────────────────────────────
@@ -469,6 +505,31 @@ class TestFetchRecentEnergy:
         result_ts = set(result["timestamp"])
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
+
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Regression test for the recurring 'lag_24h has N/48 NaN' warning:
+        a grid-import sensor that stops emitting states because solar covers
+        100% of household load (e.g. sensor.gplugk_z_ei going quiet on
+        2026-07-18) must not leave a growing gap between the last real HA
+        state and 'now'. The silent hours are genuine 0.0-kWh readings and
+        fetch_recent_energy must backfill them through the current hour."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
 
 
 # ── _check_dst_duplicates ─────────────────────────────────────────────────────
@@ -1220,25 +1281,34 @@ class TestFetchRecentEnergyTailRead:
         base = pd.Timestamp("2024-01-01 00:00")
         self._make_large_cache(cache_path, n_rows=600, base=base)
 
-        # HA provides 2 new rows just after the cache window
+        # HA provides 2 new rows just after the cache window. cache_end_ts is a
+        # naive-local timestamp (same convention as `base` / the rest of this
+        # class). Localize it to Europe/Zurich before converting to UTC for
+        # make_ha_raw — mirroring test_trailing_sensor_silence_backfilled_through_now
+        # above — rather than treating the naive value as if it were already UTC.
         cache_end_ts = base + pd.Timedelta(hours=599)
-        ha_raw = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(
-                    [
-                        cache_end_ts + pd.Timedelta(hours=1),
-                        cache_end_ts + pd.Timedelta(hours=2),
-                    ]
-                ),
-                "value": [100.0, 101.5],
-            }
+        cache_end_ts_local = cache_end_ts.tz_localize("Europe/Zurich")
+        ha_raw = make_ha_raw(
+            [
+                (cache_end_ts_local + pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                (cache_end_ts_local + pd.Timedelta(hours=2)).tz_convert("UTC").isoformat(),
+            ],
+            [100.0, 101.5],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
-        # At least 1 new kwh row (diff of ha values) must be present
-        tail_ts = result["timestamp"].max()
-        assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)
+        # The two raw HA cumulative readings diff to a genuine 1.5 kWh row at
+        # cache_end_ts + 2h. (The +1h reading's diff is NaN — no prior reading
+        # to diff against — so it's correctly dropped, same as the leading edge
+        # of any diff-based series.) Assert the exact merged value via a
+        # timestamp lookup so this test actually fails if new-HA-row merging
+        # breaks, rather than only checking that the tail timestamp is "large"
+        # (which passed trivially once end_time extended the reindex to ~now).
+        by_ts = result.set_index("timestamp")["gross_kwh"]
+        merged_ts = cache_end_ts + pd.Timedelta(hours=2)
+        assert merged_ts in by_ts.index, f"{merged_ts} missing — new HA rows weren't merged"
+        assert by_ts.loc[merged_ts] == pytest.approx(1.5)
 
 
 # ── fetch_program_sensor_history ─────────────────────────────────────────────
@@ -1808,6 +1878,63 @@ class TestRawToKwhDiff:
         assert pd.Timestamp("2024-01-01 02:00") in kwh.index
         assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
 
+    def test_end_time_extends_trailing_silence_as_zero(self):
+        """A sensor that stops emitting entirely (e.g. a grid-import meter
+        with solar fully covering household load — it has nothing new to
+        report, so it never pushes an update) must still produce 0.0-kWh
+        rows through end_time. resample() alone stops at the last raw
+        state and silently drops the hours after it."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 04:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        for hour in ("02:00", "03:00", "04:00"):
+            ts = pd.Timestamp(f"2024-01-01 {hour}")
+            assert ts in kwh.index, f"{hour} missing — trailing silence wasn't extended"
+            assert abs(kwh.loc[ts]) < 1e-9
+
+    def test_end_time_none_preserves_old_behavior(self):
+        """Without end_time (the default), trailing silence still produces
+        no rows — end_time is opt-in so unmigrated callers are unaffected."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 02:00") not in kwh.index
+
+    def test_end_time_before_last_raw_timestamp_is_noop(self):
+        """If end_time is earlier than the last real raw state, real data
+        must not be truncated or altered."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
+            [100.0, 101.0, 103.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 00:30", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 01:00")] - 1.0) < 0.01
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
+
+    def test_end_time_extension_respects_max_kwh_and_negative_diff_rules(self):
+        """Extended trailing rows are genuine 0.0 diffs, not exempt from the
+        existing max_kwh/negative-diff filtering that runs after ffill."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 99.0],  # meter reset going into the silent stretch
+        )
+        end_time = pd.Timestamp("2024-01-01 03:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index  # reset still dropped
+        # 02:00 and 03:00 are flat relative to the post-reset value (99.0) → genuine zeros
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 03:00")]) < 1e-9
+
 
 class TestFetchEnergyHistory15m:
     @patch("energy_forecast.ha_data._fetch_history")
@@ -1853,6 +1980,29 @@ class TestFetchEnergyHistory15m:
         cutoff = pd.Timestamp.now(tz="Europe/Zurich").floor("15min").tz_localize(None)
         assert (result["timestamp"] < cutoff).all()
 
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the 15-minute cache."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        result = ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        result_ts = set(result["timestamp"])
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in result_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
 
 class TestFetchRecentEnergy15m:
     @patch("energy_forecast.ha_data._fetch_history")
@@ -1883,3 +2033,28 @@ class TestFetchRecentEnergy15m:
         cache = tmp_path / "energy_history_15m.csv"
 
         ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the recent-fetch
+        15-minute cache updater (fire-and-forget from _update_sensors())."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        saved = pd.read_csv(cache)
+        saved_ts = set(pd.to_datetime(saved["timestamp"]))
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
