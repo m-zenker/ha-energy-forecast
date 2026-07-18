@@ -285,8 +285,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 1
-        assert result.iloc[0]["gross_kwh"] == pytest.approx(1.0)
+        # NB: end_time now extends the reindex through "now", so the total row
+        # count also includes trailing zero-kwh backfill hours between this
+        # 2024 fixture and today — assert on the specific hour instead of len().
+        row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_cache_only_empty_ha(self, mock_app, tmp_path):
         """HA returns nothing: existing cache is returned."""
@@ -356,7 +360,13 @@ class TestFetchEnergyHistory:
 
         assert cache_path.exists()
         saved = pd.read_csv(cache_path)
-        assert len(saved) == 1
+        saved["timestamp"] = pd.to_datetime(saved["timestamp"])
+        # NB: end_time now extends the reindex through "now", so the saved CSV
+        # also includes trailing zero-kwh backfill hours between this 2024
+        # fixture and today — assert the real row was written, not len().
+        row_10 = saved[saved["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_spikes_filtered_out(self, mock_app, tmp_path):
         """Hourly values >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
@@ -370,7 +380,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 0
+        # NB: end_time now extends the reindex through "now", so trailing
+        # zero-kwh backfill hours between this 2024 fixture and today are
+        # legitimately present — assert the spike hour specifically is
+        # filtered out, rather than asserting the whole result is empty.
+        spike_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert spike_row.empty, "Spike hour must be filtered out, not backfilled with the spike value"
 
     def test_excludes_current_partial_hour(self, mock_app, tmp_path):
         """fetch_energy_history must not return the current (incomplete) hourly bucket.
