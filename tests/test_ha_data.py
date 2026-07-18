@@ -1808,6 +1808,63 @@ class TestRawToKwhDiff:
         assert pd.Timestamp("2024-01-01 02:00") in kwh.index
         assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
 
+    def test_end_time_extends_trailing_silence_as_zero(self):
+        """A sensor that stops emitting entirely (e.g. a grid-import meter
+        with solar fully covering household load — it has nothing new to
+        report, so it never pushes an update) must still produce 0.0-kWh
+        rows through end_time. resample() alone stops at the last raw
+        state and silently drops the hours after it."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 04:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        for hour in ("02:00", "03:00", "04:00"):
+            ts = pd.Timestamp(f"2024-01-01 {hour}")
+            assert ts in kwh.index, f"{hour} missing — trailing silence wasn't extended"
+            assert abs(kwh.loc[ts]) < 1e-9
+
+    def test_end_time_none_preserves_old_behavior(self):
+        """Without end_time (the default), trailing silence still produces
+        no rows — end_time is opt-in so unmigrated callers are unaffected."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 02:00") not in kwh.index
+
+    def test_end_time_before_last_raw_timestamp_is_noop(self):
+        """If end_time is earlier than the last real raw state, real data
+        must not be truncated or altered."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
+            [100.0, 101.0, 103.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 00:30", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 01:00")] - 1.0) < 0.01
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
+
+    def test_end_time_extension_respects_max_kwh_and_negative_diff_rules(self):
+        """Extended trailing rows are genuine 0.0 diffs, not exempt from the
+        existing max_kwh/negative-diff filtering that runs after ffill."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 99.0],  # meter reset going into the silent stretch
+        )
+        end_time = pd.Timestamp("2024-01-01 03:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index  # reset still dropped
+        # 02:00 and 03:00 are flat relative to the post-reset value (99.0) → genuine zeros
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 03:00")]) < 1e-9
+
 
 class TestFetchEnergyHistory15m:
     @patch("energy_forecast.ha_data._fetch_history")
