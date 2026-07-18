@@ -438,7 +438,14 @@ def fetch_recent_energy_15m(
         _LOGGER.warning("fetch_recent_energy_15m: no data from HA or cache for %s", entity_id)
         return
 
-    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
+    df_new = _raw_to_kwh_diff(
+        raw_ha,
+        "15min",
+        MAX_15MIN_KWH,
+        timezone=timezone,
+        unit_multiplier=unit_multiplier,
+        end_time=pd.Timestamp.now(tz=timezone),
+    )
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
