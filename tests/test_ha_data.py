@@ -1980,6 +1980,29 @@ class TestFetchEnergyHistory15m:
         cutoff = pd.Timestamp.now(tz="Europe/Zurich").floor("15min").tz_localize(None)
         assert (result["timestamp"] < cutoff).all()
 
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the 15-minute cache."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        result = ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        result_ts = set(result["timestamp"])
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in result_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
 
 class TestFetchRecentEnergy15m:
     @patch("energy_forecast.ha_data._fetch_history")

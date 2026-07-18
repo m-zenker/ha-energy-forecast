@@ -376,7 +376,14 @@ def fetch_energy_history_15m(
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
-    df_new = _raw_to_kwh_diff(raw_ha, "15min", MAX_15MIN_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
+    df_new = _raw_to_kwh_diff(
+        raw_ha,
+        "15min",
+        MAX_15MIN_KWH,
+        timezone=timezone,
+        unit_multiplier=unit_multiplier,
+        end_time=pd.Timestamp.now(tz=timezone),
+    )
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     _check_dst_duplicates(combined, _LOGGER)
