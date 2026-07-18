@@ -436,6 +436,31 @@ class TestFetchRecentEnergy:
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
 
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Regression test for the recurring 'lag_24h has N/48 NaN' warning:
+        a grid-import sensor that stops emitting states because solar covers
+        100% of household load (e.g. sensor.gplugk_z_ei going quiet on
+        2026-07-18) must not leave a growing gap between the last real HA
+        state and 'now'. The silent hours are genuine 0.0-kWh readings and
+        fetch_recent_energy must backfill them through the current hour."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
+
 
 # ── _check_dst_duplicates ─────────────────────────────────────────────────────
 
@@ -1188,16 +1213,12 @@ class TestFetchRecentEnergyTailRead:
 
         # HA provides 2 new rows just after the cache window
         cache_end_ts = base + pd.Timedelta(hours=599)
-        ha_raw = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(
-                    [
-                        cache_end_ts + pd.Timedelta(hours=1),
-                        cache_end_ts + pd.Timedelta(hours=2),
-                    ]
-                ),
-                "value": [100.0, 101.5],
-            }
+        ha_raw = make_ha_raw(
+            [
+                (cache_end_ts + pd.Timedelta(hours=1)).tz_localize("UTC").isoformat(),
+                (cache_end_ts + pd.Timedelta(hours=2)).tz_localize("UTC").isoformat(),
+            ],
+            [100.0, 101.5],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
