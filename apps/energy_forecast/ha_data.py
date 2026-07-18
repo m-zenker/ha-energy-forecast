@@ -227,7 +227,14 @@ def fetch_energy_history(
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
     # 3. Process HA data into hourly gross kWh
-    df_new = _raw_to_kwh_diff(raw_ha, "1h", MAX_HOURLY_KWH, timezone=timezone, unit_multiplier=unit_multiplier)
+    df_new = _raw_to_kwh_diff(
+        raw_ha,
+        "1h",
+        MAX_HOURLY_KWH,
+        timezone=timezone,
+        unit_multiplier=unit_multiplier,
+        end_time=pd.Timestamp.now(tz=timezone),
+    )
 
     # 4. Merge — fresh HA data wins on timestamp conflicts
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)

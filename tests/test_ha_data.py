@@ -397,6 +397,27 @@ class TestFetchEnergyHistory:
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
 
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Same trailing-silence bug as fetch_recent_energy, on the weekly
+        full-resync path used by _retrain()."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
+
 
 # ── fetch_recent_energy ───────────────────────────────────────────────────────
 
