@@ -1910,6 +1910,17 @@ class EnergyForecast(hass.Hass):
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
 
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Applied to recent_actuals (feeds lag/rolling features for live
+        # prediction) so an active fault doesn't feed the model corrupted
+        # readings it was trained to treat as NaN during the same window.
+        # Does NOT extend to full_actuals (anomaly/MAE sensors) — spec §6.
+        if recent_actuals is not None and not recent_actuals.empty:
+            excluded_ranges = ha_data.load_excluded_ranges(
+                self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+            )
+            recent_actuals = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _LOGGER)
+
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df = forecast_df
         self._cached_live_temp = live_temp

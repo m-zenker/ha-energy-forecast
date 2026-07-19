@@ -3567,6 +3567,51 @@ class TestRetrainExcludedRanges:
         assert any("exclu" in r.message.lower() for r in caplog.records)
 
 
+import logging as _logging_for_excluded_ranges_tests  # noqa: E402
+
+_EXCLUDED_RANGES_TEST_LOGGER = _logging_for_excluded_ranges_tests.getLogger("energy_forecast")
+
+
+class TestUpdateSensorsExcludedRanges:
+    """Characterizes the load+filter composition Task 4 inserts into
+    _update_sensors() right before self._cached_recent_actuals = recent_actuals
+    (spec §4.2). See the Scope note above for why this doesn't drive the full
+    method."""
+
+    def test_excluded_window_removed_from_recent_actuals(self, tmp_path):
+        from energy_forecast import ha_data
+
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2024-01-01 05:00,2024-01-01 08:00,test fault\n"
+        )
+        recent_actuals = _make_energy_df(24)  # 2024-01-01 00:00..23:00, hourly
+
+        excluded_ranges = ha_data.load_excluded_ranges(
+            cache_path.parent / "excluded_ranges.csv", "Europe/Zurich", _EXCLUDED_RANGES_TEST_LOGGER
+        )
+        result = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _EXCLUDED_RANGES_TEST_LOGGER)
+
+        in_range = (result["timestamp"] >= pd.Timestamp("2024-01-01 05:00")) & (
+            result["timestamp"] <= pd.Timestamp("2024-01-01 08:00")
+        )
+        assert not in_range.any()
+        assert len(result) == 24 - 4  # 05:00..08:00 inclusive = 4 hourly rows
+
+    def test_no_excluded_ranges_file_is_noop(self, tmp_path):
+        from energy_forecast import ha_data
+
+        cache_path = tmp_path / "energy_history.csv"  # no excluded_ranges.csv written
+        recent_actuals = _make_energy_df(24)
+
+        excluded_ranges = ha_data.load_excluded_ranges(
+            cache_path.parent / "excluded_ranges.csv", "Europe/Zurich", _EXCLUDED_RANGES_TEST_LOGGER
+        )
+        result = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _EXCLUDED_RANGES_TEST_LOGGER)
+
+        assert len(result) == 24
+
+
 class TestRetrainEvCachePathBug:
     """Regression test for GitHub discussion #15 (2026-07-10): configuring
     ev_charging_sensor crashed _retrain() with
