@@ -1468,6 +1468,33 @@ class EnergyForecast(hass.Hass):
 
         energy_df = _strip_tz(energy_df, self._timezone)
 
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Filtered as early as possible: a correction/EV-detection computed
+        # from a corrupted main reading is equally meaningless.
+        excluded_ranges = ha_data.load_excluded_ranges(
+            self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+        )
+        energy_df = ha_data.filter_excluded_ranges(energy_df, excluded_ranges, _LOGGER)
+
+        if len(energy_df) < MIN_HISTORY_HOURS:
+            _LOGGER.warning(
+                "Insufficient history after excluded-range filtering (%d h) — active "
+                "exclusions in excluded_ranges.csv reduced the training set below the "
+                "%d h minimum. Skipping.",
+                len(energy_df),
+                MIN_HISTORY_HOURS,
+            )
+            return
+
+        now_ts = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        gap_hours = (now_ts - energy_df["timestamp"].max()).total_seconds() / 3600
+        if gap_hours > 24:
+            _LOGGER.warning(
+                "Most recent training data is %.1fh behind now() — an active excluded "
+                "range may be freezing the recency-weighting anchor at the fault's onset.",
+                gap_hours,
+            )
+
         # ── Solar / grid-export / battery target correction ───────────────────
         # Corrects gross_kwh (grid import) to total household consumption.
         # Each sensor is optional; any combination is valid.
