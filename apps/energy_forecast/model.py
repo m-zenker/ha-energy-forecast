@@ -412,13 +412,16 @@ class EnergyForecastModel:
         if physics_model is not None:
             physics_model.check_zone_boundary(list(climate_dfs.keys()) if climate_dfs else [])
             if physics_model.calibration_stale:
+                # Calendar-day span, not row count: a multi-day excluded date range
+                # (or any other real gap) leaves len(energy_df)/24 undercounting the
+                # true span, silently shrinking/misplacing the holdout window.
+                _span_days = (energy_df["timestamp"].max() - energy_df["timestamp"].min()).days
                 physics_model.calibrate(
                     energy_df,
                     weather_df,
                     climate_dfs,
                     dhw_df,
-                    holdout_cutoff=energy_df["timestamp"].max()
-                    - pd.Timedelta(days=int(len(energy_df) / 24 * 0.1) or 1),
+                    holdout_cutoff=energy_df["timestamp"].max() - pd.Timedelta(days=int(_span_days * 0.1) or 1),
                     heating_active_df=heating_active_df,
                     away_df=away_df,
                 )

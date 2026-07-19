@@ -7,6 +7,7 @@ when Home Assistant purges its database.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -108,6 +109,179 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
                 )
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         logger.error("validate_energy_cache raised unexpectedly: %s", exc)
+
+
+_EXCLUDED_RANGE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$")
+
+
+def load_excluded_ranges(
+    path: Path, timezone: str, logger: logging.Logger
+) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
+    """Load hand-edited known-bad training/prediction date ranges.
+
+    Never raises. A missing file or a header-only file (valid CSV, zero data
+    rows) both return [] silently — this is the common/default case. A file
+    missing the required 'start'/'end' columns, or one that can't be parsed
+    as CSV at all (zero-byte file, torn write), logs one WARNING and returns
+    []. A single malformed row (bad date format, timezone offset present,
+    end < start) logs a WARNING and is skipped; the rest of the file still
+    loads.
+
+    Args:
+        path: Path to excluded_ranges.csv (same directory as energy_history.csv).
+        timezone: IANA timezone name (e.g. self._timezone) used to flag
+            start/end values that fall in a nonexistent local time
+            (DST spring-forward gap).
+        logger: Logger to report malformed rows/files to.
+
+    Returns:
+        List of (start, end, reason) tuples — naive local pd.Timestamps,
+        end inclusive. A bare-date end (no time component in the raw
+        string) is expanded to 23:59:59 of that date; an explicit-time end
+        (including 00:00) is used exactly as written.
+    """
+    import pandas as pd
+
+    if not path.exists():
+        return []
+
+    try:
+        raw = pd.read_csv(path, dtype=str)
+    except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        logger.warning("excluded_ranges.csv unreadable (%s) — treating as no exclusions.", exc)
+        return []
+
+    if raw.empty:
+        return []
+
+    if "start" not in raw.columns or "end" not in raw.columns:
+        logger.warning(
+            "excluded_ranges.csv missing required 'start'/'end' column(s) (found: %s) — treating as no exclusions.",
+            list(raw.columns),
+        )
+        return []
+
+    if "reason" not in raw.columns:
+        raw["reason"] = ""
+    raw["reason"] = raw["reason"].fillna("")
+
+    ranges: list[tuple[pd.Timestamp, pd.Timestamp, str]] = []
+
+    for row_num, row in raw.iterrows():
+        try:
+            start_raw = str(row["start"]).strip()
+            end_raw = str(row["end"]).strip()
+            reason = str(row["reason"]).strip()
+
+            if not _EXCLUDED_RANGE_TS_RE.match(start_raw) or not _EXCLUDED_RANGE_TS_RE.match(end_raw):
+                logger.warning(
+                    "excluded_ranges.csv row %d: '%s'/'%s' doesn't match YYYY-MM-DD or "
+                    "YYYY-MM-DD HH:MM — skipping row.",
+                    row_num + 2,  # +2: 1-indexed data row, plus the header row
+                    start_raw,
+                    end_raw,
+                )
+                continue
+
+            end_is_bare_date = " " not in end_raw
+            start = pd.Timestamp(start_raw)
+            end = pd.Timestamp(end_raw)
+            if end_is_bare_date:
+                end = end + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+            if end < start:
+                logger.warning(
+                    "excluded_ranges.csv row %d: end (%s) is before start (%s) — skipping row.",
+                    row_num + 2,
+                    end,
+                    start,
+                )
+                continue
+
+            for label, ts in (("start", start), ("end", end)):
+                try:
+                    ts.tz_localize(timezone, nonexistent="raise", ambiguous="raise")
+                except ValueError as exc:
+                    if "nonexistent" in str(exc):
+                        logger.warning(
+                            "excluded_ranges.csv row %d: %s value %s falls in a nonexistent "
+                            "local time (DST spring-forward gap in %s) — check for a "
+                            "transcription error. Row still applied as written.",
+                            row_num + 2,
+                            label,
+                            ts,
+                            timezone,
+                        )
+                    # Ambiguous (DST fall-back duplicate hour) is expected/documented
+                    # behavior (spec §2) — no warning needed.
+
+            ranges.append((start, end, reason))
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.warning("excluded_ranges.csv row %d malformed (%s) — skipping row.", row_num + 2, exc)
+            continue
+
+    return ranges
+
+
+_EXCLUSION_WARN_ROW_FRACTION = 0.10
+_EXCLUSION_WARN_SPAN_DAYS = 14
+
+
+def filter_excluded_ranges(
+    df: pd.DataFrame, ranges: list[tuple[pd.Timestamp, pd.Timestamp, str]], logger: logging.Logger
+) -> pd.DataFrame:
+    """Drop rows whose timestamp falls in any hand-configured known-bad range.
+
+    Never raises — on any unexpected failure, logs .error() and returns df
+    unfiltered rather than propagating, so a bug here degrades to "no
+    filtering happened," never to "the caller's retrain/predict cycle didn't
+    happen."
+
+    Args:
+        df: DataFrame with a 'timestamp' column (naive local).
+        ranges: Output of load_excluded_ranges() — (start, end, reason)
+            tuples, end inclusive.
+        logger: Logger to report per-range and total drop counts to.
+
+    Returns:
+        df with excluded rows removed (a new DataFrame; input is not
+        mutated), index reset to a clean RangeIndex. Returns df unchanged
+        (same object) if df is empty, has no 'timestamp' column, or ranges
+        is empty/falsy.
+    """
+    import pandas as pd
+
+    if df.empty or "timestamp" not in df.columns or not ranges:
+        return df
+
+    try:
+        total_rows = len(df)
+        union_mask = pd.Series(False, index=df.index)
+        for start, end, reason in ranges:
+            range_mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
+            n_dropped = int(range_mask.sum())
+            span_days = (end - start).total_seconds() / 86400
+            escalate = (
+                total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
+            ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
+            log_fn = logger.warning if escalate else logger.info
+            log_fn(
+                "Excluded range %s -> %s (%s): dropped %d row(s).",
+                start,
+                end,
+                reason or "no reason given",
+                n_dropped,
+            )
+            union_mask = union_mask | range_mask
+
+        total_dropped = int(union_mask.sum())
+        if total_dropped:
+            logger.info("Excluded ranges: %d unique row(s) dropped in total.", total_dropped)
+
+        return df.loc[~union_mask].reset_index(drop=True)
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        logger.error("filter_excluded_ranges failed (%s) — returning df unfiltered.", exc)
+        return df
 
 
 def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: str) -> pd.DataFrame:

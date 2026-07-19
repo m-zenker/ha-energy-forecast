@@ -3472,6 +3472,146 @@ class TestFifteenMinCache:
         EnergyForecast._retrain(stub)  # must not raise
 
 
+class TestRetrainExcludedRanges:
+    """Excluded date ranges (excluded_ranges.csv) must be filtered out of
+    energy_df before it reaches _ml_model.train() — spec §4.1."""
+
+    def _patch_retrain_deps(self, monkeypatch, energy_df):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: None)
+        return ha_data_mod
+
+    def test_excluded_window_absent_from_training_frame(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(200)  # 2024-01-01 00:00, hourly, 200 rows
+        self._patch_retrain_deps(monkeypatch, energy_df)
+
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2024-01-05 00:00,2024-01-05 12:00,test fault\n"
+        )
+
+        stub = _FakeRetrain(cache_path)
+        EnergyForecast._retrain(stub)
+
+        trained_df = stub._ml_model.train.call_args.args[0]
+        excluded = (trained_df["timestamp"] >= pd.Timestamp("2024-01-05 00:00")) & (
+            trained_df["timestamp"] <= pd.Timestamp("2024-01-05 12:00")
+        )
+        assert not excluded.any(), "excluded window must not appear in the frame passed to train()"
+        assert len(trained_df) == 200 - 13  # 00:00..12:00 inclusive = 13 hourly rows
+
+    def test_stale_anchor_after_filtering_logs_warning(self, tmp_path, monkeypatch, caplog):
+        """energy_df fixtures use fixed 2024 dates, always far behind real now() —
+        exploiting that to assert the recency-anchor staleness warning (spec §4.3)
+        fires without needing to mock pd.Timestamp.now()."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(200)
+        self._patch_retrain_deps(monkeypatch, energy_df)
+        cache_path = tmp_path / "energy_history.csv"  # no excluded_ranges.csv needed
+
+        stub = _FakeRetrain(cache_path)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._retrain(stub)
+
+        assert any("behind now" in r.message.lower() for r in caplog.records)
+
+    def test_no_excluded_ranges_file_trains_on_full_history(self, tmp_path, monkeypatch):
+        """Absence of excluded_ranges.csv must be a no-op (the common case)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(200)
+        self._patch_retrain_deps(monkeypatch, energy_df)
+        cache_path = tmp_path / "energy_history.csv"  # no excluded_ranges.csv written
+
+        stub = _FakeRetrain(cache_path)
+        EnergyForecast._retrain(stub)
+
+        trained_df = stub._ml_model.train.call_args.args[0]
+        assert len(trained_df) == 200
+
+    def test_exclusion_pushing_below_min_history_hours_skips_retrain(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        # 60 rows total; MIN_HISTORY_HOURS is 48. Exclude 20 of them so the
+        # post-filter count (40) falls below the threshold that the
+        # pre-filter count (60) passed.
+        energy_df = _make_energy_df(60)
+        self._patch_retrain_deps(monkeypatch, energy_df)
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2024-01-01 00:00,2024-01-01 19:00,big fault\n"  # 20 hourly rows
+        )
+
+        stub = _FakeRetrain(cache_path)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._retrain(stub)
+
+        stub._ml_model.train.assert_not_called()
+        assert any("exclu" in r.message.lower() for r in caplog.records)
+
+
+import logging as _logging_for_excluded_ranges_tests  # noqa: E402
+
+_EXCLUDED_RANGES_TEST_LOGGER = _logging_for_excluded_ranges_tests.getLogger("energy_forecast")
+
+
+class TestUpdateSensorsExcludedRanges:
+    """Characterizes the load+filter composition Task 4 inserts into
+    _update_sensors() right before self._cached_recent_actuals = recent_actuals
+    (spec §4.2). See the Scope note above for why this doesn't drive the full
+    method."""
+
+    def test_excluded_window_removed_from_recent_actuals(self, tmp_path):
+        from energy_forecast import ha_data
+
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2024-01-01 05:00,2024-01-01 08:00,test fault\n"
+        )
+        recent_actuals = _make_energy_df(24)  # 2024-01-01 00:00..23:00, hourly
+
+        excluded_ranges = ha_data.load_excluded_ranges(
+            cache_path.parent / "excluded_ranges.csv", "Europe/Zurich", _EXCLUDED_RANGES_TEST_LOGGER
+        )
+        result = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _EXCLUDED_RANGES_TEST_LOGGER)
+
+        in_range = (result["timestamp"] >= pd.Timestamp("2024-01-01 05:00")) & (
+            result["timestamp"] <= pd.Timestamp("2024-01-01 08:00")
+        )
+        assert not in_range.any()
+        assert len(result) == 24 - 4  # 05:00..08:00 inclusive = 4 hourly rows
+
+    def test_no_excluded_ranges_file_is_noop(self, tmp_path):
+        from energy_forecast import ha_data
+
+        cache_path = tmp_path / "energy_history.csv"  # no excluded_ranges.csv written
+        recent_actuals = _make_energy_df(24)
+
+        excluded_ranges = ha_data.load_excluded_ranges(
+            cache_path.parent / "excluded_ranges.csv", "Europe/Zurich", _EXCLUDED_RANGES_TEST_LOGGER
+        )
+        result = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _EXCLUDED_RANGES_TEST_LOGGER)
+
+        assert len(result) == 24
+
+
 class TestRetrainEvCachePathBug:
     """Regression test for GitHub discussion #15 (2026-07-10): configuring
     ev_charging_sensor crashed _retrain() with

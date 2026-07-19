@@ -1468,6 +1468,34 @@ class EnergyForecast(hass.Hass):
 
         energy_df = _strip_tz(energy_df, self._timezone)
 
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Filtered as early as possible: a correction/EV-detection computed
+        # from a corrupted main reading is equally meaningless.
+        excluded_ranges = ha_data.load_excluded_ranges(
+            self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+        )
+        energy_df = ha_data.filter_excluded_ranges(energy_df, excluded_ranges, _LOGGER)
+
+        if len(energy_df) < MIN_HISTORY_HOURS:
+            _LOGGER.warning(
+                "Insufficient history after excluded-range filtering (%d h) — active "
+                "exclusions in excluded_ranges.csv reduced the training set below the "
+                "%d h minimum. Skipping.",
+                len(energy_df),
+                MIN_HISTORY_HOURS,
+            )
+            return
+
+        now_ts = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        gap_hours = (now_ts - energy_df["timestamp"].max()).total_seconds() / 3600
+        if gap_hours > 24:
+            _LOGGER.warning(
+                "Most recent training data is %.1fh behind now() — check for stale/missing "
+                "history data, or an active excluded range freezing the recency-weighting "
+                "anchor at the fault's onset.",
+                gap_hours,
+            )
+
         # ── Solar / grid-export / battery target correction ───────────────────
         # Corrects gross_kwh (grid import) to total household consumption.
         # Each sensor is optional; any combination is valid.
@@ -1882,6 +1910,17 @@ class EnergyForecast(hass.Hass):
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
+
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Applied to recent_actuals (feeds lag/rolling features for live
+        # prediction) so an active fault doesn't feed the model corrupted
+        # readings it was trained to treat as NaN during the same window.
+        # Does NOT extend to full_actuals (anomaly/MAE sensors) — spec §6.
+        if recent_actuals is not None and not recent_actuals.empty:
+            excluded_ranges = ha_data.load_excluded_ranges(
+                self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+            )
+            recent_actuals = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _LOGGER)
 
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df = forecast_df

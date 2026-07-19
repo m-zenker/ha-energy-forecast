@@ -6,11 +6,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.12.0-alpha-8] — 2026-07-19
 
 ### Added
 - `scripts/check_ha_status.py` — new diagnostic script (gitignored; a smaller, hef-specific variant of `ha-energy-manager`'s counterpart): queries HA's `/api/states` endpoint and writes a timestamped snapshot to `logs/ha_status.md`. Covers the shared AppDaemon add-on's running state, this app's `model_phase` attribute (read from `sensor.energy_forecast_today`), and the `energy_forecast_setup_status` self-reported health sensor. The same add-on `/info` 401 limitation applies — add-on state shows `unknown (fetch failed: ...)` with the current `EM_HA_TOKEN` until Supervisor credentials are configured.
 - `tests/test_check_ha_status.py` — pure-function tests for `check_ha_status.py`'s filter, classify, and render helpers; no network I/O.
+- `apps/energy_forecast/ha_data.py` — `load_excluded_ranges(path, timezone, logger)` parses a hand-edited `excluded_ranges.csv` (columns `start`, `end` required; `reason` optional) into a list of `(start, end, reason)` timestamp tuples, letting an operator exclude known-bad hardware-fault windows from both training and live prediction without a code deploy. Dates must match `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` exactly (no lenient parsing, no timezone offsets); a bare-date `end` expands to end-of-day. Flags (but still loads) start/end values that fall in a DST spring-forward gap. Never raises — degrades to `[]` on any file/row problem. `filter_excluded_ranges(df, ranges, logger)` drops matching rows from any timestamp-indexed DataFrame, with per-range and total-unique-dropped row-count logging that escalates from INFO to WARNING when a single range drops >10% of rows or spans >14 days (typo tripwire). Also never raises — degrades to returning the input unfiltered on any unexpected failure.
+- `apps/energy_forecast/energy_forecast.py` — both `_retrain()` (training path) and `_update_sensors()` (live prediction path, applied to `recent_actuals`) now load and apply `excluded_ranges.csv` before the data reaches the model. `_retrain()` re-checks `MIN_HISTORY_HOURS` after filtering — an exclusion can push history below the minimum even if the pre-filter count passed — and logs a WARNING if the post-filter training data's recency anchor is more than 24 h behind `now()`.
 
 ### Changed
 - `README.md` — Phase 2 (`use_physics_residual: true`) is now marked **experimental and not
@@ -81,6 +83,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now leaves the attribute unchanged for that cycle rather than clobbering an already-good value
   from a prior retrain; the full `recent_only=False` retrain path is unchanged and still always
   resets first and replaces on empty.
+- `apps/energy_forecast/model.py` — the physics-calibration holdout cutoff in `train()` used
+  `len(energy_df) / 24` as a proxy for calendar-day span, which silently undercounts once a
+  multi-day gap (e.g. an excluded date range) exists between rows. Now computed from the actual
+  `(max_ts − min_ts).days` span.
 - `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb`'s `energy_forecast_scenario_result`
   event never echoed back a caller-supplied `request_id`, even though the service accepts one.
   Callers with more than one `get_scenario` request potentially in flight at once (e.g.
