@@ -147,7 +147,7 @@ def load_excluded_ranges(
 
     try:
         raw = pd.read_csv(path, dtype=str)
-    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+    except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
         logger.warning("excluded_ranges.csv unreadable (%s) — treating as no exclusions.", exc)
         return []
 

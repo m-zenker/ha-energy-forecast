@@ -1229,6 +1229,14 @@ class TestLoadExcludedRanges:
         assert result == []
         assert caplog.records
 
+    def test_encoding_corrupted_csv_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_bytes(b"start,end,reason\n2026-07-19,2026-07-20,caf\xe9 fault\n")  # invalid UTF-8 byte
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
     def test_different_timezone_changes_spring_forward_detection(self, tmp_path, caplog):
         """US/Eastern's 2026 spring-forward gap (Mar 8) differs from Europe/Zurich's (Mar 29) —
         proves the timezone parameter is actually used, not hardcoded."""
