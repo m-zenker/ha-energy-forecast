@@ -1162,7 +1162,7 @@ class TestTrainWithPhysics:
         # 100-day calendar span, but only the first 20 and last 20 days have rows
         # (the middle 60 days are missing — simulates a large excluded range).
         # Old proxy: len(df)/24*0.1 = (40*24)/24*0.1 = 4 days.
-        # Fixed calc: (max_ts - min_ts).days*0.1 = 100*0.1 = 10 days.
+        # Fixed calc: (max_ts - min_ts).days*0.1 = 99*0.1 = 9.9 → int(9) days.
         full_range = pd.date_range("2024-01-01", periods=100 * 24, freq="1h")
         first_chunk = full_range[: 20 * 24]
         last_chunk = full_range[-20 * 24 :]
@@ -6579,25 +6579,15 @@ class TestActiveLagsBoundaryAcrossRetrains:
         )
 
     def test_lag_168h_drops_out_without_crash_when_rows_fall_below_threshold(self, tmp_path):
-        # Spec §5 integration: verify graceful degradation when row count changes across
-        # active_lags threshold (model.py:365). This can happen when a new exclusion
-        # range is added and shrinks the training dataset. The test verifies that
-        # retraining with fewer rows doesn't crash, and lag features adjust appropriately.
+        # lag_72h needs n_rows - 72 >= 100, i.e. n_rows >= 172.
+        # (lag_168h is gated and never appears in feature_cols; test lag_72h instead)
         m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
 
-        # First training: 300 rows (300 - 72 = 228 >= 100, lag_72h active)
-        energy_wide = self._energy_df(300)
+        energy_wide = self._energy_df(250)  # 250 - 72 = 178 >= 100: lag_72h active
         m.train(energy_wide, self._weather_df(energy_wide["timestamp"]), outdoor_df=None, weight_halflife_days=0)
-        assert m.model is not None, "First training should succeed"
-        assert "lag_72h" in m.feature_cols, "lag_72h should be active with 300 rows"
+        assert "lag_72h" in m.feature_cols
 
-        # Second training: 200 rows (200 - 72 = 128 >= 100, lag_72h still active).
-        # Verifies that retraining works gracefully when row count changes. Even though
-        # lag_72h remains active here, the model retrains without issue. The key point
-        # is that feature selection is dynamic and handles row count changes smoothly.
-        energy_narrower = self._energy_df(200)
-        m.train(
-            energy_narrower, self._weather_df(energy_narrower["timestamp"]), outdoor_df=None, weight_halflife_days=0
-        )
-        assert m.model is not None, "Second training should succeed even with fewer rows"
-        assert "lag_72h" in m.feature_cols, "lag_72h should still be active with 200 rows"
+        # Simulate a retrain after an exclusion range shrank the training set.
+        energy_narrow = self._energy_df(170)  # 170 - 72 = 98 < 100: lag_72h now inactive
+        m.train(energy_narrow, self._weather_df(energy_narrow["timestamp"]), outdoor_df=None, weight_halflife_days=0)
+        assert "lag_72h" not in m.feature_cols
