@@ -198,7 +198,10 @@ and a real train/predict mismatch (the model learns these hours are `NaN→media
 would otherwise feed it real corrupted values instead).
 
 **Fix:** `filter_excluded_ranges` (the same function, no new code) is also applied to
-`recent_actuals` at the point it's built in `_update_sensors()`, before it reaches
+`recent_actuals` after it passes through EV-splitting/`_subtract_sub_sensors` and is cached
+(energy_forecast.py:1889 — added post-final-review, as the precise insertion point; the exact
+line is order-independent here since row-masking by timestamp commutes with the upstream
+subtraction steps, but an implementer needs a concrete anchor), and before it reaches
 `_add_lag_and_rolling_prediction()`. Excluded hours fall back to `NaN`, filled by the same
 stored feature medians used elsewhere — consistent with the training-side behavior instead of
 diverging from it.
@@ -257,7 +260,7 @@ range was a complete fix, which isn't accurate for two subsystems:
 - **An already-poisoned deployed model isn't retroactively fixed by adding an exclusion** — the
   currently-serving model/`meta.pkl` keeps making live predictions, trained on the bad data,
   until the next successful filtered retrain actually completes (up to 7 days away — see §4.4).
-  `rollback_model()` (already available, model.py:974) is the recommended immediate stopgap if a
+  `rollback_model()` (already available, model.py:1548 — corrected post-final-review) is the recommended immediate stopgap if a
   fault is discovered to have measurably degraded live predictions (finding #12).
 
 ### 4.4 Applying an exclusion immediately (added post-review — finding #8)
