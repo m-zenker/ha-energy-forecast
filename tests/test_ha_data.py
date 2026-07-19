@@ -1107,6 +1107,138 @@ class TestValidateCacheIntegration:
         mock_validate.assert_called_once()
 
 
+# ── #new load_excluded_ranges / filter_excluded_ranges ────────────────────────
+
+from energy_forecast.ha_data import load_excluded_ranges  # noqa: E402
+
+
+class TestLoadExcludedRanges:
+    def test_missing_file_returns_empty_no_log(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert not caplog.records
+
+    def test_header_only_file_returns_empty_no_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert not caplog.records
+
+    def test_well_formed_multi_row_file(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text(
+            "start,end,reason\n"
+            "2026-07-19 14:00,2026-07-21 09:30,gplug fault\n"
+            "2026-07-25 00:00,2026-07-25 12:00,second fault\n"
+        )
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == [
+            (pd.Timestamp("2026-07-19 14:00"), pd.Timestamp("2026-07-21 09:30"), "gplug fault"),
+            (pd.Timestamp("2026-07-25 00:00"), pd.Timestamp("2026-07-25 12:00"), "second fault"),
+        ]
+
+    def test_reason_column_absent_defaults_to_empty_string(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end\n2026-07-19,2026-07-20\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == [(pd.Timestamp("2026-07-19 00:00"), pd.Timestamp("2026-07-20 23:59:59"), "")]
+
+    def test_extra_column_ignored(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason,ticket\n2026-07-19,2026-07-20,fault,JIRA-123\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert result[0][2] == "fault"
+
+    def test_malformed_row_skipped_others_still_load(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert result[0][2] == "good row"
+        assert any("row" in r.message.lower() for r in caplog.records)
+
+    def test_end_before_start_skipped(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-20 10:00,2026-07-19 10:00,backwards\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
+    def test_missing_required_columns_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("begin,finish\n2026-07-19,2026-07-20\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert any("start" in r.message.lower() or "end" in r.message.lower() for r in caplog.records)
+
+    def test_ambiguous_date_format_rejected(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n07/19/2026,07/20/2026,slash format\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+
+    def test_timezone_offset_rejected(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19 14:00+02:00,2026-07-20 14:00,tz offset\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+
+    def test_bare_date_end_expands_to_end_of_day(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19,2026-07-21,multi-day\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result[0][1] == pd.Timestamp("2026-07-21 23:59:59")
+
+    def test_explicit_time_end_used_exactly(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19,2026-07-21 00:00,exact midnight\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result[0][1] == pd.Timestamp("2026-07-21 00:00:00")
+
+    def test_spring_forward_nonexistent_time_warns_distinctly(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-03-29 02:30,2026-03-29 04:00,gap\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1  # still loaded, just warned
+        assert any("nonexistent" in r.message.lower() for r in caplog.records)
+
+    def test_fall_back_ambiguous_time_loads_without_special_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-10-25 02:00,2026-10-25 03:00,fall-back\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert not any("nonexistent" in r.message.lower() for r in caplog.records)
+
+    def test_truncated_csv_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_bytes(b"")  # zero-byte file, simulates a torn Samba write
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
+    def test_different_timezone_changes_spring_forward_detection(self, tmp_path, caplog):
+        """US/Eastern's 2026 spring-forward gap (Mar 8) differs from Europe/Zurich's (Mar 29) —
+        proves the timezone parameter is actually used, not hardcoded."""
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-03-08 02:30,2026-03-08 04:00,gap\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "US/Eastern", _LOGGER)
+        assert any("nonexistent" in r.message.lower() for r in caplog.records)
+
+
 # ── fetch_presence_history ──────────────────────────────────────────────────────
 
 
