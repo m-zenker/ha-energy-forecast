@@ -1,6 +1,6 @@
 # Excluded Training Date Ranges — Design Spec
 
-**Date:** 2026-07-19 (rev. 2 — post multi-stakeholder review)
+**Date:** 2026-07-19 (rev. 3 — post multi-stakeholder review, round 2)
 **Status:** Proposed — pending user review before implementation planning
 **Branch base:** `dev`
 
@@ -11,8 +11,19 @@ training), `MIN_HISTORY_HOURS` was checked before filtering instead of after, DS
 duplicate rows were unaddressed, neither new function had a specified exception-handling
 contract, overlapping ranges produced misleading log counts, and the spec implied the feature
 alone "solves" the incident class despite this project having no fault-detection/alerting
-infrastructure. Rev. 2 (this document) resolves all High/Medium findings and folds the accepted
-Low-severity gaps into an explicit Known Limitations section rather than leaving them unstated.
+infrastructure. Rev. 2 resolved all High/Medium findings and folded the accepted Low-severity
+gaps into an explicit Known Limitations section. The same three reviewers re-checked rev. 2 and
+found 27/29 original issues resolved (the remaining two — a hard sanity cap on range size, and
+CSV backup/version history — deliberately left as documented limitations rather than fixed) plus
+4 new issues from the round-2 pass: `load_excluded_ranges`'s signature was missing the
+`timezone` parameter its own spring-forward check depended on, the file-level-vs-row-level
+`KeyError` distinction lacked an implementation mechanism (would have warned once per row instead
+of once per file), two new model.py behavior changes (holdout-cutoff fix, anchor-staleness
+logging) had no corresponding tests, and the live `recent_actuals` path's 2-day fetch window
+wasn't checked against exclusion-range size (resolved by pointing at the existing empty-input
+fallback in `_add_lag_and_rolling_prediction`, no new code needed). This revision (rev. 3) fixes
+all four, plus the two lingering cosmetic items (typed `logger` parameter, docstring convention
+callout) and a code-location citation slip. See §3-§5 for the specific changes.
 
 ## 1. Problem & Motivation
 
@@ -101,33 +112,45 @@ operator excludes down to the exact minute.
   nonexistent local time into `start`/`end` (this parses without error). The resulting range
   simply won't match any real row, indistinguishable in the row-count log from a legitimately
   stale range. `load_excluded_ranges` additionally checks each parsed timestamp against the
-  known spring-forward gap for the configured timezone and logs a distinct `WARNING`
+  known spring-forward gap for the configured timezone (passed in as a parameter — see signature
+  below, fixed post-re-review) and logs a distinct `WARNING`
   ("timestamp falls in a nonexistent local time — check for a transcription error") when it does,
   so this failure mode isn't silently conflated with "range no longer needed."
 
 ## 3. Loading & Filtering
 
 Two new functions in `ha_data.py`, placed next to `validate_energy_cache()` (the existing
-data-quality section of that module):
+data-quality section of that module), following its docstring convention (one-line summary, an
+explicit "never raises" sentence, enumerated malformed-input behaviors, `Args:`/`Returns:`
+sections) and its typed-parameter style (`logger: logging.Logger`, fixed post-re-review — rev. 2
+draft omitted the type hint).
 
-### `load_excluded_ranges(path: Path, logger) -> list[tuple[Timestamp, Timestamp, str]]`
+### `load_excluded_ranges(path: Path, timezone: str, logger: logging.Logger) -> list[tuple[Timestamp, Timestamp, str]]`
 
+- Takes `timezone` explicitly (fixed post-re-review — rev. 2 draft referenced "the configured
+  timezone" in the spring-forward check without it being a parameter) so the spring-forward-gap
+  check has a timezone to check against; callers pass `self._timezone`, same as every other
+  `ha_data.py` function that needs it.
 - Missing file → return `[]`, no warning (the common/default case).
 - File-level failures (`OSError`, `pd.errors.ParserError`, `pd.errors.EmptyDataError` — covers a
   zero-byte file, a torn Samba write, or a fully corrupt file) are caught around the `read_csv`
   call; logs one `WARNING`, returns `[]`. This is a distinct branch from "missing file" (tested
   separately, per §5) but produces the same externally-visible result.
+- **Column presence is checked once, upfront, before any per-row loop** (fixed post-re-review —
+  a per-row-only check would raise the same `KeyError` N times, once per row, instead of the one
+  clean file-level warning the design intends): if `start` or `end` is missing from the parsed
+  header, log one `WARNING` and return `[]` immediately. `reason`'s absence is not an error — see
+  below.
 - A header-only file (valid CSV, zero data rows) is not an error — returns `[]` silently, same
   as "missing file," since there's nothing malformed about it.
-- Per-row validation is wrapped in its own `try/except (KeyError, ValueError, TypeError,
-  AttributeError)` — a missing `start`/`end` column raises `KeyError` (file-level, since it
-  affects every row identically — caught and treated as a malformed file, not a malformed row);
-  a single bad row (unparseable date per the format rule above, tz-offset present, or
-  `end < start` after the end-of-day expansion) is logged at `WARNING` and skipped, and the rest
-  of the file still loads.
+- With required columns confirmed present, per-row validation is wrapped in its own
+  `try/except (ValueError, TypeError, AttributeError)` (no `KeyError` here — that failure mode is
+  fully handled by the upfront column check above, so it can't recur per-row) — a single bad row
+  (unparseable date per the format rule above, tz-offset present, or `end < start` after the
+  end-of-day expansion) is logged at `WARNING` and skipped, and the rest of the file still loads.
 - `reason` defaults to `""` if the column is absent.
 
-### `filter_excluded_ranges(df: pd.DataFrame, ranges: list[tuple], logger) -> pd.DataFrame`
+### `filter_excluded_ranges(df: pd.DataFrame, ranges: list[tuple], logger: logging.Logger) -> pd.DataFrame`
 
 - Guard clause: `if df.empty or "timestamp" not in df.columns or not ranges: return df` — mirrors
   `validate_energy_cache`'s pattern.
@@ -181,7 +204,18 @@ stored feature medians used elsewhere — consistent with the training-side beha
 diverging from it.
 
 This does **not** extend to the anomaly-detection/live-MAE sensors computed earlier in the same
-`_update_sensors()` pass from the same raw fetch — see §6.
+`_update_sensors()` pass from the same raw fetch — see §6. Verified structurally: `full_actuals`
+(feeds `_actuals_history`/anomaly/MAE) and `recent_actuals` (feeds lag features, the only one
+filtered here) are genuinely distinct objects in `_update_sensors()`, so this boundary is
+implementable exactly as described, not just true in prose.
+
+**Small-window edge case (added post-re-review):** `recent_actuals` is fetched as a 2-day window
+(energy_forecast.py:1728-1729). An exclusion range comparable to or larger than 2 days can empty
+it entirely for a given prediction cycle. This is not a new failure mode:
+`_add_lag_and_rolling_prediction()` already has an explicit empty/`None` branch (model.py:2200)
+that falls back to `NaN` for every lag/rolling column, filled by stored training medians exactly
+as the "no history yet" cold-start case is handled today. No additional code is needed — noted
+here so an implementer doesn't mistake this for an unhandled gap.
 
 ### 4.3 Downstream effects requiring operator awareness (added post-review)
 
@@ -204,7 +238,8 @@ range was a complete fix, which isn't accurate for two subsystems:
   `DailyProfileClusterer.fit()` requires ≥18 hourly rows to keep a day at all (clustering.py:76-77)
   — unlike EV days (excluded from centroid *fitting* but still labeled via `km.predict`), a day
   more than ~6 hours chopped by an exclusion gets no regime label at all, and
-  `mapped_labels.ffill()` carries the previous day's label forward. The spec's original claim that
+  `mapped_labels.ffill()` (model.py:519, not clustering.py — corrected post-re-review) carries the
+  previous day's label forward. The spec's original claim that
   datetime-granularity exclusion "doesn't force discarding the whole day" holds for the GBM's
   lag/rolling features but not for clustering — documented here rather than silently
   inconsistent (finding #13).
@@ -283,6 +318,18 @@ equivalent):
 - A retrain where filtering shifts row count across the `active_lags` `n_rows - lag ≈ 100`
   threshold: confirm graceful degradation (feature dropped/median-filled), not a crash, when a
   previously-saved `meta.pkl` expected a lag feature that's no longer active.
+- **(Added post-re-review — §4.3's two model.py changes had no corresponding tests):** the
+  physics holdout cutoff, with a multi-day exclusion present, is computed from
+  `(max_ts - min_ts).days` and produces a holdout window of the expected calendar length — not
+  silently shrunk by the row-count proxy the old logic used.
+- **(Added post-re-review)**: when an active exclusion touches the tail of history (the ongoing-
+  fault case), `_retrain()` logs the gap between the frozen `weight_halflife_days` anchor and the
+  actual current time once it exceeds 24h.
+
+`tests/test_ha_data.py` additionally covers `load_excluded_ranges`'s new `timezone` parameter
+(fixed post-re-review — the spring-forward-gap check needs it, and the rev. 2 draft's signature
+omitted it): passing a different configured timezone changes which local times are flagged as
+falling in that timezone's spring-forward gap.
 
 ## 6. Known Limitations & Accepted Gaps (expanded post-review)
 
