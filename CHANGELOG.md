@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.12.0-alpha-8] — 2026-07-19
 
 ### Added
 - `scripts/check_ha_status.py` — new diagnostic script (gitignored; a smaller, hef-specific variant of `ha-energy-manager`'s counterpart): queries HA's `/api/states` endpoint and writes a timestamped snapshot to `logs/ha_status.md`. Covers the shared AppDaemon add-on's running state, this app's `model_phase` attribute (read from `sensor.energy_forecast_today`), and the `energy_forecast_setup_status` self-reported health sensor. The same add-on `/info` 401 limitation applies — add-on state shows `unknown (fetch failed: ...)` with the current `EM_HA_TOKEN` until Supervisor credentials are configured.
