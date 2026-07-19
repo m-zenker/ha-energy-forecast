@@ -1490,8 +1490,9 @@ class EnergyForecast(hass.Hass):
         gap_hours = (now_ts - energy_df["timestamp"].max()).total_seconds() / 3600
         if gap_hours > 24:
             _LOGGER.warning(
-                "Most recent training data is %.1fh behind now() — an active excluded "
-                "range may be freezing the recency-weighting anchor at the fault's onset.",
+                "Most recent training data is %.1fh behind now() — check for stale/missing "
+                "history data, or an active excluded range freezing the recency-weighting "
+                "anchor at the fault's onset.",
                 gap_hours,
             )
 
