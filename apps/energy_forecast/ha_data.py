@@ -223,6 +223,67 @@ def load_excluded_ranges(
     return ranges
 
 
+_EXCLUSION_WARN_ROW_FRACTION = 0.10
+_EXCLUSION_WARN_SPAN_DAYS = 14
+
+
+def filter_excluded_ranges(
+    df: pd.DataFrame, ranges: list[tuple[pd.Timestamp, pd.Timestamp, str]], logger: logging.Logger
+) -> pd.DataFrame:
+    """Drop rows whose timestamp falls in any hand-configured known-bad range.
+
+    Never raises — on any unexpected failure, logs .error() and returns df
+    unfiltered rather than propagating, so a bug here degrades to "no
+    filtering happened," never to "the caller's retrain/predict cycle didn't
+    happen."
+
+    Args:
+        df: DataFrame with a 'timestamp' column (naive local).
+        ranges: Output of load_excluded_ranges() — (start, end, reason)
+            tuples, end inclusive.
+        logger: Logger to report per-range and total drop counts to.
+
+    Returns:
+        df with excluded rows removed (a new DataFrame; input is not
+        mutated), index reset to a clean RangeIndex. Returns df unchanged
+        (same object) if df is empty, has no 'timestamp' column, or ranges
+        is empty/falsy.
+    """
+    import pandas as pd
+
+    if df.empty or "timestamp" not in df.columns or not ranges:
+        return df
+
+    try:
+        total_rows = len(df)
+        union_mask = pd.Series(False, index=df.index)
+        for start, end, reason in ranges:
+            range_mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
+            n_dropped = int(range_mask.sum())
+            span_days = (end - start).total_seconds() / 86400
+            escalate = (
+                total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
+            ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
+            log_fn = logger.warning if escalate else logger.info
+            log_fn(
+                "Excluded range %s -> %s (%s): dropped %d row(s).",
+                start,
+                end,
+                reason or "no reason given",
+                n_dropped,
+            )
+            union_mask = union_mask | range_mask
+
+        total_dropped = int(union_mask.sum())
+        if total_dropped:
+            logger.info("Excluded ranges: %d unique row(s) dropped in total.", total_dropped)
+
+        return df.loc[~union_mask].reset_index(drop=True)
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
+        logger.error("filter_excluded_ranges failed (%s) — returning df unfiltered.", exc)
+        return df
+
+
 def _merge_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame, value_col: str) -> pd.DataFrame:
     """Merge two DataFrames; df_winner's value wins on duplicate timestamps.
 
