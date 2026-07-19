@@ -6578,9 +6578,11 @@ class TestActiveLagsBoundaryAcrossRetrains:
             }
         )
 
-    def test_lag_168h_drops_out_without_crash_when_rows_fall_below_threshold(self, tmp_path):
+    def test_lag_72h_drops_out_without_crash_when_rows_fall_below_threshold(self, tmp_path):
         # lag_72h needs n_rows - 72 >= 100, i.e. n_rows >= 172.
-        # (lag_168h is gated and never appears in feature_cols; test lag_72h instead)
+        # (lag_168h is gated — _GATED_LAG_HOURS in model.py — and never appears
+        # in feature_cols regardless of row count, so it can't be used for this
+        # boundary-crossing test; lag_72h is the analogous non-gated lag.)
         m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
 
         energy_wide = self._energy_df(250)  # 250 - 72 = 178 >= 100: lag_72h active
