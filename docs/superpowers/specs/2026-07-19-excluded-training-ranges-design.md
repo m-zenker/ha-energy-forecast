@@ -1,8 +1,18 @@
 # Excluded Training Date Ranges — Design Spec
 
-**Date:** 2026-07-19
-**Status:** Proposed — pending user review of this document before implementation planning
+**Date:** 2026-07-19 (rev. 2 — post multi-stakeholder review)
+**Status:** Proposed — pending user review before implementation planning
 **Branch base:** `dev`
+
+**Revision note:** rev. 1 was reviewed by three independent domain experts (Data Scientist,
+Software Engineer, Domain/Energy-Systems Engineer) in parallel. That review surfaced 25 issues
+(10 High) — most significantly: excluded ranges never reached the live prediction path (only
+training), `MIN_HISTORY_HOURS` was checked before filtering instead of after, DST fall-back
+duplicate rows were unaddressed, neither new function had a specified exception-handling
+contract, overlapping ranges produced misleading log counts, and the spec implied the feature
+alone "solves" the incident class despite this project having no fault-detection/alerting
+infrastructure. Rev. 2 (this document) resolves all High/Medium findings and folds the accepted
+Low-severity gaps into an explicit Known Limitations section rather than leaving them unstated.
 
 ## 1. Problem & Motivation
 
@@ -23,6 +33,12 @@ clipping in `_raw_to_kwh_diff`, warning-only gap/monotonicity/range checks in
 `validate_energy_cache()`, and EV-hour exclusion. None of them can express "these specific
 calendar hours are untrustworthy regardless of what value they contain."
 
+**Scope note (added post-review):** this feature addresses *training-time* data quality and, as
+of rev. 2, the *live prediction-time* lag-feature path (§4). It explicitly does **not** provide
+fault detection/alerting, does not retroactively fix an already-poisoned deployed model or
+physics calibration without a follow-up operator action, and does not suppress bogus values on
+live anomaly/MAE sensors during an active fault. See §6 for the complete list of accepted gaps.
+
 ## 2. Storage Format
 
 A new file, `excluded_ranges.csv`, lives in the same directory as `energy_history.csv`
@@ -30,98 +46,280 @@ A new file, `excluded_ranges.csv`, lives in the same directory as `energy_histor
 the other cache CSVs, and already pulled locally by `scripts/pull_ha_data.py`. This location was
 chosen (over a checked-in repo file or an `apps.yaml` config block) specifically so a newly
 noticed hardware fault can be excluded immediately by editing the file directly on HA, with no
-deploy or AppDaemon restart required — the next scheduled or triggered retrain picks it up.
+deploy or AppDaemon restart required.
 
 Columns:
 
-| Column | Type | Notes |
+| Column | Required | Notes |
 |---|---|---|
-| `start` | naive local timestamp | Same tz convention as `energy_df` after `_strip_tz()` |
-| `end` | naive local timestamp | Inclusive |
-| `reason` | free text | For humans; not parsed |
+| `start` | yes | Naive local timestamp, `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` only |
+| `end` | yes | Same format; inclusive; see end-of-day rule below |
+| `reason` | no | Free text, defaults to `""` if the column is absent |
+
+Any additional/unrecognized columns are ignored (not treated as malformed).
 
 Example:
 
 ```csv
 start,end,reason
 2026-07-19 14:00,2026-07-21 09:30,gplug + solaredge hardware fault
+2026-07-25,2026-07-26,gplug + solaredge hardware fault (day 2)
 ```
 
-Ranges may be added, removed, or edited freely; the file is read fresh on every retrain. Datetime
-(not just date) granularity is supported so a fault that starts or ends mid-day doesn't force
-discarding the whole day.
+### Format requirements (added post-review — findings #16, #17)
+
+`start`/`end` must match `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` exactly (validated with a regex
+before parsing) — not passed through pandas' lenient/mixed date parser. This removes the
+day/month ambiguity risk a hand-typed date otherwise carries (e.g. `07/19/2026` vs `19/07/2026`).
+A row that doesn't match either pattern is treated as malformed: logged at `WARNING`, skipped.
+
+A timestamp containing a timezone offset or `Z` suffix (e.g. `2026-07-19 14:00+02:00`) is
+explicitly rejected as malformed (logged, skipped) rather than silently normalized — this file's
+convention is naive local time only, matching `energy_df` post-`_strip_tz()`, and silently
+accepting an offset risks a human reasoning in the wrong reference frame.
+
+### End-of-day rule (added post-review — finding #22)
+
+If `end` is given as a bare date (no time component in the raw string, distinguished at the
+string level before parsing — `2026-07-21`, not `2026-07-21 00:00`), it is expanded to
+`2026-07-21 23:59:59`, i.e. "through the end of that day." This matches the overwhelmingly likely
+human intent ("discard the 19th through the 21st") and avoids a silent off-by-23-hours bug where
+an explicit-looking date actually only covered the first minute of the last day. An explicit
+`end` with a time component (including `00:00`) is used exactly as written — this is how an
+operator excludes down to the exact minute.
+
+### DST handling (added post-review — findings #3, #20)
+
+- **Fall-back (e.g. late-October, Europe/Zurich 03:00 CEST → 02:00 CET):** after `_strip_tz()`,
+  the ambiguous hour appears as two rows sharing one naive timestamp (`_check_dst_duplicates`).
+  A range boundary landing in this hour cannot select only one occurrence — **both rows are
+  always dropped together, or neither.** This is a documented limitation, not a bug: splitting
+  them would require a schema change (UTC or explicit-offset timestamps) that isn't justified by
+  the current use case. If a future fault's boundary lands exactly here, both real hours are
+  lost; this is an acceptable, rare cost.
+- **Spring-forward (e.g. late-March, 02:00–02:59 never occurs locally):** a human can type a
+  nonexistent local time into `start`/`end` (this parses without error). The resulting range
+  simply won't match any real row, indistinguishable in the row-count log from a legitimately
+  stale range. `load_excluded_ranges` additionally checks each parsed timestamp against the
+  known spring-forward gap for the configured timezone and logs a distinct `WARNING`
+  ("timestamp falls in a nonexistent local time — check for a transcription error") when it does,
+  so this failure mode isn't silently conflated with "range no longer needed."
 
 ## 3. Loading & Filtering
 
 Two new functions in `ha_data.py`, placed next to `validate_energy_cache()` (the existing
 data-quality section of that module):
 
-- **`load_excluded_ranges(path: Path, logger) -> list[tuple[Timestamp, Timestamp, str]]`**
-  Missing file → return `[]`, no warning (this is the common/default case — most retrains have no
-  active exclusions). A malformed row (unparseable dates, or `end < start`) is logged as a
-  `WARNING` and skipped; the rest of the file still loads. A completely malformed file (e.g.
-  missing required columns) logs a `WARNING` and returns `[]` — mirrors `validate_energy_cache`'s
-  "never raise" contract, since a bad exclusions file must not block retraining.
+### `load_excluded_ranges(path: Path, logger) -> list[tuple[Timestamp, Timestamp, str]]`
 
-- **`filter_excluded_ranges(df: pd.DataFrame, ranges: list[tuple], logger) -> pd.DataFrame`**
-  Drops rows from `df` whose `timestamp` falls within `[start, end]` for any range (inclusive).
-  Logs one `INFO` line per range with the actual row count dropped — including a count of `0`,
-  which signals the range no longer overlaps the cache (useful for noticing a stale entry that
-  should be removed from the CSV). Returns `df` unchanged if `ranges` is empty.
+- Missing file → return `[]`, no warning (the common/default case).
+- File-level failures (`OSError`, `pd.errors.ParserError`, `pd.errors.EmptyDataError` — covers a
+  zero-byte file, a torn Samba write, or a fully corrupt file) are caught around the `read_csv`
+  call; logs one `WARNING`, returns `[]`. This is a distinct branch from "missing file" (tested
+  separately, per §5) but produces the same externally-visible result.
+- A header-only file (valid CSV, zero data rows) is not an error — returns `[]` silently, same
+  as "missing file," since there's nothing malformed about it.
+- Per-row validation is wrapped in its own `try/except (KeyError, ValueError, TypeError,
+  AttributeError)` — a missing `start`/`end` column raises `KeyError` (file-level, since it
+  affects every row identically — caught and treated as a malformed file, not a malformed row);
+  a single bad row (unparseable date per the format rule above, tz-offset present, or
+  `end < start` after the end-of-day expansion) is logged at `WARNING` and skipped, and the rest
+  of the file still loads.
+- `reason` defaults to `""` if the column is absent.
 
-## 4. Integration Point
+### `filter_excluded_ranges(df: pd.DataFrame, ranges: list[tuple], logger) -> pd.DataFrame`
 
-Single call site: `_retrain()` in `energy_forecast.py`, immediately after
+- Guard clause: `if df.empty or "timestamp" not in df.columns or not ranges: return df` — mirrors
+  `validate_energy_cache`'s pattern.
+- Wrapped in `try/except (KeyError, ValueError, TypeError, AttributeError)`: on any unexpected
+  failure, logs `.error(...)` and **returns `df` unfiltered** rather than propagating — a bug in
+  this new code must degrade to "no filtering happened," never to "retrain didn't happen" (added
+  post-review — finding #4; this was previously unspecified and the only exception safety net
+  upstream is `_retrain_cb`'s broad `except Exception`, which would have silently skipped the
+  *entire* retrain, not just the filter).
+- **Row-count accounting (fixed post-review — finding #6):** each range's dropped-row count is
+  computed against the *original* `df`, independently of other ranges — not sequentially against
+  a shrinking frame. This keeps a `0`-count log line meaningful ("this range doesn't overlap
+  anything, might be stale") even when a later-listed range overlaps an earlier one. After all
+  per-range lines, one additional line logs the total unique rows actually dropped (via the union
+  of all range masks), so overlapping ranges don't inflate the perceived total loss.
+- **Escalation threshold (added post-review — finding on typo protection):** if a single range's
+  drop count exceeds 10% of `len(df)` or the range spans more than 14 days, the per-range log
+  line is emitted at `WARNING` instead of `INFO` — this is the only realistic tripwire for a
+  fat-fingered year/typo in a hand-edited file, given the project has no other alerting.
+
+## 4. Integration Points
+
+### 4.1 Training path (primary)
+
+`_retrain()` in `energy_forecast.py`: `filter_excluded_ranges` is called immediately after
 `energy_df = _strip_tz(energy_df, self._timezone)` (currently line 1469) — before target
-correction and EV-threshold splitting. Rationale: if the main meter reading is corrupt, any
-correction or EV-detection computed from it is equally meaningless, so filtering as early as
-possible avoids doing wasted/misleading work on rows that are about to be dropped anyway.
+correction and EV-threshold splitting, since a correction or EV-detection computed from a
+corrupted main reading is equally meaningless.
 
-Confirmed via `grep` that `fetch_energy_history()` (the function that produces `energy_df`) has
-exactly one call site feeding the training pipeline — `_retrain()` — so no other code path needs
-touching. `energy_history_backfill.py` (the one-off historical backfill tool) writes into the
-cache CSV itself and is out of scope: exclusion is a training-time filter over the cache, not a
-cache-mutation step, so backfilled data can stay in `energy_history.csv` untouched and still gets
-filtered out at train time.
+**`MIN_HISTORY_HOURS` re-check (fixed post-review — findings #2):** the existing check at
+energy_forecast.py:1465 runs *before* `_strip_tz()`/the new filter call, so it validates the
+pre-filter row count. A second check is added immediately after `filter_excluded_ranges` runs: if
+the post-filter row count falls below `MIN_HISTORY_HOURS`, log a `WARNING` that explicitly
+attributes the shortfall to active exclusions (not just "insufficient history," which would be
+misleading to whoever edited the CSV) and skip the retrain, same as the existing pre-filter case.
 
-### Why dropping rows (not NaN-ing values in place) is safe
+### 4.2 Live prediction path (added post-review — finding #1, was entirely missing from rev. 1)
 
-`_add_lag_and_rolling_training()` (model.py:2168-2172) already reindexes `energy_df` onto a dense
-continuous hourly grid *before* computing `shift()`-based lag/rolling features, specifically so
-that gaps (from EV-adjacent-hour drops, sensor outages, etc.) don't corrupt lag calculations for
-surrounding rows — this is pre-existing, not new. `_add_sub_sensor_lags_training()` does the
-equivalent for sub-sensor lags. Consequence for this feature:
+`_add_lag_and_rolling_prediction()` (model.py:2187) is fed by `recent_actuals`, populated in
+`_update_sensors()` via a *separate* call to `ha_data.fetch_recent_energy(...)`
+(energy_forecast.py:1732) — not by `_retrain()`'s `energy_df`. Without a fix, every prediction
+made while a fault is active computes `lag_24h`/`lag_168h`/rolling stats from the same known-bad
+readings the training set is being taught to never see — the opposite of the intended isolation,
+and a real train/predict mismatch (the model learns these hours are `NaN→median`; live inference
+would otherwise feed it real corrupted values instead).
 
-- **Hours outside the excluded window**: unaffected — lags/rolling stats compute correctly, same
-  gap-handling already exercised today.
-- **Hours inside the excluded window**: lose their own training row entirely (correct — there's no
-  trustworthy label to train against). Any lag feature on a later row that looks back into the gap
-  becomes `NaN`, filled by stored feature medians — same fallback already used for short-history
-  and other-gap cases.
+**Fix:** `filter_excluded_ranges` (the same function, no new code) is also applied to
+`recent_actuals` at the point it's built in `_update_sensors()`, before it reaches
+`_add_lag_and_rolling_prediction()`. Excluded hours fall back to `NaN`, filled by the same
+stored feature medians used elsewhere — consistent with the training-side behavior instead of
+diverging from it.
 
-Other sensors' data (weather, climate, sub-sensors, presence) for the excluded hours isn't
-separately discarded — it's simply unused for those hours because there's no `energy_df` row left
-to join it to. Data for all non-excluded hours remains fully usable.
+This does **not** extend to the anomaly-detection/live-MAE sensors computed earlier in the same
+`_update_sensors()` pass from the same raw fetch — see §6.
+
+### 4.3 Downstream effects requiring operator awareness (added post-review)
+
+These are documented here because they affect what "the exclusion took effect" actually means in
+practice — none of them are new code in this iteration, but the spec previously implied adding a
+range was a complete fix, which isn't accurate for two subsystems:
+
+- **Physics calibration is not automatically refreshed.** `self._physics_model.calibrate(...)` is
+  only invoked from the manual `energy_forecast/recalibrate_physics` HA service — never from
+  `_retrain()`. If an excluded window overlaps the period `physics_calibration.json` was last
+  calibrated against, adding the exclusion does not fix that calibration; the operator must
+  separately call `recalibrate_physics` if the fault materially affected it (finding #10).
+- **Physics holdout sizing assumes no large gaps.** `train()`'s holdout cutoff
+  (`len(energy_df) / 24 * 0.1` days, ~model.py:420) treats row count as a proxy for calendar
+  span. Pre-existing gaps (EV-adjacent hours, an hour or two of outage) are small enough for this
+  to not matter; a multi-day exclusion is not. **This is being fixed as part of this feature**
+  (not deferred) — the holdout cutoff will be computed from `(max_ts - min_ts).days` instead of
+  row count (finding #11).
+- **Regime clustering's day-completeness filter is stricter than the hourly model.**
+  `DailyProfileClusterer.fit()` requires ≥18 hourly rows to keep a day at all (clustering.py:76-77)
+  — unlike EV days (excluded from centroid *fitting* but still labeled via `km.predict`), a day
+  more than ~6 hours chopped by an exclusion gets no regime label at all, and
+  `mapped_labels.ffill()` carries the previous day's label forward. The spec's original claim that
+  datetime-granularity exclusion "doesn't force discarding the whole day" holds for the GBM's
+  lag/rolling features but not for clustering — documented here rather than silently
+  inconsistent (finding #13).
+- **Gap blast radius extends past the window edges.** `lag_168h`/`lag_336h` and `rolling_mean_7d`
+  (min_periods=48/168) mean rows up to 336 hours (14 days) *after* an excluded window can have
+  individual features silently `NaN→median`-filled, not just rows strictly inside the window.
+  Sizing a multi-day exclusion should account for this wider (though much less severe —
+  individual features, not the whole row) degraded radius (finding #14).
+- **Recency weighting can freeze during an active, ongoing exclusion.** `weight_halflife_days`
+  anchors to `energy_df["timestamp"].max()` — computed post-filter. If the fault is still
+  ongoing at retrain time, this anchor becomes the last good pre-fault hour, not "now," and stays
+  there across every retrain until the fault ends. `_retrain()` will log the gap between this
+  anchor and the actual current time when it exceeds 24h, so a long-running fault is visible
+  rather than silently degrading recency weighting retrain after retrain (finding #15).
+- **An already-poisoned deployed model isn't retroactively fixed by adding an exclusion** — the
+  currently-serving model/`meta.pkl` keeps making live predictions, trained on the bad data,
+  until the next successful filtered retrain actually completes (up to 7 days away — see §4.4).
+  `rollback_model()` (already available, model.py:974) is the recommended immediate stopgap if a
+  fault is discovered to have measurably degraded live predictions (finding #12).
+
+### 4.4 Applying an exclusion immediately (added post-review — finding #8)
+
+Editing `excluded_ranges.csv` alone does not take effect until the next retrain, and the only
+unconditional automatic retrain is weekly (`RETRAIN_INTERVAL_S`, 168h). The MAE-triggered
+adaptive retrain path (`_maybe_adaptive_retrain`) is not a reliable fast path here — this
+feature's whole premise is that a hardware fault of this kind produces *plausible-looking* data,
+which is exactly the kind of degradation that may not cleanly blow out live MAE past its
+threshold. **For an active fault, the operational step is to fire the existing
+`RELOAD_ENERGY_MODEL` HA event** (already wired: `self.listen_event(self._retrain_cb,
+"RELOAD_ENERGY_MODEL")`, energy_forecast.py:397) immediately after editing the CSV, to force a
+retrain under the new exclusion right away rather than waiting up to a week.
 
 ## 5. Testing
 
-- `tests/test_ha_data.py`:
-  - `load_excluded_ranges`: missing file → `[]`; well-formed file → correct tuples; one malformed
-    row among valid ones → malformed skipped, valid ones still loaded, warning logged; fully
-    malformed file → `[]`, warning logged, no exception.
-  - `filter_excluded_ranges`: rows inside a range are dropped; rows outside are kept; multiple
-    non-overlapping ranges both apply; empty `ranges` list is a no-op; dropped-row count in the
-    log matches actual rows removed.
-- One integration-style test on `_retrain()` (or the smallest slice of it that's practical) confirming
-  a configured excluded window does not appear in the frame ultimately passed to `train()`.
+`tests/test_ha_data.py`:
 
-## 6. Out of Scope
+- `load_excluded_ranges`:
+  - missing file → `[]`, no log
+  - header-only file (valid, zero rows) → `[]`, no warning (distinct code path from missing file)
+  - well-formed multi-row file → correct tuples, `reason` populated
+  - `reason` column absent → tuples with `reason=""`
+  - extra unrecognized column present → ignored, doesn't affect parsing
+  - one malformed row among valid ones (bad format, `end < start`) → malformed skipped, others
+    still loaded, `WARNING` logged
+  - fully malformed file (missing `start`/`end` columns) → `[]`, `WARNING` logged, no exception
+  - ambiguous/non-ISO date format (e.g. `07/19/2026`) → rejected as malformed, skipped
+  - timezone-aware timestamp in a row (`+02:00` suffix) → rejected as malformed, skipped, no crash
+  - bare-date `end` → expands to `23:59:59` of that date
+  - explicit-time `end` (including `00:00`) → used exactly as given, not expanded
+  - range boundary landing on a DST fall-back ambiguous hour → both duplicate-timestamp rows
+    dropped together (asserted, not just "doesn't crash")
+  - range boundary on a spring-forward nonexistent local time → distinct `WARNING` logged,
+    doesn't crash
+  - truncated/corrupt CSV content → `[]`, `WARNING`, no exception (Samba torn-write scenario)
+- `filter_excluded_ranges`:
+  - rows inside a range dropped; rows outside kept
+  - multiple non-overlapping ranges both apply
+  - two overlapping ranges: correct per-range counts (each vs. original `df`) and correct total
+    unique-rows-dropped count
+  - empty `ranges` list → no-op, `df` unchanged
+  - range entirely before/after all cache data → no-op, `0` logged
+  - range boundary exactly matching a single row's timestamp → that row dropped (inclusive
+    correctness, off-by-one check)
+  - a range dropping >10% of rows or spanning >14 days → logged at `WARNING`, not `INFO`
+  - malformed input (e.g. non-timestamp dtype in `df["timestamp"]`) → caught, `df` returned
+    unfiltered, `.error` logged, no exception
 
-- Per-sensor exclusion (nulling only the affected sensor while keeping others for that window) —
-  rejected during design; the main-series-only drop is sufficient since gPlug/SolarEdge feed the
-  target series and its correction directly.
-- Touching `energy_history_backfill.py` or analysis scripts (`analyze_forecast_bias.py`, etc.) —
-  can be added later if those scripts turn out to need the same filter; not needed for the
-  immediate training-exclusion goal.
-- Tooling to manage the CSV (add/remove-range script) — direct hand-editing via Samba is
-  sufficient for the expected frequency of hardware faults.
+Integration-level (smallest practical slice, likely in `tests/test_energy_forecast.py` or
+equivalent):
+
+- `_retrain()`: a configured excluded window does not appear in the frame passed to `train()`,
+  and post-filter row count below `MIN_HISTORY_HOURS` produces the exclusion-attributed warning
+  and skips retraining.
+- `_update_sensors()` / `_add_lag_and_rolling_prediction()`: `recent_actuals` for an excluded
+  window is excluded from live lag-feature computation the same way it is in training.
+- A retrain where filtering shifts row count across the `active_lags` `n_rows - lag ≈ 100`
+  threshold: confirm graceful degradation (feature dropped/median-filled), not a crash, when a
+  previously-saved `meta.pkl` expected a lag feature that's no longer active.
+
+## 6. Known Limitations & Accepted Gaps (expanded post-review)
+
+- **No fault detection or alerting.** This project has no watchdog/killswitch infrastructure
+  (per project `CLAUDE.md`); both prior incidents motivating this feature were found by a human
+  noticing anomalous behavior during unrelated work, not by an automated alert. This feature is
+  the *response* mechanism, not the *detection* mechanism — a fault an operator doesn't notice
+  gets no benefit from this feature existing. Explicitly flagged as a standing risk, not solved
+  here (finding #9).
+- **Live anomaly/MAE sensors remain unfiltered.** The anomaly-detection and live-MAE computation
+  inside `_update_sensors()` (energy_forecast.py:1732-1792) uses the same raw
+  `fetch_recent_energy`/`_apply_target_correction` path as §4.2's fix, but this spec only filters
+  the *lag-feature* consumption of `recent_actuals`, not these other consumers. During an active
+  fault, anomaly/MAE sensors will keep surfacing values derived from the faulty readings. This is
+  accepted for this iteration; fully suppressing those sensors during an active exclusion window
+  is a reasonable follow-up but adds meaningful scope (finding #24).
+- **Per-sensor exclusion remains out of scope.** The main-series-only drop is sufficient for the
+  motivating incident (both gPlug and SolarEdge are simultaneously bad), but the mechanism as
+  designed always discards the whole row. A future fault affecting only one of the two sensors
+  (e.g. SolarEdge misbehaving, gPlug fine) would still force discarding an otherwise-valid
+  raw-import label rather than just dropping the correction term for that window. Revisit if that
+  scenario occurs (finding #19).
+- **No backup or version history for the hand-edited CSV.** Unlike `apps.yaml` edits in this
+  project (which get an explicit `.bak` file before patching) or code changes (git-reviewed),
+  `excluded_ranges.csv` is a bare hand-edit over Samba. A fat-fingered deletion of a still-needed
+  range has no recovery path beyond the operator's own care. Pulling this file into
+  `scripts/pull_ha_data.py`'s existing sync would give a cheap local copy for diffing, but isn't
+  required for this iteration (finding #21).
+- **Samba mid-write torn reads are accepted as a non-issue.** A read racing a hand-edit save could
+  see a truncated file. Given retrain cadence isn't sub-second and every realistic torn-read
+  outcome degrades into the malformed-file or malformed-row handling already specified in §3,
+  this is treated as covered by existing error handling rather than needing a separate mitigation
+  (finding #23; a truncated-CSV test case is included in §5 to confirm this holds).
+- **`energy_history_backfill.py` and analysis scripts remain untouched.** The one-off historical
+  backfill tool writes into the cache CSV itself and is unaffected — exclusion is a training-time
+  filter over the cache, not a cache-mutation step, so backfilled data can stay in
+  `energy_history.csv` untouched and still gets filtered at train time. `analyze_forecast_bias.py`
+  and similar scripts can be updated to use the same filter later if needed; not required now.
+- **No CSV-management tooling.** Direct hand-editing via Samba is sufficient for the expected
+  frequency of hardware faults; an add/remove-range script is not justified by that frequency.
