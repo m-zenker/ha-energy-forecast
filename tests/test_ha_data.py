@@ -1213,6 +1213,108 @@ class TestLoadExcludedRanges:
         assert any("nonexistent" in r.message.lower() for r in caplog.records)
 
 
+from energy_forecast.ha_data import filter_excluded_ranges  # noqa: E402
+
+
+class TestFilterExcludedRanges:
+    def _df(self, start="2024-01-01 00:00", periods=48, freq="1h"):
+        ts = pd.date_range(start, periods=periods, freq=freq)
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * periods})
+
+    def test_rows_inside_range_dropped_outside_kept(self):
+        df = self._df()
+        ranges = [(pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 14:00"), "fault")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48 - 5  # 10:00..14:00 inclusive = 5 hourly rows
+        in_range = (result["timestamp"] >= ranges[0][0]) & (result["timestamp"] <= ranges[0][1])
+        assert not in_range.any()
+
+    def test_multiple_non_overlapping_ranges_both_apply(self):
+        df = self._df()
+        ranges = [
+            (pd.Timestamp("2024-01-01 02:00"), pd.Timestamp("2024-01-01 03:00"), "a"),
+            (pd.Timestamp("2024-01-01 20:00"), pd.Timestamp("2024-01-01 21:00"), "b"),
+        ]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48 - 4  # 2 rows each range
+
+    def test_overlapping_ranges_correct_per_range_and_total_counts(self, caplog):
+        df = self._df()
+        ranges = [
+            (pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 14:00"), "a"),  # 5 rows
+            (pd.Timestamp("2024-01-01 12:00"), pd.Timestamp("2024-01-01 16:00"), "b"),  # 5 rows, overlaps a
+        ]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        # union of [10:00-14:00] and [12:00-16:00] = [10:00-16:00] = 7 unique hourly rows
+        assert len(result) == 48 - 7
+        messages = [r.message for r in caplog.records]
+        assert sum("dropped 5 row" in m for m in messages) == 2  # each range logged independently, 5 each
+        assert any("7" in m and ("unique" in m.lower() or "total" in m.lower()) for m in messages)
+
+    def test_empty_ranges_list_is_noop(self):
+        df = self._df()
+        result = filter_excluded_ranges(df, [], _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
+
+    def test_range_entirely_outside_cache_is_noop(self, caplog):
+        df = self._df()
+        ranges = [(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02"), "old")]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48
+        assert any("dropped 0 row" in r.message for r in caplog.records)
+
+    def test_boundary_exact_match_drops_single_row(self):
+        df = self._df()
+        exact_ts = df["timestamp"].iloc[10]
+        ranges = [(exact_ts, exact_ts, "single hour")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 47
+        assert exact_ts not in result["timestamp"].values
+
+    def test_large_drop_fraction_escalates_to_warning(self, caplog):
+        df = self._df(periods=48)
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")]  # 11/48 rows = 23%
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_long_span_escalates_to_warning(self, caplog):
+        df = self._df(periods=24 * 20, freq="1h")  # 20 days of hourly data
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[-1], "long")]  # ~20-day span > 14
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_short_small_range_stays_info(self, caplog):
+        df = self._df()
+        ranges = [(pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 11:00"), "small")]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_malformed_input_returns_df_unfiltered(self, caplog):
+        df = pd.DataFrame({"timestamp": ["not", "timestamps"], "gross_kwh": [1.0, 2.0]})
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        with caplog.at_level(logging.ERROR, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_empty_df_returns_df_unchanged(self):
+        df = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert result.empty
+
+    def test_missing_timestamp_column_returns_df_unchanged(self):
+        df = pd.DataFrame({"gross_kwh": [1.0, 2.0]})
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
+
+
 # ── fetch_presence_history ──────────────────────────────────────────────────────
 
 
