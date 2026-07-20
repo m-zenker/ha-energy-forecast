@@ -18,11 +18,15 @@ _REPO_ROOT = pathlib.Path(__file__).parent.parent
 @pytest.fixture
 def status_module(monkeypatch):
     monkeypatch.setenv("EM_HA_TOKEN", "test-token")
-    spec = importlib.util.spec_from_file_location("check_ha_status", _REPO_ROOT / "scripts" / "check_ha_status.py")
+    script_path = _REPO_ROOT / "scripts" / "check_ha_status.py"
+    if not script_path.exists():
+        pytest.skip("scripts/check_ha_status.py is gitignored/local-only and not present in this checkout")
+    spec = importlib.util.spec_from_file_location("check_ha_status", script_path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["check_ha_status"] = mod
     spec.loader.exec_module(mod)
-    return mod
+    yield mod
+    del sys.modules["check_ha_status"]
 
 
 def _state(entity_id: str, state: str, attributes: dict | None = None) -> dict:
