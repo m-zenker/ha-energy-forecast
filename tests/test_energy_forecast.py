@@ -3572,11 +3572,217 @@ import logging as _logging_for_excluded_ranges_tests  # noqa: E402
 _EXCLUDED_RANGES_TEST_LOGGER = _logging_for_excluded_ranges_tests.getLogger("energy_forecast")
 
 
+class _FakeMLModelForUpdateSensors:
+    """Minimal stand-in for EnergyForecastModel, used to drive
+    EnergyForecast._update_sensors() end-to-end without a real trained model.
+
+    predict()/predict_intervals()/_prepare_prediction_X() are unconditionally
+    called by _update_sensors() (no guard skips them), so — unlike the
+    optional-feature attributes on _FakeUpdateSensors below — they can't be
+    left unset; they must return real, minimally-valid values so the
+    downstream _aggregate()/_publish() pipeline has something to chew on.
+    predict_intervals() returns None (a value _aggregate() already treats as
+    "uncalibrated, skip the interval sensors" — see the `if intervals is not
+    None` guard at energy_forecast.py:1601) so the whole prediction-interval
+    branch is skipped rather than stubbed.
+    """
+
+    last_trained = datetime.min  # _publish() takes the "never trained" branch
+    engine = "fake-engine"
+    last_mae = None
+    last_cv_mae = None  # short-circuits _maybe_adaptive_retrain() at the top (line 1875)
+    _latest_thermal_pressure_net = 0.0
+    _tau_hours = None
+
+    def _prepare_prediction_X(self, *args, **kwargs):
+        return None
+
+    def predict(self, *args, **kwargs):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range(start=now, periods=48, freq="1h"),
+                "predicted_kwh": [1.0] * 48,
+            }
+        )
+
+    def predict_intervals(self, *args, **kwargs):
+        return None
+
+    def shap_summary(self, *args, **kwargs):  # pragma: no cover - shap_top_n=0 skips this
+        return {}
+
+
+class _FakeUpdateSensors:
+    """Minimal stub for EnergyForecast._update_sensors() tests.
+
+    Every optional feature (EV sensor, solar/battery correction, sub-energy
+    sensors, climate/DHW, away/presence, outdoor temp) is left at its falsy
+    default so _update_sensors() takes the branch that skips the
+    corresponding fetch — mirroring _FakeRetrain's strategy for _retrain().
+    See TestUpdateSensorsExcludedRanges._patch_update_sensors_deps for the
+    guard/line-number citations backing each skip.
+    """
+
+    def __init__(self, cache_path):
+        self._plz = "12345"
+        self._lat = 47.0
+        self._lon = 8.5
+        self.args = {}
+        self._energy_sensor = "sensor.energy"
+        self._cache_path = cache_path
+        self._cache_path_15m = cache_path.parent / "energy_history_15m.csv"
+        self._timezone = "Europe/Zurich"
+        self._unit_multiplier = 1.0
+        self._ev_threshold = 7.0
+        self._ev_charger_kw = 9.0
+        self._ev_charging_sensor = None
+        self._solar_sensor = None
+        self._grid_export_sensor = None
+        self._battery_charge_sensor = None
+        self._battery_discharge_sensor = None
+        self._sub_energy_sensors = []
+        self._program_sensors = {}
+        self._baseline_mode = False
+        self._outdoor_sensor = None
+        self._away_mode_entity = None
+        self._away_return_entity = None
+        self._presence_sensors = None
+        self._climate_entities = []
+        self._dhw_buffer_sensor = None
+        self._heating_active_entity = None
+        self._climate_room_areas = None
+        self._shap_top_n = 0
+        self._anomaly_sigma_threshold = 3.0
+        self._mqtt_discovery = False
+        self._pred_history = {}
+        self._actuals_history = {}
+        self._ml_model = _FakeMLModelForUpdateSensors()
+        self.set_state_calls = []
+
+    def log(self, msg, level="INFO"):
+        pass
+
+    def get_state(self, entity_id):
+        return None
+
+    def set_state(self, entity_id, **kwargs):
+        self.set_state_calls.append({"entity_id": entity_id, **kwargs})
+
+    # _read_live_temp / _build_away_prediction_series /
+    # _build_people_home_prediction_series are real EnergyForecast instance
+    # methods, not module-level functions — they can't be monkeypatched at
+    # the module level, so delegate to the real implementation (same pattern
+    # _FakeRetrain uses for _ev_charging_cache_path). Each one early-returns
+    # a falsy/empty value without touching get_state because the triggering
+    # attribute (_outdoor_sensor / _away_mode_entity / _presence_sensors) is
+    # left None above — see the guard citations in
+    # TestUpdateSensorsExcludedRanges._patch_update_sensors_deps.
+    def _read_live_temp(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._read_live_temp(self)
+
+    def _build_away_prediction_series(self, now_ts):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._build_away_prediction_series(self, now_ts)
+
+    def _build_people_home_prediction_series(self, now_ts):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._build_people_home_prediction_series(self, now_ts)
+
+    # _publish_thermal_pressure / _aggregate / _publish / _maybe_adaptive_retrain /
+    # _save_pred_history are likewise real instance methods with no module-level
+    # equivalent to monkeypatch — delegate to the real implementation. None of
+    # them need extra stubbing beyond what's already on this class:
+    # _maybe_adaptive_retrain() short-circuits on _ml_model.last_cv_mae is None
+    # (energy_forecast.py:1875) before touching self._lock/_retrain, and
+    # _save_pred_history() writes through the PRED_HISTORY_PATH module global
+    # that _patch_update_sensors_deps() redirects into tmp_path.
+    def _publish_thermal_pressure(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._publish_thermal_pressure(self)
+
+    def _aggregate(self, *args, **kwargs):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._aggregate(self, *args, **kwargs)
+
+    def _publish(self, data):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._publish(self, data)
+
+    def _maybe_adaptive_retrain(self, actuals_df):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._maybe_adaptive_retrain(self, actuals_df)
+
+    def _save_pred_history(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._save_pred_history(self)
+
+
 class TestUpdateSensorsExcludedRanges:
     """Characterizes the load+filter composition Task 4 inserts into
     _update_sensors() right before self._cached_recent_actuals = recent_actuals
-    (spec §4.2). See the Scope note above for why this doesn't drive the full
-    method."""
+    (spec §4.2). The first two tests below exercise ha_data.load_excluded_ranges()
+    + ha_data.filter_excluded_ranges() directly; test_update_sensors_drives_
+    excluded_ranges_wiring drives EnergyForecast._update_sensors() itself
+    end-to-end (guard/fetch wiring, exact cache path, reassignment) via the
+    _FakeUpdateSensors/_FakeMLModelForUpdateSensors stubs above."""
+
+    def _patch_update_sensors_deps(self, monkeypatch, energy_df, tmp_path):
+        """Monkeypatch every dependency _update_sensors() calls unconditionally.
+
+        Everything NOT patched here is skipped by a guard already present in
+        _update_sensors() because the corresponding _FakeUpdateSensors
+        attribute is left None/[]/False — matching _FakeRetrain's strategy:
+          - _fetch_correction_dfs (energy_forecast.py:1403): internally
+            no-ops per-sensor when solar/grid_export/battery_* are None
+            (energy_forecast.py:2634), so it never calls fetch_recent_sub_sensor.
+          - ha_data.split_ev_charging_from_sensor: only called if
+            self._ev_charging_sensor is set (energy_forecast.py:1424).
+          - ha_data.fetch_recent_sub_sensor (sub-sensor loop): only entered if
+            self._sub_energy_sensors is non-empty (energy_forecast.py:1452).
+          - self._read_live_temp(): returns None immediately when
+            self._outdoor_sensor is falsy (energy_forecast.py:1721-1722).
+          - self._build_away_prediction_series(): returns an all-zero series
+            without calling get_state when self._away_mode_entity is falsy
+            (energy_forecast.py:1763-1764).
+          - self._build_people_home_prediction_series(): returns an all-zero
+            series without calling get_state when self._presence_sensors is
+            falsy (energy_forecast.py:1802-1803).
+          - ha_data.fetch_recent_climate: only called if self._climate_entities
+            is non-empty (energy_forecast.py:1487).
+          - ha_data.fetch_recent_generic_sensor: only called if
+            self._dhw_buffer_sensor / self._heating_active_entity are set
+            (energy_forecast.py:1497, 1509).
+          - self._build_heating_active_projection(): only called if
+            self._heating_active_entity and climate_recent are both truthy
+            (energy_forecast.py:1523).
+          - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
+            (energy_forecast.py:1668).
+        """
+        import energy_forecast.energy_forecast as ef_mod
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(weather_mod, "fetch_forecast", lambda *a, **kw: pd.DataFrame(columns=["timestamp"]))
+        monkeypatch.setattr(ha_data_mod, "fetch_recent_energy", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(ha_data_mod, "fetch_recent_energy_15m", lambda *a, **kw: None)
+        # _save_pred_history() writes to this module-level path unconditionally
+        # (energy_forecast.py:2506-2509) — redirect it into tmp_path so the test
+        # doesn't write pred_history.json next to the source tree.
+        monkeypatch.setattr(ef_mod, "PRED_HISTORY_PATH", tmp_path / "pred_history.json")
+        return ha_data_mod
 
     def test_excluded_window_removed_from_recent_actuals(self, tmp_path):
         from energy_forecast import ha_data
@@ -3610,6 +3816,33 @@ class TestUpdateSensorsExcludedRanges:
         result = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _EXCLUDED_RANGES_TEST_LOGGER)
 
         assert len(result) == 24
+
+    def test_update_sensors_drives_excluded_ranges_wiring(self, tmp_path, monkeypatch):
+        """End-to-end: EnergyForecast._update_sensors() itself — not just the two
+        ha_data helper functions above — must apply excluded_ranges.csv to
+        recent_actuals. Exercises the actual guard, the
+        self._cache_path.parent / "excluded_ranges.csv" path construction, and
+        the recent_actuals reassignment at energy_forecast.py:1529-1538."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(24)  # 2024-01-01 00:00..23:00, hourly
+        self._patch_update_sensors_deps(monkeypatch, energy_df, tmp_path)
+
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2024-01-01 05:00,2024-01-01 08:00,test fault\n"
+        )
+
+        stub = _FakeUpdateSensors(cache_path)
+        EnergyForecast._update_sensors(stub)  # must run to completion without raising
+
+        result = stub._cached_recent_actuals
+        assert result is not None
+        in_range = (result["timestamp"] >= pd.Timestamp("2024-01-01 05:00")) & (
+            result["timestamp"] <= pd.Timestamp("2024-01-01 08:00")
+        )
+        assert not in_range.any(), "excluded window must be absent from _cached_recent_actuals"
+        assert len(result) == 24 - 4  # 05:00..08:00 inclusive = 4 hourly rows
 
 
 class TestRetrainEvCachePathBug:
