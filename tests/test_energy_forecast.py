@@ -3622,6 +3622,15 @@ class _FakeUpdateSensors:
     corresponding fetch — mirroring _FakeRetrain's strategy for _retrain().
     See TestUpdateSensorsExcludedRanges._patch_update_sensors_deps for the
     guard/line-number citations backing each skip.
+
+    `_physics_model = None` applies the same strategy to the physics-ML
+    hybrid prediction flow: both `_fetch_physics_sensor_histories` and
+    `_publish_physics_sensors` (delegated below) early-return immediately
+    when `self._physics_model` is None — see
+    `apps/energy_forecast/energy_forecast.py:1295-1296` and
+    `apps/energy_forecast/energy_forecast.py:2389-2390` respectively — so
+    absent physics config, _update_sensors() takes the same no-op branch
+    through this stub that it does in production.
     """
 
     def __init__(self, cache_path):
@@ -3653,6 +3662,8 @@ class _FakeUpdateSensors:
         self._heating_active_entity = None
         self._climate_room_areas = None
         self._shap_top_n = 0
+        self._physics_model = None
+        self._physics_heating_buffer_df = None
         self._anomaly_sigma_threshold = 3.0
         self._mqtt_discovery = False
         self._pred_history = {}
@@ -3706,6 +3717,31 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._publish_thermal_pressure(self)
 
+    # _fetch_physics_sensor_histories / _publish_physics_sensors are likewise
+    # real instance methods with no module-level equivalent to monkeypatch —
+    # delegate to the real implementation. Both early-return immediately when
+    # self._physics_model is None (left None above), so they're safe no-ops
+    # here: _fetch_physics_sensor_histories at energy_forecast.py:1295-1296,
+    # _publish_physics_sensors at energy_forecast.py:2389-2390.
+    def _fetch_physics_sensor_histories(self, *args, **kwargs):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._fetch_physics_sensor_histories(self, *args, **kwargs)
+
+    def _publish_physics_sensors(self, forecast_df):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._publish_physics_sensors(self, forecast_df)
+
+    # _model_phase_attr() is called unconditionally by _publish() (used to tag
+    # the forecast sensor's "model_phase" attribute). It returns None
+    # immediately when self._physics_model is None (energy_forecast.py:1447-1448),
+    # so it's a safe no-op here too — same delegate pattern as above.
+    def _model_phase_attr(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._model_phase_attr(self)
+
     def _aggregate(self, *args, **kwargs):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -3741,32 +3777,43 @@ class TestUpdateSensorsExcludedRanges:
 
         Everything NOT patched here is skipped by a guard already present in
         _update_sensors() because the corresponding _FakeUpdateSensors
-        attribute is left None/[]/False — matching _FakeRetrain's strategy:
-          - _fetch_correction_dfs (energy_forecast.py:1403): internally
-            no-ops per-sensor when solar/grid_export/battery_* are None
-            (energy_forecast.py:2634), so it never calls fetch_recent_sub_sensor.
+        attribute is left None/[]/False — matching _FakeRetrain's strategy.
+        Line numbers below were re-verified against dev's current
+        energy_forecast.py (they drift from the non-physics branch this test
+        was originally written against, since dev's earlier physics-ml-hybrid
+        code shifts everything in _update_sensors() down by ~300 lines):
+          - _fetch_correction_dfs (called at energy_forecast.py:1784, guarded
+            by `if not full_actuals.empty:` at 1783): internally no-ops
+            per-sensor when solar/grid_export/battery_* are None
+            (energy_forecast.py:3103), so it never calls
+            fetch_recent_sub_sensor.
           - ha_data.split_ev_charging_from_sensor: only called if
-            self._ev_charging_sensor is set (energy_forecast.py:1424).
+            self._ev_charging_sensor is set (energy_forecast.py:1805).
           - ha_data.fetch_recent_sub_sensor (sub-sensor loop): only entered if
-            self._sub_energy_sensors is non-empty (energy_forecast.py:1452).
+            self._sub_energy_sensors is non-empty (energy_forecast.py:1836).
           - self._read_live_temp(): returns None immediately when
-            self._outdoor_sensor is falsy (energy_forecast.py:1721-1722).
+            self._outdoor_sensor is falsy (energy_forecast.py:2113-2114).
           - self._build_away_prediction_series(): returns an all-zero series
             without calling get_state when self._away_mode_entity is falsy
-            (energy_forecast.py:1763-1764).
+            (energy_forecast.py:2155-2156).
           - self._build_people_home_prediction_series(): returns an all-zero
             series without calling get_state when self._presence_sensors is
-            falsy (energy_forecast.py:1802-1803).
+            falsy (energy_forecast.py:2195-2196).
           - ha_data.fetch_recent_climate: only called if self._climate_entities
-            is non-empty (energy_forecast.py:1487).
+            is non-empty (energy_forecast.py:1864).
           - ha_data.fetch_recent_generic_sensor: only called if
             self._dhw_buffer_sensor / self._heating_active_entity are set
-            (energy_forecast.py:1497, 1509).
+            (energy_forecast.py:1874, 1885).
           - self._build_heating_active_projection(): only called if
             self._heating_active_entity and climate_recent are both truthy
-            (energy_forecast.py:1523).
+            (energy_forecast.py:1906).
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
-            (energy_forecast.py:1668).
+            (energy_forecast.py:2058).
+          - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
+            / self._model_phase_attr(): all three early-return immediately when
+            self._physics_model is None (energy_forecast.py:1295-1296,
+            2389-2390, 1447-1448 respectively) — see _FakeUpdateSensors'
+            docstring above.
         """
         import energy_forecast.energy_forecast as ef_mod
         import energy_forecast.ha_data as ha_data_mod
@@ -3822,7 +3869,7 @@ class TestUpdateSensorsExcludedRanges:
         ha_data helper functions above — must apply excluded_ranges.csv to
         recent_actuals. Exercises the actual guard, the
         self._cache_path.parent / "excluded_ranges.csv" path construction, and
-        the recent_actuals reassignment at energy_forecast.py:1529-1538."""
+        the recent_actuals reassignment at energy_forecast.py:1919-1928."""
         from energy_forecast.energy_forecast import EnergyForecast
 
         energy_df = _make_energy_df(24)  # 2024-01-01 00:00..23:00, hourly
