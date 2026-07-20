@@ -3583,14 +3583,14 @@ class _FakeMLModelForUpdateSensors:
     downstream _aggregate()/_publish() pipeline has something to chew on.
     predict_intervals() returns None (a value _aggregate() already treats as
     "uncalibrated, skip the interval sensors" — see the `if intervals is not
-    None` guard at energy_forecast.py:1601) so the whole prediction-interval
+    None` guard at energy_forecast.py:2846) so the whole prediction-interval
     branch is skipped rather than stubbed.
     """
 
     last_trained = datetime.min  # _publish() takes the "never trained" branch
     engine = "fake-engine"
     last_mae = None
-    last_cv_mae = None  # short-circuits _maybe_adaptive_retrain() at the top (line 1875)
+    last_cv_mae = None  # short-circuits _maybe_adaptive_retrain() at the top (line 2267-2268)
     _latest_thermal_pressure_net = 0.0
     _tau_hours = None
 
@@ -3709,7 +3709,7 @@ class _FakeUpdateSensors:
     # equivalent to monkeypatch — delegate to the real implementation. None of
     # them need extra stubbing beyond what's already on this class:
     # _maybe_adaptive_retrain() short-circuits on _ml_model.last_cv_mae is None
-    # (energy_forecast.py:1875) before touching self._lock/_retrain, and
+    # (energy_forecast.py:2267-2268) before touching self._lock/_retrain, and
     # _save_pred_history() writes through the PRED_HISTORY_PATH module global
     # that _patch_update_sensors_deps() redirects into tmp_path.
     def _publish_thermal_pressure(self):
@@ -3826,7 +3826,7 @@ class TestUpdateSensorsExcludedRanges:
         monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
         monkeypatch.setattr(ha_data_mod, "fetch_recent_energy_15m", lambda *a, **kw: None)
         # _save_pred_history() writes to this module-level path unconditionally
-        # (energy_forecast.py:2506-2509) — redirect it into tmp_path so the test
+        # (energy_forecast.py:2975-2978) — redirect it into tmp_path so the test
         # doesn't write pred_history.json next to the source tree.
         monkeypatch.setattr(ef_mod, "PRED_HISTORY_PATH", tmp_path / "pred_history.json")
         return ha_data_mod
