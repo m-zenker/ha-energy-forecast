@@ -230,6 +230,7 @@ The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must 
 ```yaml
 system_packages:
   - build-base
+  - g++
   - gfortran
   - openblas-dev
   - python3-dev
@@ -238,7 +239,7 @@ python_packages:
   - holidays>=0.46
 init_commands:
   - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
-  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
+  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache 'lightgbm>=4.7.0,<5.0' --quiet"
 ```
 
 `system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source) plus the `libgomp` OpenMP runtime required by scikit-learn. `python_packages` handles pure-Python packages.
@@ -270,7 +271,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 | `requests` ≥ 2.31.0 | |
 | `holidays` ≥ 0.46 | Swiss public holiday feature |
 | `scikit-learn` ≥ 1.4.0 | Required — GBR fallback engine + Daily Regime Clustering |
-| `lightgbm` ≥ 4.0.0 | Optional — primary engine |
+| `lightgbm` ≥ 4.7.0, < 5.0 | Optional — primary engine; uses the `eval_X`/`eval_y` fit API (replaces deprecated `eval_set`) |
 
 ---
 

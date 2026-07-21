@@ -682,7 +682,8 @@ class EnergyForecastModel:
                                 m_nl.fit(
                                     X.iloc[tr_idx],
                                     y_fit[tr_idx],
-                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    eval_X=X.iloc[val_idx],
+                                    eval_y=y_fit[val_idx],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
                                         lgb.log_evaluation(-1),
@@ -714,7 +715,8 @@ class EnergyForecastModel:
                             m.fit(
                                 X.iloc[tr_idx],
                                 y_fit[tr_idx],
-                                eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                eval_X=X.iloc[val_idx],
+                                eval_y=y_fit[val_idx],
                                 callbacks=[
                                     lgb.early_stopping(50, verbose=False),
                                     lgb.log_evaluation(-1),
@@ -732,7 +734,8 @@ class EnergyForecastModel:
                                 m.fit(
                                     X.iloc[tr_idx],
                                     y_fit[tr_idx],
-                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    eval_X=X.iloc[val_idx],
+                                    eval_y=y_fit[val_idx],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
                                         lgb.log_evaluation(-1),
