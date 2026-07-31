@@ -5,7 +5,7 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.11.9-blue)
+![Version](https://img.shields.io/badge/version-v0.11.10-blue)
  ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-685%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
