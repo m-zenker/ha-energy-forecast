@@ -1,5 +1,6 @@
 system_packages:
   - build-base
+  - g++
   - gfortran
   - openblas-dev
   - python3-dev
@@ -8,7 +9,7 @@ python_packages:
   - holidays>=0.46
 init_commands:
   - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
-  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache lightgbm --quiet"
+  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache 'lightgbm>=4.7.0,<5.0' --quiet"
 
 # Without LightGBM (armv7 or no C compiler) — scikit-learn GBR fallback only.
 # Keep libgomp: scikit-learn requires it at runtime on Alpine/aarch64.

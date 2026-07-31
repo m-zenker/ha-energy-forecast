@@ -251,8 +251,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 1
-        assert result.iloc[0]["gross_kwh"] == pytest.approx(1.0)
+        # NB: end_time now extends the reindex through "now", so the total row
+        # count also includes trailing zero-kwh backfill hours between this
+        # 2024 fixture and today — assert on the specific hour instead of len().
+        row_10 = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_cache_only_empty_ha(self, mock_app, tmp_path):
         """HA returns nothing: existing cache is returned."""
@@ -322,7 +326,13 @@ class TestFetchEnergyHistory:
 
         assert cache_path.exists()
         saved = pd.read_csv(cache_path)
-        assert len(saved) == 1
+        saved["timestamp"] = pd.to_datetime(saved["timestamp"])
+        # NB: end_time now extends the reindex through "now", so the saved CSV
+        # also includes trailing zero-kwh backfill hours between this 2024
+        # fixture and today — assert the real row was written, not len().
+        row_10 = saved[saved["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(row_10) == 1
+        assert row_10.iloc[0]["gross_kwh"] == pytest.approx(1.0)
 
     def test_spikes_filtered_out(self, mock_app, tmp_path):
         """Hourly values >= MAX_HOURLY_KWH are filtered as meter resets/spikes."""
@@ -336,7 +346,12 @@ class TestFetchEnergyHistory:
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
-        assert len(result) == 0
+        # NB: end_time now extends the reindex through "now", so trailing
+        # zero-kwh backfill hours between this 2024 fixture and today are
+        # legitimately present — assert the spike hour specifically is
+        # filtered out, rather than asserting the whole result is empty.
+        spike_row = result[result["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert spike_row.empty, "Spike hour must be filtered out, not backfilled with the spike value"
 
     def test_excludes_current_partial_hour(self, mock_app, tmp_path):
         """fetch_energy_history must not return the current (incomplete) hourly bucket.
@@ -362,6 +377,27 @@ class TestFetchEnergyHistory:
         result_ts = set(result["timestamp"])
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
+
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Same trailing-silence bug as fetch_recent_energy, on the weekly
+        full-resync path used by _retrain()."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
 
 
 # ── fetch_recent_energy ───────────────────────────────────────────────────────
@@ -435,6 +471,31 @@ class TestFetchRecentEnergy:
         result_ts = set(result["timestamp"])
         assert current_hour not in result_ts, "Current (incomplete) hour must not be returned"
         assert prev_hour in result_ts, "Previous complete hour must be returned"
+
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_app, tmp_path):
+        """Regression test for the recurring 'lag_24h has N/48 NaN' warning:
+        a grid-import sensor that stops emitting states because solar covers
+        100% of household load (e.g. sensor.gplugk_z_ei going quiet on
+        2026-07-18) must not leave a growing gap between the last real HA
+        state and 'now'. The silent hours are genuine 0.0-kWh readings and
+        fetch_recent_energy must backfill them through the current hour."""
+        cache_path = tmp_path / "energy_history.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        ha_raw = make_ha_raw(
+            [
+                (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                last_real_hour.tz_convert("UTC").isoformat(),
+            ],
+            [50.0, 51.0],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        result_ts = set(result["timestamp"])
+        for h in (1, 2):
+            ts = (last_real_hour + pd.Timedelta(hours=h)).tz_localize(None)
+            assert ts in result_ts, f"hour {ts} missing — trailing silence wasn't backfilled"
 
 
 # ── _check_dst_duplicates ─────────────────────────────────────────────────────
@@ -964,17 +1025,26 @@ class TestValidateEnergyCache:
         assert any("DST" in r.message for r in caplog.records)
 
     def test_out_of_range_value_warns(self, caplog):
-        """gross_kwh outside (0, MAX_HOURLY_KWH] triggers WARNING."""
+        """gross_kwh outside [0, MAX_HOURLY_KWH] triggers WARNING."""
         ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
         df_over = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0, 60.0]})  # 60 > 50
-        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})  # 0 not positive
+        df_negative = pd.DataFrame({"timestamp": ts, "gross_kwh": [-1.0, 1.0]})  # negative
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             validate_energy_cache(df_over, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            validate_energy_cache(df_zero, _LOGGER)
+            validate_energy_cache(df_negative, _LOGGER)
         assert any("gross_kwh" in r.message for r in caplog.records)
+
+    def test_zero_value_does_not_warn(self, caplog):
+        """gross_kwh == 0 is a real reading (e.g. solar covering 100% of load)
+        and must NOT be flagged as out-of-range."""
+        ts = pd.date_range("2024-03-15 08:00", periods=2, freq="1h")
+        df_zero = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.0, 1.0]})
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            validate_energy_cache(df_zero, _LOGGER)
+        assert not any("gross_kwh" in r.message for r in caplog.records)
 
     def test_no_raise_on_missing_column(self, caplog):
         """DataFrame without gross_kwh column must not raise."""
@@ -1001,6 +1071,248 @@ class TestValidateCacheIntegration:
         ):
             ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
         mock_validate.assert_called_once()
+
+
+# ── #new load_excluded_ranges / filter_excluded_ranges ────────────────────────
+
+from energy_forecast.ha_data import load_excluded_ranges  # noqa: E402
+
+
+class TestLoadExcludedRanges:
+    def test_missing_file_returns_empty_no_log(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert not caplog.records
+
+    def test_header_only_file_returns_empty_no_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert not caplog.records
+
+    def test_well_formed_multi_row_file(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text(
+            "start,end,reason\n"
+            "2026-07-19 14:00,2026-07-21 09:30,gplug fault\n"
+            "2026-07-25 00:00,2026-07-25 12:00,second fault\n"
+        )
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == [
+            (pd.Timestamp("2026-07-19 14:00"), pd.Timestamp("2026-07-21 09:30"), "gplug fault"),
+            (pd.Timestamp("2026-07-25 00:00"), pd.Timestamp("2026-07-25 12:00"), "second fault"),
+        ]
+
+    def test_reason_column_absent_defaults_to_empty_string(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end\n2026-07-19,2026-07-20\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == [(pd.Timestamp("2026-07-19 00:00"), pd.Timestamp("2026-07-20 23:59:59"), "")]
+
+    def test_extra_column_ignored(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason,ticket\n2026-07-19,2026-07-20,fault,JIRA-123\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert result[0][2] == "fault"
+
+    def test_malformed_row_skipped_others_still_load(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert result[0][2] == "good row"
+        assert any("row" in r.message.lower() for r in caplog.records)
+
+    def test_end_before_start_skipped(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-20 10:00,2026-07-19 10:00,backwards\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
+    def test_missing_required_columns_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("begin,finish\n2026-07-19,2026-07-20\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert any("start" in r.message.lower() or "end" in r.message.lower() for r in caplog.records)
+
+    def test_ambiguous_date_format_rejected(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n07/19/2026,07/20/2026,slash format\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+
+    def test_timezone_offset_rejected(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19 14:00+02:00,2026-07-20 14:00,tz offset\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+
+    def test_bare_date_end_expands_to_end_of_day(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19,2026-07-21,multi-day\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result[0][1] == pd.Timestamp("2026-07-21 23:59:59")
+
+    def test_explicit_time_end_used_exactly(self, tmp_path):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-07-19,2026-07-21 00:00,exact midnight\n")
+        result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result[0][1] == pd.Timestamp("2026-07-21 00:00:00")
+
+    def test_spring_forward_nonexistent_time_warns_distinctly(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-03-29 02:30,2026-03-29 04:00,gap\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1  # still loaded, just warned
+        assert any("nonexistent" in r.message.lower() for r in caplog.records)
+
+    def test_fall_back_ambiguous_time_loads_without_special_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-10-25 02:00,2026-10-25 03:00,fall-back\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert len(result) == 1
+        assert not any("nonexistent" in r.message.lower() for r in caplog.records)
+
+    def test_truncated_csv_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_bytes(b"")  # zero-byte file, simulates a torn Samba write
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
+    def test_encoding_corrupted_csv_returns_empty_with_warning(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_bytes(b"start,end,reason\n2026-07-19,2026-07-20,caf\xe9 fault\n")  # invalid UTF-8 byte
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert result == []
+        assert caplog.records
+
+    def test_different_timezone_changes_spring_forward_detection(self, tmp_path, caplog):
+        """US/Eastern's 2026 spring-forward gap (Mar 8) differs from Europe/Zurich's (Mar 29) —
+        proves the timezone parameter is actually used, not hardcoded."""
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\n2026-03-08 02:30,2026-03-08 04:00,gap\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "US/Eastern", _LOGGER)
+        assert any("nonexistent" in r.message.lower() for r in caplog.records)
+
+
+from energy_forecast.ha_data import filter_excluded_ranges  # noqa: E402
+
+
+class TestFilterExcludedRanges:
+    def _df(self, start="2024-01-01 00:00", periods=48, freq="1h"):
+        ts = pd.date_range(start, periods=periods, freq=freq)
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * periods})
+
+    def test_rows_inside_range_dropped_outside_kept(self):
+        df = self._df()
+        ranges = [(pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 14:00"), "fault")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48 - 5  # 10:00..14:00 inclusive = 5 hourly rows
+        in_range = (result["timestamp"] >= ranges[0][0]) & (result["timestamp"] <= ranges[0][1])
+        assert not in_range.any()
+
+    def test_multiple_non_overlapping_ranges_both_apply(self):
+        df = self._df()
+        ranges = [
+            (pd.Timestamp("2024-01-01 02:00"), pd.Timestamp("2024-01-01 03:00"), "a"),
+            (pd.Timestamp("2024-01-01 20:00"), pd.Timestamp("2024-01-01 21:00"), "b"),
+        ]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48 - 4  # 2 rows each range
+
+    def test_overlapping_ranges_correct_per_range_and_total_counts(self, caplog):
+        df = self._df()
+        ranges = [
+            (pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 14:00"), "a"),  # 5 rows
+            (pd.Timestamp("2024-01-01 12:00"), pd.Timestamp("2024-01-01 16:00"), "b"),  # 5 rows, overlaps a
+        ]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        # union of [10:00-14:00] and [12:00-16:00] = [10:00-16:00] = 7 unique hourly rows
+        assert len(result) == 48 - 7
+        messages = [r.message for r in caplog.records]
+        assert sum("dropped 5 row" in m for m in messages) == 2  # each range logged independently, 5 each
+        assert any("7" in m and ("unique" in m.lower() or "total" in m.lower()) for m in messages)
+
+    def test_empty_ranges_list_is_noop(self):
+        df = self._df()
+        result = filter_excluded_ranges(df, [], _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
+
+    def test_range_entirely_outside_cache_is_noop(self, caplog):
+        df = self._df()
+        ranges = [(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02"), "old")]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 48
+        assert any("dropped 0 row" in r.message for r in caplog.records)
+
+    def test_boundary_exact_match_drops_single_row(self):
+        df = self._df()
+        exact_ts = df["timestamp"].iloc[10]
+        ranges = [(exact_ts, exact_ts, "single hour")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert len(result) == 47
+        assert exact_ts not in result["timestamp"].values
+
+    def test_large_drop_fraction_escalates_to_warning(self, caplog):
+        df = self._df(periods=48)
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")]  # 11/48 rows = 23%
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_long_span_escalates_to_warning(self, caplog):
+        df = self._df(periods=24 * 20, freq="1h")  # 20 days of hourly data
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[-1], "long")]  # ~20-day span > 14
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_short_small_range_stays_info(self, caplog):
+        df = self._df()
+        ranges = [(pd.Timestamp("2024-01-01 10:00"), pd.Timestamp("2024-01-01 11:00"), "small")]
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_malformed_input_returns_df_unfiltered(self, caplog):
+        df = pd.DataFrame({"timestamp": ["not", "timestamps"], "gross_kwh": [1.0, 2.0]})
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        with caplog.at_level(logging.ERROR, logger="energy_forecast"):
+            result = filter_excluded_ranges(df, ranges, _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_empty_df_returns_df_unchanged(self):
+        df = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        assert result.empty
+
+    def test_missing_timestamp_column_returns_df_unchanged(self):
+        df = pd.DataFrame({"gross_kwh": [1.0, 2.0]})
+        ranges = [(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), "x")]
+        result = filter_excluded_ranges(df, ranges, _LOGGER)
+        pd.testing.assert_frame_equal(result, df)
 
 
 # ── fetch_presence_history ──────────────────────────────────────────────────────
@@ -1177,25 +1489,34 @@ class TestFetchRecentEnergyTailRead:
         base = pd.Timestamp("2024-01-01 00:00")
         self._make_large_cache(cache_path, n_rows=600, base=base)
 
-        # HA provides 2 new rows just after the cache window
+        # HA provides 2 new rows just after the cache window. cache_end_ts is a
+        # naive-local timestamp (same convention as `base` / the rest of this
+        # class). Localize it to Europe/Zurich before converting to UTC for
+        # make_ha_raw — mirroring test_trailing_sensor_silence_backfilled_through_now
+        # above — rather than treating the naive value as if it were already UTC.
         cache_end_ts = base + pd.Timedelta(hours=599)
-        ha_raw = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(
-                    [
-                        cache_end_ts + pd.Timedelta(hours=1),
-                        cache_end_ts + pd.Timedelta(hours=2),
-                    ]
-                ),
-                "value": [100.0, 101.5],
-            }
+        cache_end_ts_local = cache_end_ts.tz_localize("Europe/Zurich")
+        ha_raw = make_ha_raw(
+            [
+                (cache_end_ts_local + pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
+                (cache_end_ts_local + pd.Timedelta(hours=2)).tz_convert("UTC").isoformat(),
+            ],
+            [100.0, 101.5],
         )
         with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
             result = ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
 
-        # At least 1 new kwh row (diff of ha values) must be present
-        tail_ts = result["timestamp"].max()
-        assert tail_ts >= cache_end_ts + pd.Timedelta(hours=1)
+        # The two raw HA cumulative readings diff to a genuine 1.5 kWh row at
+        # cache_end_ts + 2h. (The +1h reading's diff is NaN — no prior reading
+        # to diff against — so it's correctly dropped, same as the leading edge
+        # of any diff-based series.) Assert the exact merged value via a
+        # timestamp lookup so this test actually fails if new-HA-row merging
+        # breaks, rather than only checking that the tail timestamp is "large"
+        # (which passed trivially once end_time extended the reindex to ~now).
+        by_ts = result.set_index("timestamp")["gross_kwh"]
+        merged_ts = cache_end_ts + pd.Timedelta(hours=2)
+        assert merged_ts in by_ts.index, f"{merged_ts} missing — new HA rows weren't merged"
+        assert by_ts.loc[merged_ts] == pytest.approx(1.5)
 
 
 # ── fetch_program_sensor_history ─────────────────────────────────────────────
@@ -1739,14 +2060,88 @@ class TestRawToKwhDiff:
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
         assert result.empty  # filtered out
 
-    def test_negative_diff_clipped_to_zero(self):
+    def test_negative_diff_dropped_not_fabricated_as_zero(self):
+        """A meter reset (negative raw diff) must be dropped, not recorded as a
+        fabricated gross_kwh=0.0 — true consumption during a reset is unknown,
+        unlike a genuinely flat hour where the raw diff really is 0."""
         raw = self._make_raw(
             ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
-            [100.0, 99.0, 101.0],  # meter reset between h0 and h1
+            [100.0, 99.0, 101.0],  # meter reset between h0 and h1 (raw diff -1)
         )
         result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
-        # h1: diff = -1 → clipped to 0 → filtered (not > 0). h2: diff = 2 → kept.
-        assert all(result["gross_kwh"] > 0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index
+        # h2: diff = 2 → kept normally.
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
+
+    def test_zero_diff_hour_kept_not_dropped(self):
+        """A flat hour (e.g. solar fully covering household load) is a real
+        gross_kwh=0.0 reading and must not be dropped like a bad/missing row."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00", "2024-01-01 03:00"],
+            [100.0, 101.0, 101.0, 102.5],  # h2: no change → diff 0.0
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 02:00") in kwh.index
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
+
+    def test_end_time_extends_trailing_silence_as_zero(self):
+        """A sensor that stops emitting entirely (e.g. a grid-import meter
+        with solar fully covering household load — it has nothing new to
+        report, so it never pushes an update) must still produce 0.0-kWh
+        rows through end_time. resample() alone stops at the last raw
+        state and silently drops the hours after it."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 04:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        for hour in ("02:00", "03:00", "04:00"):
+            ts = pd.Timestamp(f"2024-01-01 {hour}")
+            assert ts in kwh.index, f"{hour} missing — trailing silence wasn't extended"
+            assert abs(kwh.loc[ts]) < 1e-9
+
+    def test_end_time_none_preserves_old_behavior(self):
+        """Without end_time (the default), trailing silence still produces
+        no rows — end_time is opt-in so unmigrated callers are unaffected."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 101.0],
+        )
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 02:00") not in kwh.index
+
+    def test_end_time_before_last_raw_timestamp_is_noop(self):
+        """If end_time is earlier than the last real raw state, real data
+        must not be truncated or altered."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 02:00"],
+            [100.0, 101.0, 103.0],
+        )
+        end_time = pd.Timestamp("2024-01-01 00:30", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 01:00")] - 1.0) < 0.01
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")] - 2.0) < 0.01
+
+    def test_end_time_extension_respects_max_kwh_and_negative_diff_rules(self):
+        """Extended trailing rows are genuine 0.0 diffs, not exempt from the
+        existing max_kwh/negative-diff filtering that runs after ffill."""
+        raw = self._make_raw(
+            ["2024-01-01 00:00", "2024-01-01 01:00"],
+            [100.0, 99.0],  # meter reset going into the silent stretch
+        )
+        end_time = pd.Timestamp("2024-01-01 03:00", tz="Europe/Zurich")
+        result = _raw_to_kwh_diff(raw, "1h", max_kwh=50.0, end_time=end_time)
+        kwh = result.set_index("timestamp")["gross_kwh"]
+        assert pd.Timestamp("2024-01-01 01:00") not in kwh.index  # reset still dropped
+        # 02:00 and 03:00 are flat relative to the post-reset value (99.0) → genuine zeros
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 02:00")]) < 1e-9
+        assert abs(kwh.loc[pd.Timestamp("2024-01-01 03:00")]) < 1e-9
 
 
 class TestFetchEnergyHistory15m:
@@ -1793,6 +2188,29 @@ class TestFetchEnergyHistory15m:
         cutoff = pd.Timestamp.now(tz="Europe/Zurich").floor("15min").tz_localize(None)
         assert (result["timestamp"] < cutoff).all()
 
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the 15-minute cache."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        result = ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        result_ts = set(result["timestamp"])
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in result_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
 
 class TestFetchRecentEnergy15m:
     @patch("energy_forecast.ha_data._fetch_history")
@@ -1823,3 +2241,28 @@ class TestFetchRecentEnergy15m:
         cache = tmp_path / "energy_history_15m.csv"
 
         ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_trailing_sensor_silence_backfilled_through_now(self, mock_fetch, tmp_path):
+        """Same trailing-silence bug as the hourly path, on the recent-fetch
+        15-minute cache updater (fire-and-forget from _update_sensors())."""
+        import pandas as pd
+
+        cache = tmp_path / "energy_history_15m.csv"
+        now_local = pd.Timestamp.now(tz="Europe/Zurich")
+        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        ts = pd.to_datetime(
+            [
+                (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
+                last_real_slot.tz_convert("UTC"),
+            ]
+        ).tz_convert("Europe/Zurich")
+        mock_fetch.return_value = pd.DataFrame({"timestamp": ts, "value": [50.0, 50.5]})
+        mock_app = MagicMock()
+
+        ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache)
+
+        saved = pd.read_csv(cache)
+        saved_ts = set(pd.to_datetime(saved["timestamp"]))
+        expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
+        assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"

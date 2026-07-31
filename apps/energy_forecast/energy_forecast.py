@@ -1100,6 +1100,72 @@ class EnergyForecast(hass.Hass):
 
         energy_df = _strip_tz(energy_df, self._timezone)
 
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Filtered as early as possible: a correction/EV-detection computed
+        # from a corrupted main reading is equally meaningless.
+        excluded_ranges = ha_data.load_excluded_ranges(
+            self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+        )
+        energy_df = ha_data.filter_excluded_ranges(energy_df, excluded_ranges, _LOGGER)
+
+        if len(energy_df) < MIN_HISTORY_HOURS:
+            _LOGGER.warning(
+                "Insufficient history after excluded-range filtering (%d h) — active "
+                "exclusions in excluded_ranges.csv reduced the training set below the "
+                "%d h minimum. Skipping.",
+                len(energy_df),
+                MIN_HISTORY_HOURS,
+            )
+            return
+
+        now_ts = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        gap_hours = (now_ts - energy_df["timestamp"].max()).total_seconds() / 3600
+        if gap_hours > 24:
+            _LOGGER.warning(
+                "Most recent training data is %.1fh behind now() — check for stale/missing "
+                "history data, or an active excluded range freezing the recency-weighting "
+                "anchor at the fault's onset.",
+                gap_hours,
+            )
+
+        # ── Solar / grid-export / battery target correction ───────────────────
+        # Corrects gross_kwh (grid import) to total household consumption.
+        # Each sensor is optional; any combination is valid.
+        # Must run BEFORE EV threshold detection below: once solar covers part
+        # of the household load, raw grid-import gross_kwh during an EV-charging
+        # hour can fall under ev_charging_threshold_kwh even though corrected
+        # total consumption stays well above it (found 2026-07-17 — a charging
+        # session with strong midday solar left raw grid import at 0.5 kWh for
+        # the hour while a ~9 kW charger ran throughout). Detecting on corrected
+        # gross_kwh keeps EV hours out of baseline training regardless of how
+        # much of the charge came from solar vs. grid.
+        correction_dfs = _fetch_correction_dfs(
+            self,
+            self._solar_sensor,
+            self._grid_export_sensor,
+            self._battery_charge_sensor,
+            self._battery_discharge_sensor,
+            self._cache_path.parent,
+            self._timezone,
+            ha_data.fetch_sub_sensor_history,
+        )
+
+        if any(v is not None for v in correction_dfs.values()):
+            energy_df = _apply_target_correction(
+                energy_df,
+                solar_df=correction_dfs["solar_production.csv"],
+                grid_export_df=correction_dfs["grid_export.csv"],
+                battery_charge_df=correction_dfs["battery_charge.csv"],
+                battery_discharge_df=correction_dfs["battery_discharge.csv"],
+            )
+            _LOGGER.info(
+                "Target corrected: total_consumption = grid_import%s%s%s%s",
+                " + solar" if correction_dfs["solar_production.csv"] is not None else "",
+                " − grid_export" if correction_dfs["grid_export.csv"] is not None else "",
+                " − battery_charge" if correction_dfs["battery_charge.csv"] is not None else "",
+                " + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "",
+            )
+
         # ── Subtract EV charging from gross import ────────────────────────────
         if self._ev_charging_sensor:
             try:
@@ -1146,44 +1212,6 @@ class EnergyForecast(hass.Hass):
                 ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
             }
             baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
-
-        # ── Solar / grid-export / battery target correction ───────────────────
-        # Corrects gross_kwh (grid import) to total household consumption.
-        # Each sensor is optional; any combination is valid.
-        _correction_specs = [
-            (self._solar_sensor, "solar_production.csv"),
-            (self._grid_export_sensor, "grid_export.csv"),
-            (self._battery_charge_sensor, "battery_charge.csv"),
-            (self._battery_discharge_sensor, "battery_discharge.csv"),
-        ]
-        correction_dfs: dict[str, Any] = {}
-        for sensor, cache_name in _correction_specs:
-            if sensor:
-                cache = self._cache_path.parent / cache_name
-                try:
-                    cdf = ha_data.fetch_sub_sensor_history(self, sensor, cache, timezone=self._timezone)
-                    correction_dfs[cache_name] = _strip_tz(cdf, self._timezone)
-                except (OSError, KeyError, ValueError) as exc:
-                    _LOGGER.warning("Target correction fetch failed (%s): %s", cache_name, exc)
-                    correction_dfs[cache_name] = None
-            else:
-                correction_dfs[cache_name] = None
-
-        if any(v is not None for v in correction_dfs.values()):
-            baseline_df = _apply_target_correction(
-                baseline_df,
-                solar_df=correction_dfs["solar_production.csv"],
-                grid_export_df=correction_dfs["grid_export.csv"],
-                battery_charge_df=correction_dfs["battery_charge.csv"],
-                battery_discharge_df=correction_dfs["battery_discharge.csv"],
-            )
-            _LOGGER.info(
-                "Target corrected: total_consumption = grid_import%s%s%s%s",
-                " + solar" if correction_dfs["solar_production.csv"] is not None else "",
-                " − grid_export" if correction_dfs["grid_export.csv"] is not None else "",
-                " − battery_charge" if correction_dfs["battery_charge.csv"] is not None else "",
-                " + battery_discharge" if correction_dfs["battery_discharge.csv"] is not None else "",
-            )
 
         sub_sensors_dict: dict = {}
         program_histories: dict = {}
@@ -1356,6 +1384,41 @@ class EnergyForecast(hass.Hass):
                 unit_multiplier=self._unit_multiplier,
             )
             full_actuals = _strip_tz(full_actuals, self._timezone)
+
+            # ── Solar / grid-export / battery target correction ───────────────
+            # Mirrors _retrain()'s correction so recent_actuals (lag features) and
+            # full_actuals (-> _actuals_history -> anomaly detector + MAE sensors)
+            # use the same "true household consumption" definition the model was
+            # trained on, instead of raw grid import (found 2026-07-16: battery
+            # charging inflated raw grid import, causing false anomaly alerts).
+            #
+            # Must run BEFORE EV threshold detection below: once solar covers
+            # part of the household load, raw grid-import gross_kwh during an
+            # EV-charging hour can fall under ev_charging_threshold_kwh even
+            # though corrected total consumption stays well above it (found
+            # 2026-07-17). Detecting on corrected gross_kwh keeps such hours out
+            # of _actuals_history regardless of how much of the charge came
+            # from solar vs. grid.
+            if not full_actuals.empty:
+                correction_dfs = _fetch_correction_dfs(
+                    self,
+                    self._solar_sensor,
+                    self._grid_export_sensor,
+                    self._battery_charge_sensor,
+                    self._battery_discharge_sensor,
+                    self._cache_path.parent,
+                    self._timezone,
+                    ha_data.fetch_recent_sub_sensor,
+                )
+                if any(v is not None for v in correction_dfs.values()):
+                    full_actuals = _apply_target_correction(
+                        full_actuals,
+                        solar_df=correction_dfs["solar_production.csv"],
+                        grid_export_df=correction_dfs["grid_export.csv"],
+                        battery_charge_df=correction_dfs["battery_charge.csv"],
+                        battery_discharge_df=correction_dfs["battery_discharge.csv"],
+                    )
+
             # Subtract EV from actuals so lag_24h pointing at a charging hour
             # doesn't inflate tomorrow's baseline prediction.
             if self._ev_charging_sensor:
@@ -1462,6 +1525,17 @@ class EnergyForecast(hass.Hass):
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
+
+        # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
+        # Applied to recent_actuals (feeds lag/rolling features for live
+        # prediction) so an active fault doesn't feed the model corrupted
+        # readings it was trained to treat as NaN during the same window.
+        # Does NOT extend to full_actuals (anomaly/MAE sensors) — spec §6.
+        if recent_actuals is not None and not recent_actuals.empty:
+            excluded_ranges = ha_data.load_excluded_ranges(
+                self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+            )
+            recent_actuals = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _LOGGER)
 
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df = forecast_df
@@ -2525,6 +2599,49 @@ def _apply_target_correction(
 
     df["gross_kwh"] = (df["gross_kwh"] + delta.values).clip(lower=0.0)
     return df
+
+
+def _fetch_correction_dfs(
+    app: Any,
+    solar_sensor: str | None,
+    grid_export_sensor: str | None,
+    battery_charge_sensor: str | None,
+    battery_discharge_sensor: str | None,
+    cache_dir: Path,
+    timezone: str,
+    fetch_fn: Any,
+) -> dict[str, Any]:
+    """Fetch the four optional solar/battery correction sensors via fetch_fn.
+
+    fetch_fn is ha_data.fetch_sub_sensor_history (full 30-day history, for
+    _retrain) or ha_data.fetch_recent_sub_sensor (lightweight 2-day, for
+    _update_sensors) — both accept (app, entity_id, cache_path, timezone=...).
+    Shared between both call sites so they can't drift out of sync on which
+    correction sensors are fetched or which cache files they use.
+
+    Returns a dict keyed by cache filename -> DataFrame|None, ready to pass
+    into _apply_target_correction's solar_df/grid_export_df/battery_charge_df/
+    battery_discharge_df kwargs.
+    """
+    _correction_specs = [
+        (solar_sensor, "solar_production.csv"),
+        (grid_export_sensor, "grid_export.csv"),
+        (battery_charge_sensor, "battery_charge.csv"),
+        (battery_discharge_sensor, "battery_discharge.csv"),
+    ]
+    correction_dfs: dict[str, Any] = {}
+    for sensor, cache_name in _correction_specs:
+        if sensor:
+            cache = cache_dir / cache_name
+            try:
+                cdf = fetch_fn(app, sensor, cache, timezone=timezone)
+                correction_dfs[cache_name] = _strip_tz(cdf, timezone)
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Target correction fetch failed (%s): %s", cache_name, exc)
+                correction_dfs[cache_name] = None
+        else:
+            correction_dfs[cache_name] = None
+    return correction_dfs
 
 
 def _subtract_sub_sensors(

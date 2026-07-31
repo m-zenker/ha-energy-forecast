@@ -925,6 +925,43 @@ class TestLogTransform:
 # ── _build_model n_estimators override (#6) ───────────────────────────────────
 
 
+class TestZeroConsumptionRowsKeptInTraining:
+    """gross_kwh == 0 is a real reading (e.g. solar fully covering household load)
+    and must not be excluded from training the same way negative/corrupt rows are."""
+
+    def test_zero_consumption_rows_not_dropped_from_training(self, tmp_path, caplog):
+        import logging
+
+        rng = np.random.default_rng(0)
+        n = 250
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        gross_kwh = rng.uniform(0.5, 5.0, size=n)
+        # Zero out 100 hours well past the lag warm-up window (active_lags maxes
+        # out at 72h for n=250) to simulate solar covering 100% of load those hours.
+        gross_kwh[100:200] = 0.0
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": gross_kwh})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        m = EnergyForecastModel(tmp_path, timezone="Europe/Zurich")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy, weather, outdoor_df=None, weight_halflife_days=0)
+
+        assert not any("skipping" in r.message.lower() for r in caplog.records), (
+            "Zero-consumption hours (real solar/grid-export readings) were dropped "
+            "from training instead of being kept as valid gross_kwh=0 examples."
+        )
+        assert m.model is not None
+
+
 class TestBuildModel:
     def _gbr(self):
         from sklearn.ensemble import GradientBoostingRegressor
@@ -5305,3 +5342,44 @@ class TestStripPartialLastDay:
     def test_empty_df_returns_empty(self):
         df = pd.DataFrame({"timestamp": pd.Series(dtype="datetime64[ns]"), "gross_kwh": pd.Series(dtype=float)})
         assert _strip_partial_last_day(df).empty
+
+
+class TestActiveLagsBoundaryAcrossRetrains:
+    """A retrain with fewer rows than a prior retrain must drop lag features that
+    no longer clear their minimum-row threshold gracefully (the lag feature is
+    simply dropped), never crash."""
+
+    def _energy_df(self, n):
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+
+    def _weather_df(self, ts):
+        rng = np.random.default_rng(1)
+        return pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=len(ts)),
+                "precipitation_mm": [0.0] * len(ts),
+                "sunshine_min": [30.0] * len(ts),
+                "wind_kmh": [10.0] * len(ts),
+                "cloud_cover_pct": [50.0] * len(ts),
+                "direct_radiation_wm2": [100.0] * len(ts),
+            }
+        )
+
+    def test_lag_72h_drops_out_without_crash_when_rows_fall_below_threshold(self, tmp_path):
+        # lag_72h needs n_rows - 72 >= 100, i.e. n_rows >= 172.
+        # (lag_168h is gated — _GATED_LAG_HOURS in model.py — and never appears
+        # in feature_cols regardless of row count, so it can't be used for this
+        # boundary-crossing test; lag_72h is the analogous non-gated lag.)
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+
+        energy_wide = self._energy_df(250)  # 250 - 72 = 178 >= 100: lag_72h active
+        m.train(energy_wide, self._weather_df(energy_wide["timestamp"]), outdoor_df=None, weight_halflife_days=0)
+        assert "lag_72h" in m.feature_cols
+
+        # Simulate a retrain after an exclusion range shrank the training set.
+        energy_narrow = self._energy_df(170)  # 170 - 72 = 98 < 100: lag_72h now inactive
+        m.train(energy_narrow, self._weather_df(energy_narrow["timestamp"]), outdoor_df=None, weight_halflife_days=0)
+        assert "lag_72h" not in m.feature_cols

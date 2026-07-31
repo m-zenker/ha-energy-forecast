@@ -523,7 +523,10 @@ class EnergyForecastModel:
                 df[col] = df[col].fillna(0)
 
         df = df.dropna(subset=feature_cols + ["gross_kwh"])
-        df = df[df["gross_kwh"] > 0]
+        # gross_kwh == 0 is a real reading (e.g. solar fully covering household
+        # load for that hour) and is kept as a training example, not treated as
+        # a bad/corrupt row.
+        df = df[df["gross_kwh"] >= 0]
 
         if len(df) < MIN_TRAINING_ROWS:
             _LOGGER.warning("Only %d clean rows — skipping (need ≥%d)", len(df), MIN_TRAINING_ROWS)
@@ -593,7 +596,8 @@ class EnergyForecastModel:
                                 m_nl.fit(
                                     X.iloc[tr_idx],
                                     y_fit[tr_idx],
-                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    eval_X=X.iloc[val_idx],
+                                    eval_y=y_fit[val_idx],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
                                         lgb.log_evaluation(-1),
@@ -616,7 +620,8 @@ class EnergyForecastModel:
                             m.fit(
                                 X.iloc[tr_idx],
                                 y_fit[tr_idx],
-                                eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                eval_X=X.iloc[val_idx],
+                                eval_y=y_fit[val_idx],
                                 callbacks=[
                                     lgb.early_stopping(50, verbose=False),
                                     lgb.log_evaluation(-1),
@@ -634,7 +639,8 @@ class EnergyForecastModel:
                                 m.fit(
                                     X.iloc[tr_idx],
                                     y_fit[tr_idx],
-                                    eval_set=[(X.iloc[val_idx], y_fit[val_idx])],
+                                    eval_X=X.iloc[val_idx],
+                                    eval_y=y_fit[val_idx],
                                     callbacks=[
                                         lgb.early_stopping(50, verbose=False),
                                         lgb.log_evaluation(-1),

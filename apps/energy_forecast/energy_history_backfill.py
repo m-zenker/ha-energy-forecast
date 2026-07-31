@@ -155,10 +155,15 @@ class EnergyHistoryBackfill(hass.Hass):
 
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        # Diff cumulative sum → per-hour kWh; clip negatives (meter resets); apply unit conversion
-        df["gross_kwh"] = df["cumsum"].diff().clip(lower=0) * unit_multiplier
-        df = df.dropna(subset=["gross_kwh"])
-        df = df[(df["gross_kwh"] > 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)]
+        # Diff cumulative sum → per-hour kWh; apply unit conversion.
+        # A negative raw diff (meter reset) is dropped, not clipped-and-kept —
+        # true consumption during a reset is unknown, unlike a genuinely flat hour.
+        # All three conditions are evaluated against the pre-dropna index together
+        # to avoid a boolean-Series alignment mismatch after row removal.
+        raw_diff = df["cumsum"].diff()
+        df["gross_kwh"] = raw_diff.clip(lower=0) * unit_multiplier
+        valid = raw_diff.notna() & (raw_diff >= 0) & (df["gross_kwh"] < MAX_HOURLY_KWH)
+        df = df[valid]
 
         df_new = df[["timestamp", "gross_kwh"]].reset_index(drop=True)
         _LOGGER.info("After diff & filtering: %d clean hourly rows.", len(df_new))

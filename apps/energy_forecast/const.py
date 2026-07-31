@@ -62,7 +62,7 @@ def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     return df
 
 
-def resolve_timezone(configured: str | None, ha_timezone: str | None, logger: logging.Logger) -> str:
+def resolve_timezone(configured: str | None, ha_timezone: Any, logger: logging.Logger) -> str:
     """Resolve the effective timezone for an app instance.
 
     Precedence: an explicit *configured* value (the `timezone:` key in
@@ -72,7 +72,18 @@ def resolve_timezone(configured: str | None, ha_timezone: str | None, logger: lo
     the UTC-offset difference between the two zones, so daytime consumption
     can appear to occur at night. Falls back to *ha_timezone*, then
     "Europe/Zurich", when *configured* is not set.
+
+    ha_timezone is coerced to str before use: AppDaemon's get_timezone() is
+    type-hinted -> str, but the installed AppDaemonConfig.time_zone field is
+    actually validated through pytz.timezone(...), so it returns a pytz
+    tzinfo object at runtime, not a str. Passing that object on to
+    urllib.parse.quote() in weather.py raises
+    "TypeError: quote_from_bytes() expected bytes" (GitHub Discussion #15).
+    str() on both pytz tzinfo and zoneinfo.ZoneInfo objects recovers the
+    IANA zone key, e.g. str(pytz.timezone("Europe/Zurich")) == "Europe/Zurich".
     """
+    if ha_timezone is not None:
+        ha_timezone = str(ha_timezone)
     if configured:
         if ha_timezone and ha_timezone != configured:
             logger.warning(
