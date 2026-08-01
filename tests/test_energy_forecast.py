@@ -1412,6 +1412,15 @@ class TestMqttDiscoveryEnergyStateClassMismatch:
             assert "device_class" not in payload
             assert payload.get("state_class") == "measurement"
 
+    @pytest.mark.parametrize("unique_id", ["energy_forecast_physics_base_today", "energy_forecast_ml_adjustment_today"])
+    def test_physics_sensors_have_no_device_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._physics_model = MagicMock()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert "device_class" not in payload
+        assert payload.get("state_class") == "measurement"
+
     def test_scenario_sensors_have_no_device_class(self):
         fake = _FakeMqttSelf()
         fake._timezone = "UTC"

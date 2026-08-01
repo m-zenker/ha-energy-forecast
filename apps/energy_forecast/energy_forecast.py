@@ -924,7 +924,7 @@ class EnergyForecast(hass.Hass):
                 "Energy Forecast Physics Base Today",
                 "kWh",
                 "mdi:lightning-bolt-outline",
-                "energy",
+                None,
                 "measurement",
                 json_attributes_topic=_physics_base_attrs_topic,
             )
@@ -936,7 +936,7 @@ class EnergyForecast(hass.Hass):
                 "Energy Forecast ML Adjustment Today",
                 "kWh",
                 "mdi:tune-vertical",
-                "energy",
+                None,
                 "measurement",
                 json_attributes_topic=_ml_adjustment_attrs_topic,
             )
