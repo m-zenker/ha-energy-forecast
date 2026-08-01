@@ -6,6 +6,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — MQTT Discovery registrations for forecast, block, MAE, scenario, and physics sensors carried `device_class: energy` paired with `state_class: measurement`, which Home Assistant rejects at startup with a warning ("state class 'measurement' is impossible considering device class ('energy')") for every affected entity. Fixed by removing `device_class` from all sensors that publish forecasts or error metrics rather than meter readings: next_1h / next_3h / today / tomorrow totals, all eight 3 h block sensors for each day, the 32 lazily-registered P10/P90 interval sensors, `model_mae` / `mae_7d` / `mae_30d`, all scenario sensors, and — when `physics:` is configured — `physics_base_today` and `ml_adjustment_today`. The two EV actual sensors (`ev_today` / `ev_yesterday`) are genuine accumulators (detected charging kWh that reset at midnight), so they keep `device_class: energy` and move to `state_class: total` instead of losing the device class. Fixes #19.
+
+---
+
 ## [0.12.0-alpha-8] — 2026-07-19
 
 ### Added
