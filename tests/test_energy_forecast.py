@@ -2770,6 +2770,16 @@ class TestShapFeatureLabelCoverage:
         for tgated in ("lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated"):
             assert tgated in _SHAP_FEATURE_LABELS
 
+    def test_physics_dynamic_features_have_labels(self):
+        """physics_kwh/heating_buffer_temp are appended to feature_cols dynamically in
+        model.py's train() (not part of the static _FEATURES_BASE list) when a physics
+        model / heating_buffer_temp_sensor is configured, so the static-list coverage
+        test above can't catch them — check them explicitly."""
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+
+        for feat in ("physics_kwh", "heating_buffer_temp"):
+            assert feat in _SHAP_FEATURE_LABELS
+
 
 # ── Relative MAE (#54) ───────────────────────────────────────────────────────────
 

@@ -137,6 +137,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "weighted_solar_gain": "passive solar heat gain",
     "dhw_buffer_temp": "hot water buffer temperature",
     "dhw_pressure": "DHW heat demand",
+    # Physics-ML hybrid (only present when a physics model is configured)
+    "physics_kwh": "physics-model baseline forecast",
+    "heating_buffer_temp": "heating buffer tank temperature (sensor)",
     # Optional sensor features
     "outdoor_temp_live": "live outdoor temperature (sensor)",
     "temp_bias": "temperature sensor bias",
