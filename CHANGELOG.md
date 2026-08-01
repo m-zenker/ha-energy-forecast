@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- `apps/energy_forecast/energy_forecast.py` — `_build_shap_narrative()` fell back to showing raw internal column names in the dashboard's "Why today?" text card whenever a top-ranked SHAP feature was missing from `_SHAP_FEATURE_LABELS`. Five unlabelled features now have human-readable labels: `hp_heating_degree`, `temp_in_neutral_zone`, and `heating_active` (static feature columns present in all configurations); `physics_kwh` and `heating_buffer_temp` (appended to the feature set only when a physics model / `heating_buffer_temp_sensor` is configured). Three stale entries were also corrected: `lag_24h`, `lag_168h`, and `lag_336h` were not real model feature columns — the dictionary now maps their `_tgated` equivalents (`lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated`) instead. A regression test guards against this silently drifting again. (#90)
+
 ## [0.12.0-alpha-8] — 2026-07-19
 
 ### Added
