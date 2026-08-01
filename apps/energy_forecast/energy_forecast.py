@@ -773,7 +773,7 @@ class EnergyForecast(hass.Hass):
                 label,
                 "kWh",
                 "mdi:lightning-bolt",
-                "energy",
+                None,
                 "measurement",
                 json_attributes_topic=attrs_topic,
             )
@@ -787,10 +787,10 @@ class EnergyForecast(hass.Hass):
                     f"{day.title()} {h_start}:00–{h_end}:00",
                     "kWh",
                     "mdi:calendar-clock",
-                    "energy",
+                    None,
                     "measurement",
                 )
-        # EV actuals
+        # EV actuals — accumulate actual detected kWh through the day, reset at midnight
         for day in ("today", "yesterday"):
             self._mqtt_publish_discovery(
                 f"energy_forecast_ev_{day}",
@@ -798,7 +798,7 @@ class EnergyForecast(hass.Hass):
                 "kWh",
                 "mdi:car-electric",
                 "energy",
-                "measurement",
+                "total",
             )
         # Model MAE
         self._mqtt_publish_discovery(
@@ -806,7 +806,7 @@ class EnergyForecast(hass.Hass):
             "Model MAE",
             "kWh",
             "mdi:chart-bell-curve-cumulative",
-            "energy",
+            None,
             "measurement",
         )
         # Rolling MAE sensors (#41)
@@ -814,7 +814,7 @@ class EnergyForecast(hass.Hass):
             ("energy_forecast_mae_7d", "Energy Forecast MAE 7d"),
             ("energy_forecast_mae_30d", "Energy Forecast MAE 30d"),
         ]:
-            self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", "energy", "measurement")
+            self._mqtt_publish_discovery(uid, name, "kWh", "mdi:chart-bell-curve-cumulative", None, "measurement")
         # Relative MAE sensors (#54)
         for uid, name in [
             ("energy_forecast_relative_mae_7d", "Energy Forecast Relative MAE 7d"),
@@ -994,7 +994,7 @@ class EnergyForecast(hass.Hass):
                     "Energy Forecast Scenario Today",
                     "kWh",
                     "mdi:chart-bell-curve-cumulative",
-                    "energy",
+                    None,
                     "measurement",
                 )
                 self._mqtt_publish_discovery(
@@ -1002,7 +1002,7 @@ class EnergyForecast(hass.Hass):
                     "Energy Forecast Scenario Tomorrow",
                     "kWh",
                     "mdi:chart-bell-curve-cumulative",
-                    "energy",
+                    None,
                     "measurement",
                 )
                 self._mqtt_publish_discovery(
@@ -1020,7 +1020,7 @@ class EnergyForecast(hass.Hass):
                         f"Energy Forecast Scenario Today {_h:02d}:{_h + 3:02d}",
                         "kWh",
                         "mdi:chart-bell-curve-cumulative",
-                        "energy",
+                        None,
                         "measurement",
                     )
                 self._scenario_mqtt_discovered = True
@@ -2094,7 +2094,7 @@ class EnergyForecast(hass.Hass):
                     f"{label} Low (10th pct)",
                     "kWh",
                     "mdi:arrow-down-bold",
-                    "energy",
+                    None,
                     "measurement",
                 )
                 self._mqtt_publish_discovery(
@@ -2102,7 +2102,7 @@ class EnergyForecast(hass.Hass):
                     f"{label} High (90th pct)",
                     "kWh",
                     "mdi:arrow-up-bold",
-                    "energy",
+                    None,
                     "measurement",
                 )
             for day in ("today", "tomorrow"):
@@ -2114,7 +2114,7 @@ class EnergyForecast(hass.Hass):
                         f"{day.title()} {h_start}:00–{h_end}:00 P10",
                         "kWh",
                         "mdi:calendar-clock",
-                        "energy",
+                        None,
                         "measurement",
                     )
                     self._mqtt_publish_discovery(
@@ -2122,7 +2122,7 @@ class EnergyForecast(hass.Hass):
                         f"{day.title()} {h_start}:00–{h_end}:00 P90",
                         "kWh",
                         "mdi:calendar-clock",
-                        "energy",
+                        None,
                         "measurement",
                     )
             self._mqtt_intervals_discovered = True
