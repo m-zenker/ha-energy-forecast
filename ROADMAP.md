@@ -229,17 +229,49 @@ if temp_sigma > 0 and predict_temp is not None:
 
 **Prerequisite:** DHW sub-sensor infrastructure (related to #22).
 
+**Priority: raised to MEDIUM-HIGH (2026-08-04)** — this is no longer just a lag-pollution smoothing item. Confirmed live evidence: a legionella DHW commit (`ha-energy-manager` → `energy_forecast/set_dhw_schedule`) landed correctly in the physics layer (`physics_base_today` showed the expected +3.6 kWh spike) but was ~94% cancelled by the ML layer (`ml_adjustment_today` = -3.4 kWh at the same hour) — `physics_kwh` didn't even place in the top-5 SHAP features that day. A dedicated binary feature is a direct, independent fix for this specific failure mode, regardless of whether/when `UA_eff` (see #92) or Phase 2 residual mode ever land. See `memory/project_physics_kwh_low_importance.md`.
+
 **Problem**: The weekly legionella DHW protection cycle (heat buffer to ~60 °C, ~1–2 h) creates a predictable spike that the model has no dedicated signal for. Currently relies entirely on `lag_168h` (1-week lag), which takes 2–3 weeks to establish after a schedule change. The schedule was shifted from Tuesday ~23 h to Wednesday ~14 h on 2026-04-22, so the transition period is live now.
 
-Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–48 h), so this is not urgent.
+Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–48 h), so this is not urgent **on its own** — but combined with the cancellation evidence above, the feature is worth doing sooner.
 
 **Design (when implemented)**:
 - New `_compute_likely_legionella_hours()`: detect HOW slots where `dhw_buffer_temp > 58 °C` within a 30-day rolling window
 - New binary feature `is_legionella_hour` (mirrors `likely_ev_hour` pattern)
+- **Revisit vs. original design**: prefer sourcing this from `physics_schedule.json`'s `committed_override` (hef already knows the exact committed date/hour from `ha-energy-manager`, when present) over inferring from a `dhw_buffer_temp > 58°C` threshold — more precise, and available immediately rather than needing 30 days of buffer-temp history to infer the pattern. Fall back to the threshold-inference approach when no override has ever been committed (e.g. Phase 1 users without `ha-energy-manager`'s scenario-gate wired up).
 - Optional `legionella_schedule_reset_date` config key to prune pre-change data and accelerate transition
 - Falls back gracefully to 0 when `dhw_buffer_sensor` is not configured
 
-**Effort:** ~3 h. **Impact:** LOW-MEDIUM (primarily useful after schedule changes; lag features self-correct within ~3 weeks otherwise).
+**Effort:** ~3 h. **Impact:** MEDIUM (was LOW-MEDIUM — see priority note above).
+
+---
+
+### #92 — Temperature-Based UA_eff Calibration Window (replace hardcoded month list)
+
+**Priority:** Medium — land before/during this coming winter so the switch is in effect when there's real cold-weather data to calibrate from.
+
+**Problem**: `_calibrate_ua_eff` (`physics.py:437`) gates its input rows to `timestamp.dt.month.isin([11, 12, 1, 2, 3])` — a hardcoded Northern-Hemisphere heating-season proxy. It's brittle in two ways: it can't react to genuinely cold shoulder-season data (a cold October or April), and it silently assumes a hemisphere/climate. Confirmed 2026-08-04 as a contributing cause of `UA_eff` staying `null` (space-heating term hard-zeroed, `physics.py:186-188`) — no calibration run has yet fallen inside a matching month since this feature went live. See `memory/project_physics_kwh_low_importance.md`.
+
+**Design (draft — needs its own short brainstorm before implementing)**: replace the calendar-month filter with a temperature/heating-degree threshold applied to the same candidate rows (e.g. `T_outdoor` below some margin under the heating setpoint) so eligibility tracks actual weather rather than the calendar. Keep the existing acceptance gates (≥30 valid passive windows, R²≥0.5) unchanged — this only changes which rows are eligible to be counted.
+
+**Not required for this**: the local climate CSV cache (`climate_<entity>.csv`) already accumulates indefinitely via merge-on-fetch (verified live: `climate_wohnzimmer.csv` has been growing since 2026-03-31, independent of HA's own recorder — confirmed via `configuration.yaml` and the HA history API that the live recorder itself only retains ~10 days, default `purge_keep_days`). No separate data-retention work is needed here.
+
+**Effort:** ~2 h (filter logic + tests). **Impact:** MEDIUM — removes a real hardcoded-assumption smell, but its practical effect (does `UA_eff` actually calibrate?) is only verifiable once real winter rows exist in the cache, ~Dec 2026/Jan 2027.
+
+---
+
+### #93 — Extend `set_dhw_schedule` Commit to Routine DHW Comfort-Boost (cross-repo, mirrors Plan 2)
+
+**Prerequisite context:** `ha-energy-manager`'s hef-physics-adoption Plan 2 (`docs/superpowers/specs/2026-07-10-hef-physics-adoption-design.md` / `plan2-legionella-scenario-gate.md`, live on both repos' `dev`) wired `_check_legionella`'s four branches to commit their chosen hour to hef via `energy_forecast/set_dhw_schedule`. It deliberately scoped out everything else.
+
+**Problem**: `ha-energy-manager`'s DHW Two-Tier Comfort-Boost Solar Scheduling (shipped 2026-07-31, `v0.15.1-alpha-26`) now *also* picks a scheduled hour ahead of time — `heat_pump.py::_arm_dhw_schedule()` → `_rank_dhw_boost_candidates()`, exposed as `dhw_boost_scheduled_hour` — but never calls `set_dhw_schedule`. hef has zero visibility into routine comfort-boosts, the same blind spot Plan 2 fixed for legionella, except this one fires far more often (near-daily on sunny days vs. weekly). Raised 2026-08-04 alongside #84/#92 but is its own item — different code path, different fix shape, not an ML feature-engineering change like #84.
+
+**Design (draft — needs its own brainstorm/spec before implementing, likely EM-side plan + a small hef-side change)**:
+- EM: call `_commit_dhw_schedule`-equivalent from `_arm_dhw_schedule` (and re-commit/cancel from `_clear_dhw_schedule`, since comfort-boost — unlike legionella — gets armed/cleared/re-armed mid-day as surplus and tank temp change; a stale commit would leave hef's forecast wrong until cleared).
+- hef: `physics.py::_dhw_override_for_hour` (`physics.py:207`) currently only recognizes `override["legionella"]` and hardcodes the target to `T_legionella` (60°C). Needs generalizing to a second override kind (e.g. `"comfort_boost"`) targeting `dhw_max_c`/the boost ceiling (~50°C) instead — not a copy-paste of the legionella path.
+- Open question: does this warrant the full `ScenarioScorer`/`get_scenario` gating Plan 2 built for legionella (score candidate hours before committing), or is a plain commit-of-whatever-was-already-chosen-by-solar-forecast enough, given comfort-boost's candidate ranking is already solar-forecast-based and self-correcting within a day? Decide during the dedicated brainstorm — don't assume parity with Plan 2's full design.
+
+**Effort:** ~1 day (cross-repo, EM + hef, tests both sides) — rough estimate, needs its own spec. **Impact:** MEDIUM-HIGH — likely bigger real-world effect than #84 given comfort-boost's higher frequency, but unverified until scoped properly.
 
 ---
 
@@ -278,7 +310,9 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 |---|------|--------|--------|----------|
 | 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | ✅ done (v0.11.0-alpha-16) |
 | 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
-| 84 | Legionella/DHW boost hour feature | low-medium | 3 h | low urgency — lag features self-corrected |
+| 84 | Legionella/DHW boost hour feature | medium | 3 h | raised 2026-08-04 — confirmed live cause of DHW commits being cancelled by ML layer |
+| 92 | Temperature-based UA_eff calibration window | medium | 2 h | ready — needs short brainstorm on threshold design first |
+| 93 | Extend `set_dhw_schedule` to routine DHW comfort-boost (cross-repo) | medium-high | ~1 day | needs its own spec — mirrors Plan 2, EM + hef both touched |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
 | 90 | Fill gaps in SHAP narrative label dictionary | low | 1 h | cosmetic — dashboard text card only |
