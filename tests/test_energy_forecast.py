@@ -1335,6 +1335,119 @@ class TestMqttPublishAllDiscoveryNext1h:
         )
 
 
+class TestMqttDiscoveryEnergyStateClassMismatch:
+    """GH #19: device_class='energy' is incompatible with state_class='measurement' in HA.
+
+    Forecast/error-metric sensors are computed values, not meter readings, so they drop
+    device_class entirely and keep state_class='measurement'. ev_today/ev_yesterday
+    genuinely accumulate detected kWh through the day (reset at midnight), so they keep
+    device_class='energy' but move to state_class='total'.
+    """
+
+    @staticmethod
+    def _payload_for(fake, unique_id: str) -> dict:
+        import json
+
+        for p in fake._publishes:
+            if p["topic"].endswith(f"/sensor/{unique_id}/config"):
+                return json.loads(p["payload"])
+        raise AssertionError(f"no discovery payload published for {unique_id}")
+
+    @pytest.mark.parametrize(
+        "unique_id",
+        [
+            "energy_forecast_next_1h",
+            "energy_forecast_next_3h",
+            "energy_forecast_today",
+            "energy_forecast_tomorrow",
+            "energy_forecast_today_00_03",
+            "energy_forecast_tomorrow_21_24",
+            "energy_forecast_model_mae",
+            "energy_forecast_mae_7d",
+            "energy_forecast_mae_30d",
+        ],
+    )
+    def test_forecast_and_mae_sensors_have_no_device_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert "device_class" not in payload
+        assert payload.get("state_class") == "measurement"
+
+    @pytest.mark.parametrize("unique_id", ["energy_forecast_ev_today", "energy_forecast_ev_yesterday"])
+    def test_ev_actual_sensors_use_total_state_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert payload.get("device_class") == "energy"
+        assert payload.get("state_class") == "total"
+
+    def test_interval_low_high_sensors_have_no_device_class(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf()
+        data = {
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "next_3h_low": 0.8,
+            "next_3h_high": 1.2,
+            "today_low": 4.5,
+            "today_high": 5.5,
+            "tomorrow_low": 5.5,
+            "tomorrow_high": 6.5,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+        }
+        EnergyForecast._publish(fake, data)
+        for unique_id in (
+            "energy_forecast_today_low",
+            "energy_forecast_today_high",
+            "energy_forecast_today_00_03_10th_pct",
+        ):
+            payload = self._payload_for(fake, unique_id)
+            assert "device_class" not in payload
+            assert payload.get("state_class") == "measurement"
+
+    @pytest.mark.parametrize("unique_id", ["energy_forecast_physics_base_today", "energy_forecast_ml_adjustment_today"])
+    def test_physics_sensors_have_no_device_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._physics_model = MagicMock()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert "device_class" not in payload
+        assert payload.get("state_class") == "measurement"
+
+    def test_scenario_sensors_have_no_device_class(self):
+        fake = _FakeMqttSelf()
+        fake._timezone = "UTC"
+        fake._scenario_mqtt_discovered = False
+        today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        ts = pd.date_range(today, periods=48, freq="1h", tz=None)
+        result_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "predicted_kwh": [1.0] * 48,
+                "delta_kwh": [0.1] * 48,
+            }
+        )
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        EnergyForecast._publish_scenario_forecast(fake, result_df)
+        for unique_id in (
+            "energy_forecast_scenario_today",
+            "energy_forecast_scenario_tomorrow",
+            "energy_forecast_scenario_delta_today",
+            "energy_forecast_scenario_today_00_03",
+        ):
+            payload = self._payload_for(fake, unique_id)
+            assert "device_class" not in payload
+            assert payload.get("state_class") == "measurement"
+
+
 class TestMqttFallback:
     """When mqtt_discovery=False, safe_set must use set_state and never call mqtt_publish."""
 
