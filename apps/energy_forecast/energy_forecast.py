@@ -89,6 +89,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "direct_radiation_wm2": "solar irradiance",
     "heating_degree": "heating degree-hours",
     "cooling_degree": "cooling degree-hours",
+    "hp_heating_degree": "HP-calibrated heating cutoff",
+    "temp_in_neutral_zone": "temperature in neutral zone",
+    "heating_active": "seasonal heating on/off",
     "temp_rolling_3d": "3-day average temperature",
     # Thermal modelling
     "temp_ewma_24h": "short-term thermal inertia",
@@ -104,11 +107,11 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "lag_2h": "2h ago consumption",
     "lag_6h": "6h ago consumption",
     "lag_12h": "12h ago consumption",
-    "lag_24h": "yesterday's same-hour consumption",
+    "lag_24h_tgated": "yesterday's same-hour consumption",
     "lag_48h": "2 days ago same-hour consumption",
     "lag_72h": "3 days ago same-hour consumption",
-    "lag_168h": "last week's same-hour consumption",
-    "lag_336h": "2 weeks ago same-hour consumption",
+    "lag_168h_tgated": "last week's same-hour consumption",
+    "lag_336h_tgated": "2 weeks ago same-hour consumption",
     # Rolling stats
     "rolling_mean_24h": "24h rolling average consumption",
     "rolling_mean_7d": "7-day rolling average consumption",
@@ -134,6 +137,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "weighted_solar_gain": "passive solar heat gain",
     "dhw_buffer_temp": "hot water buffer temperature",
     "dhw_pressure": "DHW heat demand",
+    # Physics-ML hybrid (only present when a physics model is configured)
+    "physics_kwh": "physics-model baseline forecast",
+    "heating_buffer_temp": "heating buffer tank temperature (sensor)",
     # Optional sensor features
     "outdoor_temp_live": "live outdoor temperature (sensor)",
     "temp_bias": "temperature sensor bias",

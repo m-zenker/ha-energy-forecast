@@ -275,25 +275,6 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ---
 
-### #90 — Fill Gaps in `_SHAP_FEATURE_LABELS` Dashboard Narrative Dictionary
-
-**Found:** 2026-07-15, while auditing physics/thermal feature additions (#89 review).
-
-**Problem:** `_build_shap_narrative()` (`energy_forecast.py:143-151`) falls back to the raw internal feature name (`label = _SHAP_FEATURE_LABELS.get(feat, feat)`) whenever a top-SHAP feature isn't in `_SHAP_FEATURE_LABELS` (`energy_forecast.py:62-140`). Several features that are actually in `_FEATURES_BASE`/`_FEATURES_WITH_SENSOR` (`model.py:79-160`) or added dynamically to `feature_cols` have no entry, so if they ever rank in the top SHAP features, the dashboard text card shows the raw column name instead of a readable phrase:
-
-- `hp_heating_degree` (HP-calibrated heating cutoff)
-- `temp_in_neutral_zone` (dead-band flag, 15–22 °C)
-- `heating_active` (seasonal heating on/off)
-- `lag_24h_tgated`, `lag_168h_tgated`, `lag_336h_tgated` (temp-delta-gated lag features — labels dict currently only has the untagged `lag_24h`/`lag_168h`/`lag_336h`, which are **not** real feature columns; those three dict entries are dead and should be replaced by the `_tgated` names actually in `_FEATURES_BASE`)
-- `heating_buffer_temp` (added to `base_features` when `heating_buffer_temp_sensor` is configured — `model.py:578`)
-- `physics_kwh` (added to `base_features` when the physics residual model is active — `model.py:576`)
-
-**Recommended fix (not yet implemented):** add the six missing labels above to `_SHAP_FEATURE_LABELS`, and replace the three stale untagged `lag_*h` entries with their `_tgated` equivalents. Add a test asserting `set(_SHAP_FEATURE_LABELS) ⊇ set(_FEATURES_WITH_SENSOR) ∪ {"physics_kwh", "heating_buffer_temp"}` (minus any deliberately-excluded internal-only columns) so this can't silently drift again as new features are added.
-
-**Effort:** ~1 h. **Impact:** LOW (cosmetic — dashboard narrative readability only, no forecast-accuracy effect).
-
----
-
 ### Deferred
 
 | # | Item | Reason |
@@ -315,7 +296,6 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 93 | Extend `set_dhw_schedule` to routine DHW comfort-boost (cross-repo) | medium-high | ~1 day | needs its own spec — mirrors Plan 2, EM + hef both touched |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
-| 90 | Fill gaps in SHAP narrative label dictionary | low | 1 h | cosmetic — dashboard text card only |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
@@ -426,3 +406,4 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
 | 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
 | 89 | Dedup physics sensor history fetches — DHW tank temp and room thermostat temp now reuse the ML pipeline's already-fetched data instead of redundant HA history API calls | Unreleased |
+| 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents | Unreleased |

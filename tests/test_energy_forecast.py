@@ -2824,7 +2824,7 @@ class TestBuildShapNarrative:
 
     def test_multiple_features(self):
         """Multiple features all appear in narrative."""
-        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h": 0.07}
+        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h_tgated": 0.07}
         result = _build_shap_narrative(shap_features)
         assert "time-of-day (sine)" in result
         assert "current outdoor temperature" in result
@@ -2860,6 +2860,38 @@ class TestBuildShapNarrative:
         assert "time-of-day (cosine)" in result
         # Verify both appear in the narrative
         assert result.count("time-of-day") == 2
+
+
+class TestShapFeatureLabelCoverage:
+    """ROADMAP #90: every statically-declared model feature must have a narrative label,
+    so a top-ranked SHAP feature never falls back to showing the raw column name."""
+
+    def test_all_static_features_have_labels(self):
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+        from energy_forecast.model import _FEATURES_WITH_SENSOR
+
+        missing = set(_FEATURES_WITH_SENSOR) - set(_SHAP_FEATURE_LABELS)
+        assert not missing, f"Features missing from _SHAP_FEATURE_LABELS: {missing}"
+
+    def test_stale_untagged_lag_entries_removed(self):
+        """lag_24h/lag_168h/lag_336h (untagged) are not real feature columns — only their
+        _tgated equivalents are — so the dict must not carry dead entries for them."""
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+
+        for stale in ("lag_24h", "lag_168h", "lag_336h"):
+            assert stale not in _SHAP_FEATURE_LABELS, f"{stale} is not a real feature column"
+        for tgated in ("lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated"):
+            assert tgated in _SHAP_FEATURE_LABELS
+
+    def test_physics_dynamic_features_have_labels(self):
+        """physics_kwh/heating_buffer_temp are appended to feature_cols dynamically in
+        model.py's train() (not part of the static _FEATURES_BASE list) when a physics
+        model / heating_buffer_temp_sensor is configured, so the static-list coverage
+        test above can't catch them — check them explicitly."""
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+
+        for feat in ("physics_kwh", "heating_buffer_temp"):
+            assert feat in _SHAP_FEATURE_LABELS
 
 
 # ── Relative MAE (#54) ───────────────────────────────────────────────────────────
