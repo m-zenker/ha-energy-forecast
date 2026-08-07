@@ -1,2 +1,2 @@
 # Makes this directory a Python package so relative imports work.
-__version__ = "0.12.0-alpha-8"
+__version__ = "0.12.0-alpha-9"
