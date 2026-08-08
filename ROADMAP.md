@@ -301,7 +301,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
-| 91 | Daily update-check + notification | distribution/UX | 1–1.5 h | ready |
+| 91 | Daily update-check + notification | distribution/UX | 1–1.5 h | implemented — pending release |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
