@@ -2523,6 +2523,40 @@ class EnergyForecast(hass.Hass):
         except OSError as exc:
             _LOGGER.warning("Failed to save pred_history: %s", exc)
 
+    def _update_check_state_path(self) -> Path:
+        return self._cache_path.parent / "update_check_state.json"
+
+    def _load_update_check_state(self) -> dict[str, str]:
+        """Load the update-check dedup state (`{"last_notified_tag": ...}`).
+
+        Missing or corrupt file is treated as "no prior notification" — logged
+        at WARNING, never raises.
+        """
+        path = self._update_check_state_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _LOGGER.warning("Failed to load update_check_state: %s", exc)
+            return {}
+
+    def _save_update_check_state(self, state: dict[str, str]) -> None:
+        """Serialize update-check dedup state atomically (tmp file + os.replace).
+
+        Save failure is logged at WARNING and never raises — worst case, the
+        same version is re-notified on the next daily run.
+        """
+        path = self._update_check_state_path()
+        try:
+            tmp_path = path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            _LOGGER.warning("Failed to save update_check_state: %s", exc)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
