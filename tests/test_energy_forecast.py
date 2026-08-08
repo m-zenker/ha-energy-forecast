@@ -3169,6 +3169,41 @@ class TestMaybeStartupRetrain:
         assert retrain_calls == [1], "a genuinely fresh/stale model must still retrain on startup"
 
 
+class TestUpdateCheckScheduling:
+    """initialize() must schedule the daily update check per update_check_enabled.
+
+    run_daily() is currently called from exactly one place in initialize()
+    (the update check), so assert_called_once_with is safe here — if a second
+    run_daily call is ever added elsewhere, this test should switch to
+    filtering call_args_list by callback identity instead.
+    """
+
+    def test_default_enabled_schedules_run_daily(self):
+        from datetime import time as dtime
+
+        app = _make_app({})
+        app.initialize()
+
+        assert app._update_check_enabled is True
+        app.run_daily.assert_called_once_with(app._check_for_update_cb, dtime(9, 0, 0))
+
+    def test_explicitly_enabled_schedules_run_daily(self):
+        from datetime import time as dtime
+
+        app = _make_app({"update_check_enabled": True})
+        app.initialize()
+
+        assert app._update_check_enabled is True
+        app.run_daily.assert_called_once_with(app._check_for_update_cb, dtime(9, 0, 0))
+
+    def test_disabled_never_schedules_run_daily(self):
+        app = _make_app({"update_check_enabled": False})
+        app.initialize()
+
+        assert app._update_check_enabled is False
+        app.run_daily.assert_not_called()
+
+
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
 
 

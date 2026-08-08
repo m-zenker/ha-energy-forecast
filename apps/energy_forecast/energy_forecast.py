@@ -285,6 +285,8 @@ class EnergyForecast(hass.Hass):
         self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Model versioning: number of archived model snapshots to retain
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
+        # Daily GitHub-release update check (main-track users only; see _check_for_update_cb)
+        self._update_check_enabled: bool = bool(self.args.get("update_check_enabled", True))
 
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
@@ -413,6 +415,8 @@ class EnergyForecast(hass.Hass):
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
+        if self._update_check_enabled:
+            self.run_daily(self._check_for_update_cb, time(9, 0, 0))
 
         _LOGGER.info(
             "HA Energy Forecast ready. EV threshold: %s kWh/h, charger: %s kW",
@@ -1420,6 +1424,15 @@ class EnergyForecast(hass.Hass):
             _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(f"set_dhw_schedule failed: {exc}")
+
+    def _check_for_update_cb(self, kwargs: dict = None) -> None:
+        """Daily update check callback — stub for Task 3 implementation.
+
+        Checks GitHub releases and publishes update notifications when a new
+        version is available. This will be replaced by the full implementation
+        in Task 3.
+        """
+        pass
 
     def _effective_use_physics_residual(self) -> bool:
         """Config intent AND-ed with the cold-start gate.
