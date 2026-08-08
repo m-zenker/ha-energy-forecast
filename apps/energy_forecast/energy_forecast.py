@@ -36,6 +36,7 @@ from . import __version__, ha_data, weather
 from .const import (
     CACHE_PATH,
     EV_CHARGING_THRESHOLD_KWH,
+    GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
     PRESENCE_STATE_HOME,
     UNIT_TO_KWH,
@@ -279,6 +280,8 @@ class EnergyForecast(hass.Hass):
         self._shap_top_n: int = int(self.args.get("shap_top_n", 5))
         # Model versioning: number of archived model snapshots to retain
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
+        # Daily GitHub-release update check (main-track users only; see _check_for_update_cb)
+        self._update_check_enabled: bool = bool(self.args.get("update_check_enabled", True))
 
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
@@ -345,6 +348,8 @@ class EnergyForecast(hass.Hass):
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
+        if self._update_check_enabled:
+            self.run_daily(self._check_for_update_cb, time(9, 0, 0))
 
         _LOGGER.info(
             "HA Energy Forecast ready. EV threshold: %s kWh/h, charger: %s kW",
@@ -2453,6 +2458,48 @@ class EnergyForecast(hass.Hass):
 
         return result
 
+    def _check_for_update_cb(self, kwargs: Any) -> None:
+        """Daily check: compare __version__ against the latest GitHub release tag.
+
+        Skips entirely for pre-release (-alpha/-beta) builds — those track ahead
+        of main and must never nag the maintainer's own dev instance. Any
+        fetch/parse failure is caught, logged, and retried on the next daily run.
+        """
+        if "-alpha" in __version__ or "-beta" in __version__:
+            _LOGGER.debug("Update check skipped: running a pre-release version (%s)", __version__)
+            return
+
+        import requests
+
+        try:
+            res = requests.get(GITHUB_RELEASES_URL, timeout=10)
+            res.raise_for_status()
+            raw_tag = res.json()["tag_name"]
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            _LOGGER.warning("Update check failed: %s", exc)
+            return
+
+        if not raw_tag:
+            _LOGGER.warning("Update check failed: tag_name missing or empty in release response")
+            return
+
+        tag = str(raw_tag).removeprefix("v")
+
+        if tag == __version__:
+            return  # already up to date — no dedup check, no state read/write
+
+        state = self._load_update_check_state()
+        if state.get("last_notified_tag") == tag:
+            return  # already notified about this version
+
+        self.call_service(
+            "persistent_notification/create",
+            title=f"HA Energy Forecast {tag} available",
+            message=f"A new version ({tag}) is available. You are running {__version__}.",
+            notification_id="hef_update_available",
+        )
+        self._save_update_check_state({"last_notified_tag": tag})
+
     def _load_pred_history(self) -> None:
         """Load prediction and actuals history from JSON file.
 
@@ -2512,6 +2559,40 @@ class EnergyForecast(hass.Hass):
             os.replace(tmp_path, PRED_HISTORY_PATH)
         except OSError as exc:
             _LOGGER.warning("Failed to save pred_history: %s", exc)
+
+    def _update_check_state_path(self) -> Path:
+        return self._cache_path.parent / "update_check_state.json"
+
+    def _load_update_check_state(self) -> dict[str, str]:
+        """Load the update-check dedup state (`{"last_notified_tag": ...}`).
+
+        Missing or corrupt file is treated as "no prior notification" — logged
+        at WARNING, never raises.
+        """
+        path = self._update_check_state_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            _LOGGER.warning("Failed to load update_check_state: %s", exc)
+            return {}
+
+    def _save_update_check_state(self, state: dict[str, str]) -> None:
+        """Serialize update-check dedup state atomically (tmp file + os.replace).
+
+        Save failure is logged at WARNING and never raises — worst case, the
+        same version is re-notified on the next daily run.
+        """
+        path = self._update_check_state_path()
+        try:
+            tmp_path = path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            _LOGGER.warning("Failed to save update_check_state: %s", exc)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
