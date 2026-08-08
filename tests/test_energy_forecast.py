@@ -2858,6 +2858,176 @@ class TestUpdateCheckStatePersistence:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
+class TestCheckForUpdateCb:
+    """Tests for _check_for_update_cb: fetch, compare, dedup, notify."""
+
+    def _make_fake_self(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = MagicMock(spec=EnergyForecast)
+        fake._cache_path = tmp_path / "energy_history.csv"
+        fake.call_service = MagicMock()
+        # Without this, self._update_check_state_path() inside the real load/save
+        # methods below resolves to an autospec'd MagicMock (not a real Path),
+        # silently breaking persistence. Same override as
+        # TestUpdateCheckStatePersistence._make_fake_self.
+        fake._update_check_state_path = MagicMock(
+            side_effect=lambda: fake._cache_path.parent / "update_check_state.json"
+        )
+        fake._load_update_check_state = lambda: EnergyForecast._load_update_check_state(fake)
+        fake._save_update_check_state = lambda state: EnergyForecast._save_update_check_state(fake, state)
+        return fake
+
+    def _make_response(self, tag_name: str | None = "v0.12.0", status_ok: bool = True):
+        mock = MagicMock()
+        if status_ok:
+            mock.raise_for_status = MagicMock()
+        else:
+            import requests as req
+
+            mock.raise_for_status = MagicMock(side_effect=req.HTTPError("404"))
+        if tag_name is None:
+            mock.json.return_value = {}
+        else:
+            mock.json.return_value = {"tag_name": tag_name}
+        return mock
+
+    def test_prerelease_version_skips_check_entirely(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.12.0-alpha-9")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get") as mock_get:
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        mock_get.assert_not_called()
+        fake.call_service.assert_not_called()
+
+    def test_beta_version_skips_check_entirely(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.12.0-beta-1")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get") as mock_get:
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        mock_get.assert_not_called()
+        fake.call_service.assert_not_called()
+
+    def test_new_release_notifies_and_persists_state(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("v0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast 0.12.0 available",
+            message="A new version (0.12.0) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
+        assert fake._load_update_check_state() == {"last_notified_tag": "0.12.0"}
+
+    def test_already_notified_tag_does_not_renotify(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+        fake._save_update_check_state({"last_notified_tag": "0.12.0"})
+
+        with patch("requests.get", return_value=self._make_response("v0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_not_called()
+
+    def test_newer_release_after_prior_notify_notifies_again(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+        fake._save_update_check_state({"last_notified_tag": "0.12.0"})
+
+        with patch("requests.get", return_value=self._make_response("v0.12.1")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast 0.12.1 available",
+            message="A new version (0.12.1) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
+        assert fake._load_update_check_state() == {"last_notified_tag": "0.12.1"}
+
+    def test_already_up_to_date_no_notification_no_state_write(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("v0.11.10")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_not_called()
+        assert fake._load_update_check_state() == {}
+
+    def test_request_exception_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import requests as req
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", side_effect=req.RequestException("timeout")),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_missing_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", return_value=self._make_response(tag_name=None)),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_200_status_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", return_value=self._make_response("v0.12.0", status_ok=False)),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
 
 
