@@ -2799,6 +2799,65 @@ class TestPredHistoryPersistence:
         assert any("Failed to save" in r.message for r in caplog.records)
 
 
+class TestUpdateCheckStatePersistence:
+    """Tests for _load_update_check_state / _save_update_check_state."""
+
+    def _make_fake_self(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = MagicMock(spec=EnergyForecast)
+        fake._cache_path = tmp_path / "energy_history.csv"
+        # Configure _update_check_state_path to dynamically compute the path based on current _cache_path
+        fake._update_check_state_path = MagicMock(
+            side_effect=lambda: fake._cache_path.parent / "update_check_state.json"
+        )
+        return fake
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        EnergyForecast._save_update_check_state(fake, {"last_notified_tag": "0.12.0"})
+
+        loaded = EnergyForecast._load_update_check_state(fake)
+        assert loaded == {"last_notified_tag": "0.12.0"}
+
+    def test_load_missing_file_returns_empty_dict(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        assert EnergyForecast._load_update_check_state(fake) == {}
+
+    def test_load_corrupt_file_logs_warning_and_returns_empty(self, tmp_path, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        state_path = tmp_path / "update_check_state.json"
+        state_path.write_text("{not valid json")
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = EnergyForecast._load_update_check_state(fake)
+
+        assert result == {}
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_save_failure_logs_warning_and_does_not_raise(self, tmp_path, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        # Point _cache_path at a directory that doesn't exist so os.replace/open fails.
+        fake._cache_path = tmp_path / "nonexistent_dir" / "energy_history.csv"
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._save_update_check_state(fake, {"last_notified_tag": "0.12.0"})  # must not raise
+
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
 
 
