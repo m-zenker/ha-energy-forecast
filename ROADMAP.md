@@ -1,14 +1,21 @@
 # Forecast Accuracy Roadmap
 
-Current: **v0.11.4** — 2026-06-16, main. 627 tests.
+Current: **v0.11.11** — 2026-08-08, main. 792 tests.
 
 ---
 
 ## Current Status
 
-**dev:** v0.11.4-alpha-2 (same codebase — release commit was made on main only). **main:** v0.11.4 released 2026-06-16.
+**dev:** v0.12.0-alpha-10 — carries the Physics-ML Hybrid feature (live/deployed on dev, not yet released to `main`; gated per `memory/feedback_release_process.md` Rule 3 and `memory/project_status.md`). **main:** v0.11.11 released 2026-08-08, built from curated non-physics `release/*` branches rather than a direct `dev` merge (same pattern as v0.11.10).
 
 Recent releases:
+- v0.11.11 — MQTT `device_class`/`state_class` mismatch fix (#19), SHAP narrative label gaps (#90), daily update-check + notification (#91).
+- v0.11.10 — Hand-curated excluded training-ranges (bad-data windows), live-path solar/battery target-correction fix, zero-diff cache gap fix, EV/solar correction ordering fix, weather timezone crash fix, trailing sensor silence backfill, g++/lightgbm Alpine build fix.
+- v0.11.9 — EV charging cache path bound-method crash fix.
+- v0.11.8 — `resolve_timezone()` shared helper, startup sensor-type validation, backfill timezone fix (#15).
+- v0.11.7 — Wallbox EV charging sensor split, `energy_unit` (kWh/MWh/Wh) config, anomaly sensor cold-start crash fix.
+- v0.11.6 — sklearn import-error visibility, corrected no-LightGBM install docs (#10).
+- v0.11.5 — scikit-learn ARM/Alpine install pin, clearer import-failure logging (#10).
 - v0.11.4 — 15-minute energy history cache (#85), strip partial day from clustering (#86), tomorrow block P10/P90 interval sensors, code review batch 1–5 (all open findings closed).
 - v0.11.0 — Daily Regime Clustering, EV-subtracted clustering input (#82 — live since 2026-04-23).
 
@@ -253,6 +260,14 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.11.11 | 2026-08-08 | MQTT `device_class`/`state_class` mismatch fix (#19), SHAP narrative label gaps (#90), daily update-check + notification (#91). 792 tests. |
+| v0.11.10 | 2026-07-31 | Hand-curated excluded training-ranges, live-path target-correction fix, zero-diff cache gap fix, EV/solar correction ordering fix, weather timezone crash fix, trailing sensor silence backfill, g++/lightgbm Alpine build fix. Released from curated `release/non-physics-fixes` branch, not a direct `dev` merge — `dev` carries the still-gated Physics-ML Hybrid feature. 756 tests. |
+| v0.11.9 | 2026-07-11 | EV charging cache path bound-method crash fix (GitHub discussion #15). 685 tests. |
+| v0.11.8 | 2026-07-07 | `resolve_timezone()` shared helper, startup sensor-type validation, backfill timezone fix (#15). 683 tests. |
+| v0.11.7 | 2026-06-30 | Wallbox EV charging sensor split (`split_ev_charging_from_sensor`), `energy_unit` (kWh/MWh/Wh) config, anomaly sensor cold-start crash fix. 663 tests. |
+| v0.11.6 | 2026-06-25 | sklearn import-error visibility on Alpine/aarch64 (missing `libgomp`), corrected no-LightGBM install docs (#10). 649 tests. |
+| v0.11.5 | 2026-06-22 | scikit-learn pinned `<=1.6.0` for Alpine/ARM wheel compatibility, clearer import-failure logging (#10). 649 tests. |
+| v0.11.4 | 2026-06-16 | 15-minute energy history cache (#85), strip partial day from clustering (#86), tomorrow block P10/P90 interval sensors, code review batch 1–5 (all open findings closed). 649 tests. |
 | v0.11.4-alpha | 2026-06-13 | 15-minute energy history cache (#85); strip partial day from clustering input (#86). 643 tests. |
 | v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
 | v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
