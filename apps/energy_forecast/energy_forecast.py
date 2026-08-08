@@ -2946,10 +2946,16 @@ class EnergyForecast(hass.Hass):
         try:
             res = requests.get(GITHUB_RELEASES_URL, timeout=10)
             res.raise_for_status()
-            tag = str(res.json()["tag_name"]).lstrip("v")
-        except (requests.RequestException, ValueError, KeyError) as exc:
+            raw_tag = res.json()["tag_name"]
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             _LOGGER.warning("Update check failed: %s", exc)
             return
+
+        if not raw_tag:
+            _LOGGER.warning("Update check failed: tag_name missing or empty in release response")
+            return
+
+        tag = str(raw_tag).removeprefix("v")
 
         if tag == __version__:
             return  # already up to date — no dedup check, no state read/write
