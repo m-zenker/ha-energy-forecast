@@ -84,6 +84,13 @@ energy_forecast:
   # Developer Tools → Events. Set to 0 to disable archiving.
   # model_archive_count: 3
 
+  # Optional: daily check for a newer GitHub release (default: true).
+  # Runs once/day at 09:00 local time; skipped entirely on -alpha/-beta builds
+  # (the maintainer's own dev instance always runs ahead of main). On a new,
+  # not-yet-notified release, creates a persistent_notification in the HA UI.
+  # Set to false to disable the daily check entirely (no scheduling, no network calls).
+  # update_check_enabled: true
+
   # Optional: Passive House Baseline mode (default: false).
   # When enabled, the model trains on and predicts only the household baseline,
   # subtracting all controllable sub_energy_sensors from the total.
