@@ -2623,10 +2623,9 @@ class TestUpdateCheckStatePersistence:
 
         fake = MagicMock(spec=EnergyForecast)
         fake._cache_path = tmp_path / "energy_history.csv"
-        # Configure _update_check_state_path to dynamically compute the path based on current _cache_path
-        fake._update_check_state_path = MagicMock(
-            side_effect=lambda: fake._cache_path.parent / "update_check_state.json"
-        )
+        # Delegate to the real bound method so the tests actually exercise
+        # EnergyForecast._update_check_state_path instead of re-implementing it.
+        fake._update_check_state_path = lambda: EnergyForecast._update_check_state_path(fake)
         return fake
 
     def test_save_and_load_roundtrip(self, tmp_path):
@@ -2685,11 +2684,10 @@ class TestCheckForUpdateCb:
         fake.call_service = MagicMock()
         # Without this, self._update_check_state_path() inside the real load/save
         # methods below resolves to an autospec'd MagicMock (not a real Path),
-        # silently breaking persistence. Same override as
-        # TestUpdateCheckStatePersistence._make_fake_self.
-        fake._update_check_state_path = MagicMock(
-            side_effect=lambda: fake._cache_path.parent / "update_check_state.json"
-        )
+        # silently breaking persistence. Delegates to the real bound method
+        # (same as TestUpdateCheckStatePersistence._make_fake_self) so it's
+        # actually exercised rather than re-implemented.
+        fake._update_check_state_path = lambda: EnergyForecast._update_check_state_path(fake)
         fake._load_update_check_state = lambda: EnergyForecast._load_update_check_state(fake)
         fake._save_update_check_state = lambda state: EnergyForecast._save_update_check_state(fake, state)
         return fake
@@ -2842,6 +2840,116 @@ class TestCheckForUpdateCb:
 
         fake.call_service.assert_not_called()
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_dict_json_body_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """res.json() returning None (not a dict) makes `res.json()["tag_name"]` raise
+        TypeError rather than KeyError — must still be caught, logged, and not raise."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = None
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_json_array_body_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """res.json() returning a list makes `res.json()["tag_name"]` raise TypeError
+        (list indices must be integers) rather than KeyError — must still be caught."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = ["not", "a", "dict"]
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_falsy_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """A present but falsy tag_name (e.g. null -> None, or "") must not produce
+        a nonsense "None available" notification — logs WARNING and returns."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"tag_name": None}
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_empty_string_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """A present but empty-string tag_name must also be treated as failure, not
+        as a valid (empty) version tag."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"tag_name": ""}
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_double_v_prefix_only_strips_one_leading_v(self, tmp_path, monkeypatch):
+        """removeprefix strips exactly one leading literal "v", unlike lstrip("v")
+        which would strip all leading v characters (e.g. "vv1.0" -> "1.0")."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("vv0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast v0.12.0 available",
+            message="A new version (v0.12.0) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
 
 
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
