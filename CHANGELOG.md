@@ -8,6 +8,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-08-08
+
 ### Added
 - `apps/energy_forecast/energy_forecast.py`, `const.py` — daily update-check: compares the running `__version__` against the latest GitHub release tag (`GET /repos/m-zenker/ha-energy-forecast/releases/latest`) once a day at 09:00 local time, and creates a `persistent_notification` when a newer release is available. Skipped entirely on `-alpha`/`-beta` builds (the maintainer's own dev instance always runs ahead of `main`). Dedup state persisted to `update_check_state.json` so each new version notifies at most once. New `update_check_enabled` config key (default `true`) disables the check entirely — no scheduling, no network calls. #91
 

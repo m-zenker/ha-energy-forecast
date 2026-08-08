@@ -344,3 +344,5 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 80 | `find_optimal_k()` docstring fully documents normalization, bail-out, smoothing, tolerance band, OOB note | v0.11.0-alpha-14 |
 | 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
 | 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
+| 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents | v0.11.11 |
+| 91 | Daily update-check + notification — compares `__version__` against latest GitHub release tag daily at 09:00, fires `persistent_notification` when `main`-track users are behind; `update_check_enabled` config flag | v0.11.11 |
