@@ -301,7 +301,6 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
 | 16 | HACS support | distribution | 1 h | long-term |
 | 18 | Config flow | UX / install | 8+ h | long-term |
-| 91 | Daily update-check + notification | distribution/UX | 1–1.5 h | implemented — pending release |
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
@@ -407,3 +406,4 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
 | 89 | Dedup physics sensor history fetches — DHW tank temp and room thermostat temp now reuse the ML pipeline's already-fetched data instead of redundant HA history API calls | Unreleased |
 | 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents | Unreleased |
+| 91 | Daily update-check + notification — compares `__version__` against latest GitHub release tag daily at 09:00, fires `persistent_notification` when `main`-track users are behind; `update_check_enabled` config flag | v0.12.0-alpha-10 |
