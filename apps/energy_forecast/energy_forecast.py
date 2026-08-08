@@ -36,6 +36,7 @@ from . import __version__, ha_data, weather
 from .const import (
     CACHE_PATH,
     EV_CHARGING_THRESHOLD_KWH,
+    GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
     PRESENCE_STATE_HOME,
     UNIT_TO_KWH,
@@ -1083,15 +1084,6 @@ class EnergyForecast(hass.Hass):
             self._update_sensors()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("Sensor update failed: %s", exc)
-
-    def _check_for_update_cb(self, kwargs: dict = None) -> None:
-        """Daily update check callback — stub for Task 3 implementation.
-
-        Checks GitHub releases and publishes update notifications when a new
-        version is available. This will be replaced by the full implementation
-        in Task 3.
-        """
-        pass
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
@@ -2462,6 +2454,42 @@ class EnergyForecast(hass.Hass):
                 result["ev_yesterday"] = _ev_sum(yesterday_np, today_np)
 
         return result
+
+    def _check_for_update_cb(self, kwargs: Any) -> None:
+        """Daily check: compare __version__ against the latest GitHub release tag.
+
+        Skips entirely for pre-release (-alpha/-beta) builds — those track ahead
+        of main and must never nag the maintainer's own dev instance. Any
+        fetch/parse failure is caught, logged, and retried on the next daily run.
+        """
+        if "-alpha" in __version__ or "-beta" in __version__:
+            _LOGGER.debug("Update check skipped: running a pre-release version (%s)", __version__)
+            return
+
+        import requests
+
+        try:
+            res = requests.get(GITHUB_RELEASES_URL, timeout=10)
+            res.raise_for_status()
+            tag = str(res.json()["tag_name"]).lstrip("v")
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            _LOGGER.warning("Update check failed: %s", exc)
+            return
+
+        if tag == __version__:
+            return  # already up to date — no dedup check, no state read/write
+
+        state = self._load_update_check_state()
+        if state.get("last_notified_tag") == tag:
+            return  # already notified about this version
+
+        self.call_service(
+            "persistent_notification/create",
+            title=f"HA Energy Forecast {tag} available",
+            message=f"A new version ({tag}) is available. You are running {__version__}.",
+            notification_id="hef_update_available",
+        )
+        self._save_update_check_state({"last_notified_tag": tag})
 
     def _load_pred_history(self) -> None:
         """Load prediction and actuals history from JSON file.
