@@ -1264,6 +1264,110 @@ class TestMqttPublishAllDiscoveryNext1h:
         )
 
 
+class TestMqttDiscoveryEnergyStateClassMismatch:
+    """GH #19: device_class='energy' is incompatible with state_class='measurement' in HA.
+
+    Forecast/error-metric sensors are computed values, not meter readings, so they drop
+    device_class entirely and keep state_class='measurement'. ev_today/ev_yesterday
+    genuinely accumulate detected kWh through the day (reset at midnight), so they keep
+    device_class='energy' but move to state_class='total'.
+    """
+
+    @staticmethod
+    def _payload_for(fake, unique_id: str) -> dict:
+        import json
+
+        for p in fake._publishes:
+            if p["topic"].endswith(f"/sensor/{unique_id}/config"):
+                return json.loads(p["payload"])
+        raise AssertionError(f"no discovery payload published for {unique_id}")
+
+    @pytest.mark.parametrize(
+        "unique_id",
+        [
+            "energy_forecast_next_1h",
+            "energy_forecast_next_3h",
+            "energy_forecast_today",
+            "energy_forecast_tomorrow",
+            "energy_forecast_today_00_03",
+            "energy_forecast_tomorrow_21_24",
+            "energy_forecast_model_mae",
+            "energy_forecast_mae_7d",
+            "energy_forecast_mae_30d",
+        ],
+    )
+    def test_forecast_and_mae_sensors_have_no_device_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert "device_class" not in payload
+        assert payload.get("state_class") == "measurement"
+
+    @pytest.mark.parametrize("unique_id", ["energy_forecast_ev_today", "energy_forecast_ev_yesterday"])
+    def test_ev_actual_sensors_use_total_state_class(self, unique_id):
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        payload = self._payload_for(fake, unique_id)
+        assert payload.get("device_class") == "energy"
+        assert payload.get("state_class") == "total"
+
+    def test_interval_low_high_sensors_have_no_device_class(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf()
+        data = {
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "next_3h_low": 0.8,
+            "next_3h_high": 1.2,
+            "today_low": 4.5,
+            "today_high": 5.5,
+            "tomorrow_low": 5.5,
+            "tomorrow_high": 6.5,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+        }
+        EnergyForecast._publish(fake, data)
+        for unique_id in (
+            "energy_forecast_today_low",
+            "energy_forecast_today_high",
+            "energy_forecast_today_00_03_10th_pct",
+        ):
+            payload = self._payload_for(fake, unique_id)
+            assert "device_class" not in payload
+            assert payload.get("state_class") == "measurement"
+
+    def test_scenario_sensors_have_no_device_class(self):
+        fake = _FakeMqttSelf()
+        fake._timezone = "UTC"
+        fake._scenario_mqtt_discovered = False
+        today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        ts = pd.date_range(today, periods=48, freq="1h", tz=None)
+        result_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "predicted_kwh": [1.0] * 48,
+                "delta_kwh": [0.1] * 48,
+            }
+        )
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        EnergyForecast._publish_scenario_forecast(fake, result_df)
+        for unique_id in (
+            "energy_forecast_scenario_today",
+            "energy_forecast_scenario_tomorrow",
+            "energy_forecast_scenario_delta_today",
+            "energy_forecast_scenario_today_00_03",
+        ):
+            payload = self._payload_for(fake, unique_id)
+            assert "device_class" not in payload
+            assert payload.get("state_class") == "measurement"
+
+
 class TestMqttFallback:
     """When mqtt_discovery=False, safe_set must use set_state and never call mqtt_publish."""
 
@@ -2615,6 +2719,343 @@ class TestPredHistoryPersistence:
         assert any("Failed to save" in r.message for r in caplog.records)
 
 
+class TestUpdateCheckStatePersistence:
+    """Tests for _load_update_check_state / _save_update_check_state."""
+
+    def _make_fake_self(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = MagicMock(spec=EnergyForecast)
+        fake._cache_path = tmp_path / "energy_history.csv"
+        # Delegate to the real bound method so the tests actually exercise
+        # EnergyForecast._update_check_state_path instead of re-implementing it.
+        fake._update_check_state_path = lambda: EnergyForecast._update_check_state_path(fake)
+        return fake
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        EnergyForecast._save_update_check_state(fake, {"last_notified_tag": "0.12.0"})
+
+        loaded = EnergyForecast._load_update_check_state(fake)
+        assert loaded == {"last_notified_tag": "0.12.0"}
+
+    def test_load_missing_file_returns_empty_dict(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        assert EnergyForecast._load_update_check_state(fake) == {}
+
+    def test_load_corrupt_file_logs_warning_and_returns_empty(self, tmp_path, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        state_path = tmp_path / "update_check_state.json"
+        state_path.write_text("{not valid json")
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = EnergyForecast._load_update_check_state(fake)
+
+        assert result == {}
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_save_failure_logs_warning_and_does_not_raise(self, tmp_path, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_fake_self(tmp_path)
+        # Point _cache_path at a directory that doesn't exist so os.replace/open fails.
+        fake._cache_path = tmp_path / "nonexistent_dir" / "energy_history.csv"
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._save_update_check_state(fake, {"last_notified_tag": "0.12.0"})  # must not raise
+
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+class TestCheckForUpdateCb:
+    """Tests for _check_for_update_cb: fetch, compare, dedup, notify."""
+
+    def _make_fake_self(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = MagicMock(spec=EnergyForecast)
+        fake._cache_path = tmp_path / "energy_history.csv"
+        fake.call_service = MagicMock()
+        # Without this, self._update_check_state_path() inside the real load/save
+        # methods below resolves to an autospec'd MagicMock (not a real Path),
+        # silently breaking persistence. Delegates to the real bound method
+        # (same as TestUpdateCheckStatePersistence._make_fake_self) so it's
+        # actually exercised rather than re-implemented.
+        fake._update_check_state_path = lambda: EnergyForecast._update_check_state_path(fake)
+        fake._load_update_check_state = lambda: EnergyForecast._load_update_check_state(fake)
+        fake._save_update_check_state = lambda state: EnergyForecast._save_update_check_state(fake, state)
+        return fake
+
+    def _make_response(self, tag_name: str | None = "v0.12.0", status_ok: bool = True):
+        mock = MagicMock()
+        if status_ok:
+            mock.raise_for_status = MagicMock()
+        else:
+            import requests as req
+
+            mock.raise_for_status = MagicMock(side_effect=req.HTTPError("404"))
+        if tag_name is None:
+            mock.json.return_value = {}
+        else:
+            mock.json.return_value = {"tag_name": tag_name}
+        return mock
+
+    def test_prerelease_version_skips_check_entirely(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.12.0-alpha-9")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get") as mock_get:
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        mock_get.assert_not_called()
+        fake.call_service.assert_not_called()
+
+    def test_beta_version_skips_check_entirely(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.12.0-beta-1")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get") as mock_get:
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        mock_get.assert_not_called()
+        fake.call_service.assert_not_called()
+
+    def test_new_release_notifies_and_persists_state(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("v0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast 0.12.0 available",
+            message="A new version (0.12.0) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
+        assert fake._load_update_check_state() == {"last_notified_tag": "0.12.0"}
+
+    def test_already_notified_tag_does_not_renotify(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+        fake._save_update_check_state({"last_notified_tag": "0.12.0"})
+
+        with patch("requests.get", return_value=self._make_response("v0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_not_called()
+
+    def test_newer_release_after_prior_notify_notifies_again(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+        fake._save_update_check_state({"last_notified_tag": "0.12.0"})
+
+        with patch("requests.get", return_value=self._make_response("v0.12.1")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast 0.12.1 available",
+            message="A new version (0.12.1) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
+        assert fake._load_update_check_state() == {"last_notified_tag": "0.12.1"}
+
+    def test_already_up_to_date_no_notification_no_state_write(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("v0.11.10")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_not_called()
+        assert fake._load_update_check_state() == {}
+
+    def test_request_exception_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import requests as req
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", side_effect=req.RequestException("timeout")),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_missing_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", return_value=self._make_response(tag_name=None)),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_200_status_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with (
+            patch("requests.get", return_value=self._make_response("v0.12.0", status_ok=False)),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_non_dict_json_body_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """res.json() returning None (not a dict) makes `res.json()["tag_name"]` raise
+        TypeError rather than KeyError — must still be caught, logged, and not raise."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = None
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_json_array_body_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """res.json() returning a list makes `res.json()["tag_name"]` raise TypeError
+        (list indices must be integers) rather than KeyError — must still be caught."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = ["not", "a", "dict"]
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_falsy_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """A present but falsy tag_name (e.g. null -> None, or "") must not produce
+        a nonsense "None available" notification — logs WARNING and returns."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"tag_name": None}
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_empty_string_tag_name_logs_warning_no_notification(self, tmp_path, monkeypatch, caplog):
+        """A present but empty-string tag_name must also be treated as failure, not
+        as a valid (empty) version tag."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"tag_name": ""}
+
+        with (
+            patch("requests.get", return_value=mock_response),
+            caplog.at_level(logging.WARNING, logger="energy_forecast"),
+        ):
+            EnergyForecast._check_for_update_cb(fake, {})  # must not raise
+
+        fake.call_service.assert_not_called()
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_double_v_prefix_only_strips_one_leading_v(self, tmp_path, monkeypatch):
+        """removeprefix strips exactly one leading literal "v", unlike lstrip("v")
+        which would strip all leading v characters (e.g. "vv1.0" -> "1.0")."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        monkeypatch.setattr("energy_forecast.energy_forecast.__version__", "0.11.10")
+        fake = self._make_fake_self(tmp_path)
+
+        with patch("requests.get", return_value=self._make_response("vv0.12.0")):
+            EnergyForecast._check_for_update_cb(fake, {})
+
+        fake.call_service.assert_called_once_with(
+            "persistent_notification/create",
+            title="HA Energy Forecast v0.12.0 available",
+            message="A new version (v0.12.0) is available. You are running 0.11.10.",
+            notification_id="hef_update_available",
+        )
+
+
 # ── _build_shap_narrative (#53) ──────────────────────────────────────────────────
 
 
@@ -2640,7 +3081,7 @@ class TestBuildShapNarrative:
 
     def test_multiple_features(self):
         """Multiple features all appear in narrative."""
-        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h": 0.07}
+        shap_features = {"hour_sin": 0.14, "temp_c": 0.09, "lag_24h_tgated": 0.07}
         result = _build_shap_narrative(shap_features)
         assert "time-of-day (sine)" in result
         assert "current outdoor temperature" in result
@@ -2676,6 +3117,28 @@ class TestBuildShapNarrative:
         assert "time-of-day (cosine)" in result
         # Verify both appear in the narrative
         assert result.count("time-of-day") == 2
+
+
+class TestShapFeatureLabelCoverage:
+    """ROADMAP #90: every statically-declared model feature must have a narrative label,
+    so a top-ranked SHAP feature never falls back to showing the raw column name."""
+
+    def test_all_static_features_have_labels(self):
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+        from energy_forecast.model import _FEATURES_WITH_SENSOR
+
+        missing = set(_FEATURES_WITH_SENSOR) - set(_SHAP_FEATURE_LABELS)
+        assert not missing, f"Features missing from _SHAP_FEATURE_LABELS: {missing}"
+
+    def test_stale_untagged_lag_entries_removed(self):
+        """lag_24h/lag_168h/lag_336h (untagged) are not real feature columns — only their
+        _tgated equivalents are — so the dict must not carry dead entries for them."""
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+
+        for stale in ("lag_24h", "lag_168h", "lag_336h"):
+            assert stale not in _SHAP_FEATURE_LABELS, f"{stale} is not a real feature column"
+        for tgated in ("lag_24h_tgated", "lag_168h_tgated", "lag_336h_tgated"):
+            assert tgated in _SHAP_FEATURE_LABELS
 
 
 # ── Relative MAE (#54) ───────────────────────────────────────────────────────────
@@ -2856,6 +3319,41 @@ class TestAdaptiveRetrainLock:
         acquired = fake._lock.acquire(blocking=False)
         assert acquired, "Lock must be released even when _retrain raises"
         fake._lock.release()
+
+
+class TestUpdateCheckScheduling:
+    """initialize() must schedule the daily update check per update_check_enabled.
+
+    run_daily() is currently called from exactly one place in initialize()
+    (the update check), so assert_called_once_with is safe here — if a second
+    run_daily call is ever added elsewhere, this test should switch to
+    filtering call_args_list by callback identity instead.
+    """
+
+    def test_default_enabled_schedules_run_daily(self):
+        from datetime import time as dtime
+
+        app = _make_app({})
+        app.initialize()
+
+        assert app._update_check_enabled is True
+        app.run_daily.assert_called_once_with(app._check_for_update_cb, dtime(9, 0, 0))
+
+    def test_explicitly_enabled_schedules_run_daily(self):
+        from datetime import time as dtime
+
+        app = _make_app({"update_check_enabled": True})
+        app.initialize()
+
+        assert app._update_check_enabled is True
+        app.run_daily.assert_called_once_with(app._check_for_update_cb, dtime(9, 0, 0))
+
+    def test_disabled_never_schedules_run_daily(self):
+        app = _make_app({"update_check_enabled": False})
+        app.initialize()
+
+        assert app._update_check_enabled is False
+        app.run_daily.assert_not_called()
 
 
 # ── _subtract_sub_sensors ─────────────────────────────────────────────────────
