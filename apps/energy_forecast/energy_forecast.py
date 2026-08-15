@@ -307,6 +307,11 @@ class EnergyForecast(hass.Hass):
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
+        # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
+        # resets only on AppDaemon restart, so a still-active problem re-warns at
+        # the next "system startup" instead of every hourly _update_sensors() call.
+        self._excluded_range_warned: set = set()
+
         # Stage 4: cached inputs for scenario/what-if API
         self._cached_forecast_df: Any = None
         self._cached_live_temp: Any = None
@@ -1112,9 +1117,14 @@ class EnergyForecast(hass.Hass):
         # Filtered as early as possible: a correction/EV-detection computed
         # from a corrupted main reading is equally meaningless.
         excluded_ranges = ha_data.load_excluded_ranges(
-            self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+            self._cache_path.parent / "excluded_ranges.csv",
+            self._timezone,
+            _LOGGER,
+            warned=self._excluded_range_warned,
         )
-        energy_df = ha_data.filter_excluded_ranges(energy_df, excluded_ranges, _LOGGER)
+        energy_df = ha_data.filter_excluded_ranges(
+            energy_df, excluded_ranges, _LOGGER, warned=self._excluded_range_warned
+        )
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             _LOGGER.warning(
@@ -1553,9 +1563,14 @@ class EnergyForecast(hass.Hass):
         # Does NOT extend to full_actuals (anomaly/MAE sensors) — spec §6.
         if recent_actuals is not None and not recent_actuals.empty:
             excluded_ranges = ha_data.load_excluded_ranges(
-                self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+                self._cache_path.parent / "excluded_ranges.csv",
+                self._timezone,
+                _LOGGER,
+                warned=self._excluded_range_warned,
             )
-            recent_actuals = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _LOGGER)
+            recent_actuals = ha_data.filter_excluded_ranges(
+                recent_actuals, excluded_ranges, _LOGGER, warned=self._excluded_range_warned
+            )
 
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df = forecast_df
