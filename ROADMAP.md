@@ -262,16 +262,19 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ### #93 — Extend `set_dhw_schedule` Commit to Routine DHW Comfort-Boost (cross-repo, mirrors Plan 2)
 
+**Status (2026-08-15): design spec written and APPROVED — not yet implemented.** Spec at `ha-energy-manager/docs/superpowers/specs/2026-08-15-dhw-comfort-boost-commit-design.md`, branch `feat/dhw-comfort-boost-commit` (spec-only so far, no implementation commits). Went through 3 rounds of multi-stakeholder review (hef, hem, software architect, data scientist, security — 24 + ~20 findings across two fix passes) before final sign-off. See `memory/project_dhw_comfort_boost_commit_spec.md` for a summary and what's left; read the spec itself before implementing. Next step: `superpowers:writing-plans` off the spec.
+
 **Prerequisite context:** `ha-energy-manager`'s hef-physics-adoption Plan 2 (`docs/superpowers/specs/2026-07-10-hef-physics-adoption-design.md` / `plan2-legionella-scenario-gate.md`, live on both repos' `dev`) wired `_check_legionella`'s four branches to commit their chosen hour to hef via `energy_forecast/set_dhw_schedule`. It deliberately scoped out everything else.
 
 **Problem**: `ha-energy-manager`'s DHW Two-Tier Comfort-Boost Solar Scheduling (shipped 2026-07-31, `v0.15.1-alpha-26`) now *also* picks a scheduled hour ahead of time — `heat_pump.py::_arm_dhw_schedule()` → `_rank_dhw_boost_candidates()`, exposed as `dhw_boost_scheduled_hour` — but never calls `set_dhw_schedule`. hef has zero visibility into routine comfort-boosts, the same blind spot Plan 2 fixed for legionella, except this one fires far more often (near-daily on sunny days vs. weekly). Raised 2026-08-04 alongside #84/#92 but is its own item — different code path, different fix shape, not an ML feature-engineering change like #84.
 
-**Design (draft — needs its own brainstorm/spec before implementing, likely EM-side plan + a small hef-side change)**:
-- EM: call `_commit_dhw_schedule`-equivalent from `_arm_dhw_schedule` (and re-commit/cancel from `_clear_dhw_schedule`, since comfort-boost — unlike legionella — gets armed/cleared/re-armed mid-day as surplus and tank temp change; a stale commit would leave hef's forecast wrong until cleared).
-- hef: `physics.py::_dhw_override_for_hour` (`physics.py:207`) currently only recognizes `override["legionella"]` and hardcodes the target to `T_legionella` (60°C). Needs generalizing to a second override kind (e.g. `"comfort_boost"`) targeting `dhw_max_c`/the boost ceiling (~50°C) instead — not a copy-paste of the legionella path.
-- Open question: does this warrant the full `ScenarioScorer`/`get_scenario` gating Plan 2 built for legionella (score candidate hours before committing), or is a plain commit-of-whatever-was-already-chosen-by-solar-forecast enough, given comfort-boost's candidate ranking is already solar-forecast-based and self-correcting within a day? Decide during the dedicated brainstorm — don't assume parity with Plan 2's full design.
+**Design (resolved by the spec above — summary, read the spec for the full/current design):**
+- EM: `_commit_dhw_schedule` generalized (kind + optional date), called from a new async `ScenarioScorer`-gated candidate walk off `_arm_dhw_schedule`'s ranked list, with a re-entrancy guard and a desirability re-check before commit. `_clear_dhw_schedule` gains a required `notify_hef` param so only genuine cancellation (not the boost-starting path) notifies hef.
+- hef: `commit_dhw_schedule`/`_dhw_override_for_hour` generalized to merge-semantics keyed by override kind (`legionella` / `comfort_boost`), with per-key validation, an allowlist, and a staleness-expiry backstop. `comfort_boost` targets the existing `T_dhw_upper` schedule value rather than a new constant — an accepted, not-yet-empirically-verified approximation.
+- Resolved: full `ScenarioScorer`/`get_scenario` gating (mirroring legionella) — decided during the spec's brainstorming Q&A, not left as a plain solar-forecast commit.
+- Known limitations documented but explicitly deferred (not fixed in this spec): retrain reconstruction only reflects the most-recent committed override per kind, not full history; `_calibrate_ua_dhw` has no override-awareness at all. Both gated on a dated SHAP/MAE impact check (~4 weeks post-launch) before considering an append-only override-history follow-up.
 
-**Effort:** ~1 day (cross-repo, EM + hef, tests both sides) — rough estimate, needs its own spec. **Impact:** MEDIUM-HIGH — likely bigger real-world effect than #84 given comfort-boost's higher frequency, but unverified until scoped properly.
+**Effort:** ~1 day (cross-repo, EM + hef, tests both sides) — original rough estimate; may run longer given the spec's expanded scope (re-entrancy guard, desirability re-check, entity-key fix, staleness mechanism) versus the original draft's minimal-diff assumption. **Impact:** MEDIUM-HIGH — likely bigger real-world effect than #84 given comfort-boost's higher frequency, though the spec's own Context section cautions the physics_kwh signal may still be largely cancelled by the ML layer in Phase 1 (same pattern already confirmed for legionella) — verify with SHAP/MAE post-deploy rather than assuming impact.
 
 ---
 
@@ -293,7 +296,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
 | 84 | Legionella/DHW boost hour feature | medium | 3 h | raised 2026-08-04 — confirmed live cause of DHW commits being cancelled by ML layer |
 | 92 | Temperature-based UA_eff calibration window | medium | 2 h | ready — needs short brainstorm on threshold design first |
-| 93 | Extend `set_dhw_schedule` to routine DHW comfort-boost (cross-repo) | medium-high | ~1 day | needs its own spec — mirrors Plan 2, EM + hef both touched |
+| 93 | Extend `set_dhw_schedule` to routine DHW comfort-boost (cross-repo) | medium-high | ~1 day+ | spec APPROVED (2026-08-15), ready for writing-plans — see `memory/project_dhw_comfort_boost_commit_spec.md` |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
