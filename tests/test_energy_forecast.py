@@ -3907,6 +3907,7 @@ class _FakeRetrain:
         self._physics_model = None
         self._physics_heating_buffer_df = None
         self._fetch_physics_sensor_histories = lambda **kwargs: None
+        self._excluded_range_warned = set()
 
     def log(self, msg, level="INFO"):
         pass
@@ -4187,6 +4188,7 @@ class _FakeUpdateSensors:
         self._actuals_history = {}
         self._ml_model = _FakeMLModelForUpdateSensors()
         self.set_state_calls = []
+        self._excluded_range_warned = set()
 
     def log(self, msg, level="INFO"):
         pass
@@ -4407,6 +4409,36 @@ class TestUpdateSensorsExcludedRanges:
         )
         assert not in_range.any(), "excluded window must be absent from _cached_recent_actuals"
         assert len(result) == 24 - 4  # 05:00..08:00 inclusive = 4 hourly rows
+
+    def test_update_sensors_repeat_call_downgrades_escalation_to_info(self, tmp_path, monkeypatch, caplog):
+        """ROADMAP #95: a long-span exclusion (>14 days, escalates to WARNING
+        per _EXCLUSION_WARN_SPAN_DAYS) must only WARN on the first hourly
+        _update_sensors() call for a given stub/app instance — repeat calls
+        for the same excluded_ranges.csv content downgrade to INFO."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(24)  # 2024-01-01 00:00..23:00, hourly
+        self._patch_update_sensors_deps(monkeypatch, energy_df, tmp_path)
+
+        cache_path = tmp_path / "energy_history.csv"
+        (tmp_path / "excluded_ranges.csv").write_text(
+            "start,end,reason\n2020-01-01,2020-01-25,long span test\n"  # 25-day span > 14
+        )
+
+        stub = _FakeUpdateSensors(cache_path)
+
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            EnergyForecast._update_sensors(stub)
+        assert any(r.levelno == logging.WARNING for r in caplog.records), "first hourly call must warn"
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            EnergyForecast._update_sensors(stub)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records), (
+            "second hourly call on the same stub must downgrade to INFO, not repeat the WARNING"
+        )
 
 
 class TestRetrainEvCachePathBug:

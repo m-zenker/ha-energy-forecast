@@ -1163,6 +1163,32 @@ class TestLoadExcludedRanges:
         assert result[0][2] == "good row"
         assert any("row" in r.message.lower() for r in caplog.records)
 
+    def test_repeat_malformed_row_with_shared_warned_set_downgrades_to_info(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER, warned=warned)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_warned_none_default_still_warns_every_call(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
     def test_end_before_start_skipped(self, tmp_path, caplog):
         path = tmp_path / "excluded_ranges.csv"
         path.write_text("start,end,reason\n2026-07-20 10:00,2026-07-19 10:00,backwards\n")
@@ -1327,6 +1353,32 @@ class TestFilterExcludedRanges:
         with caplog.at_level(logging.INFO, logger="energy_forecast"):
             filter_excluded_ranges(df, ranges, _LOGGER)
         assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_repeat_escalation_with_shared_warned_set_downgrades_to_info(self, caplog):
+        df = self._df(periods=48)
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")]  # 11/48 rows = 23%
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER, warned=warned)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_different_range_still_warns_despite_nonempty_warned_set(self, caplog):
+        df = self._df(periods=48)
+        first_range = (df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")
+        second_range = (df["timestamp"].iloc[20], df["timestamp"].iloc[30], "different")
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, [first_range], _LOGGER, warned=warned)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, [second_range], _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     def test_malformed_input_returns_df_unfiltered(self, caplog):
         df = pd.DataFrame({"timestamp": ["not", "timestamps"], "gross_kwh": [1.0, 2.0]})
