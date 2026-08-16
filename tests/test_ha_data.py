@@ -1323,7 +1323,11 @@ class TestFilterExcludedRanges:
         with caplog.at_level(logging.INFO, logger="energy_forecast"):
             result = filter_excluded_ranges(df, ranges, _LOGGER)
         assert len(result) == 48
-        assert any("dropped 0 row" in r.message for r in caplog.records)
+        # A configured range that matches zero rows in this call (e.g. it has
+        # aged out of the rolling data window) logs nothing — this is the
+        # steady-state for any exclusion range once real data has moved past
+        # its `end` timestamp, so it must not produce hourly noise forever.
+        assert not any("dropped" in r.message for r in caplog.records)
 
     def test_boundary_exact_match_drops_single_row(self):
         df = self._df()
