@@ -4423,8 +4423,13 @@ class TestUpdateSensorsExcludedRanges:
         self._patch_update_sensors_deps(monkeypatch, energy_df, tmp_path)
 
         cache_path = tmp_path / "energy_history.csv"
+        # Span > 14 days (2024-01-01 00:00 -> 2024-01-16 00:00 = 15 days), but
+        # only overlaps a single hour of energy_df (its first row) so the
+        # escalation seen here is genuinely the span condition, not the
+        # row-fraction one — and n_dropped > 0, since a range matching zero
+        # rows must not escalate (or log) at all (see filter_excluded_ranges).
         (tmp_path / "excluded_ranges.csv").write_text(
-            "start,end,reason\n2020-01-01,2020-01-25,long span test\n"  # 25-day span > 14
+            "start,end,reason\n2024-01-01 00:00,2024-01-16 00:00,long span test\n"
         )
 
         stub = _FakeUpdateSensors(cache_path)

@@ -317,15 +317,16 @@ def filter_excluded_ranges(
             range_mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
             n_dropped = int(range_mask.sum())
             span_days = (end - start).total_seconds() / 86400
-            escalate = (
-                total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
-            ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
-            msg = "Excluded range %s -> %s (%s): dropped %d row(s)."
-            msg_args = (start, end, reason or "no reason given", n_dropped)
-            if escalate:
-                _warn_once(logger, warned, ("escalate", start, end, reason), msg, *msg_args)
-            else:
-                logger.info(msg, *msg_args)
+            if n_dropped:
+                escalate = (
+                    total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
+                ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
+                msg = "Excluded range %s -> %s (%s): dropped %d row(s)."
+                msg_args = (start, end, reason or "no reason given", n_dropped)
+                if escalate:
+                    _warn_once(logger, warned, ("escalate", start, end, reason), msg, *msg_args)
+                else:
+                    logger.info(msg, *msg_args)
             union_mask = union_mask | range_mask
 
         total_dropped = int(union_mask.sum())
