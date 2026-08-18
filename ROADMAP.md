@@ -285,6 +285,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | #22 | EV SoC / charging state feature | EV hours are subtracted from training target — SoC has no signal to learn. Revisit if EV load is re-included. |
 | #40 | Home battery SoC as feature | Deferred until solar panels installed; revisit if residuals show SoC correlation. |
 | #24 | Electricity spot price feature | Fixed flat tariff — out of scope. |
+| #94 | Remove vestigial `dhw_tank_volume_l` in `physics_schedule.json` | Dead duplicate of the `physics:` config value (`self._config`, correctly 400L, actually used by `_dhw_kwh_series`) — the schedule file's own copy (currently 200) is only ever echoed back into itself by the autonomous legionella-schedule-learning code, never read by the computation. No functional impact, but misleading if the file is inspected directly (caught 2026-08-18 during hem's DHW boost spec review). Clean up opportunistically next time `physics.py`'s schedule-writing code (`_check_legionella_stability`/schedule-learning path, ~line 684) is touched — not worth a dedicated pass on its own. |
 
 ---
 
@@ -307,6 +308,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 22 | EV SoC | high (EV) | 4 h | deferred |
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
+| 94 | Remove vestigial `dhw_tank_volume_l` duplicate | none (dead field) | 10 min | opportunistic — clean up next time adjacent code is touched |
 
 ---
 
