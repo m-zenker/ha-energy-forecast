@@ -381,6 +381,12 @@ class EnergyForecastModel:
                 n_rows,
             )
 
+        # _override_history is hoisted here (rather than declared only inside the
+        # `if physics_model is not None:` block below) so it stays in scope for the
+        # R1-#13 pre-migration down-weight block further down in this function even
+        # when physics_model is None.
+        _override_history = physics_model.schedule.get("override_history", []) if physics_model is not None else []
+
         # Goal 1/2 (R1-#11): correct gross_kwh for any committed DHW override ONCE, upstream
         # of both calibration and the ML training target — single source of truth, not two
         # independent subtraction points that could drift apart. Uses self._calib's current
@@ -390,7 +396,6 @@ class EnergyForecastModel:
             _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
             _w_for_delta = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
             _t_outdoor_for_delta = _w_for_delta["temp_c"].reindex(_timestamps_for_delta, method="nearest")
-            _override_history = physics_model.schedule.get("override_history", [])
             if _override_history:
                 _initial_t_tank = physics_model._initial_t_tank_for_window(dhw_df, _timestamps_for_delta)
                 _override_delta = physics_model.compute_training_override_delta(
@@ -486,6 +491,25 @@ class EnergyForecastModel:
             ow = open_window_flags.reindex(df["timestamp"].values if "timestamp" in df else hourly_weights.index)
             down_weight = pd.Series(np.where(ow.fillna(False), 0.5, 1.0), index=hourly_weights.index)
             hourly_weights = hourly_weights * down_weight
+
+        # ── Down-weight pre-migration hours (R1-#13) ─────────────────────────
+        # Bounds how long training rows from before the DHW override-correction
+        # fix shipped (no override_history to reconstruct from, so any override-shaped
+        # spikes in gross_kwh are noise the model has to explain away some other way)
+        # stay at full training influence — roughly weight_halflife_days after ship,
+        # via the existing recency-halflife weighting above.
+        if _override_history and hourly_weights is not None:
+            _ship_cutoff = pd.Timestamp(min(e["committed_at"] for e in _override_history))
+            if _ship_cutoff.tzinfo is not None:
+                # committed_at is written as an ISO-8601 UTC-aware string
+                # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
+                # df["timestamp"] is naive local time throughout this module — strip
+                # tz info before comparing, same pattern as physics.py's calibrated_at
+                # age check, or pandas raises on tz-naive vs tz-aware comparison.
+                _ship_cutoff = _ship_cutoff.tz_localize(None)
+            _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
+            _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
+            hourly_weights = hourly_weights * _down_weight_migration
 
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes

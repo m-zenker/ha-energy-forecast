@@ -1263,6 +1263,104 @@ class TestTrainWithPhysics:
         assert flags.loc[anomaly_ts] == True  # noqa: E712 — explicit bool comparison reads clearer here
         assert flags.sum() < 10
 
+    def test_pre_migration_rows_down_weighted(self, tmp_path):
+        """R1-#13: training rows dated before the earliest override_history entry get
+        the same 0.5 down-weight multiplier as open-window-flagged hours, so the
+        pre-fix failure mode (override-shaped noise the model has to explain away)
+        doesn't stay at full training weight for as long as the full window spans.
+
+        Verification strategy: spy on _build_model (same technique as
+        test_training_target_reflects_override_blind_gross_kwh) to capture the exact
+        `sample_weight` array passed to the final full-fit model.fit() call, alongside
+        the fitted X's DataFrame index. Because the fixture's energy_df is already
+        timestamp-sorted before _add_lag_and_rolling_training's
+        sort_values().reset_index(drop=True), each surviving row's integer index is
+        exactly its position in `ts` — letting the test recover each row's real
+        timestamp and independently recompute the exact recency-halflife formula
+        model.py uses, then compare it (times 0.5 pre-cutoff / times 1.0 post-cutoff)
+        against the captured sample_weight bit-for-bit.
+        """
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        override_history = pm.schedule["override_history"]
+        assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
+        # Pin committed_at to a controlled cutoff splitting the fixture window, in place
+        # of the real wall-clock "now" value commit_dhw_schedule stamps (irrelevant here —
+        # this test only cares about how committed_at splits pre/post rows).
+        ship_cutoff = ts[450]
+        override_history[0]["committed_at"] = ship_cutoff.isoformat()
+
+        captured: list[tuple[np.ndarray, np.ndarray | None]] = []
+
+        def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+            built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+            real_fit = built.fit
+
+            def spy_fit(X_arg, y_arg, *a, **kw):
+                captured.append((X_arg.index.to_numpy(), kw.get("sample_weight")))
+                result = real_fit(X_arg, y_arg, *a, **kw)
+                del built.fit
+                return result
+
+            built.fit = spy_fit
+            return built
+
+        weight_halflife_days = 30.0
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+            m.train(
+                energy_df,
+                weather_df,
+                outdoor_df=None,
+                weight_halflife_days=weight_halflife_days,
+                physics_model=pm,
+            )
+
+        assert captured, "train() never reached the model-fitting stage"
+        idx, sw = max(captured, key=lambda pair: len(pair[0]))
+        assert sw is not None, "sanity: sample_weight must be computed when weight_halflife_days > 0"
+
+        row_ts = ts[idx]
+        pre_mask = row_ts < ship_cutoff
+        post_mask = ~pre_mask
+        assert pre_mask.any(), "sanity: fixture must retain rows before ship_cutoff after lag dropna"
+        assert post_mask.any(), "sanity: fixture must retain rows after ship_cutoff after lag dropna"
+
+        # Independently recompute the exact recency-halflife formula (model.py's
+        # `np.exp(-days_ago * ln2 / weight_halflife_days)`, end_ts = energy_df max) and
+        # fold in the expected pre-migration 0.5 multiplier — must match the captured
+        # sample_weight exactly, not just approximately.
+        end_ts = energy_df["timestamp"].max()
+        days_ago = (end_ts - row_ts).total_seconds() / 86400.0
+        base_weight = np.exp(-days_ago * np.log(2) / weight_halflife_days)
+        expected = np.where(pre_mask, base_weight * 0.5, base_weight)
+
+        np.testing.assert_allclose(sw, expected, rtol=1e-9, atol=1e-12)
+        # And explicitly: pre-cutoff rows are exactly half of what the same row would
+        # have been without this down-weight (all else, i.e. the recency factor, equal).
+        np.testing.assert_allclose(sw[pre_mask], base_weight[pre_mask] * 0.5, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(sw[post_mask], base_weight[post_mask], rtol=1e-9, atol=1e-12)
+
     def test_gross_kwh_corrected_before_calibration_and_target_construction(self, tmp_path):
         """R1-#11: override_delta_series must be subtracted from gross_kwh once, upstream
         of both calibrate() and the ML training target — not independently in two places
