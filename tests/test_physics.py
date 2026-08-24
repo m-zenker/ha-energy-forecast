@@ -255,6 +255,26 @@ class TestDHWOde:
         assert (q_dhw_el >= 0.0).all()
         assert 45.0 <= final_temp <= 60.0  # clamp bounds enforced
 
+    def test_reheat_cycles_multiple_times_not_permanently_pinned_after_first_floor_touch(self, tmp_path):
+        """Regression: the reheat trigger was `t_tank < t_lower` (strict), but the passive
+        branch's clip() floors any crossing to exactly t_lower. Once that happened, the
+        strict `<` check could never be true again (t_tank == t_lower forever), permanently
+        disabling reheat for the rest of any run — el_kwh stuck at 0.0 no matter how long
+        the window. Fixed to `t_tank <= t_lower` so a tank sitting exactly at the floor
+        re-triggers reheat. Over 24h with a default calibration and initial_t_tank at the
+        floor, the tank must cycle (reheat, coast down, re-touch the floor, reheat again)
+        multiple times, not just once."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-08-04 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series(10.0, index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+        nonzero_hours = (q_dhw_el > 0.0).sum()
+        assert nonzero_hours >= 2, f"expected multiple reheat cycles in 24h, got {nonzero_hours}"
+        # tank must actually revisit the floor between reheats, not just heat once and coast
+        assert (t_tank_series == pm._schedule["T_dhw_lower"]).sum() >= 2
+
     def test_heating_rise_derived_not_constant(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)

@@ -305,7 +305,7 @@ class ThermalPhysicsModel:
                 t_tank_trajectory[i] = t_tank
                 continue
 
-            if t_tank < t_lower:
+            if t_tank <= t_lower:
                 q_el_w = q_dhw_power / cop_dhw
                 el_kwh[i] = q_el_w / 1000.0
                 t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_legionella))
