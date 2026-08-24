@@ -1036,3 +1036,35 @@ class TestCommittedDhwSchedule:
         result_a = pm.predict_series(forecast_df, dhw_schedule_override=override)
         result_b = pm.predict_series(forecast_df)  # committed override (hour 10) applies
         assert not result_a.equals(result_b)
+
+
+class TestOverrideHistorySchema:
+    def test_default_schedule_has_empty_override_history(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        assert pm._schedule["override_history"] == []
+
+    def test_override_history_persists_and_reloads(self, tmp_path):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        pm._schedule["override_history"].append(
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "2026-08-04T06:00:01+02:00",
+                "cancelled_at": None,
+            }
+        )
+        _atomic_write_json(pm._schedule_path, pm._schedule)
+        pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        assert pm2._schedule["override_history"] == [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "2026-08-04T06:00:01+02:00",
+                "cancelled_at": None,
+            }
+        ]

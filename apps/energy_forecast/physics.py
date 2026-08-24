@@ -79,6 +79,7 @@ def _default_schedule() -> dict[str, Any]:
         "T_dhw_lower": 45.0,
         "dhw_tank_volume_l": 200,
         "committed_override": None,
+        "override_history": [],
     }
 
 
