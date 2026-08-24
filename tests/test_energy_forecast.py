@@ -4247,10 +4247,10 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._fetch_physics_sensor_histories(self, *args, **kwargs)
 
-    def _publish_physics_sensors(self, forecast_df):
+    def _publish_physics_sensors(self, forecast_df, override_delta=None):
         from energy_forecast.energy_forecast import EnergyForecast
 
-        return EnergyForecast._publish_physics_sensors(self, forecast_df)
+        return EnergyForecast._publish_physics_sensors(self, forecast_df, override_delta=override_delta)
 
     # _model_phase_attr() is called unconditionally by _publish() (used to tag
     # the forecast sensor's "model_phase" attribute). It returns None

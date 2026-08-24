@@ -2003,6 +2003,10 @@ class EnergyForecast(hass.Hass):
         # 2026-08-04 live bug: a committed override must move the published
         # forecast by its true expected kWh amount, independent of whatever
         # weight the trained model happens to give the override features.
+        # _override_delta stays None (not, say, an all-zero Series) when there's
+        # no physics model, so _publish_physics_sensors below can tell "nothing to
+        # fold in" apart from "a real, all-zero delta" without a redundant check.
+        _override_delta = None
         if self._physics_model is not None:
             _override_timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
             _t_ambient = pd.Series(forecast_df["temp_c"].values, index=_override_timestamps)
@@ -2018,7 +2022,7 @@ class EnergyForecast(hass.Hass):
             )
 
         self._publish_thermal_pressure()
-        self._publish_physics_sensors(predictions)
+        self._publish_physics_sensors(predictions, override_delta=_override_delta)
 
         intervals = self._ml_model.predict_intervals(
             forecast_df,
@@ -2421,7 +2425,7 @@ class EnergyForecast(hass.Hass):
                 attributes=attrs,
             )
 
-    def _publish_physics_sensors(self, forecast_df: pd.DataFrame) -> None:
+    def _publish_physics_sensors(self, forecast_df: pd.DataFrame, override_delta: pd.Series | None = None) -> None:
         """Publish the physics-only baseline and the ML adjustment on top of it.
 
         Published whenever a physics model is configured, independent of phase:
@@ -2429,10 +2433,20 @@ class EnergyForecast(hass.Hass):
         too, when it's only a model *feature* rather than the residual target.
 
         `forecast_df` is the 48h `[timestamp, predicted_kwh]` frame returned by
-        `self._ml_model.predict(...)` — the main forecast. The physics baseline
-        itself is recomputed from `self._cached_forecast_df` (the raw weather
-        forecast, which carries `temp_c`/`direct_radiation_wm2` that
-        `predict_series()` needs and that `forecast_df` does not have).
+        `self._ml_model.predict(...)` — the main forecast, already carrying the
+        Task 11 DHW override correction (if any) added to `predicted_kwh`. The
+        physics baseline itself is recomputed from `self._cached_forecast_df`
+        (the raw weather forecast, which carries `temp_c`/`direct_radiation_wm2`
+        that `predict_series()` needs and that `forecast_df` does not have) via
+        `predict_series()`, which is override-blind by design.
+
+        `override_delta`: the same per-hour override correction the caller
+        already added to `forecast_df["predicted_kwh"]` (Task 11) — folded into
+        `physics_vals` here too, before the ML-adjustment subtraction. Without
+        this, `physics_vals` stays override-blind while `predicted_kwh` isn't,
+        so `ml_adjustment_vals = predicted_kwh - physics_vals` would silently
+        misattribute the entire override delta to "ML Adjustment" instead of
+        "Physics Base" on the published diagnostic sensors.
         """
         if self._physics_model is None or forecast_df.empty:
             return
@@ -2447,6 +2461,10 @@ class EnergyForecast(hass.Hass):
                 room_areas=self._climate_room_areas or None,
             )
             physics_vals = physics_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
+            if override_delta is not None:
+                physics_vals = (
+                    physics_vals + override_delta.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
+                )
             ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
 
             physics_attrs = {
