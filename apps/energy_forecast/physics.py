@@ -209,13 +209,22 @@ class ThermalPhysicsModel:
         return q_heat_el
 
     def _dhw_override_for_hour(self, ts: pd.Timestamp, override: dict | None) -> float | None:
-        """Return an override target temp (T_legionella) for *ts* if a legionella override applies, else None."""
-        if not override or "legionella" not in override:
+        """Return an override target temp for *ts* if a committed override (legionella
+        or comfort_boost) applies, else None. Same-hour precedence: legionella wins —
+        defense in depth for the data model; Goal 5 (EM-side) makes two genuinely
+        concurrent same-hour events physically unreachable in practice."""
+        if not override:
             return None
-        date_str, hour = override["legionella"]
-        target = pd.Timestamp(f"{date_str} {hour:02d}:00")
-        if ts == target:
-            return self._schedule["T_legionella"]
+        legionella_val = override.get("legionella")
+        if legionella_val is not None:
+            date_str, hour = legionella_val
+            if ts == pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                return self._schedule["T_legionella"]
+        comfort_boost_val = override.get("comfort_boost")
+        if comfort_boost_val is not None:
+            date_str, hour, target_c = comfort_boost_val
+            if ts == pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                return float(target_c)
         return None
 
     def _dhw_kwh_series(

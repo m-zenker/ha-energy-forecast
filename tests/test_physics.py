@@ -1155,3 +1155,36 @@ class TestOverrideHistorySchema:
                 "cancelled_at": None,
             }
         ]
+
+
+class TestDhwOverrideForHour:
+    def test_legionella_override_returns_t_legionella(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-04 12:00")
+        result = pm._dhw_override_for_hour(ts, {"legionella": ("2026-08-04", 12)})
+        assert result == pm._schedule["T_legionella"]
+
+    def test_comfort_boost_override_returns_target_c(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        result = pm._dhw_override_for_hour(ts, {"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert result == 57.5
+
+    def test_no_match_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 09:00")
+        assert pm._dhw_override_for_hour(ts, {"comfort_boost": ("2026-08-05", 14, 57.5)}) is None
+
+    def test_same_hour_precedence_legionella_wins(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        result = pm._dhw_override_for_hour(
+            ts, {"legionella": ("2026-08-05", 14), "comfort_boost": ("2026-08-05", 14, 57.5)}
+        )
+        assert result == pm._schedule["T_legionella"]
+
+    def test_empty_or_none_override_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour(ts, None) is None
+        assert pm._dhw_override_for_hour(ts, {}) is None
