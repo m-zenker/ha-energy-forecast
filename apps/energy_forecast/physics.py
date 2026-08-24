@@ -111,6 +111,8 @@ def _read_json_or_default(path: Path, default: dict) -> dict:
 class ThermalPhysicsModel:
     """Calibrated physics baseline for hourly household electricity consumption."""
 
+    _OVERRIDE_TAIL_THRESHOLD_C = 0.1  # R2-#3: shared cutoff, both call sites use it identically
+
     def __init__(self, model_dir: Path, config: dict) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +317,90 @@ class ThermalPhysicsModel:
             t_tank_trajectory[i] = t_tank
 
         return pd.Series(el_kwh, index=timestamps), pd.Series(t_tank_trajectory, index=timestamps), t_tank
+
+    def _compute_override_delta_series(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+        override_lookup: Callable[[pd.Timestamp], float | None],
+        baseline_kwh: pd.Series,
+        baseline_t_tank: pd.Series,
+    ) -> pd.Series:
+        """The one shared joint trajectory-diff-and-cutoff function (R2-#3) — called
+        identically by both compute_training_override_delta and
+        compute_serving_override_delta so the two never resolve an equivalent override
+        to different tail lengths. Computes ONE with-overrides trajectory (applying
+        every override the given lookup can see, in chronological order — R2-#1, not a
+        per-override sum), diffs it against the already-computed baseline, terminates
+        the tail at the first hour the two trajectories reconverge within 0.1°C, and
+        clips to the sanity bound (R1-#12/R2-#2)."""
+        with_overrides_kwh, with_overrides_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=override_lookup
+        )
+        raw_delta = with_overrides_kwh - baseline_kwh
+        tank_diff = (with_overrides_t_tank - baseline_t_tank).abs()
+
+        diverged = tank_diff >= self._OVERRIDE_TAIL_THRESHOLD_C
+        if diverged.any():
+            diverged_start = diverged.to_numpy().argmax()
+            reconverged = tank_diff.iloc[diverged_start:] < self._OVERRIDE_TAIL_THRESHOLD_C
+            if reconverged.any():
+                tail_end = diverged_start + reconverged.to_numpy().argmax()
+                raw_delta.iloc[tail_end:] = 0.0
+        else:
+            raw_delta[:] = 0.0  # no override ever diverged the trajectory in this window
+
+        bound = pd.concat([with_overrides_kwh, baseline_kwh], axis=1).max(axis=1)
+        violated = raw_delta.abs() > bound
+        if violated.any():
+            _LOGGER.warning(f"override_delta_series exceeded sanity bound on {int(violated.sum())} hour(s) — clipping")
+        return raw_delta.clip(lower=-bound, upper=bound)
+
+    def compute_training_override_delta(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+        override_history: list[dict],
+    ) -> pd.Series:
+        """Training-side entry point (Goal 2): replays override_history over the full
+        training window, including each override's full multi-hour carryover tail."""
+        baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=None
+        )
+        if not override_history:
+            return pd.Series(0.0, index=timestamps)
+
+        def lookup(ts: pd.Timestamp) -> float | None:
+            return self._dhw_override_for_hour_from_history(ts, override_history)
+
+        return self._compute_override_delta_series(
+            timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
+        )
+
+    def compute_serving_override_delta(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+    ) -> pd.Series:
+        """Serving-side entry point (Goal 1): the deterministic post-model forecast
+        correction. Callers add this UNCONDITIONALLY to the model's already-final
+        published forecast — never fed back into physics_kwh or the trained model."""
+        baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=None
+        )
+        committed = self._schedule.get("committed_override")
+        if not committed:
+            return pd.Series(0.0, index=timestamps)
+
+        def lookup(ts: pd.Timestamp) -> float | None:
+            return self._dhw_override_for_hour(ts, committed)
+
+        return self._compute_override_delta_series(
+            timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
+        )
 
     def _area_weighted_t_indoor(
         self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None

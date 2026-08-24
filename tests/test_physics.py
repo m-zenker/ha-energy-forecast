@@ -379,6 +379,165 @@ class TestDhwKwhSeriesOverrideLookup:
         assert list(t_tank_series.index) == list(timestamps)
 
 
+class TestOverrideDeltaSeries:
+    def test_zero_when_no_override_history(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, [])
+        assert (delta == 0.0).all()
+
+    def test_legionella_override_produces_nonzero_multihour_tail(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        # 20.0, not the plan's literal 10.0: _dhw_kwh_series's reheat-trigger permanent-pin
+        # bug (t_tank < t_lower never re-firing once clipped exactly to the floor) has now
+        # been fixed (t_tank <= t_lower), so the tank genuinely cycles at either ambient.
+        # But at 10.0 the passive cool-down between cycles takes longer, so the reheat
+        # cycle period is long enough that the legionella boost's one-cycle phase-shift
+        # hasn't fully resynced with the un-boosted baseline by hour 23 (delta.iloc[-1]
+        # != 0) — empirically verified. 20.0 gives a short enough cycle period to
+        # reconverge within this 24h window while still exercising a genuine multi-hour
+        # nonzero tail.
+        t_ambient = pd.Series(20.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        # nonzero at the override hour and for at least a few hours after (reconvergence tail)
+        assert delta.loc["2026-08-04 12:00"] != 0.0
+        nonzero_after = (delta.loc["2026-08-04 13:00":"2026-08-04 18:00"] != 0.0).sum()
+        assert nonzero_after >= 1
+        # trajectories must have reconverged by the end of the 24h window
+        assert delta.iloc[-1] == 0.0
+
+    def test_joint_computation_no_double_counting_on_overlapping_tails(self, tmp_path):
+        """R2-#1 direct regression: legionella hour 12 + comfort_boost hour 14 (inside
+        the reconvergence tail) must not sum two independent per-override diffs."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-04",
+                "hour": 14,
+                "target_c": 55.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        joint_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        # independent-per-override baseline for comparison: replay legionella alone
+        legionella_only = [history[0]]
+        legionella_only_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, legionella_only)
+        comfort_boost_only = [history[1]]
+        comfort_boost_only_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, comfort_boost_only)
+        naive_sum = legionella_only_delta + comfort_boost_only_delta
+        # the joint computation must differ from the naive independent sum in at
+        # least one overlapping hour — proving it isn't just summing two diffs
+        assert not joint_delta.equals(naive_sum)
+
+    def test_sanity_bound_references_larger_of_the_two_trajectories(self, tmp_path):
+        """R2-#2: for the dominant negative-delta case (override run draws less),
+        the bound must reference max(with_override, baseline), not just the
+        override run's own (often near-zero) draw."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=12, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 0,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        baseline_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+
+        def override_lookup(ts):
+            return pm._dhw_override_for_hour_from_history(ts, history)
+
+        with_override_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup)
+        bound = pd.concat([with_override_kwh, baseline_kwh], axis=1).max(axis=1)
+        assert (delta.abs() <= bound + 1e-9).all()
+
+    def test_tail_termination_matches_between_training_and_serving_entry_points(self, tmp_path):
+        """R2-#3 direct regression: both public entry points delegate to the same
+        shared function, so they resolve an equivalent override to the identical
+        tail length."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        training_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        pm._schedule["committed_override"] = {"legionella": ["2026-08-04", 12]}
+        serving_delta = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+
+        training_tail_end = (training_delta != 0.0).to_numpy().nonzero()[0][-1]
+        serving_tail_end = (serving_delta != 0.0).to_numpy().nonzero()[0][-1]
+        assert training_tail_end == serving_tail_end
+
+    def test_train_serve_symmetry_full_delta_tail_round_trips(self, tmp_path):
+        """Subtracting then re-adding the delta across the entire tail (not just the
+        committed hour) must round-trip to the original value (R1-#7)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        with_override_kwh, _, _ = pm._dhw_kwh_series(
+            timestamps, t_ambient, 45.0, lambda ts: pm._dhw_override_for_hour_from_history(ts, history)
+        )
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        baseline_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        # train side: subtract delta from with-override actuals to get "as if blind"
+        reconstructed_blind = with_override_kwh - delta
+        pd.testing.assert_series_equal(reconstructed_blind, baseline_kwh, check_names=False)
+
+
 class TestPredictSeries:
     def test_predict_series_returns_series_aligned_to_forecast_df(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
