@@ -1188,3 +1188,113 @@ class TestDhwOverrideForHour:
         ts = pd.Timestamp("2026-08-05 14:00")
         assert pm._dhw_override_for_hour(ts, None) is None
         assert pm._dhw_override_for_hour(ts, {}) is None
+
+
+class TestDhwOverrideForHourFromHistory:
+    def test_returns_target_c_for_matching_non_cancelled_entry(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-04 12:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 60.0
+
+    def test_cancelled_entry_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "x",
+                "cancelled_at": "y",
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) is None
+
+    def test_self_expired_entry_cancelled_at_none_reconstructs_normally(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 57.5
+
+    def test_returns_the_actually_committed_value_not_just_latest(self, tmp_path):
+        """Direct regression test for the reconstruction-fidelity bug (Goal 2):
+        two different historical days' entries must each reconstruct correctly,
+        not both resolve to whichever was committed most recently."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-07-28",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 13,
+                "target_c": 60.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-07-28 12:00"), history) == 60.0
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-08-04 13:00"), history) == 60.0
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-07-28 13:00"), history) is None
+
+    def test_same_hour_precedence_legionella_wins(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 60.0
+
+    def test_malformed_entry_skipped_with_warning_not_raised(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [{"kind": "legionella", "date": "2026-08-04"}]  # missing hour/target_c
+        ts = pd.Timestamp("2026-08-04 12:00")
+        with caplog.at_level("WARNING"):
+            result = pm._dhw_override_for_hour_from_history(ts, history)
+        assert result is None
+        assert any("malformed" in r.message for r in caplog.records)
+
+    def test_empty_history_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-08-04 12:00"), []) is None

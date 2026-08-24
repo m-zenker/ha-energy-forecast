@@ -227,6 +227,36 @@ class ThermalPhysicsModel:
                 return float(target_c)
         return None
 
+    def _dhw_override_for_hour_from_history(self, ts: pd.Timestamp, history: list[dict]) -> float | None:
+        """Training-reconstruction lookup mode (Goal 2): scans override_history for a
+        non-cancelled entry matching (kind, date, hour) == ts. Same-hour precedence:
+        legionella wins (mirrors _dhw_override_for_hour). Malformed entries are skipped
+        with a WARNING, never raised — read-time validation mirrors commit_dhw_schedule's
+        write-time contract (R1-#20)."""
+        legionella_target: float | None = None
+        comfort_boost_target: float | None = None
+        for entry in history:
+            try:
+                if entry.get("cancelled_at") is not None:
+                    continue
+                kind = entry["kind"]
+                date_str = entry["date"]
+                hour = entry["hour"]
+                target_c = entry["target_c"]
+                if kind not in _VALID_OVERRIDE_KINDS or target_c is None:
+                    _LOGGER.warning(f"override_history: malformed entry skipped: {entry}")
+                    continue
+                if ts != pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                    continue
+                if kind == "legionella":
+                    legionella_target = float(target_c)
+                else:
+                    comfort_boost_target = float(target_c)
+            except Exception as e:  # noqa: BLE001 — read-time validation contract, R1-#20
+                _LOGGER.warning(f"override_history: malformed entry skipped: {entry} ({e})")
+                continue
+        return legionella_target if legionella_target is not None else comfort_boost_target
+
     def _dhw_kwh_series(
         self,
         timestamps: pd.DatetimeIndex,
