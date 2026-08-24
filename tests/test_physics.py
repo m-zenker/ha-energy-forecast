@@ -251,7 +251,7 @@ class TestDHWOde:
         pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
         ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
         t_ambient = pd.Series([20.0] * 24, index=ts)
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         assert (q_dhw_el >= 0.0).all()
         assert 45.0 <= final_temp <= 60.0  # clamp bounds enforced
 
@@ -261,12 +261,12 @@ class TestDHWOde:
         ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
         t_ambient = pd.Series([20.0, 20.0], index=ts)
         # start just below T_lower to force a reheat on hour 0
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         assert q_dhw_el.iloc[0] > 0.0
         # different tank volume -> different heating_rise -> different final tank temp (not hardcoded)
         pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 300})
         pm2._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
-        q_dhw_el2, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el2, _, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         # within 2-hour window, electricity series is identical (same reheat power/COP hour 0, silent hour 1)
         # but final tank temperature diverges due to different heating_rise values
         assert final_temp != pytest.approx(final_temp2, abs=0.5)
@@ -277,7 +277,7 @@ class TestDHWOde:
         pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
         ts = pd.date_range("2026-01-15 00:00", periods=12, freq="1h")
         t_ambient = pd.Series([20.0] * 12, index=ts)
-        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=60.0, dhw_schedule_override=None)
+        q_dhw_el, _, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=60.0, override_lookup=None)
         # tank starts at legionella temp -> several hours of zero electricity before it cools to T_lower
         assert q_dhw_el.iloc[0] == 0.0
         assert q_dhw_el.iloc[1] == 0.0
@@ -289,7 +289,9 @@ class TestDHWOde:
         ts = pd.date_range("2026-06-24 00:00", periods=48, freq="1h")  # Wed 2026-06-24 is dow=2
         t_ambient = pd.Series([20.0] * 48, index=ts)
         override = {"legionella": ("2026-06-25", 10)}  # move to Thursday 10:00
-        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=override)
+        q_dhw_el, _, _ = pm._dhw_kwh_series(
+            ts, t_ambient, initial_t_tank=50.0, override_lookup=lambda ts: pm._dhw_override_for_hour(ts, override)
+        )
         thu_10 = pd.Timestamp("2026-06-25 10:00")
         # a legionella boost (heating to T_legionella) must occur at/after the overridden hour
         assert q_dhw_el.loc[q_dhw_el.index >= thu_10].max() > 0
@@ -299,7 +301,7 @@ class TestDHWOde:
         pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
         ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
         t_ambient = pd.Series([50.0, 50.0], index=ts)  # T_ambient == T_tank -> no insulation loss
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, override_lookup=None)
         assert np.isfinite(final_temp)
 
     def test_zero_dhw_tank_volume_skips_dhw_component(self, tmp_path, caplog):
@@ -316,7 +318,7 @@ class TestDHWOde:
         initial_t = 50.0
 
         # Should not raise; should return zeros
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=initial_t, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=initial_t, override_lookup=None)
 
         # All electricity should be zero
         assert (q_dhw_el == 0.0).all(), f"Expected all zeros, got {q_dhw_el.values}"
@@ -324,6 +326,37 @@ class TestDHWOde:
         assert final_temp == pytest.approx(initial_t)
         # Should have logged a warning
         assert "DHW tank volume is zero or invalid" in caplog.text
+
+
+class TestDhwKwhSeriesOverrideLookup:
+    def test_override_lookup_none_is_override_blind(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        el_kwh, t_tank_series, final_t = pm._dhw_kwh_series(timestamps, t_ambient, 50.0, override_lookup=None)
+        # No override anywhere in a 24h override-blind run — series must have no
+        # discontinuous jump to T_legionella at any hour.
+        assert (t_tank_series <= pm._schedule["T_legionella"] + 1e-6).all()
+        assert not (t_tank_series == pm._schedule["T_legionella"]).any()
+
+    def test_override_lookup_callable_applies_target_at_matching_hour(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        target_ts = pd.Timestamp("2026-08-04 12:00")
+
+        def lookup(ts):
+            return 60.0 if ts == target_ts else None
+
+        _, t_tank_series, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=lookup)
+        assert t_tank_series.loc[target_ts] == 60.0
+
+    def test_t_tank_series_has_same_index_as_timestamps(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=6, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        _, t_tank_series, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        assert list(t_tank_series.index) == list(timestamps)
 
 
 class TestPredictSeries:

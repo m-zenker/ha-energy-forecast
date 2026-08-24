@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -262,13 +263,20 @@ class ThermalPhysicsModel:
         timestamps: pd.DatetimeIndex,
         t_ambient: pd.Series,
         initial_t_tank: float,
-        dhw_schedule_override: dict | None,
-    ) -> tuple[pd.Series, float]:
+        override_lookup: Callable[[pd.Timestamp], float | None] | None = None,
+    ) -> tuple[pd.Series, pd.Series, float]:
+        """Returns (el_kwh_series, t_tank_series, final_t_tank). override_lookup is a
+        per-hour callable returning an override target temp or None; None means
+        override-blind (the mandatory mode for physics_kwh as an ML feature — Goal 1).
+        Same ODE math as before Phase A — only the override-source abstraction changed,
+        from a dict to a callable, so one loop can serve live-dict, history-based, and
+        blind lookup modes without duplicating it (R2-#3's "one shared function")."""
         volume_l = self._config["dhw_tank_volume_l"]
         c_dhw = volume_l * WATER_SPECIFIC_HEAT_WH_PER_L_K
         if c_dhw <= 0:
             _LOGGER.warning("DHW tank volume is zero or invalid — skipping DHW component")
-            return pd.Series(0.0, index=timestamps), float(initial_t_tank)
+            zeros = pd.Series(0.0, index=timestamps)
+            return zeros, pd.Series(float(initial_t_tank), index=timestamps), float(initial_t_tank)
         q_dhw_power = self._config["dhw_power_w"]
         heating_rise = q_dhw_power / c_dhw  # K/h, derived each call — not a stored constant
 
@@ -282,17 +290,19 @@ class ThermalPhysicsModel:
 
         t_tank = float(initial_t_tank)
         el_kwh = np.zeros(len(timestamps))
+        t_tank_trajectory = np.zeros(len(timestamps))
         for i, ts in enumerate(timestamps):
             ua_dhw = self._calib.get("UA_dhw") or 15.0
             dT = -ua_dhw * (t_tank - float(t_ambient.iloc[i])) / c_dhw
             hour_of_day = ts.hour
             dT -= _DEFAULT_DRAW_PROFILE[hour_of_day] * draw_rate
 
-            override_target = self._dhw_override_for_hour(ts, dhw_schedule_override)
+            override_target = override_lookup(ts) if override_lookup is not None else None
             if override_target is not None:
                 q_el_w = q_dhw_power / cop_dhw
                 el_kwh[i] = q_el_w / 1000.0
                 t_tank = override_target
+                t_tank_trajectory[i] = t_tank
                 continue
 
             if t_tank < t_lower:
@@ -302,8 +312,9 @@ class ThermalPhysicsModel:
             else:
                 el_kwh[i] = 0.0
                 t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))
+            t_tank_trajectory[i] = t_tank
 
-        return pd.Series(el_kwh, index=timestamps), t_tank
+        return pd.Series(el_kwh, index=timestamps), pd.Series(t_tank_trajectory, index=timestamps), t_tank
 
     def _area_weighted_t_indoor(
         self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
@@ -376,10 +387,12 @@ class ThermalPhysicsModel:
             else:
                 initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
-            effective_override = (
-                dhw_schedule_override if dhw_schedule_override is not None else self._schedule.get("committed_override")
+            override_lookup = (
+                (lambda ts: self._dhw_override_for_hour(ts, dhw_schedule_override)) if dhw_schedule_override else None
             )
-            q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
+            q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
+                timestamps, t_indoor, initial_t_tank, override_lookup
+            )
 
             q_base_el = self._calib.get("Q_base_el") or 0.35
             physics_kwh = q_heat_el + q_dhw_el + q_base_el
@@ -420,8 +433,9 @@ class ThermalPhysicsModel:
         else:
             initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
-        effective_override = self._schedule.get("committed_override")
-        q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
+        q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
+            timestamps, t_indoor, initial_t_tank, override_lookup=None
+        )
         q_base_el = self._calib.get("Q_base_el") or 0.35
         return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
 
