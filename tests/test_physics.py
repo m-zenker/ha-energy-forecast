@@ -1001,6 +1001,7 @@ class TestCommittedDhwSchedule:
         # reload from disk to confirm persistence
         pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
         assert pm2._schedule["committed_override"] == {"legionella": ["2026-06-25", 22]}
+        assert len(pm2._schedule["override_history"]) == 1  # new: side effect of commit
 
     def test_natural_baseline_applies_committed_override_by_default(self, tmp_path):
         # Model WITH committed override
@@ -1036,6 +1037,84 @@ class TestCommittedDhwSchedule:
         result_a = pm.predict_series(forecast_df, dhw_schedule_override=override)
         result_b = pm.predict_series(forecast_df)  # committed override (hour 10) applies
         assert not result_a.equals(result_b)
+
+
+class TestCommitDhwScheduleMergeSemantics:
+    def test_legionella_then_comfort_boost_both_survive(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert pm._schedule["committed_override"] == {
+            "legionella": ["2026-08-04", 12],
+            "comfort_boost": ["2026-08-05", 14, 57.5],
+        }
+
+    def test_clearing_comfort_boost_leaves_legionella_intact(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        pm.commit_dhw_schedule({"comfort_boost": None})
+        assert pm._schedule["committed_override"] == {"legionella": ["2026-08-04", 12]}
+
+    def test_clearing_last_key_resets_to_none_not_empty_dict(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"legionella": None})
+        assert pm._schedule["committed_override"] is None
+
+    def test_malformed_entry_skipped_with_warning_does_not_corrupt_merge(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        with caplog.at_level("WARNING"):
+            pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14)})  # missing target_c — malformed
+        assert any("malformed" in r.message for r in caplog.records)
+        assert pm._schedule["committed_override"] == {"legionella": ["2026-08-04", 12]}
+
+    def test_commit_appends_override_history_entry(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert len(pm._schedule["override_history"]) == 1
+        entry = pm._schedule["override_history"][0]
+        assert entry["kind"] == "comfort_boost"
+        assert entry["date"] == "2026-08-05"
+        assert entry["hour"] == 14
+        assert entry["target_c"] == 57.5
+        assert entry["cancelled_at"] is None
+        assert entry["committed_at"]  # non-empty ISO string
+
+    def test_legionella_history_target_c_is_t_legionella(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        entry = pm._schedule["override_history"][0]
+        assert entry["target_c"] == pm._schedule["T_legionella"]
+
+    def test_last_write_wins_dedup_on_kind_date_hour_for_non_cancelled(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 55.0)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})  # re-armed, revised target
+        assert len(pm._schedule["override_history"]) == 1
+        assert pm._schedule["override_history"][0]["target_c"] == 57.5
+
+    def test_genuine_cancellation_marks_cancelled_at_not_deleted(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        pm.commit_dhw_schedule({"comfort_boost": None})
+        assert len(pm._schedule["override_history"]) == 1  # not deleted
+        entry = pm._schedule["override_history"][0]
+        assert entry["cancelled_at"] is not None
+        assert entry["target_c"] == 57.5  # raw value retained
+
+    def test_rearm_after_cancellation_appends_fresh_entry_not_uncancel(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 55.0)})
+        pm.commit_dhw_schedule({"comfort_boost": None})  # cancelled
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 58.0)})  # re-armed, same hour
+        assert len(pm._schedule["override_history"]) == 2
+        cancelled, fresh = pm._schedule["override_history"]
+        assert cancelled["cancelled_at"] is not None
+        assert cancelled["target_c"] == 55.0
+        assert fresh["cancelled_at"] is None
+        assert fresh["target_c"] == 58.0
 
 
 class TestOverrideHistorySchema:

@@ -5,6 +5,7 @@ See docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md for the design
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ import numpy as np
 import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast.physics")
+
+_VALID_OVERRIDE_KINDS = ("legionella", "comfort_boost")
 
 COP_MIN = 1.1
 ETA_CARNOT = 0.45
@@ -867,9 +870,86 @@ class ThermalPhysicsModel:
             _LOGGER.warning(f"Physics calibration failed: {e} — retaining previous/default parameters")
 
     def commit_dhw_schedule(self, override: dict) -> None:
-        """Persist *override* as the new standing DHW schedule, bypassing the instability guard."""
-        # Convert to JSON-serializable form (tuples -> lists)
-        serializable_override = json.loads(json.dumps(override))
-        self._schedule["committed_override"] = serializable_override
+        """Merge semantics into committed_override + append-only override_history (Goal 4).
+        This is net-new code — the previous implementation was a flat replace. Never
+        raises: a malformed entry logs a WARNING and is skipped, never corrupting the
+        rest of the merge (R1 write-time validation contract)."""
+        if self._schedule.get("committed_override") is None:
+            self._schedule["committed_override"] = {}
+        committed = self._schedule["committed_override"]
+        history = self._schedule.setdefault("override_history", [])
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+
+        for kind, value in override.items():
+            if value is None:
+                prior = committed.pop(kind, None)
+                if prior is not None:
+                    self._mark_history_cancelled(history, kind, prior[0], prior[1])
+                continue
+            if kind not in _VALID_OVERRIDE_KINDS:
+                _LOGGER.warning(f"commit_dhw_schedule: unknown kind {kind!r} — skipping")
+                continue
+            if kind == "legionella":
+                if not (isinstance(value, list | tuple) and len(value) == 2):
+                    _LOGGER.warning(f"commit_dhw_schedule: malformed legionella value {value!r} — skipping")
+                    continue
+                date_str, hour = value
+                target_c = self._schedule["T_legionella"]
+            else:  # comfort_boost
+                if not (isinstance(value, list | tuple) and len(value) == 3):
+                    _LOGGER.warning(f"commit_dhw_schedule: malformed comfort_boost value {value!r} — skipping")
+                    continue
+                date_str, hour, target_c = value
+                if target_c is None:
+                    _LOGGER.warning("commit_dhw_schedule: comfort_boost target_c is None — skipping")
+                    continue
+
+            committed[kind] = [date_str, hour] if kind == "legionella" else [date_str, hour, target_c]
+            self._replace_or_append_history(history, kind, date_str, hour, float(target_c), now_iso)
+
+        if not committed:
+            self._schedule["committed_override"] = None
         _atomic_write_json(self._schedule_path, self._schedule)
         _LOGGER.info(f"DHW schedule committed: {override}")
+
+    @staticmethod
+    def _mark_history_cancelled(history: list[dict], kind: str, date_str: str, hour: int) -> None:
+        """Genuine remote cancellation (not self-expiry): mark the specific still-pending
+        (kind, date, hour) entry cancelled rather than deleting it — keeps history
+        append-only/auditable and correctly zero-deltas it in reconstruction (R2 fix)."""
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+        for entry in history:
+            if (
+                entry.get("cancelled_at") is None
+                and entry.get("kind") == kind
+                and entry.get("date") == date_str
+                and entry.get("hour") == hour
+            ):
+                entry["cancelled_at"] = now_iso
+                return
+
+    @staticmethod
+    def _replace_or_append_history(
+        history: list[dict], kind: str, date_str: str, hour: int, target_c: float, committed_at: str
+    ) -> None:
+        """Last-write-wins dedup on (kind, date, hour) among non-cancelled entries (R1-#21)."""
+        for entry in history:
+            if (
+                entry.get("cancelled_at") is None
+                and entry.get("kind") == kind
+                and entry.get("date") == date_str
+                and entry.get("hour") == hour
+            ):
+                entry["target_c"] = target_c
+                entry["committed_at"] = committed_at
+                return
+        history.append(
+            {
+                "kind": kind,
+                "date": date_str,
+                "hour": hour,
+                "target_c": target_c,
+                "committed_at": committed_at,
+                "cancelled_at": None,
+            }
+        )
