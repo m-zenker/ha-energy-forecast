@@ -1995,6 +1995,28 @@ class EnergyForecast(hass.Hass):
             _prepared=_prepared,
         )
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
+
+        # ── Goal 1: deterministic post-model DHW override correction ──────────
+        # Added unconditionally to the model's already-final output — never fed
+        # back into physics_kwh or the trained model, so double-counting is
+        # structurally impossible (spec's Design section). Direct fix for the
+        # 2026-08-04 live bug: a committed override must move the published
+        # forecast by its true expected kWh amount, independent of whatever
+        # weight the trained model happens to give the override features.
+        if self._physics_model is not None:
+            _override_timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
+            _t_ambient = pd.Series(forecast_df["temp_c"].values, index=_override_timestamps)
+            _initial_t_tank = self._physics_model._initial_t_tank_for_window(
+                dhw_recent if not dhw_recent.empty else None, _override_timestamps
+            )
+            _override_delta = self._physics_model.compute_serving_override_delta(
+                _override_timestamps, _t_ambient, _initial_t_tank
+            )
+            predictions["predicted_kwh"] = (
+                predictions["predicted_kwh"].to_numpy()
+                + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy()
+            )
+
         self._publish_thermal_pressure()
         self._publish_physics_sensors(predictions)
 

@@ -959,3 +959,137 @@ class TestSetDhwScheduleService:
                 "default", "energy_forecast", "set_dhw_schedule", {"dhw_schedule": {"legionella": ["2026-01-16", 10]}}
             )
         assert any("physics" in r.message.lower() for r in caplog.records)
+
+
+class TestServingOverrideCorrection:
+    """Task 11: EnergyForecast._update_sensors() must add
+    compute_serving_override_delta() to the published forecast immediately after
+    self._ml_model.predict() returns — direct regression test for the 2026-08-04
+    live bug, where a committed DHW override never moved the published forecast
+    because nothing outside the ML model's own (possibly zero-weighted) feature
+    blending ever added the deterministic correction back in.
+
+    Builds a real ThermalPhysicsModel (not app.initialize()'s physics wiring,
+    which hardcodes apps/energy_forecast/models/ as the model dir — committing a
+    real override there would write into the repo; see TestSetDhwScheduleService,
+    which mocks commit_dhw_schedule for the same reason) and drives
+    EnergyForecast._update_sensors() end-to-end via test_energy_forecast.py's
+    _FakeUpdateSensors/_FakeMLModelForUpdateSensors harness, which already stubs
+    every optional-feature attribute at its skip-guard default.
+    """
+
+    def _physics_config(self):
+        return {
+            "cop_sensor": None,
+            "dhw_tank_temp_sensor": None,
+            "heating_buffer_temp_sensor": None,
+            "heating_curve_sensor": None,
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": False,
+        }
+
+    def _run_update_sensors(self, tmp_path, monkeypatch, physics_model, forecast_timestamps):
+        """Drives EnergyForecast._update_sensors() end-to-end and returns the exact
+        `predictions` DataFrame it hands to _aggregate() — i.e. the fully-corrected,
+        about-to-be-published forecast — captured via a spy wrapped around
+        stub._aggregate (which already delegates to the real implementation)."""
+        from energy_forecast import energy_forecast as ef_mod
+        from energy_forecast import ha_data as ha_data_mod
+        from energy_forecast import weather as weather_mod
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        from tests.test_energy_forecast import _FakeUpdateSensors
+
+        forecast_df = pd.DataFrame({"timestamp": forecast_timestamps, "temp_c": [5.0] * len(forecast_timestamps)})
+
+        monkeypatch.setattr(weather_mod, "fetch_forecast", lambda *a, **kw: forecast_df.copy())
+        monkeypatch.setattr(
+            ha_data_mod, "fetch_recent_energy", lambda *a, **kw: pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        )
+        monkeypatch.setattr(
+            ha_data_mod,
+            "split_ev_charging",
+            lambda df, *a, **kw: (df, pd.DataFrame(columns=["timestamp", "gross_kwh"])),
+        )
+        monkeypatch.setattr(ha_data_mod, "fetch_recent_energy_15m", lambda *a, **kw: None)
+        monkeypatch.setattr(ef_mod, "PRED_HISTORY_PATH", tmp_path / "pred_history.json")
+
+        stub = _FakeUpdateSensors(tmp_path / "energy_history.csv")
+        stub._physics_model = physics_model
+        stub._physics_config = physics_model._config
+        stub._room_thermostats = []
+        stub._physics_climate_dfs = {}
+        stub._ml_model.predict = lambda *a, **kw: pd.DataFrame(
+            {"timestamp": forecast_timestamps, "predicted_kwh": [1.0] * len(forecast_timestamps)}
+        )
+
+        captured: dict = {}
+        real_aggregate = stub._aggregate
+
+        def _capture_aggregate(predictions_df, *a, **kw):
+            captured["predictions"] = predictions_df.copy()
+            return real_aggregate(predictions_df, *a, **kw)
+
+        stub._aggregate = _capture_aggregate
+
+        EnergyForecast._update_sensors(stub)
+        return captured["predictions"]
+
+    def test_committed_override_moves_published_forecast_by_full_delta(self, tmp_path, monkeypatch):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        forecast_timestamps = pd.date_range(start=now, periods=48, freq="1h")
+        override_ts = forecast_timestamps[5]
+
+        physics_with_override = ThermalPhysicsModel(tmp_path / "physics_models_override", self._physics_config())
+        physics_with_override.commit_dhw_schedule({"legionella": [override_ts.strftime("%Y-%m-%d"), override_ts.hour]})
+        physics_no_override = ThermalPhysicsModel(tmp_path / "physics_models_baseline", self._physics_config())
+
+        # The expected delta is computed via the exact same public entry point
+        # _update_sensors() is supposed to call, with the exact same inputs it
+        # is supposed to build (t_ambient from forecast_df["temp_c"], initial
+        # tank state from _initial_t_tank_for_window with no dhw_recent data —
+        # this stub leaves _dhw_buffer_sensor unset).
+        initial_t_tank = physics_with_override._initial_t_tank_for_window(None, forecast_timestamps)
+        expected_delta = physics_with_override.compute_serving_override_delta(
+            forecast_timestamps, pd.Series(5.0, index=forecast_timestamps), initial_t_tank
+        )
+        assert (expected_delta != 0.0).any(), "test setup sanity: override must actually diverge the DHW trajectory"
+
+        predictions_with_override = self._run_update_sensors(
+            tmp_path, monkeypatch, physics_with_override, forecast_timestamps
+        )
+        predictions_baseline = self._run_update_sensors(tmp_path, monkeypatch, physics_no_override, forecast_timestamps)
+
+        actual_delta = (
+            predictions_with_override.set_index("timestamp")["predicted_kwh"]
+            - predictions_baseline.set_index("timestamp")["predicted_kwh"]
+        )
+        pd.testing.assert_series_equal(
+            actual_delta, expected_delta.rename("predicted_kwh"), check_names=False, check_freq=False, atol=1e-9
+        )
+        # Explicit multi-hour-tail check at the override hour and beyond, not just
+        # a single point — the whole point of the fix is the carryover tail moves too.
+        assert actual_delta.loc[override_ts] != pytest.approx(0.0)
+
+    def test_no_committed_override_leaves_published_forecast_unchanged(self, tmp_path, monkeypatch):
+        """Zero-override-degradation: with nothing committed,
+        compute_serving_override_delta() returns an all-zero series (Task 7/13),
+        so this addition must be a complete no-op end-to-end."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        forecast_timestamps = pd.date_range(start=now, periods=48, freq="1h")
+
+        physics_model = ThermalPhysicsModel(tmp_path / "physics_models_noop", self._physics_config())
+        assert physics_model.schedule.get("committed_override") is None
+
+        predictions = self._run_update_sensors(tmp_path, monkeypatch, physics_model, forecast_timestamps)
+
+        assert (predictions.set_index("timestamp")["predicted_kwh"] == 1.0).all()
