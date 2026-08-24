@@ -1116,6 +1116,14 @@ class TestCommitDhwScheduleMergeSemantics:
         assert fresh["cancelled_at"] is None
         assert fresh["target_c"] == 58.0
 
+    def test_comfort_boost_non_numeric_target_c_skipped_with_warning(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        with caplog.at_level("WARNING"):
+            pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, "not-a-number")})
+        assert any("not numeric" in r.message for r in caplog.records)
+        assert pm._schedule["committed_override"] is None
+        assert pm._schedule["override_history"] == []
+
 
 class TestOverrideHistorySchema:
     def test_default_schedule_has_empty_override_history(self, tmp_path):

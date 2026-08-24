@@ -900,8 +900,10 @@ class ThermalPhysicsModel:
                     _LOGGER.warning(f"commit_dhw_schedule: malformed comfort_boost value {value!r} — skipping")
                     continue
                 date_str, hour, target_c = value
-                if target_c is None:
-                    _LOGGER.warning("commit_dhw_schedule: comfort_boost target_c is None — skipping")
+                if not isinstance(target_c, int | float):
+                    _LOGGER.warning(
+                        f"commit_dhw_schedule: comfort_boost target_c {target_c!r} is not numeric — skipping"
+                    )
                     continue
 
             committed[kind] = [date_str, hour] if kind == "legionella" else [date_str, hour, target_c]
