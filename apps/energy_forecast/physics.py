@@ -128,6 +128,21 @@ class ThermalPhysicsModel:
         self._tau_hours: float | None = None  # set externally by Plan B from EnergyForecastModel._tau_hours
 
     @property
+    def schedule(self) -> dict:
+        return self._schedule
+
+    def _initial_t_tank_for_window(self, dhw_df: pd.DataFrame | None, timestamps: pd.DatetimeIndex) -> float:
+        """Shared initial-tank-state estimate for a training/forecast window — extracted
+        from predict_training_series to avoid duplicating this logic at the new
+        override-delta call site in model.py."""
+        if dhw_df is not None and not dhw_df.empty:
+            d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
+                timestamps, method="nearest"
+            )
+            return float(d.iloc[0]) if not d.empty and pd.notna(d.iloc[0]) else self._schedule["T_dhw_upper"]
+        return (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+
+    @property
     def calibration_stale(self) -> bool:
         raw = self._calib.get("calibrated_at")
         if not raw:
@@ -511,13 +526,7 @@ class ThermalPhysicsModel:
         cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
         q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
 
-        if dhw_df is not None and not dhw_df.empty:
-            d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
-                timestamps, method="nearest"
-            )
-            initial_t_tank = float(d.iloc[0]) if not d.empty and pd.notna(d.iloc[0]) else self._schedule["T_dhw_upper"]
-        else:
-            initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+        initial_t_tank = self._initial_t_tank_for_window(dhw_df, timestamps)
 
         q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
             timestamps, t_indoor, initial_t_tank, override_lookup=None

@@ -381,6 +381,24 @@ class EnergyForecastModel:
                 n_rows,
             )
 
+        # Goal 1/2 (R1-#11): correct gross_kwh for any committed DHW override ONCE, upstream
+        # of both calibration and the ML training target — single source of truth, not two
+        # independent subtraction points that could drift apart. Uses self._calib's current
+        # (pre-this-cycle) values as a bootstrap approximation — calibrate() below refines
+        # them further using the now-corrected series.
+        if physics_model is not None:
+            _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
+            _w_for_delta = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
+            _t_outdoor_for_delta = _w_for_delta["temp_c"].reindex(_timestamps_for_delta, method="nearest")
+            _override_history = physics_model.schedule.get("override_history", [])
+            if _override_history:
+                _initial_t_tank = physics_model._initial_t_tank_for_window(dhw_df, _timestamps_for_delta)
+                _override_delta = physics_model.compute_training_override_delta(
+                    _timestamps_for_delta, _t_outdoor_for_delta, _initial_t_tank, _override_history
+                )
+                energy_df = energy_df.copy()
+                energy_df["gross_kwh"] = energy_df["gross_kwh"].to_numpy() - _override_delta.to_numpy()
+
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)

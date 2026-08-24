@@ -1263,6 +1263,70 @@ class TestTrainWithPhysics:
         assert flags.loc[anomaly_ts] == True  # noqa: E712 — explicit bool comparison reads clearer here
         assert flags.sum() < 10
 
+    def test_gross_kwh_corrected_before_calibration_and_target_construction(self, tmp_path):
+        """R1-#11: override_delta_series must be subtracted from gross_kwh once, upstream
+        of both calibrate() and the ML training target — not independently in two places
+        that could drift apart.
+
+        Verification strategy: spy (wraps=) on both physics_model.calibrate and the
+        module-level _add_lag_and_rolling_training (the function that immediately follows
+        the correction block and whose output df["gross_kwh"] flows unchanged into the
+        final `y` used for the LightGBM fit — confirmed by reading _add_lag_and_rolling_training,
+        which only adds lag/rolling columns and otherwise copies energy_df's gross_kwh
+        verbatim). Inspecting both call sites' energy_df argument directly proves (a) calibrate
+        sees the corrected series and (b) the same corrected series reaches the ML target,
+        without needing to reach into LightGBM's fit() internals.
+        """
+        from energy_forecast.model import _add_lag_and_rolling_training
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        raw_value_at_override = energy_df.loc[energy_df["timestamp"] == ts[300], "gross_kwh"].iloc[0]
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        # ts[300] == 2024-01-13 12:00:00 — well inside the training window so the
+        # override's multi-hour carryover tail lands on real rows.
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        assert pm.schedule["override_history"], "sanity: commit_dhw_schedule did not populate override_history"
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+
+        with (
+            patch.object(pm, "calibrate", wraps=pm.calibrate) as mock_calibrate,
+            patch(
+                "energy_forecast.model._add_lag_and_rolling_training", wraps=_add_lag_and_rolling_training
+            ) as mock_add_lag,
+        ):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=pm)
+
+        calibrate_energy_df = mock_calibrate.call_args.args[0]
+        add_lag_energy_df = mock_add_lag.call_args.args[0]
+
+        calib_value = calibrate_energy_df.loc[calibrate_energy_df["timestamp"] == override_ts, "gross_kwh"].iloc[0]
+        target_value = add_lag_energy_df.loc[add_lag_energy_df["timestamp"] == override_ts, "gross_kwh"].iloc[0]
+
+        # (a) calibrate() sees the corrected series, not the raw fixture value.
+        assert calib_value != pytest.approx(raw_value_at_override)
+        # (b) the series feeding the ML training target (_add_lag_and_rolling_training,
+        # whose output df["gross_kwh"] becomes `y` unmodified) is the SAME corrected
+        # value — single source of truth, not two independent subtraction points.
+        assert target_value == pytest.approx(calib_value)
+
 
 # ── Physics-ML hybrid: predict() physics feature + portability fallback (Plan B Task 5) ──
 
