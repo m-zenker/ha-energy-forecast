@@ -1269,6 +1269,19 @@ class TestTrainWithPhysics:
         pre-fix failure mode (override-shaped noise the model has to explain away)
         doesn't stay at full training weight for as long as the full window spans.
 
+        Also exercises the tz-aware conversion path: `committed_at` is genuinely
+        UTC-aware here (built the same way `commit_dhw_schedule` really writes it —
+        an aware UTC ISO string), while `df["timestamp"]` is naive Europe/Zurich LOCAL
+        time (per the model's convention). A bare `tz_localize(None)` on the UTC value
+        would strip the tz label without converting, leaving UTC wall-clock numbers
+        mislabeled as local — misclassifying every row within Zurich's UTC+1 offset
+        (January = CET standard time, no DST edge case) of the true cutoff. This test's
+        `ship_cutoff_local` and `committed_at_utc` are deliberately 1 hour apart in
+        wall-clock terms so `ts[449]` (exactly at the UTC-mislabeled boundary) would be
+        misclassified as post-cutoff under the bare-tz_localize(None) bug but is
+        correctly pre-cutoff once `committed_at` is properly converted to local time
+        first.
+
         Verification strategy: spy on _build_model (same technique as
         test_training_target_reflects_override_blind_gross_kwh) to capture the exact
         `sample_weight` array passed to the final full-fit model.fit() call, alongside
@@ -1304,11 +1317,19 @@ class TestTrainWithPhysics:
         pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
         override_history = pm.schedule["override_history"]
         assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
-        # Pin committed_at to a controlled cutoff splitting the fixture window, in place
-        # of the real wall-clock "now" value commit_dhw_schedule stamps (irrelevant here —
-        # this test only cares about how committed_at splits pre/post rows).
-        ship_cutoff = ts[450]
-        override_history[0]["committed_at"] = ship_cutoff.isoformat()
+
+        # ship_cutoff_local is the intended LOCAL (Europe/Zurich) wall-clock cutoff that
+        # df["timestamp"] rows (naive local) get compared against. committed_at_utc is
+        # what actually gets written into override_history — genuinely UTC-aware, exactly
+        # like commit_dhw_schedule's real `dt.datetime.now(dt.UTC).isoformat()` — derived
+        # from ship_cutoff_local by a real local→UTC conversion, not hand-picked to match.
+        ship_cutoff_local = ts[450]
+        committed_at_utc = ship_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC")
+        assert committed_at_utc.utcoffset() == pd.Timedelta(0), "sanity: parsed as UTC-aware"
+        assert committed_at_utc.tz_convert("Europe/Zurich").tz_localize(None) == ship_cutoff_local, (
+            "sanity: local->UTC->local round-trip must recover the original wall-clock cutoff"
+        )
+        override_history[0]["committed_at"] = committed_at_utc.isoformat()
 
         captured: list[tuple[np.ndarray, np.ndarray | None]] = []
 
@@ -1341,10 +1362,10 @@ class TestTrainWithPhysics:
         assert sw is not None, "sanity: sample_weight must be computed when weight_halflife_days > 0"
 
         row_ts = ts[idx]
-        pre_mask = row_ts < ship_cutoff
+        pre_mask = row_ts < ship_cutoff_local
         post_mask = ~pre_mask
-        assert pre_mask.any(), "sanity: fixture must retain rows before ship_cutoff after lag dropna"
-        assert post_mask.any(), "sanity: fixture must retain rows after ship_cutoff after lag dropna"
+        assert pre_mask.any(), "sanity: fixture must retain rows before ship_cutoff_local after lag dropna"
+        assert post_mask.any(), "sanity: fixture must retain rows after ship_cutoff_local after lag dropna"
 
         # Independently recompute the exact recency-halflife formula (model.py's
         # `np.exp(-days_ago * ln2 / weight_halflife_days)`, end_ts = energy_df max) and
@@ -1360,6 +1381,21 @@ class TestTrainWithPhysics:
         # have been without this down-weight (all else, i.e. the recency factor, equal).
         np.testing.assert_allclose(sw[pre_mask], base_weight[pre_mask] * 0.5, rtol=1e-9, atol=1e-12)
         np.testing.assert_allclose(sw[post_mask], base_weight[post_mask], rtol=1e-9, atol=1e-12)
+
+        # The critical boundary row: ts[449] (== ship_cutoff_local - 1h) is exactly the
+        # timestamp a bare tz_localize(None) bug would use as its (mislabeled-naive) UTC
+        # cutoff, misclassifying it as post-cutoff. With the correct local conversion it
+        # must land pre-cutoff and get the full 0.5 down-weight.
+        boundary_pos = np.where(idx == 449)[0]
+        assert boundary_pos.size == 1, "sanity: boundary row ts[449] must survive lag dropna for this check"
+        boundary_weight = sw[boundary_pos[0]]
+        boundary_days_ago = (end_ts - ts[449]).total_seconds() / 86400.0
+        boundary_base = np.exp(-boundary_days_ago * np.log(2) / weight_halflife_days)
+        assert boundary_weight == pytest.approx(boundary_base * 0.5, rel=1e-9), (
+            "boundary row ts[449] (1h before ship_cutoff_local) must be classified pre-cutoff — "
+            "if this fails with boundary_weight == boundary_base (no 0.5 applied), committed_at's "
+            "UTC->local conversion regressed to a bare tz_localize(None)"
+        )
 
     def test_gross_kwh_corrected_before_calibration_and_target_construction(self, tmp_path):
         """R1-#11: override_delta_series must be subtracted from gross_kwh once, upstream

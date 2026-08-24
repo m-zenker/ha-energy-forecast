@@ -503,10 +503,17 @@ class EnergyForecastModel:
             if _ship_cutoff.tzinfo is not None:
                 # committed_at is written as an ISO-8601 UTC-aware string
                 # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
-                # df["timestamp"] is naive local time throughout this module — strip
-                # tz info before comparing, same pattern as physics.py's calibrated_at
-                # age check, or pandas raises on tz-naive vs tz-aware comparison.
-                _ship_cutoff = _ship_cutoff.tz_localize(None)
+                # df["timestamp"] is naive LOCAL time throughout this module (stripped
+                # via _strip_tz(df, self._timezone) before train() ever sees it). A bare
+                # tz_localize(None) would strip the tz label without converting, leaving
+                # UTC wall-clock numbers mislabeled as naive — silently misclassifying
+                # every row within the local UTC offset of the true cutoff. Must convert
+                # to local time first, same pattern as energy_forecast.py:1013
+                # (`.tz_convert(self._timezone).tz_localize(None)`), not the bare
+                # tz_localize(None) used elsewhere in this class for values that were
+                # already local when constructed (e.g. model.py's own
+                # `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` calls).
+                _ship_cutoff = _ship_cutoff.tz_convert(self._timezone).tz_localize(None)
             _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
             _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
             hourly_weights = hourly_weights * _down_weight_migration
