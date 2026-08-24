@@ -1327,6 +1327,113 @@ class TestTrainWithPhysics:
         # value — single source of truth, not two independent subtraction points.
         assert target_value == pytest.approx(calib_value)
 
+    def test_training_target_reflects_override_blind_gross_kwh(self, tmp_path):
+        """Direct regression test for Goal 1/2: with a committed historical override in
+        override_history, the model's training target (`y_fit`, the array actually passed
+        to the final `model.fit(X, y_fit, ...)` call — log1p(gross_kwh) in this feature-mode
+        config) must be computed from the override-blind-corrected gross_kwh, not the raw
+        override-inflated actuals.
+
+        Fixture strategy: build a shared baseline gross_kwh series representing "what the
+        household would have consumed with no override ever happening". `energy_df_a`
+        adds the real `compute_training_override_delta` spike on top of that baseline and
+        commits the same override into `override_history` (this is what a real override
+        recording looks like — the *actual* meter reading is inflated by the override, and
+        the deterministic delta is the thing train() must subtract back out). `energy_df_b`
+        is the untouched baseline with an empty `override_history` (a pure "as if blind"
+        reference — nothing to correct). Because the same delta is added in fixture A and
+        (per Task 8's correction block) subtracted back out inside train(), the two runs'
+        corrected `gross_kwh` — and therefore their final training-target arrays — must
+        coincide, proving the correction genuinely neutralizes the override's effect on
+        what the model fits against, not just on some intermediate DataFrame.
+        """
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        def _train_capture_final_yfit(model, energy_df, weather_df, physics_model):
+            """Spy on _build_model so every model.fit(X, y, ...) call in train() is
+            recorded. The final "model on all data" fit (model.py ~line 799) is the
+            only one that ever sees the full-length y_fit array — CV folds, the
+            holdout model, and the quantile models all fit on strict subsets — so
+            picking the longest captured array reliably isolates it regardless of
+            how many CV folds ran."""
+            calls: list[np.ndarray] = []
+
+            def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+                built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+                real_fit = built.fit
+
+                def spy_fit(X_arg, y_arg, *a, **kw):
+                    calls.append(np.asarray(y_arg, dtype=float))
+                    result = real_fit(X_arg, y_arg, *a, **kw)
+                    # Restore the class-level `fit` (drop the instance-attribute
+                    # override) immediately after the single call each model
+                    # instance ever receives, so the trained model — captured
+                    # later in self.model and pickled by train()'s self._save() —
+                    # doesn't carry an unpicklable local closure.
+                    del built.fit
+                    return result
+
+                built.fit = spy_fit
+                return built
+
+            with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+                model.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=physics_model)
+            assert calls, "train() never reached the model-fitting stage"
+            return max(calls, key=len)
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        baseline_gross_kwh = rng.uniform(0.5, 5.0, size=n)
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+
+        # ── pm_a: real committed override, "as recorded" fixture includes the spike ──
+        pm_a = ThermalPhysicsModel(tmp_path / "physics_models_a", self._physics_config())
+        override_ts = ts[300]  # well inside the training window — carryover tail lands on real rows
+        pm_a.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        override_history = pm_a.schedule["override_history"]
+        assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
+
+        timestamps_for_delta = pd.DatetimeIndex(ts)
+        t_outdoor_for_delta = pd.Series(weather_df["temp_c"].to_numpy(), index=timestamps_for_delta)
+        initial_t_tank = pm_a._initial_t_tank_for_window(None, timestamps_for_delta)
+        override_delta = pm_a.compute_training_override_delta(
+            timestamps_for_delta, t_outdoor_for_delta, initial_t_tank, override_history
+        )
+        delta_at_override = float(override_delta.loc[override_ts])
+        assert delta_at_override != pytest.approx(0.0), (
+            "sanity: override delta must be nonzero at the override hour for this test to be meaningful"
+        )
+
+        energy_df_a = pd.DataFrame({"timestamp": ts, "gross_kwh": baseline_gross_kwh + override_delta.to_numpy()})
+        model_a = EnergyForecastModel(tmp_path / "model_a", timezone="Europe/Zurich")
+        y_fit_a = _train_capture_final_yfit(model_a, energy_df_a, weather_df, pm_a)
+
+        # ── pm_b: no override ever committed — pure "as if blind" reference ──────────
+        pm_b = ThermalPhysicsModel(tmp_path / "physics_models_b", self._physics_config())
+        assert not pm_b.schedule.get("override_history"), "sanity: pm_b must start with no override history"
+
+        energy_df_b = pd.DataFrame({"timestamp": ts, "gross_kwh": baseline_gross_kwh})
+        model_b = EnergyForecastModel(tmp_path / "model_b", timezone="Europe/Zurich")
+        y_fit_b = _train_capture_final_yfit(model_b, energy_df_b, weather_df, pm_b)
+
+        # The override's real spike (fixture A) must be fully neutralized by train()'s
+        # correction, landing on the exact same training target the override-blind
+        # reference (fixture B) produces — this is the property Goal 1/2 requires.
+        assert y_fit_a.shape == y_fit_b.shape
+        np.testing.assert_allclose(y_fit_a, y_fit_b, atol=1e-6, rtol=1e-6)
+
 
 # ── Physics-ML hybrid: predict() physics feature + portability fallback (Plan B Task 5) ──
 
