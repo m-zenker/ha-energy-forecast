@@ -3873,9 +3873,20 @@ class TestScenarioDhwDelta:
         # exactly this: `physics_model.commit_dhw_schedule(override)`.
         pm.commit_dhw_schedule(override_a)
 
-        # Task 1 proof: the natural baseline (no explicit override passed to
-        # predict()) now reflects committed A, not "no override at all".
-        pred_natural_with_a = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        # Task 1 proof: the natural baseline reflects committed A, not "no
+        # override at all". NOTE: as of Phase A Task 6, model.predict() itself
+        # no longer implicitly falls back to committed_override when
+        # dhw_schedule_override is omitted (physics_model.predict_series's
+        # silent fallback was removed, intentionally — the real forecast path
+        # energy_forecast.py:1980 must stay override-blind by default). The
+        # "natural baseline" guarantee this test exercises now lives
+        # specifically in predict_scenario()'s natural_baseline_df construction
+        # (model.py ~L1337), which asks for the committed override explicitly.
+        # Mirror that explicit ask here so this is a true proof of that
+        # invariant, not of a since-removed implicit default.
+        pred_natural_with_a = model.predict(
+            forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=pm._schedule.get("committed_override")
+        )
         pred_truly_uncommitted = model.predict(forecast_df, live_temp=5.0, physics_model=pm_never_committed)
         assert not np.allclose(
             pred_natural_with_a["predicted_kwh"].to_numpy(),

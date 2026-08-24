@@ -1347,7 +1347,14 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
             room_areas=room_areas,
-            physics_model=physics_model,  # dhw_schedule_override intentionally omitted — this is the natural baseline
+            physics_model=physics_model,
+            # predict_series's silent committed_override fallback was removed (Phase A Task 6) —
+            # this call site must ask for the live committed override explicitly so the "natural
+            # baseline" still reflects whatever's actually committed right now (e.g. an already-
+            # armed legionella boost) when scoring a *different* candidate dhw_schedule_override.
+            dhw_schedule_override=(
+                physics_model._schedule.get("committed_override") if physics_model is not None else None
+            ),
         )
 
         if dhw_schedule_override is not None and physics_model is not None:

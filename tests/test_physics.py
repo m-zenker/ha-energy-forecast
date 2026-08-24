@@ -1036,7 +1036,18 @@ class TestCommittedDhwSchedule:
         assert pm2._schedule["committed_override"] == {"legionella": ["2026-06-25", 22]}
         assert len(pm2._schedule["override_history"]) == 1  # new: side effect of commit
 
-    def test_natural_baseline_applies_committed_override_by_default(self, tmp_path):
+    def test_predict_series_is_override_blind_by_default_even_with_committed_override(self, tmp_path):
+        """As of Phase A Task 6, predict_series's silent fallback to
+        self._schedule["committed_override"] was intentionally removed — the
+        ML-facing physics_kwh feature must never silently pick up whatever
+        happens to be currently committed (Goal 1). Formerly named
+        test_natural_baseline_applies_committed_override_by_default and
+        asserted the opposite; that fallback no longer exists anywhere in
+        predict_series. Reflecting a committed override into a "natural
+        baseline" is now the caller's explicit responsibility — see
+        predict_scenario()'s natural_baseline_df construction (model.py) and
+        TestScenarioDhwDelta::test_set_dhw_schedule_then_get_scenario_with_different_override,
+        which exercises that call site."""
         # Model WITH committed override
         pm_with_override = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm_with_override._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
@@ -1052,13 +1063,18 @@ class TestCommittedDhwSchedule:
         ts = pd.date_range("2026-06-25 00:00", periods=24, freq="1h")
         forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
 
-        # no explicit dhw_schedule_override passed — the committed one should still apply
+        # no explicit dhw_schedule_override passed — must be override-blind
+        # regardless of what is committed on the model
         result_with = pm_with_override.predict_series(forecast_df)
         result_without = pm_no_override.predict_series(forecast_df)
+        assert result_with.equals(result_without)
 
-        # The committed override (hour 10 legionella boost) produces a different DHW profile
-        # than the default schedule with no override, so results must differ
-        assert not result_with.equals(result_without)
+        # Proof the committed override is real and would matter if asked for
+        # explicitly (same explicit-ask pattern predict_scenario now uses)
+        result_with_explicit = pm_with_override.predict_series(
+            forecast_df, dhw_schedule_override=pm_with_override._schedule.get("committed_override")
+        )
+        assert not result_with_explicit.equals(result_with)
 
     def test_explicit_per_call_override_takes_precedence_over_committed(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
