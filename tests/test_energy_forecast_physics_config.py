@@ -1028,6 +1028,51 @@ class TestSetDhwScheduleService:
             )
         assert any("physics" in r.message.lower() for r in caplog.records)
 
+    def test_comfort_boost_3elem_payload_forwards_unmodified(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+
+        app._set_dhw_schedule_cb(
+            "default",
+            "energy_forecast",
+            "set_dhw_schedule",
+            {"dhw_schedule": {"comfort_boost": ["2026-08-05", 14, 57.5]}},
+        )
+        assert app._physics_model._schedule["committed_override"] == {"comfort_boost": ["2026-08-05", 14, 57.5]}
+        assert len(app._physics_model._schedule["override_history"]) == 1
+        assert app._cached_forecast_df is None  # cache invalidated, same as legionella today
+
+    def test_legionella_and_comfort_boost_same_day_neither_clobbers_other(self, tmp_path):
+        """Cross-repo scenario from the spec's Testing section: same-day legionella-then-
+        comfort_boost commit sequence through the real call_service→commit_dhw_schedule
+        path, verifying override_history accumulates both."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+
+        app._set_dhw_schedule_cb(
+            "default",
+            "energy_forecast",
+            "set_dhw_schedule",
+            {"dhw_schedule": {"legionella": ["2026-08-04", 12]}},
+        )
+        app._set_dhw_schedule_cb(
+            "default",
+            "energy_forecast",
+            "set_dhw_schedule",
+            {"dhw_schedule": {"comfort_boost": ["2026-08-05", 14, 57.5]}},
+        )
+        committed = app._physics_model._schedule["committed_override"]
+        assert committed == {"legionella": ["2026-08-04", 12], "comfort_boost": ["2026-08-05", 14, 57.5]}
+        assert len(app._physics_model._schedule["override_history"]) == 2
+
 
 class TestServingOverrideCorrection:
     """Task 11: EnergyForecast._update_sensors() must add
