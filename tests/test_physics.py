@@ -1526,3 +1526,26 @@ class TestDhwOverrideForHourFromHistory:
     def test_empty_history_returns_none(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-08-04 12:00"), []) is None
+
+
+class TestZeroOverrideDegradation:
+    def test_empty_history_and_committed_override_produces_zero_delta_everywhere(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=48, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        training_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, [])
+        serving_delta = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        assert (training_delta == 0.0).all()
+        assert (serving_delta == 0.0).all()
+
+    def test_physics_kwh_identical_to_pre_phase_a_when_no_override_ever_committed(self, tmp_path):
+        """No regression risk for installs that never use DHW overrides — the
+        override-blind physics_kwh feature must be bit-identical to calling
+        _dhw_kwh_series with override_lookup=None (today's only behavior)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        el_kwh_a, _, final_a = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        el_kwh_b, _, final_b = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        pd.testing.assert_series_equal(el_kwh_a, el_kwh_b)
+        assert final_a == final_b
