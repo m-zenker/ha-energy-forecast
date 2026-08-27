@@ -1029,11 +1029,26 @@ class TestSetDhwScheduleService:
             )
         assert any("physics" in r.message.lower() for r in caplog.records)
 
+    @staticmethod
+    def _isolate_physics_model_dir(app, tmp_path):
+        """initialize() hardcodes the physics model dir to apps/energy_forecast/models/ —
+        the REAL directory on disk. Tests that drive the unmocked commit_dhw_schedule
+        write path must not persist a committed override there: it leaves stale state
+        that the next run of the very same test reads back, making the suite
+        non-idempotent (final-review #6). Swap in a tmp_path-backed model, mirroring
+        TestServingOverrideCorrection's approach of building a real ThermalPhysicsModel
+        against tmp_path rather than relying on initialize()'s wiring."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        app._physics_model = ThermalPhysicsModel(tmp_path / "physics_models", app._physics_config)
+        return app
+
     def test_comfort_boost_3elem_payload_forwards_unmodified(self, tmp_path):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
         app.initialize()
+        self._isolate_physics_model_dir(app, tmp_path)
         app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
         app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
 
@@ -1055,6 +1070,7 @@ class TestSetDhwScheduleService:
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
         app.initialize()
+        self._isolate_physics_model_dir(app, tmp_path)
         app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
         app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
 
