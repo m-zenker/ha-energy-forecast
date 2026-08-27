@@ -62,6 +62,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   at the same per-cycle energy cost — the direction of the change may be counterintuitive. This
   measurably changes modelled DHW electricity for every installation. The fixed-hour charge vs.
   actual ΔT mismatch is a known limitation and a candidate for a separate follow-up.
+- `apps/energy_forecast/physics.py` — follow-up to the T_dhw_upper ceiling fix (b68b25d): the
+  normal (non-override) reheat branch in `_dhw_kwh_series()` billed a full rated-power hour of
+  electricity on every cycle, even when the tank reached the upper-setpoint ceiling partway
+  through the hour (clipped short). With the ceiling corrected to 55 °C, cycles became more
+  frequent while per-cycle cost stayed constant, inflating modelled DHW electricity by +29 % in a
+  14-day test scenario (50.26 → 64.62 kWh/14d — the wrong direction for a tighter ceiling).
+  Electricity per cycle is now prorated to the temperature rise actually achieved that hour rather
+  than the full nominal hour. Re-measured after the fix: ~−7 % (46.40 vs 49.72 kWh/14d),
+  confirming the correction.
 - `apps/energy_forecast/energy_forecast.py` — `sensor.energy_forecast_ml_adjustment_today`
   was misattributing the new override correction to "ML Adjustment" instead of "Physics Base".
   `_publish_physics_sensors()` computed the physics baseline via an override-blind

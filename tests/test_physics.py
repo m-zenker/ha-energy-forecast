@@ -299,6 +299,30 @@ class TestDHWOde:
         # ... while the tank still genuinely cycles (reheat / coast / reheat).
         assert (q_dhw_el > 0.0).sum() >= 2
 
+    def test_reheat_energy_prorated_to_actual_delta_when_ceiling_clips_mid_hour(self, tmp_path):
+        """Regression for the +29% DHW electricity side effect discovered after the
+        T_dhw_upper ceiling fix above: shrinking the T_dhw_lower..T_dhw_upper buffer
+        makes reheat cycles more frequent, and each one used to bill a flat full hour
+        at rated power even when the tank hit the ceiling partway through the hour.
+        Electricity must instead be prorated to the delta actually achieved by
+        heating (14-day scenario: 50.26 -> 64.62 kWh with flat billing, ~neutral with
+        prorating)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        # 1 K buffer guarantees the ~17.2 K/h heating rise clips well within the hour.
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=46.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=1, freq="1h")
+        t_ambient = pd.Series([20.0], index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+
+        cop_dhw = pm._cop_formula_value(20.0, None)
+        full_hour_kwh = (DEFAULT_CONFIG["dhw_power_w"] / cop_dhw) / 1000.0
+        assert t_tank_series.iloc[0] == pytest.approx(46.0, abs=1e-6)  # ceiling reached mid-hour
+        assert 0.0 < q_dhw_el.iloc[0] < full_hour_kwh, (
+            f"expected prorated billing below the full-hour amount ({full_hour_kwh:.3f} kWh), "
+            f"got {q_dhw_el.iloc[0]:.3f} kWh"
+        )
+
     def test_override_target_still_bypasses_the_reheat_ceiling(self, tmp_path):
         """Companion to the above: a legionella override must still be able to drive the
         tank to T_legionella (60 degC), above the normal-reheat T_dhw_upper ceiling."""

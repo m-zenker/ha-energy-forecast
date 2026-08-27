@@ -324,15 +324,25 @@ class ThermalPhysicsModel:
                 continue
 
             if t_tank <= t_lower:
-                q_el_w = q_dhw_power / cop_dhw
-                el_kwh[i] = q_el_w / 1000.0
                 # A NORMAL reheat cycle targets T_dhw_upper, not T_legionella
                 # (final-review #3) — the legionella/comfort_boost ceiling belongs to the
                 # override branch above, which sets t_tank directly and never reaches here.
                 # The passive branch below deliberately keeps t_legionella as its ceiling:
                 # it must let a just-completed override coast DOWN from 60 degC rather than
                 # instantly clamping it to 55 and erasing the override's carryover tail.
-                t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_upper))
+                new_t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_upper))
+                # Bill electricity for the ΔT actually achieved by heating this hour, not a
+                # flat full hour at rated power. Without this, hitting the (now lower)
+                # T_dhw_upper ceiling mid-hour still billed a full hour — since the
+                # T_dhw_lower..T_dhw_upper buffer shrank when the ceiling was corrected from
+                # T_legionella to T_dhw_upper, cycles became more frequent and each still cost
+                # a full hour, a measured +29% DHW electricity in a 14-day scenario (parked
+                # follow-up from the ceiling fix). Clipped to [0, heating_rise] to also bound
+                # the symmetric edge case where decay/draw this hour exceeds what full-power
+                # heating can offset, which would otherwise bill MORE than a full hour.
+                actual_heating_rise = float(np.clip(new_t_tank - (t_tank + dT), 0.0, heating_rise))
+                el_kwh[i] = actual_heating_rise * c_dhw / cop_dhw / 1000.0
+                t_tank = new_t_tank
             else:
                 el_kwh[i] = 0.0
                 t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))
