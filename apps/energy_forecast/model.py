@@ -511,24 +511,55 @@ class EnergyForecastModel:
         # stay at full training influence — roughly weight_halflife_days after ship,
         # via the existing recency-halflife weighting above.
         if _override_history and hourly_weights is not None:
-            _ship_cutoff = pd.Timestamp(min(e["committed_at"] for e in _override_history))
-            if _ship_cutoff.tzinfo is not None:
-                # committed_at is written as an ISO-8601 UTC-aware string
-                # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
-                # df["timestamp"] is naive LOCAL time throughout this module (stripped
-                # via _strip_tz(df, self._timezone) before train() ever sees it). A bare
-                # tz_localize(None) would strip the tz label without converting, leaving
-                # UTC wall-clock numbers mislabeled as naive — silently misclassifying
-                # every row within the local UTC offset of the true cutoff. Must convert
-                # to local time first, same pattern as energy_forecast.py:1013
-                # (`.tz_convert(self._timezone).tz_localize(None)`), not the bare
-                # tz_localize(None) used elsewhere in this class for values that were
-                # already local when constructed (e.g. model.py's own
-                # `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` calls).
-                _ship_cutoff = _ship_cutoff.tz_convert(self._timezone).tz_localize(None)
-            _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
-            _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
-            hourly_weights = hourly_weights * _down_weight_migration
+            # Read-time validation, never raise (final-review #5): a single malformed
+            # entry used to raise straight out of train(), where _retrain_cb's blanket
+            # handler logs an ERROR and the model then never retrains again until the
+            # file is hand-fixed. Every other read-time path this plan added
+            # skips-and-warns; this one now does too.
+            _committed_ats: list[Any] = []
+            for _entry in _override_history:
+                try:
+                    if _entry.get("cancelled_at") is not None:
+                        # A cancelled override never actually happened, so its commit
+                        # can't mark when migration to this feature began.
+                        continue
+                    _committed_at = pd.Timestamp(_entry["committed_at"])
+                    if pd.isna(_committed_at):
+                        raise ValueError("committed_at is not a timestamp")
+                    if _committed_at.tzinfo is not None:
+                        # committed_at is written as an ISO-8601 UTC-aware string
+                        # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
+                        # df["timestamp"] is naive LOCAL time throughout this module (stripped
+                        # via _strip_tz(df, self._timezone) before train() ever sees it). A bare
+                        # tz_localize(None) would strip the tz label without converting, leaving
+                        # UTC wall-clock numbers mislabeled as naive — silently misclassifying
+                        # every row within the local UTC offset of the true cutoff. Must convert
+                        # to local time first, same pattern as energy_forecast.py:1013
+                        # (`.tz_convert(self._timezone).tz_localize(None)`), not the bare
+                        # tz_localize(None) used elsewhere in this class for values that were
+                        # already local when constructed (e.g. model.py's own
+                        # `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` calls).
+                        # Normalizing here (rather than after min()) also keeps min() from
+                        # comparing tz-aware against naive Timestamps, which itself raises.
+                        _committed_at = _committed_at.tz_convert(self._timezone).tz_localize(None)
+                    _committed_ats.append(_committed_at)
+                except Exception as _exc:  # noqa: BLE001 — read-time validation contract
+                    _LOGGER.warning(
+                        "override_history: entry with unusable committed_at skipped for the "
+                        "pre-migration down-weight: %s (%s)",
+                        _entry,
+                        _exc,
+                    )
+            if not _committed_ats:
+                _LOGGER.warning(
+                    "override_history: no entry has a usable committed_at (all malformed or "
+                    "cancelled) — skipping the pre-migration down-weight this cycle"
+                )
+            else:
+                _ship_cutoff = min(_committed_ats)
+                _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
+                _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
+                hourly_weights = hourly_weights * _down_weight_migration
 
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes

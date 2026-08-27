@@ -1397,6 +1397,122 @@ class TestTrainWithPhysics:
             "UTC->local conversion regressed to a bare tz_localize(None)"
         )
 
+    def _pre_migration_fixture(self, tmp_path, n=600):
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        return ts, energy_df, weather_df
+
+    def test_malformed_committed_at_does_not_raise_out_of_train(self, tmp_path, caplog):
+        """Final-review #5: the pre-migration down-weight block computed
+        `min(e["committed_at"] for e in override_history)` unguarded. A single malformed
+        entry (missing or unparseable committed_at) raised straight out of train(), where
+        _retrain_cb's blanket handler logs an ERROR and the model then never retrains
+        again until someone hand-edits the file — while every other read-time path this
+        plan added skips-and-warns. Must skip the bad entry, warn, and keep training."""
+        import logging
+
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        ts, energy_df, weather_df = self._pre_migration_fixture(tmp_path)
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        # Every entry unusable: one missing committed_at entirely, one unparseable.
+        pm.schedule["override_history"][0].pop("committed_at")
+        pm.schedule["override_history"].append(
+            {
+                "kind": "comfort_boost",
+                "date": "2024-01-14",
+                "hour": 9,
+                "target_c": 57.0,
+                "committed_at": "not-a-timestamp",
+                "cancelled_at": None,
+            }
+        )
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=30.0, physics_model=pm)
+
+        assert m.model is not None, "train() must still complete and fit a model"
+        assert any("committed_at" in r.message for r in caplog.records), (
+            f"expected a WARNING naming committed_at, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_cancelled_overrides_excluded_from_pre_migration_cutoff(self, tmp_path):
+        """Parked finding folded into final-review #5: a CANCELLED override never actually
+        happened, so its commit timestamp must not define "when did migration to this
+        feature begin". The cutoff must come from the earliest still-live entry."""
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        ts, energy_df, weather_df = self._pre_migration_fixture(tmp_path)
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models_cancelled", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        history = pm.schedule["override_history"]
+
+        # An EARLIER but cancelled entry must be ignored; the later live one wins.
+        live_cutoff_local = ts[450]
+        cancelled_cutoff_local = ts[100]
+        history[0]["committed_at"] = live_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC").isoformat()
+        history.append(
+            {
+                "kind": "comfort_boost",
+                "date": "2024-01-05",
+                "hour": 4,
+                "target_c": 57.0,
+                "committed_at": cancelled_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC").isoformat(),
+                "cancelled_at": "2024-01-05T05:00:00+00:00",
+            }
+        )
+
+        captured: list[tuple[np.ndarray, np.ndarray | None]] = []
+
+        def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+            built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+            real_fit = built.fit
+
+            def spy_fit(X_arg, y_arg, *a, **kw):
+                captured.append((X_arg.index.to_numpy(), kw.get("sample_weight")))
+                result = real_fit(X_arg, y_arg, *a, **kw)
+                del built.fit
+                return result
+
+            built.fit = spy_fit
+            return built
+
+        weight_halflife_days = 30.0
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=weight_halflife_days, physics_model=pm)
+
+        idx, sw = max(captured, key=lambda pair: len(pair[0]))
+        row_ts = ts[idx]
+        end_ts = energy_df["timestamp"].max()
+        base_weight = np.exp(-((end_ts - row_ts).total_seconds() / 86400.0) * np.log(2) / weight_halflife_days)
+
+        # Rows between the cancelled entry's commit and the live one's must still be
+        # down-weighted — if the cancelled entry had set the cutoff, they would be at
+        # full weight instead.
+        between = (row_ts >= cancelled_cutoff_local) & (row_ts < live_cutoff_local)
+        assert between.any(), "sanity: fixture must retain rows between the two commit timestamps"
+        np.testing.assert_allclose(sw[between], base_weight[between] * 0.5, rtol=1e-9, atol=1e-12)
+
     def test_gross_kwh_corrected_before_calibration_and_target_construction(self, tmp_path):
         """R1-#11: override_delta_series must be subtracted from gross_kwh once, upstream
         of both calibrate() and the ML training target — not independently in two places
