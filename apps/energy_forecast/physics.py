@@ -333,6 +333,42 @@ class ThermalPhysicsModel:
 
         return pd.Series(el_kwh, index=timestamps), pd.Series(t_tank_trajectory, index=timestamps), t_tank
 
+    def _override_active_mask(self, tank_diff: pd.Series) -> np.ndarray:
+        """Boolean mask of the hours whose raw_delta is a genuine consequence of an
+        override, given the per-hour |with_override − baseline| tank-temperature gap.
+
+        A training window can contain MANY independent override episodes (e.g. one
+        legionella cycle per week over a 30-day window). The previous implementation
+        located only the FIRST divergence → reconvergence pair and then zeroed
+        raw_delta from that reconvergence hour to the END of the array, silently
+        destroying every later episode's correctly-computed delta (final-review #1).
+
+        Each maximal contiguous run of `tank_diff >= threshold` is one episode; its
+        active window runs from the episode's first hour through the first subsequent
+        hour where the two trajectories are back within `threshold` (inclusive — that
+        hour's reheat decision was still taken from a diverged tank state, so its kWh
+        difference is real). Everything outside the union of those windows is zeroed:
+        before the first episode, in every gap between episodes, and after the last
+        one. With no episode at all the mask is all-False, i.e. an all-zero delta —
+        identical to the previous implementation's `raw_delta[:] = 0.0` branch.
+        """
+        diverged = (tank_diff >= self._OVERRIDE_TAIL_THRESHOLD_C).to_numpy()
+        n = len(diverged)
+        active = np.zeros(n, dtype=bool)
+        i = 0
+        while i < n:
+            if not diverged[i]:
+                i += 1
+                continue
+            episode_end = i
+            while episode_end < n and diverged[episode_end]:
+                episode_end += 1
+            # episode_end is the reconvergence hour (or n if the window ends mid-episode);
+            # the slice bound clips itself at n, so no special-casing is needed.
+            active[i : episode_end + 1] = True
+            i = episode_end + 1
+        return active
+
     def _compute_override_delta_series(
         self,
         timestamps: pd.DatetimeIndex,
@@ -356,15 +392,7 @@ class ThermalPhysicsModel:
         raw_delta = with_overrides_kwh - baseline_kwh
         tank_diff = (with_overrides_t_tank - baseline_t_tank).abs()
 
-        diverged = tank_diff >= self._OVERRIDE_TAIL_THRESHOLD_C
-        if diverged.any():
-            diverged_start = diverged.to_numpy().argmax()
-            reconverged = tank_diff.iloc[diverged_start:] < self._OVERRIDE_TAIL_THRESHOLD_C
-            if reconverged.any():
-                tail_end = diverged_start + reconverged.to_numpy().argmax()
-                raw_delta.iloc[tail_end:] = 0.0
-        else:
-            raw_delta[:] = 0.0  # no override ever diverged the trajectory in this window
+        raw_delta[~self._override_active_mask(tank_diff)] = 0.0
 
         bound = pd.concat([with_overrides_kwh, baseline_kwh], axis=1).max(axis=1)
         violated = raw_delta.abs() > bound

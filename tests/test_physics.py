@@ -511,6 +511,53 @@ class TestOverrideDeltaSeries:
         serving_tail_end = (serving_delta != 0.0).to_numpy().nonzero()[0][-1]
         assert training_tail_end == serving_tail_end
 
+    def test_two_separate_episodes_both_keep_their_own_tail(self, tmp_path):
+        """Final-review regression (#1): the tail-termination logic used to find only the
+        FIRST divergence→reconvergence pair and then zero raw_delta from that reconvergence
+        point to the END of the array — silently destroying every later override episode's
+        legitimate, already-correctly-computed delta. Two legionella overrides two weeks
+        apart in a month-long training window must BOTH produce a nonzero delta."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-01 00:00", periods=24 * 30, freq="h")
+        # 20.0 ambient keeps the reheat cycle short enough that the first episode fully
+        # reconverges long before the second one starts (same rationale as the
+        # single-episode test above), so the two episodes are genuinely independent.
+        t_ambient = pd.Series(20.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "legionella",
+                "date": "2026-08-18",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        first = delta.loc["2026-08-04 12:00":"2026-08-04 23:00"]
+        second = delta.loc["2026-08-18 12:00":"2026-08-18 23:00"]
+        assert (first != 0.0).any(), "first episode must produce a nonzero delta"
+        assert (second != 0.0).any(), "second episode must produce a nonzero delta too"
+        assert delta.loc["2026-08-18 12:00"] != 0.0
+        # ... and the quiet gap between the two episodes must still be fully zeroed
+        # (episode 1's tank trajectories reconverge at 2026-08-07 06:00, so the gap
+        # starts after that — the point is that the SECOND episode is not swallowed,
+        # not that the first one's legitimate tail is cut short)
+        gap = delta.loc["2026-08-07 07:00":"2026-08-18 11:00"]
+        assert (gap == 0.0).all(), "hours between the two episodes must stay zeroed"
+        # ... as must the tail after the last episode reconverges
+        assert delta.iloc[-1] == 0.0
+
     def test_train_serve_symmetry_full_delta_tail_round_trips(self, tmp_path):
         """Subtracting then re-adding the delta across the entire tail (not just the
         committed hour) must round-trip to the original value (R1-#7)."""
