@@ -381,6 +381,41 @@ class EnergyForecastModel:
                 n_rows,
             )
 
+        # _override_history is hoisted here (rather than declared only inside the
+        # `if physics_model is not None:` block below) so it stays in scope for the
+        # R1-#13 pre-migration down-weight block further down in this function even
+        # when physics_model is None.
+        _override_history = physics_model.schedule.get("override_history", []) if physics_model is not None else []
+
+        # Goal 1/2 (R1-#11): correct gross_kwh for any committed DHW override ONCE, upstream
+        # of both calibration and the ML training target — single source of truth, not two
+        # independent subtraction points that could drift apart. Uses self._calib's current
+        # (pre-this-cycle) values as a bootstrap approximation — calibrate() below refines
+        # them further using the now-corrected series.
+        if physics_model is not None:
+            _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
+            if _override_history:
+                # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
+                # derived exactly the way predict_training_series derives it for the real
+                # physics_kwh feature — not raw outdoor temperature (final-review #2).
+                # Deliberately the simple _area_weighted_t_indoor form, without
+                # _project_indoor_temps: this is a historical training window with real
+                # readings, so there is nothing to project, and predict_training_series
+                # doesn't project here either — the two must agree.
+                from .physics import DEFAULT_AMBIENT_C
+
+                _t_indoor_for_delta = physics_model._area_weighted_t_indoor(
+                    climate_dfs or {}, _timestamps_for_delta, room_areas
+                )
+                if _t_indoor_for_delta is None:
+                    _t_indoor_for_delta = pd.Series(DEFAULT_AMBIENT_C, index=_timestamps_for_delta)
+                _initial_t_tank = physics_model._initial_t_tank_for_window(dhw_df, _timestamps_for_delta)
+                _override_delta = physics_model.compute_training_override_delta(
+                    _timestamps_for_delta, _t_indoor_for_delta, _initial_t_tank, _override_history
+                )
+                energy_df = energy_df.copy()
+                energy_df["gross_kwh"] = energy_df["gross_kwh"].to_numpy() - _override_delta.to_numpy()
+
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
@@ -468,6 +503,63 @@ class EnergyForecastModel:
             ow = open_window_flags.reindex(df["timestamp"].values if "timestamp" in df else hourly_weights.index)
             down_weight = pd.Series(np.where(ow.fillna(False), 0.5, 1.0), index=hourly_weights.index)
             hourly_weights = hourly_weights * down_weight
+
+        # ── Down-weight pre-migration hours (R1-#13) ─────────────────────────
+        # Bounds how long training rows from before the DHW override-correction
+        # fix shipped (no override_history to reconstruct from, so any override-shaped
+        # spikes in gross_kwh are noise the model has to explain away some other way)
+        # stay at full training influence — roughly weight_halflife_days after ship,
+        # via the existing recency-halflife weighting above.
+        if _override_history and hourly_weights is not None:
+            # Read-time validation, never raise (final-review #5): a single malformed
+            # entry used to raise straight out of train(), where _retrain_cb's blanket
+            # handler logs an ERROR and the model then never retrains again until the
+            # file is hand-fixed. Every other read-time path this plan added
+            # skips-and-warns; this one now does too.
+            _committed_ats: list[Any] = []
+            for _entry in _override_history:
+                try:
+                    if _entry.get("cancelled_at") is not None:
+                        # A cancelled override never actually happened, so its commit
+                        # can't mark when migration to this feature began.
+                        continue
+                    _committed_at = pd.Timestamp(_entry["committed_at"])
+                    if pd.isna(_committed_at):
+                        raise ValueError("committed_at is not a timestamp")
+                    if _committed_at.tzinfo is not None:
+                        # committed_at is written as an ISO-8601 UTC-aware string
+                        # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
+                        # df["timestamp"] is naive LOCAL time throughout this module (stripped
+                        # via _strip_tz(df, self._timezone) before train() ever sees it). A bare
+                        # tz_localize(None) would strip the tz label without converting, leaving
+                        # UTC wall-clock numbers mislabeled as naive — silently misclassifying
+                        # every row within the local UTC offset of the true cutoff. Must convert
+                        # to local time first, same pattern as energy_forecast.py:1013
+                        # (`.tz_convert(self._timezone).tz_localize(None)`), not the bare
+                        # tz_localize(None) used elsewhere in this class for values that were
+                        # already local when constructed (e.g. model.py's own
+                        # `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` calls).
+                        # Normalizing here (rather than after min()) also keeps min() from
+                        # comparing tz-aware against naive Timestamps, which itself raises.
+                        _committed_at = _committed_at.tz_convert(self._timezone).tz_localize(None)
+                    _committed_ats.append(_committed_at)
+                except Exception as _exc:  # noqa: BLE001 — read-time validation contract
+                    _LOGGER.warning(
+                        "override_history: entry with unusable committed_at skipped for the "
+                        "pre-migration down-weight: %s (%s)",
+                        _entry,
+                        _exc,
+                    )
+            if not _committed_ats:
+                _LOGGER.warning(
+                    "override_history: no entry has a usable committed_at (all malformed or "
+                    "cancelled) — skipping the pre-migration down-weight this cycle"
+                )
+            else:
+                _ship_cutoff = min(_committed_ats)
+                _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
+                _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
+                hourly_weights = hourly_weights * _down_weight_migration
 
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes
@@ -1347,7 +1439,14 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
             room_areas=room_areas,
-            physics_model=physics_model,  # dhw_schedule_override intentionally omitted — this is the natural baseline
+            physics_model=physics_model,
+            # predict_series's silent committed_override fallback was removed (Phase A Task 6) —
+            # this call site must ask for the live committed override explicitly so the "natural
+            # baseline" still reflects whatever's actually committed right now (e.g. an already-
+            # armed legionella boost) when scoring a *different* candidate dhw_schedule_override.
+            dhw_schedule_override=(
+                physics_model.schedule.get("committed_override") if physics_model is not None else None
+            ),
         )
 
         if dhw_schedule_override is not None and physics_model is not None:

@@ -16,6 +16,7 @@ apps/energy_forecast/energy_model.pkl.sha256
 apps/energy_forecast/meta.pkl
 apps/energy_forecast/meta.pkl.sha256
 apps/energy_forecast/energy_history.csv
+apps/energy_forecast/models/
 
 # HA database (large, local only)
 *.db

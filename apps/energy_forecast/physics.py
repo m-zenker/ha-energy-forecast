@@ -5,9 +5,11 @@ See docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md for the design
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,8 @@ import numpy as np
 import pandas as pd
 
 _LOGGER = logging.getLogger("energy_forecast.physics")
+
+_VALID_OVERRIDE_KINDS = ("legionella", "comfort_boost")
 
 COP_MIN = 1.1
 ETA_CARNOT = 0.45
@@ -79,6 +83,7 @@ def _default_schedule() -> dict[str, Any]:
         "T_dhw_lower": 45.0,
         "dhw_tank_volume_l": 200,
         "committed_override": None,
+        "override_history": [],
     }
 
 
@@ -106,6 +111,8 @@ def _read_json_or_default(path: Path, default: dict) -> dict:
 class ThermalPhysicsModel:
     """Calibrated physics baseline for hourly household electricity consumption."""
 
+    _OVERRIDE_TAIL_THRESHOLD_C = 0.1  # R2-#3: shared cutoff, both call sites use it identically
+
     def __init__(self, model_dir: Path, config: dict) -> None:
         self._model_dir = model_dir
         self._model_dir.mkdir(parents=True, exist_ok=True)
@@ -119,6 +126,21 @@ class ThermalPhysicsModel:
         self._schedule = {**schedule_defaults, **_read_json_or_default(self._schedule_path, schedule_defaults)}
 
         self._tau_hours: float | None = None  # set externally by Plan B from EnergyForecastModel._tau_hours
+
+    @property
+    def schedule(self) -> dict:
+        return self._schedule
+
+    def _initial_t_tank_for_window(self, dhw_df: pd.DataFrame | None, timestamps: pd.DatetimeIndex) -> float:
+        """Shared initial-tank-state estimate for a training/forecast window — extracted
+        from predict_training_series to avoid duplicating this logic at the new
+        override-delta call site in model.py."""
+        if dhw_df is not None and not dhw_df.empty:
+            d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
+                timestamps, method="nearest"
+            )
+            return float(d.iloc[0]) if not d.empty and pd.notna(d.iloc[0]) else self._schedule["T_dhw_upper"]
+        return (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
     @property
     def calibration_stale(self) -> bool:
@@ -205,31 +227,78 @@ class ThermalPhysicsModel:
         return q_heat_el
 
     def _dhw_override_for_hour(self, ts: pd.Timestamp, override: dict | None) -> float | None:
-        """Return an override target temp (T_legionella) for *ts* if a legionella override applies, else None."""
-        if not override or "legionella" not in override:
+        """Return an override target temp for *ts* if a committed override (legionella
+        or comfort_boost) applies, else None. Same-hour precedence: legionella wins —
+        defense in depth for the data model; Goal 5 (EM-side) makes two genuinely
+        concurrent same-hour events physically unreachable in practice."""
+        if not override:
             return None
-        date_str, hour = override["legionella"]
-        target = pd.Timestamp(f"{date_str} {hour:02d}:00")
-        if ts == target:
-            return self._schedule["T_legionella"]
+        legionella_val = override.get("legionella")
+        if legionella_val is not None:
+            date_str, hour = legionella_val
+            if ts == pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                return self._schedule["T_legionella"]
+        comfort_boost_val = override.get("comfort_boost")
+        if comfort_boost_val is not None:
+            date_str, hour, target_c = comfort_boost_val
+            if ts == pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                return float(target_c)
         return None
+
+    def _dhw_override_for_hour_from_history(self, ts: pd.Timestamp, history: list[dict]) -> float | None:
+        """Training-reconstruction lookup mode (Goal 2): scans override_history for a
+        non-cancelled entry matching (kind, date, hour) == ts. Same-hour precedence:
+        legionella wins (mirrors _dhw_override_for_hour). Malformed entries are skipped
+        with a WARNING, never raised — read-time validation mirrors commit_dhw_schedule's
+        write-time contract (R1-#20)."""
+        legionella_target: float | None = None
+        comfort_boost_target: float | None = None
+        for entry in history:
+            try:
+                if entry.get("cancelled_at") is not None:
+                    continue
+                kind = entry["kind"]
+                date_str = entry["date"]
+                hour = entry["hour"]
+                target_c = entry["target_c"]
+                if kind not in _VALID_OVERRIDE_KINDS or target_c is None:
+                    _LOGGER.warning(f"override_history: malformed entry skipped: {entry}")
+                    continue
+                if ts != pd.Timestamp(f"{date_str} {int(hour):02d}:00"):
+                    continue
+                if kind == "legionella":
+                    legionella_target = float(target_c)
+                else:
+                    comfort_boost_target = float(target_c)
+            except Exception as e:  # noqa: BLE001 — read-time validation contract, R1-#20
+                _LOGGER.warning(f"override_history: malformed entry skipped: {entry} ({e})")
+                continue
+        return legionella_target if legionella_target is not None else comfort_boost_target
 
     def _dhw_kwh_series(
         self,
         timestamps: pd.DatetimeIndex,
         t_ambient: pd.Series,
         initial_t_tank: float,
-        dhw_schedule_override: dict | None,
-    ) -> tuple[pd.Series, float]:
+        override_lookup: Callable[[pd.Timestamp], float | None] | None = None,
+    ) -> tuple[pd.Series, pd.Series, float]:
+        """Returns (el_kwh_series, t_tank_series, final_t_tank). override_lookup is a
+        per-hour callable returning an override target temp or None; None means
+        override-blind (the mandatory mode for physics_kwh as an ML feature — Goal 1).
+        Same ODE math as before Phase A — only the override-source abstraction changed,
+        from a dict to a callable, so one loop can serve live-dict, history-based, and
+        blind lookup modes without duplicating it (R2-#3's "one shared function")."""
         volume_l = self._config["dhw_tank_volume_l"]
         c_dhw = volume_l * WATER_SPECIFIC_HEAT_WH_PER_L_K
         if c_dhw <= 0:
             _LOGGER.warning("DHW tank volume is zero or invalid — skipping DHW component")
-            return pd.Series(0.0, index=timestamps), float(initial_t_tank)
+            zeros = pd.Series(0.0, index=timestamps)
+            return zeros, pd.Series(float(initial_t_tank), index=timestamps), float(initial_t_tank)
         q_dhw_power = self._config["dhw_power_w"]
         heating_rise = q_dhw_power / c_dhw  # K/h, derived each call — not a stored constant
 
         t_lower = self._schedule["T_dhw_lower"]
+        t_upper = self._schedule["T_dhw_upper"]
         t_legionella = self._schedule["T_legionella"]
 
         q_dhw_daily = self._calib.get("Q_dhw_daily") or 0.0
@@ -239,28 +308,159 @@ class ThermalPhysicsModel:
 
         t_tank = float(initial_t_tank)
         el_kwh = np.zeros(len(timestamps))
+        t_tank_trajectory = np.zeros(len(timestamps))
         for i, ts in enumerate(timestamps):
             ua_dhw = self._calib.get("UA_dhw") or 15.0
             dT = -ua_dhw * (t_tank - float(t_ambient.iloc[i])) / c_dhw
             hour_of_day = ts.hour
             dT -= _DEFAULT_DRAW_PROFILE[hour_of_day] * draw_rate
 
-            override_target = self._dhw_override_for_hour(ts, dhw_schedule_override)
+            override_target = override_lookup(ts) if override_lookup is not None else None
             if override_target is not None:
                 q_el_w = q_dhw_power / cop_dhw
                 el_kwh[i] = q_el_w / 1000.0
                 t_tank = override_target
+                t_tank_trajectory[i] = t_tank
                 continue
 
-            if t_tank < t_lower:
-                q_el_w = q_dhw_power / cop_dhw
-                el_kwh[i] = q_el_w / 1000.0
-                t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_legionella))
+            if t_tank <= t_lower:
+                # A NORMAL reheat cycle targets T_dhw_upper, not T_legionella
+                # (final-review #3) — the legionella/comfort_boost ceiling belongs to the
+                # override branch above, which sets t_tank directly and never reaches here.
+                # The passive branch below deliberately keeps t_legionella as its ceiling:
+                # it must let a just-completed override coast DOWN from 60 degC rather than
+                # instantly clamping it to 55 and erasing the override's carryover tail.
+                new_t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_upper))
+                # Bill electricity for the ΔT actually achieved by heating this hour, not a
+                # flat full hour at rated power. Without this, hitting the (now lower)
+                # T_dhw_upper ceiling mid-hour still billed a full hour — since the
+                # T_dhw_lower..T_dhw_upper buffer shrank when the ceiling was corrected from
+                # T_legionella to T_dhw_upper, cycles became more frequent and each still cost
+                # a full hour, a measured +29% DHW electricity in a 14-day scenario (parked
+                # follow-up from the ceiling fix). Clipped to [0, heating_rise] to also bound
+                # the symmetric edge case where decay/draw this hour exceeds what full-power
+                # heating can offset, which would otherwise bill MORE than a full hour.
+                actual_heating_rise = float(np.clip(new_t_tank - (t_tank + dT), 0.0, heating_rise))
+                el_kwh[i] = actual_heating_rise * c_dhw / cop_dhw / 1000.0
+                t_tank = new_t_tank
             else:
                 el_kwh[i] = 0.0
                 t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))
+            t_tank_trajectory[i] = t_tank
 
-        return pd.Series(el_kwh, index=timestamps), t_tank
+        return pd.Series(el_kwh, index=timestamps), pd.Series(t_tank_trajectory, index=timestamps), t_tank
+
+    def _override_active_mask(self, tank_diff: pd.Series) -> np.ndarray:
+        """Boolean mask of the hours whose raw_delta is a genuine consequence of an
+        override, given the per-hour |with_override − baseline| tank-temperature gap.
+
+        A training window can contain MANY independent override episodes (e.g. one
+        legionella cycle per week over a 30-day window). The previous implementation
+        located only the FIRST divergence → reconvergence pair and then zeroed
+        raw_delta from that reconvergence hour to the END of the array, silently
+        destroying every later episode's correctly-computed delta (final-review #1).
+
+        Each maximal contiguous run of `tank_diff >= threshold` is one episode; its
+        active window runs from the episode's first hour through the first subsequent
+        hour where the two trajectories are back within `threshold` (inclusive — that
+        hour's reheat decision was still taken from a diverged tank state, so its kWh
+        difference is real). Everything outside the union of those windows is zeroed:
+        before the first episode, in every gap between episodes, and after the last
+        one. With no episode at all the mask is all-False, i.e. an all-zero delta —
+        identical to the previous implementation's `raw_delta[:] = 0.0` branch.
+        """
+        diverged = (tank_diff >= self._OVERRIDE_TAIL_THRESHOLD_C).to_numpy()
+        n = len(diverged)
+        active = np.zeros(n, dtype=bool)
+        i = 0
+        while i < n:
+            if not diverged[i]:
+                i += 1
+                continue
+            episode_end = i
+            while episode_end < n and diverged[episode_end]:
+                episode_end += 1
+            # episode_end is the reconvergence hour (or n if the window ends mid-episode);
+            # the slice bound clips itself at n, so no special-casing is needed.
+            active[i : episode_end + 1] = True
+            i = episode_end + 1
+        return active
+
+    def _compute_override_delta_series(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+        override_lookup: Callable[[pd.Timestamp], float | None],
+        baseline_kwh: pd.Series,
+        baseline_t_tank: pd.Series,
+    ) -> pd.Series:
+        """The one shared joint trajectory-diff-and-cutoff function (R2-#3) — called
+        identically by both compute_training_override_delta and
+        compute_serving_override_delta so the two never resolve an equivalent override
+        to different tail lengths. Computes ONE with-overrides trajectory (applying
+        every override the given lookup can see, in chronological order — R2-#1, not a
+        per-override sum), diffs it against the already-computed baseline, terminates
+        the tail at the first hour the two trajectories reconverge within 0.1°C, and
+        clips to the sanity bound (R1-#12/R2-#2)."""
+        with_overrides_kwh, with_overrides_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=override_lookup
+        )
+        raw_delta = with_overrides_kwh - baseline_kwh
+        tank_diff = (with_overrides_t_tank - baseline_t_tank).abs()
+
+        raw_delta[~self._override_active_mask(tank_diff)] = 0.0
+
+        bound = pd.concat([with_overrides_kwh, baseline_kwh], axis=1).max(axis=1)
+        violated = raw_delta.abs() > bound
+        if violated.any():
+            _LOGGER.warning(f"override_delta_series exceeded sanity bound on {int(violated.sum())} hour(s) — clipping")
+        return raw_delta.clip(lower=-bound, upper=bound)
+
+    def compute_training_override_delta(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+        override_history: list[dict],
+    ) -> pd.Series:
+        """Training-side entry point (Goal 2): replays override_history over the full
+        training window, including each override's full multi-hour carryover tail."""
+        baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=None
+        )
+        if not override_history:
+            return pd.Series(0.0, index=timestamps)
+
+        def lookup(ts: pd.Timestamp) -> float | None:
+            return self._dhw_override_for_hour_from_history(ts, override_history)
+
+        return self._compute_override_delta_series(
+            timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
+        )
+
+    def compute_serving_override_delta(
+        self,
+        timestamps: pd.DatetimeIndex,
+        t_ambient: pd.Series,
+        initial_t_tank: float,
+    ) -> pd.Series:
+        """Serving-side entry point (Goal 1): the deterministic post-model forecast
+        correction. Callers add this UNCONDITIONALLY to the model's already-final
+        published forecast — never fed back into physics_kwh or the trained model."""
+        baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
+            timestamps, t_ambient, initial_t_tank, override_lookup=None
+        )
+        committed = self._schedule.get("committed_override")
+        if not committed:
+            return pd.Series(0.0, index=timestamps)
+
+        def lookup(ts: pd.Timestamp) -> float | None:
+            return self._dhw_override_for_hour(ts, committed)
+
+        return self._compute_override_delta_series(
+            timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
+        )
 
     def _area_weighted_t_indoor(
         self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
@@ -280,6 +480,45 @@ class ThermalPhysicsModel:
         w = np.array(weights)
         return pd.Series(np.average(stacked.values, axis=1, weights=w), index=timestamps)
 
+    def _t_indoor_for_window(
+        self,
+        climate_recent: dict[str, pd.DataFrame] | None,
+        timestamps: pd.DatetimeIndex,
+        t_outdoor: pd.Series,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
+    ) -> pd.Series:
+        """Shared serving-side indoor-temperature derivation for a forecast window —
+        extracted verbatim from predict_series so the deterministic override correction
+        in energy_forecast.py drives _dhw_kwh_series with exactly the same ambient series
+        the real physics_kwh feature uses (final-review #2).
+
+        Before this extraction, the correction fed raw OUTDOOR temperature into a DHW
+        ODE whose t_ambient argument means "the air surrounding the tank" — i.e. it
+        modelled a tank standing outside in winter, inflating standing losses and thus
+        the correction itself. Same cross-module-reuse pattern as
+        _initial_t_tank_for_window."""
+        from .model import _project_indoor_temps  # local import avoids a circular import at module load time
+
+        t_indoor = None
+        if climate_recent:
+            projected = _project_indoor_temps(
+                climate_recent,
+                timestamps,
+                t_outdoor,
+                tau_hours=self._tau_hours,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
+            t_indoor = self._area_weighted_t_indoor(projected, timestamps, room_areas)
+
+        if t_indoor is None:
+            t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
+        return t_indoor
+
     def predict_series(
         self,
         forecast_df: pd.DataFrame,
@@ -291,8 +530,6 @@ class ThermalPhysicsModel:
         setpoint_off: float | None = None,
         dhw_schedule_override: dict | None = None,
     ) -> pd.Series:
-        from .model import _project_indoor_temps  # local import avoids a circular import at module load time
-
         timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
         t_outdoor = pd.Series(forecast_df["temp_c"].values, index=timestamps)
         ghi = (
@@ -302,22 +539,15 @@ class ThermalPhysicsModel:
         )
 
         try:
-            if climate_recent:
-                projected = _project_indoor_temps(
-                    climate_recent,
-                    timestamps,
-                    t_outdoor,
-                    tau_hours=self._tau_hours,
-                    heating_active_series=heating_active_series,
-                    setpoint_on=setpoint_on,
-                    setpoint_off=setpoint_off,
-                )
-                t_indoor = self._area_weighted_t_indoor(projected, timestamps, room_areas)
-            else:
-                t_indoor = None
-
-            if t_indoor is None:
-                t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
+            t_indoor = self._t_indoor_for_window(
+                climate_recent,
+                timestamps,
+                t_outdoor,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
 
             cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
             q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
@@ -333,10 +563,12 @@ class ThermalPhysicsModel:
             else:
                 initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
 
-            effective_override = (
-                dhw_schedule_override if dhw_schedule_override is not None else self._schedule.get("committed_override")
+            override_lookup = (
+                (lambda ts: self._dhw_override_for_hour(ts, dhw_schedule_override)) if dhw_schedule_override else None
             )
-            q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
+            q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
+                timestamps, t_indoor, initial_t_tank, override_lookup
+            )
 
             q_base_el = self._calib.get("Q_base_el") or 0.35
             physics_kwh = q_heat_el + q_dhw_el + q_base_el
@@ -369,16 +601,11 @@ class ThermalPhysicsModel:
         cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
         q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
 
-        if dhw_df is not None and not dhw_df.empty:
-            d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
-                timestamps, method="nearest"
-            )
-            initial_t_tank = float(d.iloc[0]) if not d.empty and pd.notna(d.iloc[0]) else self._schedule["T_dhw_upper"]
-        else:
-            initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
+        initial_t_tank = self._initial_t_tank_for_window(dhw_df, timestamps)
 
-        effective_override = self._schedule.get("committed_override")
-        q_dhw_el, _ = self._dhw_kwh_series(timestamps, t_indoor, initial_t_tank, effective_override)
+        q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
+            timestamps, t_indoor, initial_t_tank, override_lookup=None
+        )
         q_base_el = self._calib.get("Q_base_el") or 0.35
         return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
 
@@ -866,9 +1093,88 @@ class ThermalPhysicsModel:
             _LOGGER.warning(f"Physics calibration failed: {e} — retaining previous/default parameters")
 
     def commit_dhw_schedule(self, override: dict) -> None:
-        """Persist *override* as the new standing DHW schedule, bypassing the instability guard."""
-        # Convert to JSON-serializable form (tuples -> lists)
-        serializable_override = json.loads(json.dumps(override))
-        self._schedule["committed_override"] = serializable_override
+        """Merge semantics into committed_override + append-only override_history (Goal 4).
+        This is net-new code — the previous implementation was a flat replace. Never
+        raises: a malformed entry logs a WARNING and is skipped, never corrupting the
+        rest of the merge (R1 write-time validation contract)."""
+        if self._schedule.get("committed_override") is None:
+            self._schedule["committed_override"] = {}
+        committed = self._schedule["committed_override"]
+        history = self._schedule.setdefault("override_history", [])
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+
+        for kind, value in override.items():
+            if value is None:
+                prior = committed.pop(kind, None)
+                if prior is not None:
+                    self._mark_history_cancelled(history, kind, prior[0], prior[1])
+                continue
+            if kind not in _VALID_OVERRIDE_KINDS:
+                _LOGGER.warning(f"commit_dhw_schedule: unknown kind {kind!r} — skipping")
+                continue
+            if kind == "legionella":
+                if not (isinstance(value, list | tuple) and len(value) == 2):
+                    _LOGGER.warning(f"commit_dhw_schedule: malformed legionella value {value!r} — skipping")
+                    continue
+                date_str, hour = value
+                target_c = self._schedule["T_legionella"]
+            else:  # comfort_boost
+                if not (isinstance(value, list | tuple) and len(value) == 3):
+                    _LOGGER.warning(f"commit_dhw_schedule: malformed comfort_boost value {value!r} — skipping")
+                    continue
+                date_str, hour, target_c = value
+                if not isinstance(target_c, int | float):
+                    _LOGGER.warning(
+                        f"commit_dhw_schedule: comfort_boost target_c {target_c!r} is not numeric — skipping"
+                    )
+                    continue
+
+            committed[kind] = [date_str, hour] if kind == "legionella" else [date_str, hour, target_c]
+            self._replace_or_append_history(history, kind, date_str, hour, float(target_c), now_iso)
+
+        if not committed:
+            self._schedule["committed_override"] = None
         _atomic_write_json(self._schedule_path, self._schedule)
         _LOGGER.info(f"DHW schedule committed: {override}")
+
+    @staticmethod
+    def _mark_history_cancelled(history: list[dict], kind: str, date_str: str, hour: int) -> None:
+        """Genuine remote cancellation (not self-expiry): mark the specific still-pending
+        (kind, date, hour) entry cancelled rather than deleting it — keeps history
+        append-only/auditable and correctly zero-deltas it in reconstruction (R2 fix)."""
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+        for entry in history:
+            if (
+                entry.get("cancelled_at") is None
+                and entry.get("kind") == kind
+                and entry.get("date") == date_str
+                and entry.get("hour") == hour
+            ):
+                entry["cancelled_at"] = now_iso
+                return
+
+    @staticmethod
+    def _replace_or_append_history(
+        history: list[dict], kind: str, date_str: str, hour: int, target_c: float, committed_at: str
+    ) -> None:
+        """Last-write-wins dedup on (kind, date, hour) among non-cancelled entries (R1-#21)."""
+        for entry in history:
+            if (
+                entry.get("cancelled_at") is None
+                and entry.get("kind") == kind
+                and entry.get("date") == date_str
+                and entry.get("hour") == hour
+            ):
+                entry["target_c"] = target_c
+                entry["committed_at"] = committed_at
+                return
+        history.append(
+            {
+                "kind": kind,
+                "date": date_str,
+                "hour": hour,
+                "target_c": target_c,
+                "committed_at": committed_at,
+                "cancelled_at": None,
+            }
+        )

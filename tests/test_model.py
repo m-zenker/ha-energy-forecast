@@ -1263,6 +1263,446 @@ class TestTrainWithPhysics:
         assert flags.loc[anomaly_ts] == True  # noqa: E712 — explicit bool comparison reads clearer here
         assert flags.sum() < 10
 
+    def test_pre_migration_rows_down_weighted(self, tmp_path):
+        """R1-#13: training rows dated before the earliest override_history entry get
+        the same 0.5 down-weight multiplier as open-window-flagged hours, so the
+        pre-fix failure mode (override-shaped noise the model has to explain away)
+        doesn't stay at full training weight for as long as the full window spans.
+
+        Also exercises the tz-aware conversion path: `committed_at` is genuinely
+        UTC-aware here (built the same way `commit_dhw_schedule` really writes it —
+        an aware UTC ISO string), while `df["timestamp"]` is naive Europe/Zurich LOCAL
+        time (per the model's convention). A bare `tz_localize(None)` on the UTC value
+        would strip the tz label without converting, leaving UTC wall-clock numbers
+        mislabeled as local — misclassifying every row within Zurich's UTC+1 offset
+        (January = CET standard time, no DST edge case) of the true cutoff. This test's
+        `ship_cutoff_local` and `committed_at_utc` are deliberately 1 hour apart in
+        wall-clock terms so `ts[449]` (exactly at the UTC-mislabeled boundary) would be
+        misclassified as post-cutoff under the bare-tz_localize(None) bug but is
+        correctly pre-cutoff once `committed_at` is properly converted to local time
+        first.
+
+        Verification strategy: spy on _build_model (same technique as
+        test_training_target_reflects_override_blind_gross_kwh) to capture the exact
+        `sample_weight` array passed to the final full-fit model.fit() call, alongside
+        the fitted X's DataFrame index. Because the fixture's energy_df is already
+        timestamp-sorted before _add_lag_and_rolling_training's
+        sort_values().reset_index(drop=True), each surviving row's integer index is
+        exactly its position in `ts` — letting the test recover each row's real
+        timestamp and independently recompute the exact recency-halflife formula
+        model.py uses, then compare it (times 0.5 pre-cutoff / times 1.0 post-cutoff)
+        against the captured sample_weight bit-for-bit.
+        """
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        override_history = pm.schedule["override_history"]
+        assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
+
+        # ship_cutoff_local is the intended LOCAL (Europe/Zurich) wall-clock cutoff that
+        # df["timestamp"] rows (naive local) get compared against. committed_at_utc is
+        # what actually gets written into override_history — genuinely UTC-aware, exactly
+        # like commit_dhw_schedule's real `dt.datetime.now(dt.UTC).isoformat()` — derived
+        # from ship_cutoff_local by a real local→UTC conversion, not hand-picked to match.
+        ship_cutoff_local = ts[450]
+        committed_at_utc = ship_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC")
+        assert committed_at_utc.utcoffset() == pd.Timedelta(0), "sanity: parsed as UTC-aware"
+        assert committed_at_utc.tz_convert("Europe/Zurich").tz_localize(None) == ship_cutoff_local, (
+            "sanity: local->UTC->local round-trip must recover the original wall-clock cutoff"
+        )
+        override_history[0]["committed_at"] = committed_at_utc.isoformat()
+
+        captured: list[tuple[np.ndarray, np.ndarray | None]] = []
+
+        def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+            built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+            real_fit = built.fit
+
+            def spy_fit(X_arg, y_arg, *a, **kw):
+                captured.append((X_arg.index.to_numpy(), kw.get("sample_weight")))
+                result = real_fit(X_arg, y_arg, *a, **kw)
+                del built.fit
+                return result
+
+            built.fit = spy_fit
+            return built
+
+        weight_halflife_days = 30.0
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+            m.train(
+                energy_df,
+                weather_df,
+                outdoor_df=None,
+                weight_halflife_days=weight_halflife_days,
+                physics_model=pm,
+            )
+
+        assert captured, "train() never reached the model-fitting stage"
+        idx, sw = max(captured, key=lambda pair: len(pair[0]))
+        assert sw is not None, "sanity: sample_weight must be computed when weight_halflife_days > 0"
+
+        row_ts = ts[idx]
+        pre_mask = row_ts < ship_cutoff_local
+        post_mask = ~pre_mask
+        assert pre_mask.any(), "sanity: fixture must retain rows before ship_cutoff_local after lag dropna"
+        assert post_mask.any(), "sanity: fixture must retain rows after ship_cutoff_local after lag dropna"
+
+        # Independently recompute the exact recency-halflife formula (model.py's
+        # `np.exp(-days_ago * ln2 / weight_halflife_days)`, end_ts = energy_df max) and
+        # fold in the expected pre-migration 0.5 multiplier — must match the captured
+        # sample_weight exactly, not just approximately.
+        end_ts = energy_df["timestamp"].max()
+        days_ago = (end_ts - row_ts).total_seconds() / 86400.0
+        base_weight = np.exp(-days_ago * np.log(2) / weight_halflife_days)
+        expected = np.where(pre_mask, base_weight * 0.5, base_weight)
+
+        np.testing.assert_allclose(sw, expected, rtol=1e-9, atol=1e-12)
+        # And explicitly: pre-cutoff rows are exactly half of what the same row would
+        # have been without this down-weight (all else, i.e. the recency factor, equal).
+        np.testing.assert_allclose(sw[pre_mask], base_weight[pre_mask] * 0.5, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(sw[post_mask], base_weight[post_mask], rtol=1e-9, atol=1e-12)
+
+        # The critical boundary row: ts[449] (== ship_cutoff_local - 1h) is exactly the
+        # timestamp a bare tz_localize(None) bug would use as its (mislabeled-naive) UTC
+        # cutoff, misclassifying it as post-cutoff. With the correct local conversion it
+        # must land pre-cutoff and get the full 0.5 down-weight.
+        boundary_pos = np.where(idx == 449)[0]
+        assert boundary_pos.size == 1, "sanity: boundary row ts[449] must survive lag dropna for this check"
+        boundary_weight = sw[boundary_pos[0]]
+        boundary_days_ago = (end_ts - ts[449]).total_seconds() / 86400.0
+        boundary_base = np.exp(-boundary_days_ago * np.log(2) / weight_halflife_days)
+        assert boundary_weight == pytest.approx(boundary_base * 0.5, rel=1e-9), (
+            "boundary row ts[449] (1h before ship_cutoff_local) must be classified pre-cutoff — "
+            "if this fails with boundary_weight == boundary_base (no 0.5 applied), committed_at's "
+            "UTC->local conversion regressed to a bare tz_localize(None)"
+        )
+
+    def _pre_migration_fixture(self, tmp_path, n=600):
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        return ts, energy_df, weather_df
+
+    def test_malformed_committed_at_does_not_raise_out_of_train(self, tmp_path, caplog):
+        """Final-review #5: the pre-migration down-weight block computed
+        `min(e["committed_at"] for e in override_history)` unguarded. A single malformed
+        entry (missing or unparseable committed_at) raised straight out of train(), where
+        _retrain_cb's blanket handler logs an ERROR and the model then never retrains
+        again until someone hand-edits the file — while every other read-time path this
+        plan added skips-and-warns. Must skip the bad entry, warn, and keep training."""
+        import logging
+
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        ts, energy_df, weather_df = self._pre_migration_fixture(tmp_path)
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        # Every entry unusable: one missing committed_at entirely, one unparseable.
+        pm.schedule["override_history"][0].pop("committed_at")
+        pm.schedule["override_history"].append(
+            {
+                "kind": "comfort_boost",
+                "date": "2024-01-14",
+                "hour": 9,
+                "target_c": 57.0,
+                "committed_at": "not-a-timestamp",
+                "cancelled_at": None,
+            }
+        )
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=30.0, physics_model=pm)
+
+        assert m.model is not None, "train() must still complete and fit a model"
+        assert any("committed_at" in r.message for r in caplog.records), (
+            f"expected a WARNING naming committed_at, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_cancelled_overrides_excluded_from_pre_migration_cutoff(self, tmp_path):
+        """Parked finding folded into final-review #5: a CANCELLED override never actually
+        happened, so its commit timestamp must not define "when did migration to this
+        feature begin". The cutoff must come from the earliest still-live entry."""
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        ts, energy_df, weather_df = self._pre_migration_fixture(tmp_path)
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models_cancelled", self._physics_config())
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        history = pm.schedule["override_history"]
+
+        # An EARLIER but cancelled entry must be ignored; the later live one wins.
+        live_cutoff_local = ts[450]
+        cancelled_cutoff_local = ts[100]
+        history[0]["committed_at"] = live_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC").isoformat()
+        history.append(
+            {
+                "kind": "comfort_boost",
+                "date": "2024-01-05",
+                "hour": 4,
+                "target_c": 57.0,
+                "committed_at": cancelled_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC").isoformat(),
+                "cancelled_at": "2024-01-05T05:00:00+00:00",
+            }
+        )
+
+        captured: list[tuple[np.ndarray, np.ndarray | None]] = []
+
+        def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+            built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+            real_fit = built.fit
+
+            def spy_fit(X_arg, y_arg, *a, **kw):
+                captured.append((X_arg.index.to_numpy(), kw.get("sample_weight")))
+                result = real_fit(X_arg, y_arg, *a, **kw)
+                del built.fit
+                return result
+
+            built.fit = spy_fit
+            return built
+
+        weight_halflife_days = 30.0
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=weight_halflife_days, physics_model=pm)
+
+        idx, sw = max(captured, key=lambda pair: len(pair[0]))
+        row_ts = ts[idx]
+        end_ts = energy_df["timestamp"].max()
+        base_weight = np.exp(-((end_ts - row_ts).total_seconds() / 86400.0) * np.log(2) / weight_halflife_days)
+
+        # Rows between the cancelled entry's commit and the live one's must still be
+        # down-weighted — if the cancelled entry had set the cutoff, they would be at
+        # full weight instead.
+        between = (row_ts >= cancelled_cutoff_local) & (row_ts < live_cutoff_local)
+        assert between.any(), "sanity: fixture must retain rows between the two commit timestamps"
+        np.testing.assert_allclose(sw[between], base_weight[between] * 0.5, rtol=1e-9, atol=1e-12)
+
+    def test_gross_kwh_corrected_before_calibration_and_target_construction(self, tmp_path):
+        """R1-#11: override_delta_series must be subtracted from gross_kwh once, upstream
+        of both calibrate() and the ML training target — not independently in two places
+        that could drift apart.
+
+        Verification strategy: spy (wraps=) on both physics_model.calibrate and the
+        module-level _add_lag_and_rolling_training (the function that immediately follows
+        the correction block and whose output df["gross_kwh"] flows unchanged into the
+        final `y` used for the LightGBM fit — confirmed by reading _add_lag_and_rolling_training,
+        which only adds lag/rolling columns and otherwise copies energy_df's gross_kwh
+        verbatim). Inspecting both call sites' energy_df argument directly proves (a) calibrate
+        sees the corrected series and (b) the same corrected series reaches the ML target,
+        without needing to reach into LightGBM's fit() internals.
+        """
+        from energy_forecast.model import _add_lag_and_rolling_training
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        raw_value_at_override = energy_df.loc[energy_df["timestamp"] == ts[300], "gross_kwh"].iloc[0]
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        # ts[300] == 2024-01-13 12:00:00 — well inside the training window so the
+        # override's multi-hour carryover tail lands on real rows.
+        override_ts = ts[300]
+        pm.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        assert pm.schedule["override_history"], "sanity: commit_dhw_schedule did not populate override_history"
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+
+        with (
+            patch.object(pm, "calibrate", wraps=pm.calibrate) as mock_calibrate,
+            patch(
+                "energy_forecast.model._add_lag_and_rolling_training", wraps=_add_lag_and_rolling_training
+            ) as mock_add_lag,
+        ):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=pm)
+
+        calibrate_energy_df = mock_calibrate.call_args.args[0]
+        add_lag_energy_df = mock_add_lag.call_args.args[0]
+
+        calib_value = calibrate_energy_df.loc[calibrate_energy_df["timestamp"] == override_ts, "gross_kwh"].iloc[0]
+        target_value = add_lag_energy_df.loc[add_lag_energy_df["timestamp"] == override_ts, "gross_kwh"].iloc[0]
+
+        # (a) calibrate() sees the corrected series, not the raw fixture value.
+        assert calib_value != pytest.approx(raw_value_at_override)
+        # (b) the series feeding the ML training target (_add_lag_and_rolling_training,
+        # whose output df["gross_kwh"] becomes `y` unmodified) is the SAME corrected
+        # value — single source of truth, not two independent subtraction points.
+        assert target_value == pytest.approx(calib_value)
+
+    def test_training_target_reflects_override_blind_gross_kwh(self, tmp_path):
+        """Direct regression test for Goal 1/2: with a committed historical override in
+        override_history, the model's training target (`y_fit`, the array actually passed
+        to the final `model.fit(X, y_fit, ...)` call — log1p(gross_kwh) in this feature-mode
+        config) must be computed from the override-blind-corrected gross_kwh, not the raw
+        override-inflated actuals.
+
+        Fixture strategy: build a shared baseline gross_kwh series representing "what the
+        household would have consumed with no override ever happening". `energy_df_a`
+        adds the real `compute_training_override_delta` spike on top of that baseline and
+        commits the same override into `override_history` (this is what a real override
+        recording looks like — the *actual* meter reading is inflated by the override, and
+        the deterministic delta is the thing train() must subtract back out). `energy_df_b`
+        is the untouched baseline with an empty `override_history` (a pure "as if blind"
+        reference — nothing to correct). Because the same delta is added in fixture A and
+        (per Task 8's correction block) subtracted back out inside train(), the two runs'
+        corrected `gross_kwh` — and therefore their final training-target arrays — must
+        coincide, proving the correction genuinely neutralizes the override's effect on
+        what the model fits against, not just on some intermediate DataFrame.
+        """
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import DEFAULT_AMBIENT_C, ThermalPhysicsModel
+
+        def _train_capture_final_yfit(model, energy_df, weather_df, physics_model):
+            """Spy on _build_model so every model.fit(X, y, ...) call in train() is
+            recorded. The final "model on all data" fit (model.py ~line 799) is the
+            only one that ever sees the full-length y_fit array — CV folds, the
+            holdout model, and the quantile models all fit on strict subsets — so
+            picking the longest captured array reliably isolates it regardless of
+            how many CV folds ran."""
+            calls: list[np.ndarray] = []
+
+            def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+                built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+                real_fit = built.fit
+
+                def spy_fit(X_arg, y_arg, *a, **kw):
+                    calls.append(np.asarray(y_arg, dtype=float))
+                    result = real_fit(X_arg, y_arg, *a, **kw)
+                    # Restore the class-level `fit` (drop the instance-attribute
+                    # override) immediately after the single call each model
+                    # instance ever receives, so the trained model — captured
+                    # later in self.model and pickled by train()'s self._save() —
+                    # doesn't carry an unpicklable local closure.
+                    del built.fit
+                    return result
+
+                built.fit = spy_fit
+                return built
+
+            with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+                model.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=physics_model)
+            assert calls, "train() never reached the model-fitting stage"
+            return max(calls, key=len)
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        baseline_gross_kwh = rng.uniform(0.5, 5.0, size=n)
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+
+        # ── pm_a: real committed override, "as recorded" fixture includes the spike ──
+        pm_a = ThermalPhysicsModel(tmp_path / "physics_models_a", self._physics_config())
+        override_ts = ts[300]  # well inside the training window — carryover tail lands on real rows
+        pm_a.commit_dhw_schedule({"legionella": (override_ts.strftime("%Y-%m-%d"), int(override_ts.hour))})
+        override_history = pm_a.schedule["override_history"]
+        assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
+
+        timestamps_for_delta = pd.DatetimeIndex(ts)
+        # Final-review #2: the DHW ODE's t_ambient is INDOOR air, derived exactly the way
+        # predict_training_series derives it for the real physics_kwh feature — no
+        # climate_dfs in this fixture, so that derivation is the DEFAULT_AMBIENT_C
+        # fallback, NOT weather_df["temp_c"]. Building the expected delta from outdoor
+        # temperature (as this test originally did) no longer reproduces what train()
+        # subtracts, which is exactly the bug this assertion now pins down.
+        t_indoor_for_delta = pm_a._area_weighted_t_indoor({}, timestamps_for_delta, None)
+        if t_indoor_for_delta is None:
+            t_indoor_for_delta = pd.Series(DEFAULT_AMBIENT_C, index=timestamps_for_delta)
+        initial_t_tank = pm_a._initial_t_tank_for_window(None, timestamps_for_delta)
+        override_delta = pm_a.compute_training_override_delta(
+            timestamps_for_delta, t_indoor_for_delta, initial_t_tank, override_history
+        )
+        # Guard that this test can actually tell the two apart: the outdoor-temperature
+        # series must produce a materially different delta, so a regression back to
+        # outdoor temp inside train() fails the final allclose below rather than
+        # coincidentally passing.
+        t_outdoor_for_delta = pd.Series(weather_df["temp_c"].to_numpy(), index=timestamps_for_delta)
+        outdoor_delta = pm_a.compute_training_override_delta(
+            timestamps_for_delta, t_outdoor_for_delta, initial_t_tank, override_history
+        )
+        assert not np.allclose(override_delta.to_numpy(), outdoor_delta.to_numpy()), (
+            "sanity: indoor- and outdoor-ambient deltas must differ for this test to discriminate"
+        )
+        delta_at_override = float(override_delta.loc[override_ts])
+        assert delta_at_override != pytest.approx(0.0), (
+            "sanity: override delta must be nonzero at the override hour for this test to be meaningful"
+        )
+
+        energy_df_a = pd.DataFrame({"timestamp": ts, "gross_kwh": baseline_gross_kwh + override_delta.to_numpy()})
+        model_a = EnergyForecastModel(tmp_path / "model_a", timezone="Europe/Zurich")
+        y_fit_a = _train_capture_final_yfit(model_a, energy_df_a, weather_df, pm_a)
+
+        # ── pm_b: no override ever committed — pure "as if blind" reference ──────────
+        pm_b = ThermalPhysicsModel(tmp_path / "physics_models_b", self._physics_config())
+        assert not pm_b.schedule.get("override_history"), "sanity: pm_b must start with no override history"
+
+        energy_df_b = pd.DataFrame({"timestamp": ts, "gross_kwh": baseline_gross_kwh})
+        model_b = EnergyForecastModel(tmp_path / "model_b", timezone="Europe/Zurich")
+        y_fit_b = _train_capture_final_yfit(model_b, energy_df_b, weather_df, pm_b)
+
+        # The override's real spike (fixture A) must be fully neutralized by train()'s
+        # correction, landing on the exact same training target the override-blind
+        # reference (fixture B) produces — this is the property Goal 1/2 requires.
+        assert y_fit_a.shape == y_fit_b.shape
+        np.testing.assert_allclose(y_fit_a, y_fit_b, atol=1e-6, rtol=1e-6)
+
 
 # ── Physics-ML hybrid: predict() physics feature + portability fallback (Plan B Task 5) ──
 
@@ -3873,9 +4313,20 @@ class TestScenarioDhwDelta:
         # exactly this: `physics_model.commit_dhw_schedule(override)`.
         pm.commit_dhw_schedule(override_a)
 
-        # Task 1 proof: the natural baseline (no explicit override passed to
-        # predict()) now reflects committed A, not "no override at all".
-        pred_natural_with_a = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        # Task 1 proof: the natural baseline reflects committed A, not "no
+        # override at all". NOTE: as of Phase A Task 6, model.predict() itself
+        # no longer implicitly falls back to committed_override when
+        # dhw_schedule_override is omitted (physics_model.predict_series's
+        # silent fallback was removed, intentionally — the real forecast path
+        # energy_forecast.py:1980 must stay override-blind by default). The
+        # "natural baseline" guarantee this test exercises now lives
+        # specifically in predict_scenario()'s natural_baseline_df construction
+        # (model.py ~L1337), which asks for the committed override explicitly.
+        # Mirror that explicit ask here so this is a true proof of that
+        # invariant, not of a since-removed implicit default.
+        pred_natural_with_a = model.predict(
+            forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=pm._schedule.get("committed_override")
+        )
         pred_truly_uncommitted = model.predict(forecast_df, live_temp=5.0, physics_model=pm_never_committed)
         assert not np.allclose(
             pred_natural_with_a["predicted_kwh"].to_numpy(),

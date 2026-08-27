@@ -251,9 +251,91 @@ class TestDHWOde:
         pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
         ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
         t_ambient = pd.Series([20.0] * 24, index=ts)
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         assert (q_dhw_el >= 0.0).all()
         assert 45.0 <= final_temp <= 60.0  # clamp bounds enforced
+
+    def test_reheat_cycles_multiple_times_not_permanently_pinned_after_first_floor_touch(self, tmp_path):
+        """Regression: the reheat trigger was `t_tank < t_lower` (strict), but the passive
+        branch's clip() floors any crossing to exactly t_lower. Once that happened, the
+        strict `<` check could never be true again (t_tank == t_lower forever), permanently
+        disabling reheat for the rest of any run — el_kwh stuck at 0.0 no matter how long
+        the window. Fixed to `t_tank <= t_lower` so a tank sitting exactly at the floor
+        re-triggers reheat. Over 24h with a default calibration and initial_t_tank at the
+        floor, the tank must cycle (reheat, coast down, re-touch the floor, reheat again)
+        multiple times, not just once."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-08-04 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series(10.0, index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+        nonzero_hours = (q_dhw_el > 0.0).sum()
+        assert nonzero_hours >= 2, f"expected multiple reheat cycles in 24h, got {nonzero_hours}"
+        # tank must actually revisit the floor between reheats, not just heat once and coast
+        assert (t_tank_series == pm._schedule["T_dhw_lower"]).sum() >= 2
+
+    def test_normal_reheat_caps_at_t_dhw_upper_not_t_legionella(self, tmp_path):
+        """Final-review #3: the NORMAL (non-override) reheat branch used to clip to
+        T_legionella (60 degC) as its ceiling, so every ordinary reheat cycle over-shot
+        the real setpoint T_dhw_upper (55 degC) by 5 K — inflating stored energy, and
+        therefore standing losses and the silent-coast time that follows, for every
+        install. Legionella/comfort_boost overrides are unaffected: they bypass this
+        branch entirely via the `override_target is not None` branch above it.
+        """
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=24 * 5, freq="1h")
+        t_ambient = pd.Series(20.0, index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+
+        assert t_tank_series.max() <= pm._schedule["T_dhw_upper"] + 1e-9, (
+            f"normal reheat overshot T_dhw_upper: max={t_tank_series.max()}"
+        )
+        # ... and the ceiling is actually reachable (not a vacuous bound): with a
+        # 17.2 K/h heating rise from the 45 degC floor, a full reheat hour saturates it.
+        assert t_tank_series.max() == pytest.approx(pm._schedule["T_dhw_upper"], abs=1e-6)
+        # ... while the tank still genuinely cycles (reheat / coast / reheat).
+        assert (q_dhw_el > 0.0).sum() >= 2
+
+    def test_reheat_energy_prorated_to_actual_delta_when_ceiling_clips_mid_hour(self, tmp_path):
+        """Regression for the +29% DHW electricity side effect discovered after the
+        T_dhw_upper ceiling fix above: shrinking the T_dhw_lower..T_dhw_upper buffer
+        makes reheat cycles more frequent, and each one used to bill a flat full hour
+        at rated power even when the tank hit the ceiling partway through the hour.
+        Electricity must instead be prorated to the delta actually achieved by
+        heating (14-day scenario: 50.26 -> 64.62 kWh with flat billing, ~neutral with
+        prorating)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        # 1 K buffer guarantees the ~17.2 K/h heating rise clips well within the hour.
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=46.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=1, freq="1h")
+        t_ambient = pd.Series([20.0], index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+
+        cop_dhw = pm._cop_formula_value(20.0, None)
+        full_hour_kwh = (DEFAULT_CONFIG["dhw_power_w"] / cop_dhw) / 1000.0
+        assert t_tank_series.iloc[0] == pytest.approx(46.0, abs=1e-6)  # ceiling reached mid-hour
+        assert 0.0 < q_dhw_el.iloc[0] < full_hour_kwh, (
+            f"expected prorated billing below the full-hour amount ({full_hour_kwh:.3f} kWh), "
+            f"got {q_dhw_el.iloc[0]:.3f} kWh"
+        )
+
+    def test_override_target_still_bypasses_the_reheat_ceiling(self, tmp_path):
+        """Companion to the above: a legionella override must still be able to drive the
+        tank to T_legionella (60 degC), above the normal-reheat T_dhw_upper ceiling."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series(20.0, index=ts)
+        target_ts = pd.Timestamp("2026-01-15 12:00")
+        _, t_tank_series, _ = pm._dhw_kwh_series(
+            ts, t_ambient, initial_t_tank=45.0, override_lookup=lambda t: 60.0 if t == target_ts else None
+        )
+        assert t_tank_series.loc[target_ts] == pytest.approx(60.0)
 
     def test_heating_rise_derived_not_constant(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
@@ -261,12 +343,18 @@ class TestDHWOde:
         ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
         t_ambient = pd.Series([20.0, 20.0], index=ts)
         # start just below T_lower to force a reheat on hour 0
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         assert q_dhw_el.iloc[0] > 0.0
-        # different tank volume -> different heating_rise -> different final tank temp (not hardcoded)
-        pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 300})
+        # different tank volume -> different heating_rise -> different final tank temp (not hardcoded).
+        # 500 L, not 300 L: once the normal-reheat ceiling was corrected from T_legionella
+        # (60 degC) to T_dhw_upper (55 degC) — final-review #3 — a 300 L tank's 11.5 K/h rise
+        # from the 44 degC start still saturates that lower ceiling within the single reheat
+        # hour, just as the 200 L tank's 17.2 K/h does, so both land on 55.0 and the volume
+        # difference is masked by the clip rather than by any hardcoding. 500 L (6.9 K/h)
+        # stays below the ceiling, so heating_rise still visibly drives the result.
+        pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 500})
         pm2._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
-        q_dhw_el2, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, dhw_schedule_override=None)
+        q_dhw_el2, _, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         # within 2-hour window, electricity series is identical (same reheat power/COP hour 0, silent hour 1)
         # but final tank temperature diverges due to different heating_rise values
         assert final_temp != pytest.approx(final_temp2, abs=0.5)
@@ -277,7 +365,7 @@ class TestDHWOde:
         pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
         ts = pd.date_range("2026-01-15 00:00", periods=12, freq="1h")
         t_ambient = pd.Series([20.0] * 12, index=ts)
-        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=60.0, dhw_schedule_override=None)
+        q_dhw_el, _, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=60.0, override_lookup=None)
         # tank starts at legionella temp -> several hours of zero electricity before it cools to T_lower
         assert q_dhw_el.iloc[0] == 0.0
         assert q_dhw_el.iloc[1] == 0.0
@@ -289,7 +377,9 @@ class TestDHWOde:
         ts = pd.date_range("2026-06-24 00:00", periods=48, freq="1h")  # Wed 2026-06-24 is dow=2
         t_ambient = pd.Series([20.0] * 48, index=ts)
         override = {"legionella": ("2026-06-25", 10)}  # move to Thursday 10:00
-        q_dhw_el, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=override)
+        q_dhw_el, _, _ = pm._dhw_kwh_series(
+            ts, t_ambient, initial_t_tank=50.0, override_lookup=lambda ts: pm._dhw_override_for_hour(ts, override)
+        )
         thu_10 = pd.Timestamp("2026-06-25 10:00")
         # a legionella boost (heating to T_legionella) must occur at/after the overridden hour
         assert q_dhw_el.loc[q_dhw_el.index >= thu_10].max() > 0
@@ -299,7 +389,7 @@ class TestDHWOde:
         pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
         ts = pd.date_range("2026-01-15 00:00", periods=2, freq="1h")
         t_ambient = pd.Series([50.0, 50.0], index=ts)  # T_ambient == T_tank -> no insulation loss
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=50.0, override_lookup=None)
         assert np.isfinite(final_temp)
 
     def test_zero_dhw_tank_volume_skips_dhw_component(self, tmp_path, caplog):
@@ -316,7 +406,7 @@ class TestDHWOde:
         initial_t = 50.0
 
         # Should not raise; should return zeros
-        q_dhw_el, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=initial_t, dhw_schedule_override=None)
+        q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=initial_t, override_lookup=None)
 
         # All electricity should be zero
         assert (q_dhw_el == 0.0).all(), f"Expected all zeros, got {q_dhw_el.values}"
@@ -324,6 +414,243 @@ class TestDHWOde:
         assert final_temp == pytest.approx(initial_t)
         # Should have logged a warning
         assert "DHW tank volume is zero or invalid" in caplog.text
+
+
+class TestDhwKwhSeriesOverrideLookup:
+    def test_override_lookup_none_is_override_blind(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        el_kwh, t_tank_series, final_t = pm._dhw_kwh_series(timestamps, t_ambient, 50.0, override_lookup=None)
+        # No override anywhere in a 24h override-blind run — series must have no
+        # discontinuous jump to T_legionella at any hour.
+        assert (t_tank_series <= pm._schedule["T_legionella"] + 1e-6).all()
+        assert not (t_tank_series == pm._schedule["T_legionella"]).any()
+
+    def test_override_lookup_callable_applies_target_at_matching_hour(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        target_ts = pd.Timestamp("2026-08-04 12:00")
+
+        def lookup(ts):
+            return 60.0 if ts == target_ts else None
+
+        _, t_tank_series, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=lookup)
+        assert t_tank_series.loc[target_ts] == 60.0
+
+    def test_t_tank_series_has_same_index_as_timestamps(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=6, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        _, t_tank_series, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        assert list(t_tank_series.index) == list(timestamps)
+
+
+class TestOverrideDeltaSeries:
+    def test_zero_when_no_override_history(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, [])
+        assert (delta == 0.0).all()
+
+    def test_legionella_override_produces_nonzero_multihour_tail(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        # 20.0, not the plan's literal 10.0: _dhw_kwh_series's reheat-trigger permanent-pin
+        # bug (t_tank < t_lower never re-firing once clipped exactly to the floor) has now
+        # been fixed (t_tank <= t_lower), so the tank genuinely cycles at either ambient.
+        # But at 10.0 the passive cool-down between cycles takes longer, so the reheat
+        # cycle period is long enough that the legionella boost's one-cycle phase-shift
+        # hasn't fully resynced with the un-boosted baseline by hour 23 (delta.iloc[-1]
+        # != 0) — empirically verified. 20.0 gives a short enough cycle period to
+        # reconverge within this 24h window while still exercising a genuine multi-hour
+        # nonzero tail.
+        t_ambient = pd.Series(20.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        # nonzero at the override hour and for at least a few hours after (reconvergence tail)
+        assert delta.loc["2026-08-04 12:00"] != 0.0
+        nonzero_after = (delta.loc["2026-08-04 13:00":"2026-08-04 18:00"] != 0.0).sum()
+        assert nonzero_after >= 1
+        # trajectories must have reconverged by the end of the 24h window
+        assert delta.iloc[-1] == 0.0
+
+    def test_joint_computation_no_double_counting_on_overlapping_tails(self, tmp_path):
+        """R2-#1 direct regression: legionella hour 12 + comfort_boost hour 14 (inside
+        the reconvergence tail) must not sum two independent per-override diffs."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-04",
+                "hour": 14,
+                "target_c": 55.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        joint_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        # independent-per-override baseline for comparison: replay legionella alone
+        legionella_only = [history[0]]
+        legionella_only_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, legionella_only)
+        comfort_boost_only = [history[1]]
+        comfort_boost_only_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, comfort_boost_only)
+        naive_sum = legionella_only_delta + comfort_boost_only_delta
+        # the joint computation must differ from the naive independent sum in at
+        # least one overlapping hour — proving it isn't just summing two diffs
+        assert not joint_delta.equals(naive_sum)
+
+    def test_sanity_bound_references_larger_of_the_two_trajectories(self, tmp_path):
+        """R2-#2: for the dominant negative-delta case (override run draws less),
+        the bound must reference max(with_override, baseline), not just the
+        override run's own (often near-zero) draw."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=12, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 0,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        baseline_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+
+        def override_lookup(ts):
+            return pm._dhw_override_for_hour_from_history(ts, history)
+
+        with_override_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup)
+        bound = pd.concat([with_override_kwh, baseline_kwh], axis=1).max(axis=1)
+        assert (delta.abs() <= bound + 1e-9).all()
+
+    def test_tail_termination_matches_between_training_and_serving_entry_points(self, tmp_path):
+        """R2-#3 direct regression: both public entry points delegate to the same
+        shared function, so they resolve an equivalent override to the identical
+        tail length."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        training_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        pm._schedule["committed_override"] = {"legionella": ["2026-08-04", 12]}
+        serving_delta = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+
+        training_tail_end = (training_delta != 0.0).to_numpy().nonzero()[0][-1]
+        serving_tail_end = (serving_delta != 0.0).to_numpy().nonzero()[0][-1]
+        assert training_tail_end == serving_tail_end
+
+    def test_two_separate_episodes_both_keep_their_own_tail(self, tmp_path):
+        """Final-review regression (#1): the tail-termination logic used to find only the
+        FIRST divergence→reconvergence pair and then zero raw_delta from that reconvergence
+        point to the END of the array — silently destroying every later override episode's
+        legitimate, already-correctly-computed delta. Two legionella overrides two weeks
+        apart in a month-long training window must BOTH produce a nonzero delta."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-01 00:00", periods=24 * 30, freq="h")
+        # 20.0 ambient keeps the reheat cycle short enough that the first episode fully
+        # reconverges long before the second one starts (same rationale as the
+        # single-episode test above), so the two episodes are genuinely independent.
+        t_ambient = pd.Series(20.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "legionella",
+                "date": "2026-08-18",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+
+        first = delta.loc["2026-08-04 12:00":"2026-08-04 23:00"]
+        second = delta.loc["2026-08-18 12:00":"2026-08-18 23:00"]
+        assert (first != 0.0).any(), "first episode must produce a nonzero delta"
+        assert (second != 0.0).any(), "second episode must produce a nonzero delta too"
+        assert delta.loc["2026-08-18 12:00"] != 0.0
+        # ... and the quiet gap between the two episodes must still be fully zeroed
+        # (episode 1's tank trajectories reconverge at 2026-08-07 06:00, so the gap
+        # starts after that — the point is that the SECOND episode is not swallowed,
+        # not that the first one's legitimate tail is cut short)
+        gap = delta.loc["2026-08-07 07:00":"2026-08-18 11:00"]
+        assert (gap == 0.0).all(), "hours between the two episodes must stay zeroed"
+        # ... as must the tail after the last episode reconverges
+        assert delta.iloc[-1] == 0.0
+
+    def test_train_serve_symmetry_full_delta_tail_round_trips(self, tmp_path):
+        """Subtracting then re-adding the delta across the entire tail (not just the
+        committed hour) must round-trip to the original value (R1-#7)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        with_override_kwh, _, _ = pm._dhw_kwh_series(
+            timestamps, t_ambient, 45.0, lambda ts: pm._dhw_override_for_hour_from_history(ts, history)
+        )
+        delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        baseline_kwh, _, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        # train side: subtract delta from with-override actuals to get "as if blind"
+        reconstructed_blind = with_override_kwh - delta
+        pd.testing.assert_series_equal(reconstructed_blind, baseline_kwh, check_names=False)
 
 
 class TestPredictSeries:
@@ -1001,8 +1328,20 @@ class TestCommittedDhwSchedule:
         # reload from disk to confirm persistence
         pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
         assert pm2._schedule["committed_override"] == {"legionella": ["2026-06-25", 22]}
+        assert len(pm2._schedule["override_history"]) == 1  # new: side effect of commit
 
-    def test_natural_baseline_applies_committed_override_by_default(self, tmp_path):
+    def test_predict_series_is_override_blind_by_default_even_with_committed_override(self, tmp_path):
+        """As of Phase A Task 6, predict_series's silent fallback to
+        self._schedule["committed_override"] was intentionally removed — the
+        ML-facing physics_kwh feature must never silently pick up whatever
+        happens to be currently committed (Goal 1). Formerly named
+        test_natural_baseline_applies_committed_override_by_default and
+        asserted the opposite; that fallback no longer exists anywhere in
+        predict_series. Reflecting a committed override into a "natural
+        baseline" is now the caller's explicit responsibility — see
+        predict_scenario()'s natural_baseline_df construction (model.py) and
+        TestScenarioDhwDelta::test_set_dhw_schedule_then_get_scenario_with_different_override,
+        which exercises that call site."""
         # Model WITH committed override
         pm_with_override = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm_with_override._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
@@ -1018,13 +1357,18 @@ class TestCommittedDhwSchedule:
         ts = pd.date_range("2026-06-25 00:00", periods=24, freq="1h")
         forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
 
-        # no explicit dhw_schedule_override passed — the committed one should still apply
+        # no explicit dhw_schedule_override passed — must be override-blind
+        # regardless of what is committed on the model
         result_with = pm_with_override.predict_series(forecast_df)
         result_without = pm_no_override.predict_series(forecast_df)
+        assert result_with.equals(result_without)
 
-        # The committed override (hour 10 legionella boost) produces a different DHW profile
-        # than the default schedule with no override, so results must differ
-        assert not result_with.equals(result_without)
+        # Proof the committed override is real and would matter if asked for
+        # explicitly (same explicit-ask pattern predict_scenario now uses)
+        result_with_explicit = pm_with_override.predict_series(
+            forecast_df, dhw_schedule_override=pm_with_override._schedule.get("committed_override")
+        )
+        assert not result_with_explicit.equals(result_with)
 
     def test_explicit_per_call_override_takes_precedence_over_committed(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
@@ -1034,5 +1378,293 @@ class TestCommittedDhwSchedule:
         forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
         override = {"legionella": ("2026-06-25", 20)}
         result_a = pm.predict_series(forecast_df, dhw_schedule_override=override)
-        result_b = pm.predict_series(forecast_df)  # committed override (hour 10) applies
+        # No explicit override: predict_series is override-BLIND — Task 6 removed its
+        # silent fallback to committed_override, so result_b applies no override at all
+        # (not the committed hour-10 one). result_a therefore differs because it alone
+        # carries the explicitly-passed hour-20 boost.
+        result_b = pm.predict_series(forecast_df)
         assert not result_a.equals(result_b)
+
+
+class TestCommitDhwScheduleMergeSemantics:
+    def test_legionella_then_comfort_boost_both_survive(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert pm._schedule["committed_override"] == {
+            "legionella": ["2026-08-04", 12],
+            "comfort_boost": ["2026-08-05", 14, 57.5],
+        }
+
+    def test_clearing_comfort_boost_leaves_legionella_intact(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        pm.commit_dhw_schedule({"comfort_boost": None})
+        assert pm._schedule["committed_override"] == {"legionella": ["2026-08-04", 12]}
+
+    def test_clearing_last_key_resets_to_none_not_empty_dict(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        pm.commit_dhw_schedule({"legionella": None})
+        assert pm._schedule["committed_override"] is None
+
+    def test_malformed_entry_skipped_with_warning_does_not_corrupt_merge(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        with caplog.at_level("WARNING"):
+            pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14)})  # missing target_c — malformed
+        assert any("malformed" in r.message for r in caplog.records)
+        assert pm._schedule["committed_override"] == {"legionella": ["2026-08-04", 12]}
+
+    def test_commit_appends_override_history_entry(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert len(pm._schedule["override_history"]) == 1
+        entry = pm._schedule["override_history"][0]
+        assert entry["kind"] == "comfort_boost"
+        assert entry["date"] == "2026-08-05"
+        assert entry["hour"] == 14
+        assert entry["target_c"] == 57.5
+        assert entry["cancelled_at"] is None
+        assert entry["committed_at"]  # non-empty ISO string
+
+    def test_legionella_history_target_c_is_t_legionella(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"legionella": ("2026-08-04", 12)})
+        entry = pm._schedule["override_history"][0]
+        assert entry["target_c"] == pm._schedule["T_legionella"]
+
+    def test_last_write_wins_dedup_on_kind_date_hour_for_non_cancelled(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 55.0)})
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})  # re-armed, revised target
+        assert len(pm._schedule["override_history"]) == 1
+        assert pm._schedule["override_history"][0]["target_c"] == 57.5
+
+    def test_genuine_cancellation_marks_cancelled_at_not_deleted(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 57.5)})
+        pm.commit_dhw_schedule({"comfort_boost": None})
+        assert len(pm._schedule["override_history"]) == 1  # not deleted
+        entry = pm._schedule["override_history"][0]
+        assert entry["cancelled_at"] is not None
+        assert entry["target_c"] == 57.5  # raw value retained
+
+    def test_rearm_after_cancellation_appends_fresh_entry_not_uncancel(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 55.0)})
+        pm.commit_dhw_schedule({"comfort_boost": None})  # cancelled
+        pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, 58.0)})  # re-armed, same hour
+        assert len(pm._schedule["override_history"]) == 2
+        cancelled, fresh = pm._schedule["override_history"]
+        assert cancelled["cancelled_at"] is not None
+        assert cancelled["target_c"] == 55.0
+        assert fresh["cancelled_at"] is None
+        assert fresh["target_c"] == 58.0
+
+    def test_comfort_boost_non_numeric_target_c_skipped_with_warning(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        with caplog.at_level("WARNING"):
+            pm.commit_dhw_schedule({"comfort_boost": ("2026-08-05", 14, "not-a-number")})
+        assert any("not numeric" in r.message for r in caplog.records)
+        assert pm._schedule["committed_override"] is None
+        assert pm._schedule["override_history"] == []
+
+
+class TestOverrideHistorySchema:
+    def test_default_schedule_has_empty_override_history(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        assert pm._schedule["override_history"] == []
+
+    def test_override_history_persists_and_reloads(self, tmp_path):
+        model_dir = tmp_path / "models"
+        pm = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        pm._schedule["override_history"].append(
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "2026-08-04T06:00:01+02:00",
+                "cancelled_at": None,
+            }
+        )
+        _atomic_write_json(pm._schedule_path, pm._schedule)
+        pm2 = ThermalPhysicsModel(model_dir, DEFAULT_CONFIG)
+        assert pm2._schedule["override_history"] == [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "2026-08-04T06:00:01+02:00",
+                "cancelled_at": None,
+            }
+        ]
+
+
+class TestDhwOverrideForHour:
+    def test_legionella_override_returns_t_legionella(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-04 12:00")
+        result = pm._dhw_override_for_hour(ts, {"legionella": ("2026-08-04", 12)})
+        assert result == pm._schedule["T_legionella"]
+
+    def test_comfort_boost_override_returns_target_c(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        result = pm._dhw_override_for_hour(ts, {"comfort_boost": ("2026-08-05", 14, 57.5)})
+        assert result == 57.5
+
+    def test_no_match_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 09:00")
+        assert pm._dhw_override_for_hour(ts, {"comfort_boost": ("2026-08-05", 14, 57.5)}) is None
+
+    def test_same_hour_precedence_legionella_wins(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        result = pm._dhw_override_for_hour(
+            ts, {"legionella": ("2026-08-05", 14), "comfort_boost": ("2026-08-05", 14, 57.5)}
+        )
+        assert result == pm._schedule["T_legionella"]
+
+    def test_empty_or_none_override_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour(ts, None) is None
+        assert pm._dhw_override_for_hour(ts, {}) is None
+
+
+class TestDhwOverrideForHourFromHistory:
+    def test_returns_target_c_for_matching_non_cancelled_entry(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-04 12:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 60.0
+
+    def test_cancelled_entry_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "x",
+                "cancelled_at": "y",
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) is None
+
+    def test_self_expired_entry_cancelled_at_none_reconstructs_normally(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 57.5
+
+    def test_returns_the_actually_committed_value_not_just_latest(self, tmp_path):
+        """Direct regression test for the reconstruction-fidelity bug (Goal 2):
+        two different historical days' entries must each reconstruct correctly,
+        not both resolve to whichever was committed most recently."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-07-28",
+                "hour": 12,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "legionella",
+                "date": "2026-08-04",
+                "hour": 13,
+                "target_c": 60.0,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-07-28 12:00"), history) == 60.0
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-08-04 13:00"), history) == 60.0
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-07-28 13:00"), history) is None
+
+    def test_same_hour_precedence_legionella_wins(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [
+            {
+                "kind": "legionella",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 60.0,
+                "committed_at": "x",
+                "cancelled_at": None,
+            },
+            {
+                "kind": "comfort_boost",
+                "date": "2026-08-05",
+                "hour": 14,
+                "target_c": 57.5,
+                "committed_at": "y",
+                "cancelled_at": None,
+            },
+        ]
+        ts = pd.Timestamp("2026-08-05 14:00")
+        assert pm._dhw_override_for_hour_from_history(ts, history) == 60.0
+
+    def test_malformed_entry_skipped_with_warning_not_raised(self, tmp_path, caplog):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        history = [{"kind": "legionella", "date": "2026-08-04"}]  # missing hour/target_c
+        ts = pd.Timestamp("2026-08-04 12:00")
+        with caplog.at_level("WARNING"):
+            result = pm._dhw_override_for_hour_from_history(ts, history)
+        assert result is None
+        assert any("malformed" in r.message for r in caplog.records)
+
+    def test_empty_history_returns_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        assert pm._dhw_override_for_hour_from_history(pd.Timestamp("2026-08-04 12:00"), []) is None
+
+
+class TestZeroOverrideDegradation:
+    def test_empty_history_and_committed_override_produces_zero_delta_everywhere(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=48, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        training_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, [])
+        serving_delta = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        assert (training_delta == 0.0).all()
+        assert (serving_delta == 0.0).all()
+
+    def test_physics_kwh_identical_to_pre_phase_a_when_no_override_ever_committed(self, tmp_path):
+        """No regression risk for installs that never use DHW overrides — the
+        override-blind physics_kwh feature must be bit-identical to calling
+        _dhw_kwh_series with override_lookup=None (today's only behavior)."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        t_ambient = pd.Series(10.0, index=timestamps)
+        el_kwh_a, _, final_a = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        el_kwh_b, _, final_b = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        pd.testing.assert_series_equal(el_kwh_a, el_kwh_b)
+        assert final_a == final_b

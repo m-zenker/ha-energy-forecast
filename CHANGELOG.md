@@ -10,6 +10,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - `apps/energy_forecast/energy_forecast.py`, `const.py` — daily update-check: compares the running `__version__` against the latest GitHub release tag (`GET /repos/m-zenker/ha-energy-forecast/releases/latest`) once a day at 09:00 local time, and creates a `persistent_notification` when a newer release is available. Skipped entirely on `-alpha`/`-beta` builds (the maintainer's own dev instance always runs ahead of `main`). Dedup state persisted to `update_check_state.json` so each new version notifies at most once. New `update_check_enabled` config key (default `true`) disables the check entirely — no scheduling, no network calls. #91
+- `apps/energy_forecast/physics.py` — DHW Override Deterministic Forecast Correction, Phase A
+  (closes ROADMAP #93 / #84). Three interlocking additions. **(1)** `override_history` — the
+  persisted DHW schedule data model (`physics_schedule.json`) gains an append-only list that
+  records every committed override: kind (`legionella` or `comfort_boost`), date, hour, target
+  temperature, UTC commit timestamp, and an optional `cancelled_at` timestamp. Cancellation
+  stamps a history entry rather than deleting it, keeping the list auditable and enabling correct
+  reconstruction during future retrains. `commit_dhw_schedule()` is rewritten with merge
+  semantics: multiple override kinds coexist independently so a comfort_boost commit in a future
+  phase does not evict a pending legionella entry; last-write-wins dedup prevents duplicate
+  `(kind, date, hour)` entries on repeated commits. **(2)** `compute_training_override_delta()`
+  — for use in `train()`: simulates one joint with-overrides DHW tank trajectory (applying all
+  entries in `override_history` at once, not per-override diffs summed), diffs it against an
+  override-blind baseline, terminates the energy tail at the first hour the two trajectories
+  reconverge within 0.1 °C, and clips each hour to a sanity bound (`|delta| ≤
+  max(with_overrides_kwh, baseline_kwh)`) — logging a WARNING on any violation. **(3)**
+  `compute_serving_override_delta()` — the serving-side counterpart, driven from the current
+  `committed_override`, for use in `_update_sensors()`.
+- `apps/energy_forecast/model.py` — `train()` now subtracts the training-side override delta
+  (computed via `compute_training_override_delta()` from the full `override_history`) from
+  `gross_kwh` once, upstream of both physics calibration and the LightGBM training target —
+  a single shared correction that closes the 2026-08-04 retrain bug where reconstruction
+  replayed only the most-recently committed override, not the override actually in effect for
+  each historical row. Training rows predating the earliest `override_history` entry (rows
+  recorded before this fix shipped, with no override to reconstruct from) are down-weighted
+  via the existing sample-weight mechanism so any override-shaped noise in those rows fades
+  out more quickly.
+- `apps/energy_forecast/energy_forecast.py` — `_update_sensors()` now adds
+  `compute_serving_override_delta()` to `predicted_kwh` unconditionally after `model.predict()`
+  returns, then floors the result at zero. The correction is additive and post-model — never
+  fed back into `physics_kwh` or the trained model — so the tree's own feature weighting
+  cannot discount it. Direct serving-path fix for the 2026-08-04 live bug where a committed
+  legionella override barely moved the published forecast.
 
 ### Fixed
 - `apps/energy_forecast/energy_forecast.py` — MQTT Discovery registrations for forecast, block, MAE, scenario, and physics sensors carried `device_class: energy` paired with `state_class: measurement`, which Home Assistant rejects at startup with a warning ("state class 'measurement' is impossible considering device class ('energy')") for every affected entity. Fixed by removing `device_class` from all sensors that publish forecasts or error metrics rather than meter readings: next_1h / next_3h / today / tomorrow totals, all eight 3 h block sensors for each day, the 32 lazily-registered P10/P90 interval sensors, `model_mae` / `mae_7d` / `mae_30d`, all scenario sensors, and — when `physics:` is configured — `physics_base_today` and `ml_adjustment_today`. The two EV actual sensors (`ev_today` / `ev_yesterday`) are genuine accumulators (detected charging kWh that reset at midnight), so they keep `device_class: energy` and move to `state_class: total` instead of losing the device class. Fixes #19.
@@ -17,6 +49,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `apps/energy_forecast/ha_data.py` — a persistent problem with `excluded_ranges.csv` (unreadable file, missing columns, a malformed row, a date in a DST spring-forward gap) or an escalation condition in `filter_excluded_ranges()` (range spans >14 days, or drops >10 % of rows) logged the same WARNING every hour because both functions are called from the hourly `_update_sensors()` cycle. A new `_warn_once()` helper accepts an optional dedup `warned` set: it logs at WARNING the first time a given condition key is seen and demotes to INFO on repeats. All seven warning sites across `load_excluded_ranges()` and `filter_excluded_ranges()` route through it when a set is supplied; omitting `warned` (default `None`) preserves the original always-warn behaviour for any caller that doesn't pass it. ROADMAP #95.
 - `apps/energy_forecast/energy_forecast.py` — wires the dedup set from the above fix into both call sites: `_retrain()` and `_update_sensors()` now pass a shared `self._excluded_range_warned` instance attribute (initialised in `initialize()`) to both `load_excluded_ranges()` and `filter_excluded_ranges()`. Each distinct condition key warns once per AppDaemon process lifetime — a new or changed exclusion range still warns immediately because it is a new key. The set resets on AppDaemon restart, so a condition that persists across a restart re-warns once on the next startup. ROADMAP #95.
 - `apps/energy_forecast/ha_data.py` — follow-up correction to ROADMAP #95: `filter_excluded_ranges()` still logged a per-range INFO line on every hourly `_update_sensors()` call even when that range matched zero rows — the steady-state for any `excluded_ranges.csv` entry whose `end` timestamp has passed the current rolling data window (e.g. a hardware-fault exclusion left in place after the fault period ended). This was the actual source of the ongoing log noise reported after alpha-11; the #95 `_warn_once()` severity-demotion fix only gated WARNING escalation, not whether anything was logged at all. The per-range logging block is now wrapped in `if n_dropped:`, matching the pattern already used for the aggregate summary line. A range with no overlap in the current data window now logs nothing. ROADMAP #95.
+- `apps/energy_forecast/physics.py` — two pre-existing bugs in `_dhw_kwh_series()` found and
+  fixed during the Phase A implementation (both affect every install, override use or not).
+  **(1)** The reheat trigger used `t_tank < t_lower` (strict less-than), but the passive-decay
+  branch clips the tank to exactly `t_lower` on any crossing. Once the tank reached the floor,
+  the strict `<` check could never be true again — reheat was permanently disabled for the rest
+  of any forecast window. Fixed to `t_tank <= t_lower`. **(2)** The normal (non-override)
+  reheat cycle clipped the target temperature to `T_legionella` (60 °C) instead of the correct
+  `T_dhw_upper` (55 °C) ceiling; the legionella/comfort_boost override branch is a separate
+  code path and is unaffected. Because `_dhw_kwh_series()` charges one full hour of
+  `dhw_power_w` per cycle regardless of ΔT actually reached, a lower ceiling means more cycles
+  at the same per-cycle energy cost — the direction of the change may be counterintuitive. This
+  measurably changes modelled DHW electricity for every installation. The fixed-hour charge vs.
+  actual ΔT mismatch is a known limitation and a candidate for a separate follow-up.
+- `apps/energy_forecast/physics.py` — follow-up to the T_dhw_upper ceiling fix (b68b25d): the
+  normal (non-override) reheat branch in `_dhw_kwh_series()` billed a full rated-power hour of
+  electricity on every cycle, even when the tank reached the upper-setpoint ceiling partway
+  through the hour (clipped short). With the ceiling corrected to 55 °C, cycles became more
+  frequent while per-cycle cost stayed constant, inflating modelled DHW electricity by +29 % in a
+  14-day test scenario (50.26 → 64.62 kWh/14d — the wrong direction for a tighter ceiling).
+  Electricity per cycle is now prorated to the temperature rise actually achieved that hour rather
+  than the full nominal hour. Re-measured after the fix: ~−7 % (46.40 vs 49.72 kWh/14d),
+  confirming the correction.
+- `apps/energy_forecast/energy_forecast.py` — `sensor.energy_forecast_ml_adjustment_today`
+  was misattributing the new override correction to "ML Adjustment" instead of "Physics Base".
+  `_publish_physics_sensors()` computed the physics baseline via an override-blind
+  `predict_series()` call while `predicted_kwh` already carried the per-hour override delta,
+  so the full correction appeared in `predicted_kwh − physics_vals` as if the ML model had
+  produced it. Fixed by threading the same `override_delta` into `_publish_physics_sensors()`,
+  which now folds it into the physics baseline before computing the ML adjustment. Also:
+  `predict_scenario()`'s (`energy_forecast/get_scenario` service) natural-baseline construction
+  was relying on a silent committed-override fallback inside `predict_series()` that this plan
+  intentionally removed; fixed by making that call site pass the committed override explicitly,
+  preserving its pre-existing behaviour.
+- `apps/energy_forecast/model.py` — the pre-migration training-row cutoff derived from
+  `override_history` entries' `committed_at` timestamps (UTC-aware ISO strings) was being
+  compared against naive-local training timestamps after a bare `tz_localize(None)` that
+  stripped the UTC label without converting to local time first, silently misclassifying every
+  training row within the local UTC offset of the true cutoff as post-migration (fully weighted)
+  when it should have been down-weighted. Fixed to `tz_convert(timezone).tz_localize(None)`.
 
 ---
 
