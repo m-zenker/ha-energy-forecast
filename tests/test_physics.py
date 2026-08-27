@@ -275,6 +275,44 @@ class TestDHWOde:
         # tank must actually revisit the floor between reheats, not just heat once and coast
         assert (t_tank_series == pm._schedule["T_dhw_lower"]).sum() >= 2
 
+    def test_normal_reheat_caps_at_t_dhw_upper_not_t_legionella(self, tmp_path):
+        """Final-review #3: the NORMAL (non-override) reheat branch used to clip to
+        T_legionella (60 degC) as its ceiling, so every ordinary reheat cycle over-shot
+        the real setpoint T_dhw_upper (55 degC) by 5 K — inflating stored energy, and
+        therefore standing losses and the silent-coast time that follows, for every
+        install. Legionella/comfort_boost overrides are unaffected: they bypass this
+        branch entirely via the `override_target is not None` branch above it.
+        """
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=24 * 5, freq="1h")
+        t_ambient = pd.Series(20.0, index=ts)
+        q_dhw_el, t_tank_series, _ = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=45.0, override_lookup=None)
+
+        assert t_tank_series.max() <= pm._schedule["T_dhw_upper"] + 1e-9, (
+            f"normal reheat overshot T_dhw_upper: max={t_tank_series.max()}"
+        )
+        # ... and the ceiling is actually reachable (not a vacuous bound): with a
+        # 17.2 K/h heating rise from the 45 degC floor, a full reheat hour saturates it.
+        assert t_tank_series.max() == pytest.approx(pm._schedule["T_dhw_upper"], abs=1e-6)
+        # ... while the tank still genuinely cycles (reheat / coast / reheat).
+        assert (q_dhw_el > 0.0).sum() >= 2
+
+    def test_override_target_still_bypasses_the_reheat_ceiling(self, tmp_path):
+        """Companion to the above: a legionella override must still be able to drive the
+        tank to T_legionella (60 degC), above the normal-reheat T_dhw_upper ceiling."""
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
+        pm._schedule.update(T_dhw_lower=45.0, T_dhw_upper=55.0, T_legionella=60.0)
+        ts = pd.date_range("2026-01-15 00:00", periods=24, freq="1h")
+        t_ambient = pd.Series(20.0, index=ts)
+        target_ts = pd.Timestamp("2026-01-15 12:00")
+        _, t_tank_series, _ = pm._dhw_kwh_series(
+            ts, t_ambient, initial_t_tank=45.0, override_lookup=lambda t: 60.0 if t == target_ts else None
+        )
+        assert t_tank_series.loc[target_ts] == pytest.approx(60.0)
+
     def test_heating_rise_derived_not_constant(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
@@ -283,8 +321,14 @@ class TestDHWOde:
         # start just below T_lower to force a reheat on hour 0
         q_dhw_el, _, final_temp = pm._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         assert q_dhw_el.iloc[0] > 0.0
-        # different tank volume -> different heating_rise -> different final tank temp (not hardcoded)
-        pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 300})
+        # different tank volume -> different heating_rise -> different final tank temp (not hardcoded).
+        # 500 L, not 300 L: once the normal-reheat ceiling was corrected from T_legionella
+        # (60 degC) to T_dhw_upper (55 degC) — final-review #3 — a 300 L tank's 11.5 K/h rise
+        # from the 44 degC start still saturates that lower ceiling within the single reheat
+        # hour, just as the 200 L tank's 17.2 K/h does, so both land on 55.0 and the volume
+        # difference is masked by the clip rather than by any hardcoding. 500 L (6.9 K/h)
+        # stays below the ceiling, so heating_rise still visibly drives the result.
+        pm2 = ThermalPhysicsModel(tmp_path / "models2", {**DEFAULT_CONFIG, "dhw_tank_volume_l": 500})
         pm2._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5)
         q_dhw_el2, _, final_temp2 = pm2._dhw_kwh_series(ts, t_ambient, initial_t_tank=44.0, override_lookup=None)
         # within 2-hour window, electricity series is identical (same reheat power/COP hour 0, silent hour 1)

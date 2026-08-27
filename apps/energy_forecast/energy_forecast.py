@@ -2029,9 +2029,14 @@ class EnergyForecast(hass.Hass):
             _override_delta = self._physics_model.compute_serving_override_delta(
                 _override_timestamps, _t_ambient, _initial_t_tank
             )
-            predictions["predicted_kwh"] = (
+            # Floored at zero, same as model.py's own `np.maximum(0, preds)`: this is a
+            # SIGNED delta applied to an already-final forecast with nothing downstream of
+            # it, so without the floor a large negative correction publishes a visibly
+            # negative hourly forecast (final-review #4).
+            predictions["predicted_kwh"] = np.maximum(
+                0.0,
                 predictions["predicted_kwh"].to_numpy()
-                + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy()
+                + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy(),
             )
 
         self._publish_thermal_pressure()

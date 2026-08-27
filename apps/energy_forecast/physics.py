@@ -298,6 +298,7 @@ class ThermalPhysicsModel:
         heating_rise = q_dhw_power / c_dhw  # K/h, derived each call — not a stored constant
 
         t_lower = self._schedule["T_dhw_lower"]
+        t_upper = self._schedule["T_dhw_upper"]
         t_legionella = self._schedule["T_legionella"]
 
         q_dhw_daily = self._calib.get("Q_dhw_daily") or 0.0
@@ -325,7 +326,13 @@ class ThermalPhysicsModel:
             if t_tank <= t_lower:
                 q_el_w = q_dhw_power / cop_dhw
                 el_kwh[i] = q_el_w / 1000.0
-                t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_legionella))
+                # A NORMAL reheat cycle targets T_dhw_upper, not T_legionella
+                # (final-review #3) — the legionella/comfort_boost ceiling belongs to the
+                # override branch above, which sets t_tank directly and never reaches here.
+                # The passive branch below deliberately keeps t_legionella as its ceiling:
+                # it must let a just-completed override coast DOWN from 60 degC rather than
+                # instantly clamping it to 55 and erasing the override's carryover tail.
+                t_tank = float(np.clip(t_tank + dT + heating_rise, t_lower, t_upper))
             else:
                 el_kwh[i] = 0.0
                 t_tank = float(np.clip(t_tank + dT, t_lower, t_legionella))

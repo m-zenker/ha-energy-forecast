@@ -1108,7 +1108,14 @@ class TestServingOverrideCorrection:
         }
 
     def _run_update_sensors(
-        self, tmp_path, monkeypatch, physics_model, forecast_timestamps, outdoor_temp_c=5.0, climate_recent=None
+        self,
+        tmp_path,
+        monkeypatch,
+        physics_model,
+        forecast_timestamps,
+        outdoor_temp_c=5.0,
+        climate_recent=None,
+        base_kwh=1.0,
     ):
         """Drives EnergyForecast._update_sensors() end-to-end and returns
         (predictions, stub): `predictions` is the exact DataFrame it hands to
@@ -1158,7 +1165,7 @@ class TestServingOverrideCorrection:
         stub._physics_dhw_tank_df = None
         stub._physics_cop_df = None
         stub._ml_model.predict = lambda *a, **kw: pd.DataFrame(
-            {"timestamp": forecast_timestamps, "predicted_kwh": [1.0] * len(forecast_timestamps)}
+            {"timestamp": forecast_timestamps, "predicted_kwh": [base_kwh] * len(forecast_timestamps)}
         )
 
         captured: dict = {}
@@ -1200,11 +1207,16 @@ class TestServingOverrideCorrection:
         )
         assert (expected_delta != 0.0).any(), "test setup sanity: override must actually diverge the DHW trajectory"
 
+        # base_kwh=5.0, not the harness default 1.0: the correction is now floored at
+        # zero (final-review #4), and a single skipped reheat cycle is a ~1.03 kWh
+        # NEGATIVE delta — larger than a 1.0 kWh/h baseline, so the floor would clip it
+        # and this "moves by the FULL delta" assertion would be measuring the floor
+        # instead. 5.0 keeps every corrected hour comfortably positive.
         predictions_with_override, _ = self._run_update_sensors(
-            tmp_path, monkeypatch, physics_with_override, forecast_timestamps
+            tmp_path, monkeypatch, physics_with_override, forecast_timestamps, base_kwh=5.0
         )
         predictions_baseline, _ = self._run_update_sensors(
-            tmp_path, monkeypatch, physics_no_override, forecast_timestamps
+            tmp_path, monkeypatch, physics_no_override, forecast_timestamps, base_kwh=5.0
         )
 
         actual_delta = (
@@ -1267,6 +1279,7 @@ class TestServingOverrideCorrection:
             forecast_timestamps,
             outdoor_temp_c=-5.0,
             climate_recent=climate_recent,
+            base_kwh=5.0,  # keep the final-review #4 zero-floor from clipping a negative correction hour
         )
         predictions_base, _ = self._run_update_sensors(
             tmp_path,
@@ -1275,6 +1288,7 @@ class TestServingOverrideCorrection:
             forecast_timestamps,
             outdoor_temp_c=-5.0,
             climate_recent=climate_recent,
+            base_kwh=5.0,  # keep the final-review #4 zero-floor from clipping a negative correction hour
         )
         actual_delta = (
             predictions_with.set_index("timestamp")["predicted_kwh"]
@@ -1288,6 +1302,35 @@ class TestServingOverrideCorrection:
             check_freq=False,
             atol=1e-9,
         )
+
+    def test_large_negative_delta_never_publishes_a_negative_forecast(self, tmp_path, monkeypatch):
+        """Final-review #4: the override correction is a SIGNED delta added to an
+        already-final forecast, with nothing between it and the published sensor. A
+        large enough negative delta would publish a visibly negative hourly forecast.
+        Floor it at zero, matching model.py's existing `np.maximum(0, preds)` precedent.
+        """
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        forecast_timestamps = pd.date_range(start=now, periods=48, freq="1h")
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models_negative", self._physics_config())
+        # Synthetic, deliberately unphysical delta: the point is that the publish path
+        # itself must be safe, whatever the correction hands it.
+        monkeypatch.setattr(
+            pm,
+            "compute_serving_override_delta",
+            lambda ts, *a, **kw: pd.Series(-50.0, index=ts),
+        )
+
+        predictions, _ = self._run_update_sensors(tmp_path, monkeypatch, pm, forecast_timestamps)
+
+        # The fake ML model predicts a flat 1.0 kWh/h, so an unfloored -50.0 delta would
+        # publish -49.0 on every hour.
+        assert (predictions["predicted_kwh"] >= 0.0).all(), (
+            f"negative forecast published: min={predictions['predicted_kwh'].min()}"
+        )
+        assert (predictions["predicted_kwh"] == 0.0).all()
 
     def test_no_committed_override_leaves_published_forecast_unchanged(self, tmp_path, monkeypatch):
         """Zero-override-degradation: with nothing committed,
@@ -1324,10 +1367,17 @@ class TestServingOverrideCorrection:
         physics_with_override.commit_dhw_schedule({"legionella": [override_ts.strftime("%Y-%m-%d"), override_ts.hour]})
         physics_no_override = ThermalPhysicsModel(tmp_path / "physics_models_attr_baseline", self._physics_config())
 
+        # base_kwh=5.0 for the same reason as
+        # test_committed_override_moves_published_forecast_by_full_delta: keep the
+        # zero-floor (final-review #4) from clipping a negative correction hour, which
+        # would otherwise shift ml_adjustment between the two runs for a reason that has
+        # nothing to do with the misattribution this test is about.
         _, stub_with_override = self._run_update_sensors(
-            tmp_path, monkeypatch, physics_with_override, forecast_timestamps
+            tmp_path, monkeypatch, physics_with_override, forecast_timestamps, base_kwh=5.0
         )
-        _, stub_baseline = self._run_update_sensors(tmp_path, monkeypatch, physics_no_override, forecast_timestamps)
+        _, stub_baseline = self._run_update_sensors(
+            tmp_path, monkeypatch, physics_no_override, forecast_timestamps, base_kwh=5.0
+        )
 
         def _hourly_kwh(stub, entity_id):
             call = next(c for c in stub.set_state_calls if c["entity_id"] == entity_id)
