@@ -1445,7 +1445,7 @@ class EnergyForecastModel:
             # baseline" still reflects whatever's actually committed right now (e.g. an already-
             # armed legionella boost) when scoring a *different* candidate dhw_schedule_override.
             dhw_schedule_override=(
-                physics_model._schedule.get("committed_override") if physics_model is not None else None
+                physics_model.schedule.get("committed_override") if physics_model is not None else None
             ),
         )
 

@@ -1354,7 +1354,11 @@ class TestCommittedDhwSchedule:
         forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [10.0] * 24, "direct_radiation_wm2": [0.0] * 24})
         override = {"legionella": ("2026-06-25", 20)}
         result_a = pm.predict_series(forecast_df, dhw_schedule_override=override)
-        result_b = pm.predict_series(forecast_df)  # committed override (hour 10) applies
+        # No explicit override: predict_series is override-BLIND — Task 6 removed its
+        # silent fallback to committed_override, so result_b applies no override at all
+        # (not the committed hour-10 one). result_a therefore differs because it alone
+        # carries the explicitly-passed hour-20 boost.
+        result_b = pm.predict_series(forecast_df)
         assert not result_a.equals(result_b)
 
 
