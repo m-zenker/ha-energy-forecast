@@ -264,7 +264,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ### #93 — DHW Override Commit + Deterministic Forecast Correction (cross-repo, mirrors Plan 2; supersedes #84)
 
-**Status (2026-08-22): spec REVISED, needs a fresh multi-stakeholder-spec-review — not yet implemented.** Spec at `ha-energy-manager/docs/superpowers/specs/2026-08-15-dhw-comfort-boost-commit-design.md` (same file, revised content), branch `feat/dhw-comfort-boost-commit` (spec-only so far, no implementation commits). The original design (approved 2026-08-15, 3 review rounds) is superseded on the hef side by a deterministic-correction mechanism — see `memory/project_dhw_comfort_boost_commit_spec.md` for what changed and why; read the spec itself before implementing or re-reviewing. This item now also supersedes #84 entirely.
+**Status (2026-08-27): both phases implemented and deployed live — kill-switch pending exit-gate observation.** Spec at `ha-energy-manager/docs/superpowers/specs/2026-08-15-dhw-comfort-boost-commit-design.md`. Phase A (this repo's hef-side deterministic-correction half) deployed 2026-08-27 as `v0.12.0-alpha-13`. Phase B (`ha-energy-manager`'s EM-side commit-triggering half) deployed the same day as `v0.15.1-alpha-51`, with its `dhw_comfort_boost_commit_enabled` kill-switch left `false` — comfort-boost commits don't actually reach hef yet. Activation requires a manual exit-gate check (≥3 observed legionella cycles against Phase A's live correction, ~2-3 weeks) before the kill-switch flips; see `ha-energy-manager/memory/project_dhw_comfort_boost_cross_repo_rollout.md` for the runbook and `memory/project_dhw_comfort_boost_commit_spec.md` for what the spec revision changed and why. This item supersedes #84 entirely.
 
 **Prerequisite context:** `ha-energy-manager`'s hef-physics-adoption Plan 2 (`docs/superpowers/specs/2026-07-10-hef-physics-adoption-design.md` / `plan2-legionella-scenario-gate.md`, live on both repos' `dev`) wired `_check_legionella`'s four branches to commit their chosen hour to hef via `energy_forecast/set_dhw_schedule`. It deliberately scoped out everything else.
 
@@ -321,7 +321,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
 | 92 | Temperature-based UA_eff calibration window | medium | 2 h | ready — needs short brainstorm on threshold design first |
-| 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | spec REVISED (2026-08-22), needs fresh multi-stakeholder-spec-review before writing-plans — see `memory/project_dhw_comfort_boost_commit_spec.md` |
+| 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | both phases deployed live 2026-08-27 (hef `v0.12.0-alpha-13`, EM `v0.15.1-alpha-51`) — kill-switch pending exit-gate observation, see `memory/project_dhw_comfort_boost_commit_spec.md` |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
