@@ -1482,7 +1482,7 @@ class TestTrainWithPhysics:
         what the model fits against, not just on some intermediate DataFrame.
         """
         from energy_forecast.model import _build_model as _real_build_model
-        from energy_forecast.physics import ThermalPhysicsModel
+        from energy_forecast.physics import DEFAULT_AMBIENT_C, ThermalPhysicsModel
 
         def _train_capture_final_yfit(model, energy_df, weather_df, physics_model):
             """Spy on _build_model so every model.fit(X, y, ...) call in train() is
@@ -1540,10 +1540,29 @@ class TestTrainWithPhysics:
         assert override_history, "sanity: commit_dhw_schedule did not populate override_history"
 
         timestamps_for_delta = pd.DatetimeIndex(ts)
-        t_outdoor_for_delta = pd.Series(weather_df["temp_c"].to_numpy(), index=timestamps_for_delta)
+        # Final-review #2: the DHW ODE's t_ambient is INDOOR air, derived exactly the way
+        # predict_training_series derives it for the real physics_kwh feature — no
+        # climate_dfs in this fixture, so that derivation is the DEFAULT_AMBIENT_C
+        # fallback, NOT weather_df["temp_c"]. Building the expected delta from outdoor
+        # temperature (as this test originally did) no longer reproduces what train()
+        # subtracts, which is exactly the bug this assertion now pins down.
+        t_indoor_for_delta = pm_a._area_weighted_t_indoor({}, timestamps_for_delta, None)
+        if t_indoor_for_delta is None:
+            t_indoor_for_delta = pd.Series(DEFAULT_AMBIENT_C, index=timestamps_for_delta)
         initial_t_tank = pm_a._initial_t_tank_for_window(None, timestamps_for_delta)
         override_delta = pm_a.compute_training_override_delta(
+            timestamps_for_delta, t_indoor_for_delta, initial_t_tank, override_history
+        )
+        # Guard that this test can actually tell the two apart: the outdoor-temperature
+        # series must produce a materially different delta, so a regression back to
+        # outdoor temp inside train() fails the final allclose below rather than
+        # coincidentally passing.
+        t_outdoor_for_delta = pd.Series(weather_df["temp_c"].to_numpy(), index=timestamps_for_delta)
+        outdoor_delta = pm_a.compute_training_override_delta(
             timestamps_for_delta, t_outdoor_for_delta, initial_t_tank, override_history
+        )
+        assert not np.allclose(override_delta.to_numpy(), outdoor_delta.to_numpy()), (
+            "sanity: indoor- and outdoor-ambient deltas must differ for this test to discriminate"
         )
         delta_at_override = float(override_delta.loc[override_ts])
         assert delta_at_override != pytest.approx(0.0), (

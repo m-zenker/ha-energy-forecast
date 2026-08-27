@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1106,7 +1107,9 @@ class TestServingOverrideCorrection:
             "use_physics_residual": False,
         }
 
-    def _run_update_sensors(self, tmp_path, monkeypatch, physics_model, forecast_timestamps):
+    def _run_update_sensors(
+        self, tmp_path, monkeypatch, physics_model, forecast_timestamps, outdoor_temp_c=5.0, climate_recent=None
+    ):
         """Drives EnergyForecast._update_sensors() end-to-end and returns
         (predictions, stub): `predictions` is the exact DataFrame it hands to
         _aggregate() — i.e. the fully-corrected, about-to-be-published forecast —
@@ -1122,7 +1125,9 @@ class TestServingOverrideCorrection:
 
         from tests.test_energy_forecast import _FakeUpdateSensors
 
-        forecast_df = pd.DataFrame({"timestamp": forecast_timestamps, "temp_c": [5.0] * len(forecast_timestamps)})
+        forecast_df = pd.DataFrame(
+            {"timestamp": forecast_timestamps, "temp_c": [outdoor_temp_c] * len(forecast_timestamps)}
+        )
 
         monkeypatch.setattr(weather_mod, "fetch_forecast", lambda *a, **kw: forecast_df.copy())
         monkeypatch.setattr(
@@ -1137,6 +1142,15 @@ class TestServingOverrideCorrection:
         monkeypatch.setattr(ef_mod, "PRED_HISTORY_PATH", tmp_path / "pred_history.json")
 
         stub = _FakeUpdateSensors(tmp_path / "energy_history.csv")
+        if climate_recent:
+            # Drive _update_sensors()'s real climate-fetch loop so it builds the same
+            # `climate_recent` dict production does, which the override correction then
+            # projects into an indoor-temperature series (final-review #2).
+            stub._climate_entities = list(climate_recent)
+            stub._climate_cache_path = lambda eid, _tmp=tmp_path: _tmp / f"climate_{eid}.csv"
+            monkeypatch.setattr(
+                ha_data_mod, "fetch_recent_climate", lambda _self, eid, *a, **kw: climate_recent[eid].copy()
+            )
         stub._physics_model = physics_model
         stub._physics_config = physics_model._config
         stub._room_thermostats = []
@@ -1172,12 +1186,17 @@ class TestServingOverrideCorrection:
 
         # The expected delta is computed via the exact same public entry point
         # _update_sensors() is supposed to call, with the exact same inputs it
-        # is supposed to build (t_ambient from forecast_df["temp_c"], initial
-        # tank state from _initial_t_tank_for_window with no dhw_recent data —
-        # this stub leaves _dhw_buffer_sensor unset).
+        # is supposed to build: t_ambient from _t_indoor_for_window (INDOOR air —
+        # final-review #2; with no climate_recent in this stub that is the
+        # `setpoint_on or DEFAULT_AMBIENT_C` fallback, NOT forecast_df["temp_c"]),
+        # and initial tank state from _initial_t_tank_for_window with no
+        # dhw_recent data — this stub leaves _dhw_buffer_sensor unset.
+        t_ambient = physics_with_override._t_indoor_for_window(
+            None, forecast_timestamps, pd.Series(5.0, index=forecast_timestamps)
+        )
         initial_t_tank = physics_with_override._initial_t_tank_for_window(None, forecast_timestamps)
         expected_delta = physics_with_override.compute_serving_override_delta(
-            forecast_timestamps, pd.Series(5.0, index=forecast_timestamps), initial_t_tank
+            forecast_timestamps, t_ambient, initial_t_tank
         )
         assert (expected_delta != 0.0).any(), "test setup sanity: override must actually diverge the DHW trajectory"
 
@@ -1198,6 +1217,77 @@ class TestServingOverrideCorrection:
         # Explicit multi-hour-tail check at the override hour and beyond, not just
         # a single point — the whole point of the fix is the carryover tail moves too.
         assert actual_delta.loc[override_ts] != pytest.approx(0.0)
+
+    def test_serving_delta_uses_indoor_temperature_not_outdoor(self, tmp_path, monkeypatch):
+        """Final-review #2: the DHW ODE's `t_ambient` is the air around the TANK, i.e.
+        indoor temperature — exactly what predict_series feeds physics_kwh. The serving
+        correction used to pass raw outdoor `forecast_df["temp_c"]` instead, so on a cold
+        day it modelled a tank standing outside: inflated standing losses, wrong delta.
+
+        Cold outdoor (-5 degC) + warm indoor (22 degC via climate_recent) makes the two
+        derivations diverge sharply, so the published delta can only match one of them.
+        """
+        from energy_forecast.energy_forecast import _strip_tz
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        forecast_timestamps = pd.date_range(start=now, periods=48, freq="1h")
+        override_ts = forecast_timestamps[5]
+
+        climate_df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(end=now, periods=6, freq="1h"),
+                "current_temp": [22.0] * 6,
+                "setpoint": [22.0] * 6,
+            }
+        )
+        climate_recent = {"climate.living": climate_df}
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models_indoor", self._physics_config())
+        pm.commit_dhw_schedule({"legionella": [override_ts.strftime("%Y-%m-%d"), override_ts.hour]})
+        pm_baseline = ThermalPhysicsModel(tmp_path / "physics_models_indoor_base", self._physics_config())
+
+        t_outdoor = pd.Series(-5.0, index=forecast_timestamps)
+        stripped = {eid: _strip_tz(df.copy(), "Europe/Zurich") for eid, df in climate_recent.items()}
+        t_indoor = pm._t_indoor_for_window(stripped, forecast_timestamps, t_outdoor, room_areas=None)
+        assert t_indoor.iloc[0] == pytest.approx(22.0), "sanity: projection must start from the warm indoor reading"
+
+        initial_t_tank = pm._initial_t_tank_for_window(None, forecast_timestamps)
+        expected_indoor_delta = pm.compute_serving_override_delta(forecast_timestamps, t_indoor, initial_t_tank)
+        outdoor_delta = pm.compute_serving_override_delta(forecast_timestamps, t_outdoor, initial_t_tank)
+        assert (expected_indoor_delta != 0.0).any(), "sanity: the override must move the forecast at all"
+        assert not np.allclose(expected_indoor_delta.to_numpy(), outdoor_delta.to_numpy()), (
+            "sanity: indoor- and outdoor-ambient deltas must differ for this test to discriminate"
+        )
+
+        predictions_with, _ = self._run_update_sensors(
+            tmp_path,
+            monkeypatch,
+            pm,
+            forecast_timestamps,
+            outdoor_temp_c=-5.0,
+            climate_recent=climate_recent,
+        )
+        predictions_base, _ = self._run_update_sensors(
+            tmp_path,
+            monkeypatch,
+            pm_baseline,
+            forecast_timestamps,
+            outdoor_temp_c=-5.0,
+            climate_recent=climate_recent,
+        )
+        actual_delta = (
+            predictions_with.set_index("timestamp")["predicted_kwh"]
+            - predictions_base.set_index("timestamp")["predicted_kwh"]
+        )
+
+        pd.testing.assert_series_equal(
+            actual_delta,
+            expected_indoor_delta.rename("predicted_kwh"),
+            check_names=False,
+            check_freq=False,
+            atol=1e-9,
+        )
 
     def test_no_committed_override_leaves_published_forecast_unchanged(self, tmp_path, monkeypatch):
         """Zero-override-degradation: with nothing committed,

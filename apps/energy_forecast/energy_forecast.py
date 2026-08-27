@@ -2009,7 +2009,20 @@ class EnergyForecast(hass.Hass):
         _override_delta = None
         if self._physics_model is not None:
             _override_timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
-            _t_ambient = pd.Series(forecast_df["temp_c"].values, index=_override_timestamps)
+            # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
+            # derived through the exact same climate-projection path predict_series
+            # uses for the real physics_kwh feature — not raw outdoor temperature
+            # (final-review #2). Feeding outdoor temp here modelled a tank standing
+            # outside, inflating standing losses and therefore the correction itself.
+            _t_ambient = self._physics_model._t_indoor_for_window(
+                climate_recent or None,
+                _override_timestamps,
+                pd.Series(forecast_df["temp_c"].values, index=_override_timestamps),
+                room_areas=self._climate_room_areas or None,
+                heating_active_series=heating_active_series,
+                setpoint_on=heating_setpoint_on,
+                setpoint_off=heating_setpoint_off,
+            )
             _initial_t_tank = self._physics_model._initial_t_tank_for_window(
                 dhw_recent if not dhw_recent.empty else None, _override_timestamps
             )

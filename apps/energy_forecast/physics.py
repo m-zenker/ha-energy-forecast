@@ -463,6 +463,45 @@ class ThermalPhysicsModel:
         w = np.array(weights)
         return pd.Series(np.average(stacked.values, axis=1, weights=w), index=timestamps)
 
+    def _t_indoor_for_window(
+        self,
+        climate_recent: dict[str, pd.DataFrame] | None,
+        timestamps: pd.DatetimeIndex,
+        t_outdoor: pd.Series,
+        room_areas: dict[str, float] | None = None,
+        heating_active_series: pd.Series | None = None,
+        setpoint_on: float | None = None,
+        setpoint_off: float | None = None,
+    ) -> pd.Series:
+        """Shared serving-side indoor-temperature derivation for a forecast window —
+        extracted verbatim from predict_series so the deterministic override correction
+        in energy_forecast.py drives _dhw_kwh_series with exactly the same ambient series
+        the real physics_kwh feature uses (final-review #2).
+
+        Before this extraction, the correction fed raw OUTDOOR temperature into a DHW
+        ODE whose t_ambient argument means "the air surrounding the tank" — i.e. it
+        modelled a tank standing outside in winter, inflating standing losses and thus
+        the correction itself. Same cross-module-reuse pattern as
+        _initial_t_tank_for_window."""
+        from .model import _project_indoor_temps  # local import avoids a circular import at module load time
+
+        t_indoor = None
+        if climate_recent:
+            projected = _project_indoor_temps(
+                climate_recent,
+                timestamps,
+                t_outdoor,
+                tau_hours=self._tau_hours,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
+            t_indoor = self._area_weighted_t_indoor(projected, timestamps, room_areas)
+
+        if t_indoor is None:
+            t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
+        return t_indoor
+
     def predict_series(
         self,
         forecast_df: pd.DataFrame,
@@ -474,8 +513,6 @@ class ThermalPhysicsModel:
         setpoint_off: float | None = None,
         dhw_schedule_override: dict | None = None,
     ) -> pd.Series:
-        from .model import _project_indoor_temps  # local import avoids a circular import at module load time
-
         timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
         t_outdoor = pd.Series(forecast_df["temp_c"].values, index=timestamps)
         ghi = (
@@ -485,22 +522,15 @@ class ThermalPhysicsModel:
         )
 
         try:
-            if climate_recent:
-                projected = _project_indoor_temps(
-                    climate_recent,
-                    timestamps,
-                    t_outdoor,
-                    tau_hours=self._tau_hours,
-                    heating_active_series=heating_active_series,
-                    setpoint_on=setpoint_on,
-                    setpoint_off=setpoint_off,
-                )
-                t_indoor = self._area_weighted_t_indoor(projected, timestamps, room_areas)
-            else:
-                t_indoor = None
-
-            if t_indoor is None:
-                t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
+            t_indoor = self._t_indoor_for_window(
+                climate_recent,
+                timestamps,
+                t_outdoor,
+                room_areas=room_areas,
+                heating_active_series=heating_active_series,
+                setpoint_on=setpoint_on,
+                setpoint_off=setpoint_off,
+            )
 
             cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
             q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
