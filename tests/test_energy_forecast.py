@@ -644,6 +644,130 @@ class TestEvChargingSensor:
         assert abs(result["ev_today"] - 9.0) < 1e-6
 
 
+class TestRetrainCoversPreWallboxEvHistory:
+    """Regression test (found 2026-08-28): once ev_charging_sensor is configured,
+    _retrain() ran split_ev_charging_from_sensor() on the FULL energy_df history,
+    not just the sensor's own coverage window. Its left-join fillna(0.0) then
+    silently treated every pre-installation date as "0 kWh charged", un-excluding
+    real threshold-shaped EV sessions from before the wallbox existed. Fixed by
+    routing through split_ev_charging_hybrid(), which falls back to threshold
+    detection outside the sensor's coverage window.
+    """
+
+    def _patch_deps(self, monkeypatch, energy_df, ev_kwh_df):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_sub_sensor_history", lambda *a, **kw: ev_kwh_df)
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: None)
+        # split_ev_charging / split_ev_charging_from_sensor / split_ev_charging_hybrid
+        # deliberately left unpatched — this test exercises the real hybrid split.
+
+    def test_pre_wallbox_ev_spike_still_excluded_from_training(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(60)  # 2024-01-01 00:00..02:00 (60h), flat 1.0 kWh
+        # Threshold-shaped spike at 10:00, well before the wallbox existed.
+        energy_df.loc[energy_df["timestamp"] == pd.Timestamp("2024-01-01 10:00"), "gross_kwh"] = 10.0
+
+        # Wallbox sensor coverage only starts 2024-01-02 06:00 (idx30) — after the spike.
+        ev_kwh_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-02 06:00", periods=11, freq="1h"), "kwh": [0.0] * 11}
+        )
+
+        self._patch_deps(monkeypatch, energy_df, ev_kwh_df)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._ev_threshold = 7.0
+        stub._ev_charger_kw = 9.0
+        stub._ev_charging_sensor = "sensor.se_one_ev_charger_total_energy"
+
+        EnergyForecast._retrain(stub)
+
+        trained_df = stub._ml_model.train.call_args.args[0]
+        spike_row = trained_df[trained_df["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
+        assert len(spike_row) == 1, "the EV hour itself must remain in the training frame"
+        assert abs(spike_row.iloc[0]["gross_kwh"] - 1.0) < 1e-6, (
+            "pre-wallbox spike must be threshold-detected (10.0 - 9.0 charger_kw = 1.0), "
+            f"got {spike_row.iloc[0]['gross_kwh']} — it is leaking into training as raw baseline load"
+        )
+
+
+class TestRetrainSkipsPaddingForSensorDetectedEv:
+    """Regression test (found 2026-08-28): _retrain() dropped the ±1h hours
+    adjacent to EVERY EV hour, regardless of detection method. That padding
+    exists to cover split_ev_charging()'s flat-charger-kw tapering uncertainty;
+    split_ev_charging_from_sensor() has no such uncertainty (exact per-hour kWh),
+    so padding sensor-detected hours only discards good training rows — and for
+    long solar-tracking wallbox sessions, discards enough of the day to push it
+    below clustering's 18h/day completeness floor. Threshold-detected hours
+    (including the pre-wallbox-coverage ones from Task 3) must still be padded.
+    """
+
+    def _patch_deps(self, monkeypatch, energy_df, ev_kwh_df):
+        TestRetrainCoversPreWallboxEvHistory()._patch_deps(monkeypatch, energy_df, ev_kwh_df)
+
+    def test_sensor_detected_ev_hour_neighbors_are_kept(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(60)  # 2024-01-01 00:00.., flat 1.0 kWh
+
+        # Wallbox coverage 2024-01-02 06:00..16:00 (idx30..idx40); charges at 11:00 (idx35).
+        ev_kwh_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-02 06:00", periods=11, freq="1h"), "kwh": [0.0] * 11}
+        )
+        ev_kwh_df.loc[ev_kwh_df["timestamp"] == pd.Timestamp("2024-01-02 11:00"), "kwh"] = 5.0
+
+        self._patch_deps(monkeypatch, energy_df, ev_kwh_df)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._ev_threshold = 7.0
+        stub._ev_charger_kw = 9.0
+        stub._ev_charging_sensor = "sensor.se_one_ev_charger_total_energy"
+
+        EnergyForecast._retrain(stub)
+
+        trained_ts = set(stub._ml_model.train.call_args.args[0]["timestamp"])
+        assert pd.Timestamp("2024-01-02 10:00") in trained_ts, "sensor-detected EV hour's left neighbor must be kept"
+        assert pd.Timestamp("2024-01-02 12:00") in trained_ts, "sensor-detected EV hour's right neighbor must be kept"
+
+    def test_threshold_detected_ev_hour_neighbors_are_still_padded(self, tmp_path, monkeypatch):
+        """Same retrain call, but the pre-coverage threshold-detected hour (Task 3's
+        scenario) must still lose its ±1h neighbors — padding is still needed there."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(60)
+        energy_df.loc[energy_df["timestamp"] == pd.Timestamp("2024-01-01 10:00"), "gross_kwh"] = 10.0
+
+        ev_kwh_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-02 06:00", periods=11, freq="1h"), "kwh": [0.0] * 11}
+        )
+
+        self._patch_deps(monkeypatch, energy_df, ev_kwh_df)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._ev_threshold = 7.0
+        stub._ev_charger_kw = 9.0
+        stub._ev_charging_sensor = "sensor.se_one_ev_charger_total_energy"
+
+        EnergyForecast._retrain(stub)
+
+        trained_ts = set(stub._ml_model.train.call_args.args[0]["timestamp"])
+        assert pd.Timestamp("2024-01-01 09:00") not in trained_ts, (
+            "threshold-detected EV hour's left neighbor must still be dropped"
+        )
+        assert pd.Timestamp("2024-01-01 11:00") not in trained_ts, (
+            "threshold-detected EV hour's right neighbor must still be dropped"
+        )
+
+
 # ── Callback signature compatibility ─────────────────────────────────────────
 
 

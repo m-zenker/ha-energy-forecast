@@ -42,6 +42,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fed back into `physics_kwh` or the trained model — so the tree's own feature weighting
   cannot discount it. Direct serving-path fix for the 2026-08-04 live bug where a committed
   legionella override barely moved the published forecast.
+- `apps/energy_forecast/ha_data.py` — two new helpers support hybrid EV-detection when a
+  wallbox sensor is configured alongside a threshold. `ev_sensor_coverage()` returns the
+  `(start, end)` hour-floored timestamp range the wallbox sensor cache actually contains, or
+  `None` when the cache is empty — gives `_retrain()` a precise boundary for which rows the
+  sensor can speak for. `split_ev_charging_hybrid()` uses exact per-hour wallbox kWh inside
+  that coverage window and falls back to threshold detection outside it, so pre-wallbox EV
+  sessions are correctly excluded from training rather than silently retained as normal
+  household load.
 
 ### Fixed
 - `apps/energy_forecast/energy_forecast.py` — MQTT Discovery registrations for forecast, block, MAE, scenario, and physics sensors carried `device_class: energy` paired with `state_class: measurement`, which Home Assistant rejects at startup with a warning ("state class 'measurement' is impossible considering device class ('energy')") for every affected entity. Fixed by removing `device_class` from all sensors that publish forecasts or error metrics rather than meter readings: next_1h / next_3h / today / tomorrow totals, all eight 3 h block sensors for each day, the 32 lazily-registered P10/P90 interval sensors, `model_mae` / `mae_7d` / `mae_30d`, all scenario sensors, and — when `physics:` is configured — `physics_base_today` and `ml_adjustment_today`. The two EV actual sensors (`ev_today` / `ev_yesterday`) are genuine accumulators (detected charging kWh that reset at midnight), so they keep `device_class: energy` and move to `state_class: total` instead of losing the device class. Fixes #19.
@@ -88,6 +96,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stripped the UTC label without converting to local time first, silently misclassifying every
   training row within the local UTC offset of the true cutoff as post-migration (fully weighted)
   when it should have been down-weighted. Fixed to `tz_convert(timezone).tz_localize(None)`.
+- `apps/energy_forecast/energy_forecast.py` — `_retrain()` called `split_ev_charging_from_sensor()`
+  directly when `ev_charging_sensor` was configured. That function fills rows predating the sensor's
+  first record with 0 kWh, so real EV sessions from before the wallbox was installed were silently
+  treated as normal household load and included in training rather than excluded. Fixed by switching
+  to `split_ev_charging_hybrid()`: sensor readings are used inside the wallbox sensor's history
+  window; threshold detection covers the earlier period.
+- `apps/energy_forecast/energy_forecast.py` — `_retrain()` applied ±1h adjacent-hour padding
+  (to absorb charger ramp-up/down noise around threshold-detected EV hours) to every EV hour,
+  including hours with exact wallbox sensor readings. Sensor-detected hours need no padding and
+  discarding them is wasteful; for long solar-surplus charging sessions spanning most of the day,
+  the extra drops pushed days below regime clustering's 18 h/day completeness floor, silently
+  removing them from cluster training entirely rather than counting them as EV-excluded (6 of 8
+  post-wallbox EV days were affected). The padding is now restricted to threshold-detected hours
+  only (hours outside the sensor's coverage window).
 
 ---
 

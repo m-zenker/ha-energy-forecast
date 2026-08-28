@@ -730,6 +730,94 @@ class TestSplitEvChargingFromSensor:
         assert len(ev) == 1
 
 
+# ── ev_sensor_coverage ───────────────────────────────────────────────────────
+
+
+class TestEvSensorCoverage:
+    def test_returns_floored_min_and_max(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-03-10 03:37"), pd.Timestamp("2026-03-12 21:05")],
+                "kwh": [1.0, 2.0],
+            }
+        )
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == pd.Timestamp("2026-03-10 03:00")
+        assert end == pd.Timestamp("2026-03-12 21:00")
+
+    def test_empty_df_returns_none(self):
+        assert ha_data.ev_sensor_coverage(pd.DataFrame(columns=["timestamp", "kwh"])) is None
+
+    def test_none_input_returns_none(self):
+        assert ha_data.ev_sensor_coverage(None) is None
+
+    def test_single_row_start_equals_end(self):
+        df = pd.DataFrame({"timestamp": [pd.Timestamp("2026-03-10 03:00")], "kwh": [1.0]})
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == end == pd.Timestamp("2026-03-10 03:00")
+
+
+# ── split_ev_charging_hybrid ─────────────────────────────────────────────────
+
+
+class TestSplitEvChargingHybrid:
+    def _energy_df(self) -> pd.DataFrame:
+        """6 hourly rows, 2026-03-10 00:00..05:00. Row 1 (01:00) is a pre-coverage
+        threshold-shaped spike; row 3 (03:00) is a sub-threshold, in-coverage hour
+        the wallbox sensor reports as charging."""
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-10 00:00", periods=6, freq="1h"),
+                "gross_kwh": [3.0, 10.0, 3.0, 3.0, 2.0, 3.0],
+            }
+        )
+
+    def _ev_kwh_df(self) -> pd.DataFrame:
+        """Wallbox coverage starts 03:00 — the sensor was only installed then."""
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-10 03:00", periods=3, freq="1h"),
+                "kwh": [2.5, 0.0, 0.0],
+            }
+        )
+
+    def test_pre_coverage_hour_uses_threshold_detection(self):
+        """A spike before the wallbox existed must still be caught by the threshold."""
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        row = baseline[baseline["timestamp"] == pd.Timestamp("2026-03-10 01:00")].iloc[0]
+        assert abs(row["gross_kwh"] - 1.0) < 1e-6  # 10.0 - 9.0 charger_kw
+        assert pd.Timestamp("2026-03-10 01:00") in set(ev["timestamp"])
+
+    def test_in_coverage_subthreshold_hour_uses_sensor_detection(self):
+        """A sub-threshold hour within coverage must still be caught via the wallbox reading."""
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        row = baseline[baseline["timestamp"] == pd.Timestamp("2026-03-10 03:00")].iloc[0]
+        assert abs(row["gross_kwh"] - 0.5) < 1e-6  # 3.0 - 2.5 (sensor kWh, not charger_kw)
+        ev_row = ev[ev["timestamp"] == pd.Timestamp("2026-03-10 03:00")].iloc[0]
+        assert abs(ev_row["gross_kwh"] - 2.5) < 1e-6
+
+    def test_no_double_counting_or_dropped_rows(self):
+        baseline, _ = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        assert len(baseline) == 6
+        assert list(baseline["timestamp"]) == list(self._energy_df()["timestamp"])
+
+    def test_empty_ev_kwh_df_falls_back_to_pure_threshold(self):
+        """No sensor data at all -> identical result to calling split_ev_charging directly."""
+        energy_df = self._energy_df()
+        expected_baseline, expected_ev = ha_data.split_ev_charging(energy_df, threshold_kwh=4.5, charger_kw=9.0)
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            energy_df, pd.DataFrame(columns=["timestamp", "kwh"]), threshold_kwh=4.5, charger_kw=9.0
+        )
+        pd.testing.assert_frame_equal(baseline.reset_index(drop=True), expected_baseline.reset_index(drop=True))
+        assert len(ev) == len(expected_ev)
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 
