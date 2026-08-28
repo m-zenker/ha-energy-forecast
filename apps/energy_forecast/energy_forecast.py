@@ -1556,6 +1556,7 @@ class EnergyForecast(hass.Hass):
             )
 
         # ── Subtract EV charging from gross import ────────────────────────────
+        _ev_sensor_coverage: tuple | None = None
         if self._ev_charging_sensor:
             try:
                 _ev_hist = ha_data.fetch_sub_sensor_history(
@@ -1571,7 +1572,10 @@ class EnergyForecast(hass.Hass):
                         energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
                     )
                 else:
-                    baseline_df, ev_df = ha_data.split_ev_charging_from_sensor(energy_df, _ev_hist_stripped)
+                    baseline_df, ev_df = ha_data.split_ev_charging_hybrid(
+                        energy_df, _ev_hist_stripped, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
+                    _ev_sensor_coverage = ha_data.ev_sensor_coverage(_ev_hist_stripped)
             except (OSError, ValueError, KeyError) as exc:
                 _LOGGER.warning(
                     "EV sensor %s fetch failed (%s) — falling back to threshold detection",
