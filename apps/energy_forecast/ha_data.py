@@ -753,6 +753,27 @@ def split_ev_charging_from_sensor(
     return energy_df, ev_df
 
 
+def ev_sensor_coverage(ev_kwh_df: pd.DataFrame | None) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Return the (start, end) hour-range a wallbox kWh cache actually covers.
+
+    Both bounds are floored to the hour, matching how split_ev_charging_from_sensor
+    aligns timestamps. Returns None when *ev_kwh_df* is None or empty — callers
+    should then treat every row as outside coverage (fall back to threshold
+    detection everywhere), since the sensor has no data to be a source of truth for.
+
+    fetch_sub_sensor_history()'s on-disk cache only ever contains rows from
+    whenever the sensor entity was first configured onward — it never backfills
+    dates before that. This coverage window is how callers know which part of a
+    longer energy_df the sensor can actually speak for.
+    """
+    import pandas as pd
+
+    if ev_kwh_df is None or ev_kwh_df.empty:
+        return None
+    ts = pd.to_datetime(ev_kwh_df["timestamp"]).dt.floor("1h")
+    return ts.min(), ts.max()
+
+
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
 
