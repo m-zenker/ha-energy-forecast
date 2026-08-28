@@ -1596,14 +1596,22 @@ class EnergyForecast(hass.Hass):
                 ev_df["gross_kwh"].sum(),
                 sorted(ev_df["timestamp"].dt.date.unique().tolist()),
             )
-            # Drop ±1h adjacent hours (ramp-up/down) — split_ev_charging subtracts the
-            # charger load from exact EV hours but can't cleanly correct adjacent hours
-            # whose elevation comes from a tapering charger.  Dropping 1–2 rows per
-            # session (≈15% of days) has negligible training impact; NaN lags are
-            # filled by feature medians in meta.pkl.
-            _ev_adj_ts: set = {
-                ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
-            }
+            # Drop ±1h adjacent hours (ramp-up/down) — but only for threshold-detected
+            # EV hours. split_ev_charging()'s flat charger_kw subtraction can't tell
+            # exactly when a session ramps up/down, so its immediate neighbors may
+            # still carry a partial co-load. split_ev_charging_from_sensor() has no
+            # such ambiguity (exact per-hour wallbox kWh) — padding those hours too
+            # only discards good rows, and for long solar-tracking sessions discards
+            # enough of the day to push it below clustering's 18h/day completeness
+            # floor (found 2026-08-28: 6 of 8 real post-wallbox EV days were silently
+            # dropped from regime clustering entirely, not counted as excluded).
+            ev_ts_floor = pd.to_datetime(ev_df["timestamp"]).dt.floor("1h")
+            if _ev_sensor_coverage is not None:
+                cov_start, cov_end = _ev_sensor_coverage
+                pad_ts = ev_ts_floor[(ev_ts_floor < cov_start) | (ev_ts_floor > cov_end)]
+            else:
+                pad_ts = ev_ts_floor
+            _ev_adj_ts: set = {ts + pd.Timedelta(hours=d) for ts in pad_ts for d in (-1, 1)}
             baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
 
         sub_sensors_dict: dict = {}
