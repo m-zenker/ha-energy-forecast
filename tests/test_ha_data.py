@@ -696,6 +696,33 @@ class TestSplitEvChargingFromSensor:
         assert len(ev) == 1
 
 
+# ── ev_sensor_coverage ───────────────────────────────────────────────────────
+
+
+class TestEvSensorCoverage:
+    def test_returns_floored_min_and_max(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-03-10 03:37"), pd.Timestamp("2026-03-12 21:05")],
+                "kwh": [1.0, 2.0],
+            }
+        )
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == pd.Timestamp("2026-03-10 03:00")
+        assert end == pd.Timestamp("2026-03-12 21:00")
+
+    def test_empty_df_returns_none(self):
+        assert ha_data.ev_sensor_coverage(pd.DataFrame(columns=["timestamp", "kwh"])) is None
+
+    def test_none_input_returns_none(self):
+        assert ha_data.ev_sensor_coverage(None) is None
+
+    def test_single_row_start_equals_end(self):
+        df = pd.DataFrame({"timestamp": [pd.Timestamp("2026-03-10 03:00")], "kwh": [1.0]})
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == end == pd.Timestamp("2026-03-10 03:00")
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 
