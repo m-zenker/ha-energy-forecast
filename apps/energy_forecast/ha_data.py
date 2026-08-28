@@ -719,6 +719,43 @@ def ev_sensor_coverage(ev_kwh_df: pd.DataFrame | None) -> tuple[pd.Timestamp, pd
     return ts.min(), ts.max()
 
 
+def split_ev_charging_hybrid(
+    energy_df: pd.DataFrame,
+    ev_kwh_df: pd.DataFrame,
+    threshold_kwh: float,
+    charger_kw: float = 9.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split EV charging using the wallbox sensor where it has coverage, threshold
+    detection everywhere else. Same (baseline_df, ev_df) contract as
+    split_ev_charging() / split_ev_charging_from_sensor().
+
+    Rationale: fetch_sub_sensor_history()'s cache for ev_charging_sensor only
+    covers dates from whenever that entity was configured onward.
+    split_ev_charging_from_sensor() alone would silently treat every row before
+    that as "0 kWh charged" (its left-join fillna(0.0)), un-excluding real
+    pre-wallbox EV sessions from training. This function keeps the sensor as the
+    source of truth inside its coverage window (exact per-hour kWh — catches
+    variable-power solar-surplus charging the threshold would miss) and falls
+    back to threshold detection for rows outside it.
+    """
+    import pandas as pd
+
+    coverage = ev_sensor_coverage(ev_kwh_df)
+    if coverage is None:
+        return split_ev_charging(energy_df, threshold_kwh, charger_kw=charger_kw)
+
+    cov_start, cov_end = coverage
+    ts_floor = pd.to_datetime(energy_df["timestamp"]).dt.floor("1h")
+    in_coverage = (ts_floor >= cov_start) & (ts_floor <= cov_end)
+
+    sensor_baseline, sensor_ev = split_ev_charging_from_sensor(energy_df[in_coverage], ev_kwh_df)
+    threshold_baseline, threshold_ev = split_ev_charging(energy_df[~in_coverage], threshold_kwh, charger_kw=charger_kw)
+
+    baseline_df = pd.concat([sensor_baseline, threshold_baseline]).sort_values("timestamp").reset_index(drop=True)
+    ev_df = pd.concat([sensor_ev, threshold_ev]).sort_values("timestamp").reset_index(drop=True)
+    return baseline_df, ev_df
+
+
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
     """Merge two sub-sensor DataFrames (columns 'kwh', optional 'program').
 
