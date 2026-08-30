@@ -1111,6 +1111,7 @@ class EnergyForecast(hass.Hass):
                 dhw_recent=self._cached_dhw_recent,
                 room_areas=self._climate_room_areas or None,
                 physics_model=self._physics_model,
+                heating_buffer_temp_recent=self._physics_heating_buffer_df,
                 dhw_schedule_override=dhw_schedule,
             )
 
