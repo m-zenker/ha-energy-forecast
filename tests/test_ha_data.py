@@ -696,6 +696,94 @@ class TestSplitEvChargingFromSensor:
         assert len(ev) == 1
 
 
+# ── ev_sensor_coverage ───────────────────────────────────────────────────────
+
+
+class TestEvSensorCoverage:
+    def test_returns_floored_min_and_max(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-03-10 03:37"), pd.Timestamp("2026-03-12 21:05")],
+                "kwh": [1.0, 2.0],
+            }
+        )
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == pd.Timestamp("2026-03-10 03:00")
+        assert end == pd.Timestamp("2026-03-12 21:00")
+
+    def test_empty_df_returns_none(self):
+        assert ha_data.ev_sensor_coverage(pd.DataFrame(columns=["timestamp", "kwh"])) is None
+
+    def test_none_input_returns_none(self):
+        assert ha_data.ev_sensor_coverage(None) is None
+
+    def test_single_row_start_equals_end(self):
+        df = pd.DataFrame({"timestamp": [pd.Timestamp("2026-03-10 03:00")], "kwh": [1.0]})
+        start, end = ha_data.ev_sensor_coverage(df)
+        assert start == end == pd.Timestamp("2026-03-10 03:00")
+
+
+# ── split_ev_charging_hybrid ─────────────────────────────────────────────────
+
+
+class TestSplitEvChargingHybrid:
+    def _energy_df(self) -> pd.DataFrame:
+        """6 hourly rows, 2026-03-10 00:00..05:00. Row 1 (01:00) is a pre-coverage
+        threshold-shaped spike; row 3 (03:00) is a sub-threshold, in-coverage hour
+        the wallbox sensor reports as charging."""
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-10 00:00", periods=6, freq="1h"),
+                "gross_kwh": [3.0, 10.0, 3.0, 3.0, 2.0, 3.0],
+            }
+        )
+
+    def _ev_kwh_df(self) -> pd.DataFrame:
+        """Wallbox coverage starts 03:00 — the sensor was only installed then."""
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-03-10 03:00", periods=3, freq="1h"),
+                "kwh": [2.5, 0.0, 0.0],
+            }
+        )
+
+    def test_pre_coverage_hour_uses_threshold_detection(self):
+        """A spike before the wallbox existed must still be caught by the threshold."""
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        row = baseline[baseline["timestamp"] == pd.Timestamp("2026-03-10 01:00")].iloc[0]
+        assert abs(row["gross_kwh"] - 1.0) < 1e-6  # 10.0 - 9.0 charger_kw
+        assert pd.Timestamp("2026-03-10 01:00") in set(ev["timestamp"])
+
+    def test_in_coverage_subthreshold_hour_uses_sensor_detection(self):
+        """A sub-threshold hour within coverage must still be caught via the wallbox reading."""
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        row = baseline[baseline["timestamp"] == pd.Timestamp("2026-03-10 03:00")].iloc[0]
+        assert abs(row["gross_kwh"] - 0.5) < 1e-6  # 3.0 - 2.5 (sensor kWh, not charger_kw)
+        ev_row = ev[ev["timestamp"] == pd.Timestamp("2026-03-10 03:00")].iloc[0]
+        assert abs(ev_row["gross_kwh"] - 2.5) < 1e-6
+
+    def test_no_double_counting_or_dropped_rows(self):
+        baseline, _ = ha_data.split_ev_charging_hybrid(
+            self._energy_df(), self._ev_kwh_df(), threshold_kwh=4.5, charger_kw=9.0
+        )
+        assert len(baseline) == 6
+        assert list(baseline["timestamp"]) == list(self._energy_df()["timestamp"])
+
+    def test_empty_ev_kwh_df_falls_back_to_pure_threshold(self):
+        """No sensor data at all -> identical result to calling split_ev_charging directly."""
+        energy_df = self._energy_df()
+        expected_baseline, expected_ev = ha_data.split_ev_charging(energy_df, threshold_kwh=4.5, charger_kw=9.0)
+        baseline, ev = ha_data.split_ev_charging_hybrid(
+            energy_df, pd.DataFrame(columns=["timestamp", "kwh"]), threshold_kwh=4.5, charger_kw=9.0
+        )
+        pd.testing.assert_frame_equal(baseline.reset_index(drop=True), expected_baseline.reset_index(drop=True))
+        assert len(ev) == len(expected_ev)
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 
@@ -1129,6 +1217,32 @@ class TestLoadExcludedRanges:
         assert result[0][2] == "good row"
         assert any("row" in r.message.lower() for r in caplog.records)
 
+    def test_repeat_malformed_row_with_shared_warned_set_downgrades_to_info(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER, warned=warned)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_warned_none_default_still_warns_every_call(self, tmp_path, caplog):
+        path = tmp_path / "excluded_ranges.csv"
+        path.write_text("start,end,reason\nnot-a-date,2026-07-20,bad row\n2026-07-25,2026-07-26,good row\n")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            load_excluded_ranges(path, "Europe/Zurich", _LOGGER)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
     def test_end_before_start_skipped(self, tmp_path, caplog):
         path = tmp_path / "excluded_ranges.csv"
         path.write_text("start,end,reason\n2026-07-20 10:00,2026-07-19 10:00,backwards\n")
@@ -1263,7 +1377,11 @@ class TestFilterExcludedRanges:
         with caplog.at_level(logging.INFO, logger="energy_forecast"):
             result = filter_excluded_ranges(df, ranges, _LOGGER)
         assert len(result) == 48
-        assert any("dropped 0 row" in r.message for r in caplog.records)
+        # A configured range that matches zero rows in this call (e.g. it has
+        # aged out of the rolling data window) logs nothing — this is the
+        # steady-state for any exclusion range once real data has moved past
+        # its `end` timestamp, so it must not produce hourly noise forever.
+        assert not any("dropped" in r.message for r in caplog.records)
 
     def test_boundary_exact_match_drops_single_row(self):
         df = self._df()
@@ -1293,6 +1411,32 @@ class TestFilterExcludedRanges:
         with caplog.at_level(logging.INFO, logger="energy_forecast"):
             filter_excluded_ranges(df, ranges, _LOGGER)
         assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_repeat_escalation_with_shared_warned_set_downgrades_to_info(self, caplog):
+        df = self._df(periods=48)
+        ranges = [(df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")]  # 11/48 rows = 23%
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, ranges, _LOGGER, warned=warned)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    def test_different_range_still_warns_despite_nonempty_warned_set(self, caplog):
+        df = self._df(periods=48)
+        first_range = (df["timestamp"].iloc[0], df["timestamp"].iloc[10], "big")
+        second_range = (df["timestamp"].iloc[20], df["timestamp"].iloc[30], "different")
+        warned: set = set()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, [first_range], _LOGGER, warned=warned)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            filter_excluded_ranges(df, [second_range], _LOGGER, warned=warned)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     def test_malformed_input_returns_df_unfiltered(self, caplog):
         df = pd.DataFrame({"timestamp": ["not", "timestamps"], "gross_kwh": [1.0, 2.0]})

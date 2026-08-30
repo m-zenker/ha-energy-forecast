@@ -307,6 +307,11 @@ class EnergyForecast(hass.Hass):
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._last_adaptive_retrain: datetime = datetime.min
 
+        # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
+        # resets only on AppDaemon restart, so a still-active problem re-warns at
+        # the next "system startup" instead of every hourly _update_sensors() call.
+        self._excluded_range_warned: set = set()
+
         # Stage 4: cached inputs for scenario/what-if API
         self._cached_forecast_df: Any = None
         self._cached_live_temp: Any = None
@@ -1112,9 +1117,14 @@ class EnergyForecast(hass.Hass):
         # Filtered as early as possible: a correction/EV-detection computed
         # from a corrupted main reading is equally meaningless.
         excluded_ranges = ha_data.load_excluded_ranges(
-            self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+            self._cache_path.parent / "excluded_ranges.csv",
+            self._timezone,
+            _LOGGER,
+            warned=self._excluded_range_warned,
         )
-        energy_df = ha_data.filter_excluded_ranges(energy_df, excluded_ranges, _LOGGER)
+        energy_df = ha_data.filter_excluded_ranges(
+            energy_df, excluded_ranges, _LOGGER, warned=self._excluded_range_warned
+        )
 
         if len(energy_df) < MIN_HISTORY_HOURS:
             _LOGGER.warning(
@@ -1175,6 +1185,7 @@ class EnergyForecast(hass.Hass):
             )
 
         # ── Subtract EV charging from gross import ────────────────────────────
+        _ev_sensor_coverage: tuple | None = None
         if self._ev_charging_sensor:
             try:
                 _ev_hist = ha_data.fetch_sub_sensor_history(
@@ -1190,7 +1201,10 @@ class EnergyForecast(hass.Hass):
                         energy_df, self._ev_threshold, charger_kw=self._ev_charger_kw
                     )
                 else:
-                    baseline_df, ev_df = ha_data.split_ev_charging_from_sensor(energy_df, _ev_hist_stripped)
+                    baseline_df, ev_df = ha_data.split_ev_charging_hybrid(
+                        energy_df, _ev_hist_stripped, self._ev_threshold, charger_kw=self._ev_charger_kw
+                    )
+                    _ev_sensor_coverage = ha_data.ev_sensor_coverage(_ev_hist_stripped)
             except (OSError, ValueError, KeyError) as exc:
                 _LOGGER.warning(
                     "EV sensor %s fetch failed (%s) — falling back to threshold detection",
@@ -1211,14 +1225,22 @@ class EnergyForecast(hass.Hass):
                 ev_df["gross_kwh"].sum(),
                 sorted(ev_df["timestamp"].dt.date.unique().tolist()),
             )
-            # Drop ±1h adjacent hours (ramp-up/down) — split_ev_charging subtracts the
-            # charger load from exact EV hours but can't cleanly correct adjacent hours
-            # whose elevation comes from a tapering charger.  Dropping 1–2 rows per
-            # session (≈15% of days) has negligible training impact; NaN lags are
-            # filled by feature medians in meta.pkl.
-            _ev_adj_ts: set = {
-                ts + pd.Timedelta(hours=d) for ts in pd.to_datetime(ev_df["timestamp"]).dt.floor("1h") for d in (-1, 1)
-            }
+            # Drop ±1h adjacent hours (ramp-up/down) — but only for threshold-detected
+            # EV hours. split_ev_charging()'s flat charger_kw subtraction can't tell
+            # exactly when a session ramps up/down, so its immediate neighbors may
+            # still carry a partial co-load. split_ev_charging_from_sensor() has no
+            # such ambiguity (exact per-hour wallbox kWh) — padding those hours too
+            # only discards good rows, and for long solar-tracking sessions discards
+            # enough of the day to push it below clustering's 18h/day completeness
+            # floor (found 2026-08-28: 6 of 8 real post-wallbox EV days were silently
+            # dropped from regime clustering entirely, not counted as excluded).
+            ev_ts_floor = pd.to_datetime(ev_df["timestamp"]).dt.floor("1h")
+            if _ev_sensor_coverage is not None:
+                cov_start, cov_end = _ev_sensor_coverage
+                pad_ts = ev_ts_floor[(ev_ts_floor < cov_start) | (ev_ts_floor > cov_end)]
+            else:
+                pad_ts = ev_ts_floor
+            _ev_adj_ts: set = {ts + pd.Timedelta(hours=d) for ts in pad_ts for d in (-1, 1)}
             baseline_df = baseline_df[~pd.to_datetime(baseline_df["timestamp"]).dt.floor("1h").isin(_ev_adj_ts)]
 
         sub_sensors_dict: dict = {}
@@ -1541,9 +1563,14 @@ class EnergyForecast(hass.Hass):
         # Does NOT extend to full_actuals (anomaly/MAE sensors) — spec §6.
         if recent_actuals is not None and not recent_actuals.empty:
             excluded_ranges = ha_data.load_excluded_ranges(
-                self._cache_path.parent / "excluded_ranges.csv", self._timezone, _LOGGER
+                self._cache_path.parent / "excluded_ranges.csv",
+                self._timezone,
+                _LOGGER,
+                warned=self._excluded_range_warned,
             )
-            recent_actuals = ha_data.filter_excluded_ranges(recent_actuals, excluded_ranges, _LOGGER)
+            recent_actuals = ha_data.filter_excluded_ranges(
+                recent_actuals, excluded_ranges, _LOGGER, warned=self._excluded_range_warned
+            )
 
         # Cache inputs for scenario/what-if API (Stage 4)
         self._cached_forecast_df = forecast_df

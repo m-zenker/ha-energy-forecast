@@ -114,8 +114,23 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
 _EXCLUDED_RANGE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$")
 
 
+def _warn_once(logger: logging.Logger, warned: set | None, key: tuple, msg: str, *args) -> None:
+    """Log at WARNING the first time `key` is seen, INFO on repeats.
+
+    `warned` is an optional dedup set shared across an app instance's call
+    sites (see load_excluded_ranges/filter_excluded_ranges). `warned=None`
+    disables dedup — always logs at WARNING, matching pre-#95 behavior.
+    """
+    if warned is not None and key in warned:
+        logger.info(msg, *args)
+    else:
+        logger.warning(msg, *args)
+        if warned is not None:
+            warned.add(key)
+
+
 def load_excluded_ranges(
-    path: Path, timezone: str, logger: logging.Logger
+    path: Path, timezone: str, logger: logging.Logger, warned: set | None = None
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
     """Load hand-edited known-bad training/prediction date ranges.
 
@@ -133,6 +148,12 @@ def load_excluded_ranges(
             start/end values that fall in a nonexistent local time
             (DST spring-forward gap).
         logger: Logger to report malformed rows/files to.
+        warned: Optional dedup set shared across calls. When given, a
+            condition (unreadable file, missing columns, a specific bad
+            row) that already warned once logs at INFO on repeat calls
+            instead of WARNING again — "should only fire on system
+            startup" (ROADMAP #95). Omit for the pre-existing behavior of
+            warning on every call.
 
     Returns:
         List of (start, end, reason) tuples — naive local pd.Timestamps,
@@ -148,14 +169,23 @@ def load_excluded_ranges(
     try:
         raw = pd.read_csv(path, dtype=str)
     except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        logger.warning("excluded_ranges.csv unreadable (%s) — treating as no exclusions.", exc)
+        _warn_once(
+            logger,
+            warned,
+            ("csv_unreadable", str(path)),
+            "excluded_ranges.csv unreadable (%s) — treating as no exclusions.",
+            exc,
+        )
         return []
 
     if raw.empty:
         return []
 
     if "start" not in raw.columns or "end" not in raw.columns:
-        logger.warning(
+        _warn_once(
+            logger,
+            warned,
+            ("missing_columns", tuple(raw.columns)),
             "excluded_ranges.csv missing required 'start'/'end' column(s) (found: %s) — treating as no exclusions.",
             list(raw.columns),
         )
@@ -174,7 +204,10 @@ def load_excluded_ranges(
             reason = str(row["reason"]).strip()
 
             if not _EXCLUDED_RANGE_TS_RE.match(start_raw) or not _EXCLUDED_RANGE_TS_RE.match(end_raw):
-                logger.warning(
+                _warn_once(
+                    logger,
+                    warned,
+                    ("bad_format", row_num, start_raw, end_raw),
                     "excluded_ranges.csv row %d: '%s'/'%s' doesn't match YYYY-MM-DD or "
                     "YYYY-MM-DD HH:MM — skipping row.",
                     row_num + 2,  # +2: 1-indexed data row, plus the header row
@@ -190,7 +223,10 @@ def load_excluded_ranges(
                 end = end + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
             if end < start:
-                logger.warning(
+                _warn_once(
+                    logger,
+                    warned,
+                    ("end_before_start", row_num, start_raw, end_raw),
                     "excluded_ranges.csv row %d: end (%s) is before start (%s) — skipping row.",
                     row_num + 2,
                     end,
@@ -203,7 +239,10 @@ def load_excluded_ranges(
                     ts.tz_localize(timezone, nonexistent="raise", ambiguous="raise")
                 except ValueError as exc:
                     if "nonexistent" in str(exc):
-                        logger.warning(
+                        _warn_once(
+                            logger,
+                            warned,
+                            ("dst_gap", row_num, label, str(ts)),
                             "excluded_ranges.csv row %d: %s value %s falls in a nonexistent "
                             "local time (DST spring-forward gap in %s) — check for a "
                             "transcription error. Row still applied as written.",
@@ -217,7 +256,14 @@ def load_excluded_ranges(
 
             ranges.append((start, end, reason))
         except (ValueError, TypeError, AttributeError) as exc:
-            logger.warning("excluded_ranges.csv row %d malformed (%s) — skipping row.", row_num + 2, exc)
+            _warn_once(
+                logger,
+                warned,
+                ("row_error", row_num, str(exc)),
+                "excluded_ranges.csv row %d malformed (%s) — skipping row.",
+                row_num + 2,
+                exc,
+            )
             continue
 
     return ranges
@@ -228,7 +274,10 @@ _EXCLUSION_WARN_SPAN_DAYS = 14
 
 
 def filter_excluded_ranges(
-    df: pd.DataFrame, ranges: list[tuple[pd.Timestamp, pd.Timestamp, str]], logger: logging.Logger
+    df: pd.DataFrame,
+    ranges: list[tuple[pd.Timestamp, pd.Timestamp, str]],
+    logger: logging.Logger,
+    warned: set | None = None,
 ) -> pd.DataFrame:
     """Drop rows whose timestamp falls in any hand-configured known-bad range.
 
@@ -242,6 +291,13 @@ def filter_excluded_ranges(
         ranges: Output of load_excluded_ranges() — (start, end, reason)
             tuples, end inclusive.
         logger: Logger to report per-range and total drop counts to.
+        warned: Optional dedup set shared across calls (e.g. across an
+            app instance's hourly + weekly call sites). When given, a
+            range whose escalation condition (see below) already fired
+            once logs at INFO on repeat calls instead of WARNING again —
+            "should only fire on system startup" (ROADMAP #95). Callers
+            that don't need dedup can omit it; every call then warns as
+            before.
 
     Returns:
         df with excluded rows removed (a new DataFrame; input is not
@@ -261,17 +317,16 @@ def filter_excluded_ranges(
             range_mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
             n_dropped = int(range_mask.sum())
             span_days = (end - start).total_seconds() / 86400
-            escalate = (
-                total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
-            ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
-            log_fn = logger.warning if escalate else logger.info
-            log_fn(
-                "Excluded range %s -> %s (%s): dropped %d row(s).",
-                start,
-                end,
-                reason or "no reason given",
-                n_dropped,
-            )
+            if n_dropped:
+                escalate = (
+                    total_rows > 0 and n_dropped > total_rows * _EXCLUSION_WARN_ROW_FRACTION
+                ) or span_days > _EXCLUSION_WARN_SPAN_DAYS
+                msg = "Excluded range %s -> %s (%s): dropped %d row(s)."
+                msg_args = (start, end, reason or "no reason given", n_dropped)
+                if escalate:
+                    _warn_once(logger, warned, ("escalate", start, end, reason), msg, *msg_args)
+                else:
+                    logger.info(msg, *msg_args)
             union_mask = union_mask | range_mask
 
         total_dropped = int(union_mask.sum())
@@ -696,6 +751,64 @@ def split_ev_charging_from_sensor(
     ev_df["gross_kwh"] = ev_kwh[ev_mask]
 
     return energy_df, ev_df
+
+
+def ev_sensor_coverage(ev_kwh_df: pd.DataFrame | None) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Return the (start, end) hour-range a wallbox kWh cache actually covers.
+
+    Both bounds are floored to the hour, matching how split_ev_charging_from_sensor
+    aligns timestamps. Returns None when *ev_kwh_df* is None or empty — callers
+    should then treat every row as outside coverage (fall back to threshold
+    detection everywhere), since the sensor has no data to be a source of truth for.
+
+    fetch_sub_sensor_history()'s on-disk cache only ever contains rows from
+    whenever the sensor entity was first configured onward — it never backfills
+    dates before that. This coverage window is how callers know which part of a
+    longer energy_df the sensor can actually speak for.
+    """
+    import pandas as pd
+
+    if ev_kwh_df is None or ev_kwh_df.empty:
+        return None
+    ts = pd.to_datetime(ev_kwh_df["timestamp"]).dt.floor("1h")
+    return ts.min(), ts.max()
+
+
+def split_ev_charging_hybrid(
+    energy_df: pd.DataFrame,
+    ev_kwh_df: pd.DataFrame,
+    threshold_kwh: float,
+    charger_kw: float = 9.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split EV charging using the wallbox sensor where it has coverage, threshold
+    detection everywhere else. Same (baseline_df, ev_df) contract as
+    split_ev_charging() / split_ev_charging_from_sensor().
+
+    Rationale: fetch_sub_sensor_history()'s cache for ev_charging_sensor only
+    covers dates from whenever that entity was configured onward.
+    split_ev_charging_from_sensor() alone would silently treat every row before
+    that as "0 kWh charged" (its left-join fillna(0.0)), un-excluding real
+    pre-wallbox EV sessions from training. This function keeps the sensor as the
+    source of truth inside its coverage window (exact per-hour kWh — catches
+    variable-power solar-surplus charging the threshold would miss) and falls
+    back to threshold detection for rows outside it.
+    """
+    import pandas as pd
+
+    coverage = ev_sensor_coverage(ev_kwh_df)
+    if coverage is None:
+        return split_ev_charging(energy_df, threshold_kwh, charger_kw=charger_kw)
+
+    cov_start, cov_end = coverage
+    ts_floor = pd.to_datetime(energy_df["timestamp"]).dt.floor("1h")
+    in_coverage = (ts_floor >= cov_start) & (ts_floor <= cov_end)
+
+    sensor_baseline, sensor_ev = split_ev_charging_from_sensor(energy_df[in_coverage], ev_kwh_df)
+    threshold_baseline, threshold_ev = split_ev_charging(energy_df[~in_coverage], threshold_kwh, charger_kw=charger_kw)
+
+    baseline_df = pd.concat([sensor_baseline, threshold_baseline]).sort_values("timestamp").reset_index(drop=True)
+    ev_df = pd.concat([sensor_ev, threshold_ev]).sort_values("timestamp").reset_index(drop=True)
+    return baseline_df, ev_df
 
 
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:

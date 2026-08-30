@@ -47,6 +47,27 @@ class TestCheckAddonState:
         assert status_module.check_addon_state({}) == "unknown"
 
 
+class TestCheckAddonStateFallback:
+    def test_reports_registered_addon_from_update_entity(self, status_module):
+        states_by_id = status_module.index_by_entity_id(
+            [
+                _state(
+                    "update.appdaemon_update",
+                    "off",
+                    {"installed_version": "0.18.5", "in_progress": False},
+                )
+            ]
+        )
+        # last_updated isn't part of `attributes`, it's a top-level state field —
+        # patch it in directly to match the real HA REST API shape.
+        states_by_id["update.appdaemon_update"]["last_updated"] = "2026-08-27T11:28:25+00:00"
+        result = status_module.check_addon_state_fallback(states_by_id)
+        assert result == ("registered, installed=0.18.5, update_in_progress=False, last_seen=2026-08-27T11:28:25+00:00")
+
+    def test_none_when_update_entity_missing(self, status_module):
+        assert status_module.check_addon_state_fallback({}) is None
+
+
 class TestCheckModelPhase:
     def test_reads_model_phase_attribute(self, status_module):
         states_by_id = status_module.index_by_entity_id(
