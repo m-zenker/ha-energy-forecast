@@ -4005,30 +4005,62 @@ class TestCompositeForecast:
         """predict_scenario() must forward heating_buffer_temp_recent to both internal
         predict() calls — regression test for the 2026-08-19 phantom-0.0-buffer-temp bug
         (predict_scenario() previously had no such parameter at all, so every
-        get_scenario call silently predicted with heating_buffer_temp=0.0)."""
+        get_scenario call silently predicted with heating_buffer_temp=0.0).
+
+        Tests forwarding to both natural_baseline_df and scenario_baseline_df predict() calls
+        by providing dhw_schedule_override+physics_model together, which triggers the second
+        predict() call path.
+        """
         from unittest.mock import MagicMock
 
-        m, forecast = _make_trained_model(tmp_path)
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        # Create physics model (same pattern as TestScenarioDhwDelta fixtures)
+        pm = ThermalPhysicsModel(
+            tmp_path / "physics_models",
+            {
+                "cop_formula": {"a": 2.5, "b": 0.07},
+                "dhw_tank_volume_l": 200,
+                "dhw_power_w": 4000,
+                "internal_gains_fraction": 0.8,
+                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+                "room_thermostats": [],
+                "use_physics_residual": True,
+            },
+        )
+        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
+
+        m, forecast = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
         m._appliance_signatures = {
             "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
         }
         buffer_df = pd.DataFrame(
             {"timestamp": pd.date_range("2024-01-01", periods=3, freq="1h"), "heating_buffer_temp": [45.0, 46.0, 47.0]}
         )
+
+        # Create dhw override to exercise the second predict() call path
+        override = {"legionella": (str(forecast["timestamp"].iloc[10].date()), forecast["timestamp"].iloc[10].hour)}
+
         real_predict = m.predict
         wrapped = MagicMock(side_effect=real_predict)
         m.predict = wrapped
 
         m.predict_scenario(
             forecast,
-            live_temp=None,
+            live_temp=5.0,
             schedule={"sub_dw": "12:00"},
+            physics_model=pm,
             heating_buffer_temp_recent=buffer_df,
+            dhw_schedule_override=override,
         )
 
-        assert wrapped.call_count >= 1
-        for call in wrapped.call_args_list:
-            assert call.kwargs.get("heating_buffer_temp_recent") is buffer_df
+        # Must have called predict() at least twice: natural_baseline_df and scenario_baseline_df
+        assert wrapped.call_count >= 2, f"Expected at least 2 predict() calls, got {wrapped.call_count}"
+        # Both calls must forward the heating_buffer_temp_recent parameter
+        for i, call in enumerate(wrapped.call_args_list):
+            assert call.kwargs.get("heating_buffer_temp_recent") is buffer_df, (
+                f"predict() call {i} did not receive heating_buffer_temp_recent"
+            )
 
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
