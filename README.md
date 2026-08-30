@@ -78,7 +78,7 @@ These four steps get forecasts running. Skip MQTT Discovery, sub-sensors, and ba
 **1. Install AppDaemon and configure dependencies.**
 In HA go to **Settings → Add-ons → Add-on Store**, install **AppDaemon**, then paste the dependency block from [Requirements → AppDaemon add-on configuration](#appdaemon-add-on-configuration) into the add-on's Configuration tab and save.
 
-> **Timing:** the first AppDaemon restart takes **5–10 minutes** while LightGBM compiles on some platforms. Subsequent restarts take ~30 seconds (wheel is cached). On **Raspberry Pi (armv7)**, omit the `lightgbm` `init_commands` line if compilation fails — the app falls back to scikit-learn automatically.
+> **Timing:** on AppDaemon add-on **v0.19.0+** (Debian-based), the first restart installs prebuilt wheels for every dependency — well under a minute, no compiling. On **Raspberry Pi (armv7)**, drop `lightgbm` from `python_packages` if it fails to install — the app falls back to scikit-learn automatically. (Pre-v0.19.0, Alpine-based add-ons compiled LightGBM from source on first restart, ~5–10 minutes — see [git history](https://github.com/m-zenker/ha-energy-forecast/commits/main/README.md) if you're still on an older add-on version.)
 
 **2. Copy the app files** into your AppDaemon apps directory:
 ```
@@ -229,36 +229,34 @@ The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must 
 
 ```yaml
 system_packages:
-  - build-base
-  - g++
-  - gfortran
-  - openblas-dev
-  - python3-dev
+  - libgomp1
 python_packages:
   - requests>=2.31.0
   - holidays>=0.46
-init_commands:
-  - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
-  - "mkdir -p /data/pip_cache && pip install --cache-dir /data/pip_cache 'lightgbm>=4.7.0,<5.0' --quiet"
+  - pandas
+  - numpy
+  - scikit-learn
+  - lightgbm>=4.7.0,<5.0
+init_commands: []
 ```
 
-`system_packages` provides the Alpine build toolchain (needed to compile LightGBM from source) plus the `libgomp` OpenMP runtime required by scikit-learn. `python_packages` handles pure-Python packages.
+`system_packages` needs only `libgomp1`, the OpenMP runtime scikit-learn requires at import time. Everything else is a normal PyPI package declared through `python_packages` — as of AppDaemon add-on **v0.19.0**, the add-on runs on Debian instead of Alpine, so pandas/numpy/scikit-learn/lightgbm all install as prebuilt manylinux wheels with no compiler and no third-party wheel index needed. `init_commands: []` is required as an empty key — the add-on's options schema rejects the block if the key is missing entirely, even unused.
 
-**Why `init_commands` instead of `python_packages` for pandas/numpy/scikit-learn?** AppDaemon runs on Alpine Linux (musl libc). PyPI and the HA musllinux-index do not provide pre-built musl wheels for these packages on aarch64 — pip would fall back to a source build (very slow). The alpine-wheels index provides pre-built musl-compatible wheels. LightGBM must be compiled from source; the add-on's `/data/` volume cache means it compiles once (**~5 min on first restart**) and reuses the wheel on every subsequent start (**~30 sec**).
-
-> **Important:** each `init_commands` entry must be a **separate list item**. A single `>-` folded scalar merges all lines into one string, which can pass package names as stray tokens to an earlier pip command.
-
-> **Note:** If LightGBM fails to build on your platform (e.g. armv7 without a C compiler), remove the second `init_commands` entry and the build toolchain from `system_packages` — but keep `libgomp`, which scikit-learn requires at runtime on Alpine/aarch64:
+> **Note:** on **Raspberry Pi armv7** there's no prebuilt LightGBM wheel — drop it from `python_packages` if it fails to install:
 > ```yaml
 > system_packages:
->   - libgomp
+>   - libgomp1
 > python_packages:
 >   - requests>=2.31.0
 >   - holidays>=0.46
-> init_commands:
->   - "pip install --extra-index-url https://alpine-wheels.github.io/index pandas numpy 'scikit-learn<=1.6.0'"
+>   - pandas
+>   - numpy
+>   - scikit-learn
+> init_commands: []
 > ```
-> The app will automatically fall back to scikit-learn's GradientBoostingRegressor. Removing `libgomp` causes scikit-learn to fail to import even though it installs without error (issue [#10](https://github.com/m-zenker/ha-energy-forecast/issues/10)).
+> The app automatically falls back to scikit-learn's GradientBoostingRegressor. Keep `libgomp1` even here — scikit-learn fails to import without it even though it installs without error (issue [#10](https://github.com/m-zenker/ha-energy-forecast/issues/10), originally an Alpine finding but the same failure mode applies to Debian's `libgomp1`).
+
+> **On AppDaemon add-on v0.18.x or earlier (Alpine-based):** use the [pre-v0.19.0 instructions](https://github.com/m-zenker/ha-energy-forecast/blob/777aff1/README.md#appdaemon-add-on-configuration) instead — this add-on version's `system_packages` still takes Alpine package names and needs the `alpine-wheels` mirror. Upstream release notes: [hassio-addons/app-appdaemon v0.19.0](https://github.com/hassio-addons/app-appdaemon/releases/tag/v0.19.0).
 
 This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemon_config.yaml) in the repository root — copy either source.
 
@@ -1241,9 +1239,9 @@ Dashboard YAML files are in the `dashboard/` directory. To import them into Home
 - **New installs:** run the [backfill tool](#backfilling-history) to import existing HA history before the first training run. Without it, you will not receive a forecast until at least 48 consecutive hours of energy readings have been collected.
 
 **`ML engine: sklearn GBR` instead of LightGBM**
-- LightGBM failed to install (no C compiler on the host, e.g. armv7).
-- The sklearn fallback is fully functional. If you want LightGBM, ensure the build toolchain system packages are present in the add-on configuration.
-- On Alpine ARM without a C compiler: remove `lightgbm` from the `init_commands` line in the add-on configuration to avoid a failed install attempt.
+- LightGBM failed to install — typically armv7, which has no prebuilt LightGBM wheel on PyPI.
+- The sklearn fallback is fully functional. If you want LightGBM, confirm your architecture has a wheel available (amd64/aarch64 do; armv7 doesn't).
+- On armv7: remove `lightgbm` from `python_packages` in the add-on configuration to avoid a failed install attempt.
 
 **Forecast accuracy is poor in the first few weeks**
 - The model needs at least a few weeks of data to learn daily and weekly patterns. Use the backfill tool to give it a head start.
