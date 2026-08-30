@@ -8,6 +8,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.11.12] - 2026-08-30
+
 ### Added
 - `apps/energy_forecast/ha_data.py` — two new helpers support hybrid EV-detection when a wallbox sensor is configured alongside a threshold. `ev_sensor_coverage()` returns the `(start, end)` hour-floored timestamp range the wallbox sensor cache actually contains, or `None` when the cache is empty — gives `_retrain()` a precise boundary for which rows the sensor can speak for. `split_ev_charging_hybrid()` uses exact per-hour wallbox kWh inside that coverage window and falls back to threshold detection outside it, so pre-wallbox EV sessions are correctly excluded from training rather than silently retained as normal household load.
 
