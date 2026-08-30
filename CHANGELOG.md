@@ -112,6 +112,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   removing them from cluster training entirely rather than counting them as EV-excluded (6 of 8
   post-wallbox EV days were affected). The padding is now restricted to threshold-detected hours
   only (hours outside the sensor's coverage window).
+- `apps/energy_forecast/model.py` — `predict_scenario()` had no `heating_buffer_temp_recent` parameter, so every `energy_forecast/get_scenario` service call (legionella DHW candidate scoring, appliance what-if queries from `ha-energy-manager`) silently predicted with a phantom `heating_buffer_temp=0.0` instead of the real live sensor value whenever `heating_buffer_temp` appeared in the model's feature set. Added the parameter (matching the identical one already on `predict()`) and forwarded it to both internal `predict()` calls — the natural-baseline and the scenario-baseline.
+- `apps/energy_forecast/energy_forecast.py` — `_get_scenario_cb` (the `energy_forecast/get_scenario` service handler) now passes the cached `_physics_heating_buffer_df` attribute as `heating_buffer_temp_recent` to `predict_scenario()`, completing the fix above: the live heating-buffer temperature is used for all scenario comparisons instead of zero.
 
 ---
 
