@@ -161,6 +161,34 @@ class TestGetScenarioCb:
         call_kwargs = app._ml_model.predict_scenario.call_args[1]
         assert call_kwargs.get("room_areas") == {"climate.living": 40.0}
 
+    def test_heating_buffer_temp_forwarded_to_predict_scenario(self):
+        """_get_scenario_cb must pass self._physics_heating_buffer_df to predict_scenario
+        as heating_buffer_temp_recent — regression test for the 2026-08-19 bug where every
+        get_scenario call silently predicted with a phantom heating_buffer_temp=0.0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        buffer_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-01", periods=3, freq="1h"), "heating_buffer_temp": [45.0, 46.0, 47.0]}
+        )
+        app._physics_heating_buffer_df = buffer_df
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False},
+        )
+
+        call_kwargs = app._ml_model.predict_scenario.call_args[1]
+        assert call_kwargs.get("heating_buffer_temp_recent") is buffer_df
+
     def test_publish_flag_calls_publish_method(self):
         """publish=True should call _publish_scenario_forecast."""
         from energy_forecast.energy_forecast import EnergyForecast
