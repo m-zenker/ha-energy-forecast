@@ -1410,6 +1410,7 @@ class EnergyForecastModel:
         setpoint_off: float | None = None,
         room_areas: dict[str, float] | None = None,
         physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         dhw_schedule_override: dict | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
@@ -1440,6 +1441,7 @@ class EnergyForecastModel:
             setpoint_off=setpoint_off,
             room_areas=room_areas,
             physics_model=physics_model,
+            heating_buffer_temp_recent=heating_buffer_temp_recent,
             # predict_series's silent committed_override fallback was removed (Phase A Task 6) —
             # this call site must ask for the live committed override explicitly so the "natural
             # baseline" still reflects whatever's actually committed right now (e.g. an already-
@@ -1464,6 +1466,7 @@ class EnergyForecastModel:
                 setpoint_off=setpoint_off,
                 room_areas=room_areas,
                 physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
             )
         else:

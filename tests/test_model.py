@@ -4001,6 +4001,35 @@ class TestCompositeForecast:
         )
         assert "delta_kwh" in result.columns
 
+    def test_predict_scenario_forwards_heating_buffer_temp_recent(self, tmp_path):
+        """predict_scenario() must forward heating_buffer_temp_recent to both internal
+        predict() calls — regression test for the 2026-08-19 phantom-0.0-buffer-temp bug
+        (predict_scenario() previously had no such parameter at all, so every
+        get_scenario call silently predicted with heating_buffer_temp=0.0)."""
+        from unittest.mock import MagicMock
+
+        m, forecast = _make_trained_model(tmp_path)
+        m._appliance_signatures = {
+            "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
+        }
+        buffer_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-01", periods=3, freq="1h"), "heating_buffer_temp": [45.0, 46.0, 47.0]}
+        )
+        real_predict = m.predict
+        wrapped = MagicMock(side_effect=real_predict)
+        m.predict = wrapped
+
+        m.predict_scenario(
+            forecast,
+            live_temp=None,
+            schedule={"sub_dw": "12:00"},
+            heating_buffer_temp_recent=buffer_df,
+        )
+
+        assert wrapped.call_count >= 1
+        for call in wrapped.call_args_list:
+            assert call.kwargs.get("heating_buffer_temp_recent") is buffer_df
+
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
         df = _make_baseline_df(start="2024-06-01 10:00")
