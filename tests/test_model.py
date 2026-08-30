@@ -1764,8 +1764,7 @@ class TestPredictWithPhysics:
         """Mirrors test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time:
         a model trained WITH heating_buffer_temp_df (so heating_buffer_temp lands in
         feature_cols) must not raise KeyError when predicting WITHOUT
-        heating_buffer_temp_recent (sensor outage, config change, or predict_scenario()
-        which never supplies this series at all)."""
+        heating_buffer_temp_recent (sensor outage or config change)."""
         n = 600
         ts = pd.date_range("2024-01-01", periods=n, freq="1h")
         rng = np.random.default_rng(0)
