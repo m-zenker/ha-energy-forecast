@@ -60,7 +60,7 @@ partially wired:
 - A cooling-day exclusion in `DailyProfileClusterer.fit()`, mirroring the existing `ev_day_dates`
   mechanism (§4.10) — round-1 review confirmed this is not a deferrable question but the same
   contamination class as #82 (EV-day centroid contamination), with no exclusion today.
-- A model-artifact rollback fallback for the three new feature columns, mirroring the existing
+- A model-artifact rollback fallback for the two new feature columns, mirroring the existing
   `physics_kwh`/`heating_buffer_temp` pattern (§4.11).
 - Config validation and a runtime sanity/warning mechanism for the unvalidated placeholder
   constants (§4.6, §6).
@@ -294,7 +294,7 @@ formula Discussion #20 proposed under the name "cooling degree" — it already e
 new work; §10 covers this. `cooling_deg_sum` was close enough to `cooling_degree` to be a real
 interpretability trap in SHAP output (two similarly-named, semantically different signals), hence
 the rename to `cooling_load_sum_24h` for the AC-active-gated rolling sum proposed here. Same
-rolling-sum pattern as `heating_deg_sum_24h` (`model.py:3036`): accumulates cooling-direction
+rolling-sum pattern as `heating_deg_sum_24h` (`model.py:3179`): accumulates cooling-direction
 `thermal_pressure` only (0 during heating-mode or cooling-inactive hours).
 
 **History note (#96):** a `cooling_load_sum_168h` sibling was originally proposed alongside this
@@ -302,8 +302,8 @@ column (mirroring `heating_deg_sum_168h`) but was removed before release — its
 cannot be seeded at prediction time the way `heating_deg_sum_168h` is (via `self._weather_tail`),
 since `cooling_load_sum` is derived from `climate_dfs`/`cooling_active` on the primary prediction
 frame itself, not from the weather side-channel `_weather_tail` extends. That made it a permanent,
-structural train/serve scale mismatch rather than a fixable gap — see the original §7 finding this
-note replaces. `cooling_load_sum_24h` has no such problem (its window fits entirely inside the
+structural train/serve scale mismatch rather than a fixable gap (this note replaces the §7 finding
+that previously described it). `cooling_load_sum_24h` has no such problem (its window fits entirely inside the
 48-row prediction horizon) and was kept.
 
 ### 4.8 `defrost_risk` — forced to 0 while `cooling_active`
@@ -394,8 +394,8 @@ collapse to the same Python `False` before any downstream code runs via the exis
 - **No-regression guarantee, tested against the actual risk:** a test comparing the *full*
   `X.columns` composition and holdout MAE against pre-change `main` output, using existing real
   heating-season fixtures, with `cooling_mode_enabled` both absent and explicitly `false` — this
-  is what actually verifies the three unconditionally-added columns (§5) don't perturb trained
-  tree structure or accuracy for this deployment, not just that three named Series match.
+  is what actually verifies the two unconditionally-added columns (§5) don't perturb trained
+  tree structure or accuracy for this deployment, not just that two named Series match.
 - **The "enabled but no active entity configured" branch** (§3's validation-warns-but-doesn't-
   block case) — untested in rev. 1 — gets its own test confirming it also reproduces heating-only
   output.
