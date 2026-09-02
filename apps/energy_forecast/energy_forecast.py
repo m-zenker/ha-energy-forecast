@@ -307,6 +307,25 @@ class EnergyForecast(hass.Hass):
         self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
 
+        # ── Cooling mode / AC support (community contribution, #96) ───────────
+        # cooling_mode_enabled: master switch; False = zero new code paths execute.
+        # hvac_mode_entity: single mode-string entity (preferred where available;
+        #   e.g. a reversible heat pump's climate.hvac_mode). When set, it is the
+        #   sole source of heating_active/cooling_active — mutually exclusive by
+        #   construction, so §4.2's conflict rule never applies.
+        # cooling_system_active_entity: alternative binary entity, mirrors
+        #   heating_system_active_entity. Ignored (with a warning) if
+        #   hvac_mode_entity is also set.
+        self._cooling_mode_enabled: bool = bool(self.args.get("cooling_mode_enabled", False))
+        self._hvac_mode_entity: str | None = self.args.get("hvac_mode_entity") or None
+        self._cooling_active_entity: str | None = self.args.get("cooling_system_active_entity") or None
+        self._cooling_setpoint_on: float = float(self.args.get("cooling_setpoint_on", 24.0))
+        self._cooling_setpoint_off: float = float(self.args.get("cooling_setpoint_off", 28.0))
+        self._cooling_eer_slope: float = float(self.args.get("cooling_eer_slope", -0.05))
+        self._cooling_eer_intercept: float = float(self.args.get("cooling_eer_intercept", 4.0))
+        self._cooling_sanity_bound: float = float(self.args.get("cooling_sanity_bound", 20.0))
+        self._cooling_load_sanity_bound: float = float(self.args.get("cooling_load_sanity_bound", 50.0))
+
         # ── Physics model config (physics-ml-hybrid) ──────────────────────────
         physics_raw = self.args.get("physics") or {}
         if not isinstance(physics_raw, dict):
@@ -473,6 +492,23 @@ class EnergyForecast(hass.Hass):
                 raise ValueError("mqtt_namespace must be a non-empty string when mqtt_discovery is True")
             if not self._mqtt_discovery_prefix:
                 raise ValueError("mqtt_discovery_prefix must be a non-empty string when mqtt_discovery is True")
+        if self._cooling_mode_enabled and not (self._hvac_mode_entity or self._cooling_active_entity):
+            _LOGGER.warning(
+                "cooling_mode_enabled is True but neither hvac_mode_entity nor "
+                "cooling_system_active_entity is set — cooling features will stay at their "
+                "default-off values. Configure one of these entities to enable cooling mode."
+            )
+        if self._hvac_mode_entity and self._cooling_active_entity:
+            _LOGGER.warning(
+                "Both hvac_mode_entity and cooling_system_active_entity are configured — "
+                "hvac_mode_entity takes precedence and cooling_system_active_entity is ignored."
+            )
+        if self._cooling_setpoint_on >= self._cooling_setpoint_off:
+            raise ValueError(
+                f"cooling_setpoint_on ({self._cooling_setpoint_on}) must be < cooling_setpoint_off "
+                f"({self._cooling_setpoint_off}) — inverted values would silently flip the "
+                f"thermal_pressure sign logic for cooling mode."
+            )
         _LOGGER.info(
             "Config validated — lat=%s, lon=%s, plz=%s, timezone=%s, "
             "holiday_country=%s, weight_halflife=%sd, baseline_mode=%s, "

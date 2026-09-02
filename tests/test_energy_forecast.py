@@ -857,6 +857,12 @@ class _FakeValidateSelf:
         self._mqtt_discovery = False
         self._mqtt_namespace = "mqtt"
         self._mqtt_discovery_prefix = "homeassistant"
+        # ── Cooling mode / AC support (#96) ──────────────────────────────────
+        self._cooling_mode_enabled = False
+        self._hvac_mode_entity = None
+        self._cooling_active_entity = None
+        self._cooling_setpoint_on = 24.0
+        self._cooling_setpoint_off = 28.0
         self._warnings: list[str] = []
 
     def log(self, msg: str, level: str = "INFO") -> None:
@@ -921,6 +927,92 @@ class TestValidateConfig:
         assert not any("grid_export_sensor" in w for w in fake._warnings), (
             "No grid_export warning expected when both solar and export sensors are configured"
         )
+
+
+class TestValidateConfigCooling:
+    """_validate_config must validate the new cooling-mode config keys (#96)."""
+
+    def test_no_warning_when_cooling_disabled(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert not any("cooling" in r.message.lower() for r in caplog.records)
+
+    def test_warns_when_enabled_with_no_active_entity(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._cooling_mode_enabled = True
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any("cooling_mode_enabled" in r.message for r in caplog.records)
+
+    def test_no_warning_when_enabled_with_hvac_mode_entity(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._cooling_mode_enabled = True
+        fake._hvac_mode_entity = "climate.living_room"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert not any("neither" in r.message.lower() for r in caplog.records)
+
+    def test_no_warning_when_enabled_with_cooling_active_entity(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._cooling_mode_enabled = True
+        fake._cooling_active_entity = "binary_sensor.ac_active"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert not any("neither" in r.message.lower() for r in caplog.records)
+
+    def test_warns_when_both_hvac_mode_and_binary_entity_configured(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._hvac_mode_entity = "climate.living_room"
+        fake._cooling_active_entity = "binary_sensor.ac_active"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any("both" in r.message.lower() for r in caplog.records)
+
+    def test_raises_when_setpoint_on_equals_setpoint_off(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._cooling_setpoint_on = 26.0
+        fake._cooling_setpoint_off = 26.0
+        with pytest.raises(ValueError, match="cooling_setpoint_on"):
+            EnergyForecast._validate_config(fake)
+
+    def test_raises_when_setpoint_on_above_setpoint_off(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._cooling_setpoint_on = 30.0
+        fake._cooling_setpoint_off = 28.0
+        with pytest.raises(ValueError, match="cooling_setpoint_on"):
+            EnergyForecast._validate_config(fake)
+
+    def test_default_setpoints_pass_validation(self):
+        """Sanity: the shipped defaults (24.0/28.0) must not raise."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        EnergyForecast._validate_config(fake)  # no raise
 
 
 # ── Sensor-type validation (discussion #15: power vs energy sensor mixups) ───
