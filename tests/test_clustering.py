@@ -590,6 +590,139 @@ def test_clusterer_fit_no_ev_dates_unchanged():
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_excludes_cooling_days_from_centroids():
+    """Cooling days must not influence centroid shape; they still receive a label."""
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    rows = []
+    for dt in dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 2.0 if h == 7 else 0.3})
+
+    cooling_dates = pd.date_range("2024-01-21", periods=3, freq="D")
+    cooling_day_set = {d.date() for d in cooling_dates}
+    for dt in cooling_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 8.0 if h == 15 else 0.3})
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, cooling_day_dates=cooling_day_set)
+
+    assert labels is not None
+    assert len(labels) == 23
+    for d in cooling_day_set:
+        assert d in labels.index
+        assert labels[d] >= 0
+
+    assert clusterer.centroids is not None
+    max_h15 = clusterer.centroids[:, 15].max()
+    assert max_h15 < 2.0, f"Midday centroid h15={max_h15:.2f} suggests cooling days leaked into fitting"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_cooling_fallback_too_few_non_cooling_days():
+    """Falls back to fitting on all days when fewer than 14 non-cooling days remain."""
+    dates = pd.date_range("2024-01-01", periods=16, freq="D")
+    rows = []
+    for dt in dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 0.5})
+
+    cooling_day_set = {d.date() for d in dates[6:]}  # 10 cooling days, 6 non-cooling
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, cooling_day_dates=cooling_day_set)
+
+    assert labels is not None
+    assert len(labels) == 16
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_find_optimal_k_excludes_cooling_days():
+    """find_optimal_k with cooling_day_dates matches result of simply removing those days."""
+    dates_normal = pd.date_range("2024-01-01", periods=30, freq="D")
+    rows = []
+    for i, dt in enumerate(dates_normal):
+        level = 0.5 if i % 2 == 0 else 2.0
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": level})
+
+    cooling_dates = pd.date_range("2024-02-01", periods=5, freq="D")
+    cooling_day_set = {d.date() for d in cooling_dates}
+    for dt in cooling_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 15.0 if 12 <= h <= 16 else 0.3})
+
+    df_all = pd.DataFrame(rows)
+    df_no_cooling = pd.DataFrame([r for r in rows if r["timestamp"].date() not in cooling_day_set])
+
+    feats_all, _ = _make_daily_features(n=35)
+    feats_no_cooling, _ = _make_daily_features(n=30)
+
+    k_with_exclusion = find_optimal_k(df_all, feats_all, k_range=(2, 5), cooling_day_dates=cooling_day_set)
+    k_without_cooling = find_optimal_k(df_no_cooling, feats_no_cooling, k_range=(2, 5))
+
+    assert k_with_exclusion == k_without_cooling, (
+        f"K selection should match when cooling days excluded: got {k_with_exclusion} vs {k_without_cooling}"
+    )
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_no_cooling_dates_unchanged():
+    """cooling_day_dates=None and cooling_day_dates=set() both match default behaviour."""
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    rows = []
+    for i, dt in enumerate(dates):
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0 if h == 8 else 0.3})
+    df = pd.DataFrame(rows)
+
+    clusterer_default = DailyProfileClusterer(n_clusters=2)
+    labels_default = clusterer_default.fit(df)
+
+    clusterer_none = DailyProfileClusterer(n_clusters=2)
+    labels_none = clusterer_none.fit(df, cooling_day_dates=None)
+
+    clusterer_empty = DailyProfileClusterer(n_clusters=2)
+    labels_empty = clusterer_empty.fit(df, cooling_day_dates=set())
+
+    assert labels_default is not None
+    np.testing.assert_array_equal(labels_default.values, labels_none.values)
+    np.testing.assert_array_equal(labels_default.values, labels_empty.values)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_unions_ev_and_cooling_exclusions():
+    """A day that is both an EV day and a cooling day is excluded exactly once;
+    both exclusion sets apply simultaneously."""
+    dates = pd.date_range("2024-01-01", periods=20, freq="D")
+    rows = []
+    for dt in dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 1.0 if h == 8 else 0.3})
+
+    ev_dates = pd.date_range("2024-01-21", periods=2, freq="D")
+    cooling_dates = pd.date_range("2024-01-23", periods=2, freq="D")  # disjoint from ev_dates
+    ev_day_set = {d.date() for d in ev_dates}
+    cooling_day_set = {d.date() for d in cooling_dates}
+    for dt in list(ev_dates) + list(cooling_dates):
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 9.0 if h == 20 else 0.3})
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, ev_day_dates=ev_day_set, cooling_day_dates=cooling_day_set)
+
+    assert labels is not None
+    assert len(labels) == 24  # 20 normal + 2 ev + 2 cooling
+    for d in ev_day_set | cooling_day_set:
+        assert d in labels.index
+    max_h20 = clusterer.centroids[:, 20].max()
+    assert max_h20 < 2.0, "EV/cooling day spike leaked into centroid fitting"
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_regime_predictor_timeseries_cv_logged(caplog):
     """RegimePredictor.fit() logs TimeSeriesCV accuracy alongside OOB."""
     import logging

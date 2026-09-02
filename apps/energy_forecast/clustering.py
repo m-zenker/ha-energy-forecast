@@ -47,6 +47,7 @@ class DailyProfileClusterer:
         df: pd.DataFrame,
         sample_weight: pd.Series | None = None,
         ev_day_dates: set | None = None,
+        cooling_day_dates: set | None = None,
     ) -> pd.Series | None:
         """Find clusters in hourly energy data.
 
@@ -59,6 +60,10 @@ class DailyProfileClusterer:
                 evening-peaked EV residual shape does not distort thermal/behavioural
                 clusters. EV days are still assigned to their nearest centroid afterward
                 so that every day gets a valid regime label.
+            cooling_day_dates: Optional set of dates (datetime.date) with active AC/cooling
+                (#96 §4.10). Unioned with ev_day_dates and excluded from centroid fitting
+                for the same reason — AC-driven midday spikes would otherwise distort
+                regime centroids. Cooling days are still assigned a label afterward.
 
         Returns:
             A Series of cluster labels indexed by date, or None if failed.
@@ -84,26 +89,28 @@ class DailyProfileClusterer:
             # Interpolate to fill missing hours (up to 6 per day)
             pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1, limit=6).ffill(axis=1).bfill(axis=1)
 
-            # 2. Determine which days to fit on (exclude EV days from centroid learning)
-            ev_set = ev_day_dates or set()
-            fit_index = [d for d in pivoted.index if d not in ev_set]
-            ev_excluded = len(pivoted) - len(fit_index)
+            # 2. Determine which days to fit on (exclude EV/cooling days from centroid learning)
+            # #96 §4.10: union with cooling_day_dates — a day can be both an EV
+            # day and a cooling day; both need excluding from centroid fitting.
+            excluded_set = (ev_day_dates or set()) | (cooling_day_dates or set())
+            fit_index = [d for d in pivoted.index if d not in excluded_set]
+            n_excluded = len(pivoted) - len(fit_index)
 
-            if ev_excluded > 0 and len(fit_index) < 14:
+            if n_excluded > 0 and len(fit_index) < 14:
                 _LOGGER.info(
-                    "Clustering: only %d non-EV days (< 14); including all %d days for fitting.",
+                    "Clustering: only %d non-excluded days (< 14); including all %d days for fitting.",
                     len(fit_index),
                     len(pivoted),
                 )
                 fit_index = list(pivoted.index)
-                ev_excluded = 0
+                n_excluded = 0
 
-            if ev_excluded > 0:
-                _LOGGER.info("Clustering: excluding %d EV days from centroid fitting.", ev_excluded)
+            if n_excluded > 0:
+                _LOGGER.info("Clustering: excluding %d EV/cooling day(s) from centroid fitting.", n_excluded)
 
             piv_fit = pivoted.loc[fit_index]
 
-            # 3. Fit KMeans on non-EV days only (unweighted — exponential weights distort geometry)
+            # 3. Fit KMeans on non-excluded days only (unweighted — exponential weights distort geometry)
             n = min(self.n_clusters, len(piv_fit))
             km = KMeans(n_clusters=n, random_state=42, n_init=10)
             km.fit(piv_fit)
@@ -111,7 +118,7 @@ class DailyProfileClusterer:
             self.centroids = km.cluster_centers_
             self.is_fitted = True
 
-            # 4. Assign ALL valid days (including EV days) to their nearest centroid
+            # 4. Assign ALL valid days (including EV/cooling days) to their nearest centroid
             all_labels = km.predict(pivoted)
 
             _LOGGER.info(f"Regime Clustering: Identified {n} profiles from {len(piv_fit)} days.")
@@ -229,6 +236,7 @@ def find_optimal_k(
     sample_weight: pd.Series | None = None,
     k_range: tuple = (2, 8),
     ev_day_dates: set | None = None,
+    cooling_day_dates: set | None = None,
 ) -> int:
     """Return K ∈ k_range selected by the inertia elbow (second derivative).
 
@@ -266,15 +274,16 @@ def find_optimal_k(
             )
             return k_range[0]
 
-        # Exclude EV days from inertia computation so EV session timing does not
-        # inflate the apparent number of meaningful clusters.
-        if ev_day_dates:
-            fit_days = [d for d in valid_days if d not in ev_day_dates]
+        # Exclude EV/cooling days from inertia computation so EV session timing and
+        # AC-driven spikes do not inflate the apparent number of meaningful clusters.
+        excluded_set = (ev_day_dates or set()) | (cooling_day_dates or set())
+        if excluded_set:
+            fit_days = [d for d in valid_days if d not in excluded_set]
             if len(fit_days) >= 14:
                 valid_days = fit_days
             else:
                 _LOGGER.info(
-                    "Auto-K: only %d non-EV days (< 14); including all days for K selection.",
+                    "Auto-K: only %d non-excluded days (< 14); including all days for K selection.",
                     len(fit_days),
                 )
 
