@@ -59,6 +59,7 @@ from .const import (
     MIN_TRAINING_ROWS,
     SENSOR_BLEND_HOURS,
     SENSOR_FULL_TRUST_HOURS,
+    warn_once,
 )
 
 _LOGGER = logging.getLogger("energy_forecast")
@@ -299,6 +300,12 @@ class EnergyForecastModel:
         self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
+
+        # §4.2 — dedup set for the heating/cooling conflict WARNING-once escalation.
+        # Lives on the model instance (persists across retrains via the pickled
+        # artifact), per spec §4.2's explicit instruction — not on the AppDaemon
+        # app class (unlike _excluded_range_warned, which does live there).
+        self._cooling_conflict_warned: set = set()
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
@@ -645,6 +652,7 @@ class EnergyForecastModel:
             regime_kwh_series=regime_kwh_series,
             heating_active_df=heating_active_df,
             cooling_active_df=cooling_active_df,
+            cooling_conflict_warned=self._cooling_conflict_warned,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -1132,6 +1140,7 @@ class EnergyForecastModel:
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
             cooling_active_df=ca_df_for_features,
+            cooling_conflict_warned=self._cooling_conflict_warned,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -3004,6 +3013,7 @@ def _engineer_features(
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
     cooling_active_df: pd.DataFrame | None = None,  # cols: timestamp, cooling_active (0/1) — #96
+    cooling_conflict_warned: set | None = None,  # §4.2 — dedup set for WARNING-once escalation
     physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
     heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
@@ -3198,6 +3208,27 @@ def _engineer_features(
         df["cooling_active"] = df["cooling_active"].fillna(0).astype(int)
     else:
         df["cooling_active"] = 0
+
+    # ── Conflict resolution: heating_active & cooling_active both 1 (§4.2) ───
+    # Only reachable via the two-independent-entities config path — hvac_mode_entity
+    # makes this state unreachable by construction. Heating takes precedence (the
+    # existing, tested path); cooling_active is zeroed for conflict hours *before*
+    # either series reaches the climate_dfs loop below, so every consumer there
+    # sees an already-resolved signal with no per-formula "and not heating_active"
+    # term needed.
+    conflict_mask = (df["heating_active"] == 1) & (df["cooling_active"] == 1)
+    if conflict_mask.any():
+        df.loc[conflict_mask, "cooling_active"] = 0
+        warn_once(
+            _LOGGER,
+            cooling_conflict_warned,
+            ("heating_cooling_conflict",),
+            "heating_active and cooling_active both 1 for %d hour(s) in this batch "
+            "(first at %s) — heating takes precedence per §4.2; cooling_active set "
+            "to 0 for those hours.",
+            int(conflict_mask.sum()),
+            df.loc[conflict_mask, "timestamp"].min(),
+        )
 
     # ── Temperature-delta gated lags ─────────────────────────────────────
     # Suppress lag features proportionally when today is warmer than the lag

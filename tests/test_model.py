@@ -7114,8 +7114,12 @@ class TestCoolingActiveFeature:
         ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
         df = _make_bare_df(ts)
         w = _make_weather_df(ts)
+        # Explicitly disable heating so this test isolates the cooling_active merge
+        # behavior from §4.2's conflict resolution (heating_active defaults to 1
+        # when heating_active_df is omitted, which would otherwise zero cooling here).
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [0, 0, 0, 0]})
         ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1, 1, 0, 0]})
-        result = _engineer_features(df, w, None, cooling_active_df=ca_df)
+        result = _engineer_features(df, w, None, heating_active_df=ha_df, cooling_active_df=ca_df)
         assert list(result["cooling_active"]) == [1, 1, 0, 0]
 
     def test_cooling_active_defaults_to_0_when_not_provided(self):
@@ -7131,8 +7135,10 @@ class TestCoolingActiveFeature:
         ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
         df = _make_bare_df(ts)
         w = _make_weather_df(ts)
+        # Explicitly disable heating — see test_cooling_active_uses_provided_df above.
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [0, 0, 0, 0]})
         ca_df = pd.DataFrame({"timestamp": ts[:2], "cooling_active": [1, 1]})
-        result = _engineer_features(df, w, None, cooling_active_df=ca_df)
+        result = _engineer_features(df, w, None, heating_active_df=ha_df, cooling_active_df=ca_df)
         assert result["cooling_active"].iloc[0] == 1
         assert result["cooling_active"].iloc[1] == 1
         assert result["cooling_active"].iloc[2] == 0  # filled with default
@@ -7145,6 +7151,64 @@ class TestCoolingActiveFeature:
         ca_df = pd.DataFrame(columns=["timestamp", "cooling_active"])
         result = _engineer_features(df, w, None, cooling_active_df=ca_df)
         assert (result["cooling_active"] == 0).all()
+
+
+class TestCoolingConflictResolution:
+    """§4.2: heating takes precedence; cooling_active is zeroed for conflict hours;
+    WARNING on first occurrence, INFO on repeats (matching warn_once's real contract)."""
+
+    def test_cooling_active_zeroed_when_both_active(self):
+        ts = pd.date_range("2026-06-01 08:00", periods=3, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [1, 1, 0]})
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1, 0, 1]})
+
+        result = _engineer_features(df, w, None, heating_active_df=ha_df, cooling_active_df=ca_df)
+
+        # Hour 0: both active -> cooling loses. Hour 1: only heating. Hour 2: only cooling.
+        assert list(result["cooling_active"]) == [0, 0, 1]
+        assert list(result["heating_active"]) == [1, 1, 0]
+
+    def test_no_conflict_leaves_both_series_unchanged(self):
+        ts = pd.date_range("2026-06-01 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ha_df = pd.DataFrame({"timestamp": ts, "heating_active": [1, 0]})
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [0, 1]})
+
+        result = _engineer_features(df, w, None, heating_active_df=ha_df, cooling_active_df=ca_df)
+        assert list(result["cooling_active"]) == [0, 1]
+        assert list(result["heating_active"]) == [1, 0]
+
+    def test_first_conflict_warns_then_repeats_log_info(self, caplog):
+        import logging
+
+        ts1 = pd.date_range("2026-06-01 08:00", periods=1, freq="1h")
+        ts2 = pd.date_range("2026-06-02 08:00", periods=1, freq="1h")
+        df1 = _make_bare_df(ts1)
+        w1 = _make_weather_df(ts1)
+        ha1 = pd.DataFrame({"timestamp": ts1, "heating_active": [1]})
+        ca1 = pd.DataFrame({"timestamp": ts1, "cooling_active": [1]})
+        warned: set = set()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df1, w1, None, heating_active_df=ha1, cooling_active_df=ca1, cooling_conflict_warned=warned
+            )
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        caplog.clear()
+
+        df2 = _make_bare_df(ts2)
+        w2 = _make_weather_df(ts2)
+        ha2 = pd.DataFrame({"timestamp": ts2, "heating_active": [1]})
+        ca2 = pd.DataFrame({"timestamp": ts2, "cooling_active": [1]})
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            _engineer_features(
+                df2, w2, None, heating_active_df=ha2, cooling_active_df=ca2, cooling_conflict_warned=warned
+            )
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any(r.levelno == logging.INFO for r in caplog.records)
 
 
 class TestProjectIndoorTempsCooling:
