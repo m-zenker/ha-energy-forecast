@@ -3404,7 +3404,17 @@ def _engineer_features(
     # ── §3: Solar-compensated pressure (#56) ─────────────────────────────────
     # Primary signal: subtract passive solar gain from thermal pressure.
     # High impact on reducing over-forecast on sunny winter days.
-    df["thermal_pressure_net"] = np.maximum(0.0, df["thermal_pressure"] - 0.01 * df["weighted_solar_gain"])
+    # §4.4: heating — solar gain reduces debt (subtract, unchanged). Cooling —
+    # solar gain increases cooling load (add). Known approximation, not fixed
+    # here: reuses heating's same-day 09:00-17:00 half-cosine solar window,
+    # unadjusted for thermal-mass lag — likely understates evening-peak cooling
+    # load (spec §4.4/§7).
+    cooling_mask = df["cooling_active"] == 1
+    df["thermal_pressure_net"] = np.where(
+        cooling_mask,
+        df["thermal_pressure"] + 0.01 * df["weighted_solar_gain"],
+        np.maximum(0.0, df["thermal_pressure"] - 0.01 * df["weighted_solar_gain"]),
+    )
 
     # ── §3: Wind-driven infiltration (#57) ───────────────────────────────────
     # Feature interaction: infiltration loss ∝ WindSpeed * (T_in - T_out).

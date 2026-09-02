@@ -102,6 +102,62 @@ def test_solar_compensation():
     assert feat_df.iloc[0]["thermal_pressure_net"] >= 0
 
 
+def test_solar_compensation_cooling_adds_instead_of_subtracts():
+    """§4.4: during cooling_active hours, solar gain increases (not decreases)
+    thermal_pressure_net."""
+    ts = pd.to_datetime(["2026-07-15 13:00"])
+    df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0]})
+    weather_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [30.0],
+            "humidity": [50.0],
+            "precipitation_mm": [0],
+            "sunshine_min": [60],
+            "wind_kmh": [0],
+            "cloud_cover_pct": [0],
+            "direct_radiation_wm2": [800.0],
+        }
+    )
+    # 3°C above cooling setpoint
+    climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+    cooling_active_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+    feat_df = _engineer_features(df, weather_df, None, climate_dfs=climate_dfs, cooling_active_df=cooling_active_df)
+
+    assert feat_df.iloc[0]["thermal_pressure"] == 3.0
+    assert feat_df.iloc[0]["weighted_solar_gain"] > 0
+    # cooling: net = raw + solar term -> strictly greater than raw pressure
+    assert feat_df.iloc[0]["thermal_pressure_net"] > 3.0
+
+
+def test_solar_compensation_heating_path_unchanged():
+    """cooling_active=0 reproduces the existing subtract-and-clip formula exactly."""
+    ts = pd.to_datetime(["2026-07-15 13:00"])
+    df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0]})
+    weather_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [30.0],
+            "humidity": [50.0],
+            "precipitation_mm": [0],
+            "sunshine_min": [60],
+            "wind_kmh": [0],
+            "cloud_cover_pct": [0],
+            "direct_radiation_wm2": [800.0],
+        }
+    )
+    climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+    cooling_active_df = pd.DataFrame({"timestamp": ts, "cooling_active": [0]})
+
+    feat_df = _engineer_features(df, weather_df, None, climate_dfs=climate_dfs, cooling_active_df=cooling_active_df)
+
+    # heating path: thermal_pressure is 0 (setpoint below current_temp, clipped),
+    # so thermal_pressure_net = max(0, 0 - solar_term) = 0
+    assert feat_df.iloc[0]["thermal_pressure"] == 0.0
+    assert feat_df.iloc[0]["thermal_pressure_net"] == 0.0
+
+
 def test_infiltration_pressure():
     df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-04-15 12:00"]), "gross_kwh": [1.0]})
     weather_df = pd.DataFrame(
