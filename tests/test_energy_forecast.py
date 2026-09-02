@@ -862,6 +862,7 @@ class _FakeValidateSelf:
         self._cooling_mode_enabled = False
         self._hvac_mode_entity = None
         self._cooling_active_entity = None
+        self._heating_active_entity = None
         self._cooling_setpoint_on = 24.0
         self._cooling_setpoint_off = 28.0
         self._warnings: list[str] = []
@@ -989,6 +990,33 @@ class TestValidateConfigCooling:
         with caplog.at_level(logging.WARNING, logger="energy_forecast"):
             EnergyForecast._validate_config(fake)
         assert any("both" in r.message.lower() for r in caplog.records)
+
+    def test_warns_when_hvac_mode_entity_and_heating_active_entity_configured(self, caplog):
+        """Symmetric case of the cooling one above (final whole-branch review
+        finding #4): hvac_mode_entity silently overrides heating_system_active_entity
+        too — a heating-only install migrating to hvac_mode_entity must be warned
+        that its existing heating sensor config is now ignored."""
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._hvac_mode_entity = "climate.living_room"
+        fake._heating_active_entity = "binary_sensor.heating"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert any("both" in r.message.lower() and "heating" in r.message.lower() for r in caplog.records)
+
+    def test_no_warning_when_hvac_mode_entity_alone(self, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeValidateSelf(ev_threshold=7.0, ev_charger_kw=9.0)
+        fake._hvac_mode_entity = "climate.living_room"
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._validate_config(fake)
+        assert not any("heating_system_active_entity" in r.message for r in caplog.records)
 
     def test_raises_when_setpoint_on_equals_setpoint_off(self):
         from energy_forecast.energy_forecast import EnergyForecast
@@ -4556,8 +4584,9 @@ class TestUpdateSensorsExcludedRanges:
             self._dhw_buffer_sensor / self._heating_active_entity are set
             (energy_forecast.py:1874, 1885).
           - self._build_heating_active_projection(): only called if
-            self._heating_active_entity and climate_recent are both truthy
-            (energy_forecast.py:1906).
+            (self._heating_active_entity or self._hvac_mode_entity) and
+            climate_recent are truthy (energy_forecast.py:1906) — both are None
+            on this fake.
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
             (energy_forecast.py:2058).
           - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
@@ -4676,6 +4705,72 @@ class TestUpdateSensorsExcludedRanges:
         assert not any(r.levelno == logging.WARNING for r in caplog.records), (
             "second hourly call on the same stub must downgrade to INFO, not repeat the WARNING"
         )
+
+
+class TestRetrainCoolingModeGate:
+    """Direct regression test for _retrain()'s `if not self._cooling_mode_enabled:
+    cooling_active_df = empty` line (final whole-branch review finding #1's
+    regression test #2) — previously only verified by code reading, never
+    directly tested."""
+
+    def _patch_retrain_deps(self, monkeypatch, energy_df, cooling_df):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        empty_df = pd.DataFrame()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            ha_data_mod,
+            "fetch_generic_sensor_history",
+            lambda app, entity_id, path, column_name, timezone: cooling_df,
+        )
+        return ha_data_mod
+
+    def _make_stub(self, tmp_path):
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._cooling_active_entity = "binary_sensor.ac_active"
+        stub._generic_sensor_cache_path = lambda entity_id, prefix="sensor": tmp_path / f"{prefix}.csv"
+        return stub
+
+    def test_cooling_active_df_zeroed_when_disabled(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(100)
+        cooling_df = pd.DataFrame({"timestamp": energy_df["timestamp"], "cooling_active": [1] * len(energy_df)})
+        self._patch_retrain_deps(monkeypatch, energy_df, cooling_df)
+
+        stub = self._make_stub(tmp_path)
+        stub._cooling_mode_enabled = False
+
+        EnergyForecast._retrain(stub)
+
+        passed = stub._ml_model.train.call_args.kwargs["cooling_active_df"]
+        assert passed is None, "cooling_active_df must be zeroed when cooling_mode_enabled is False"
+
+    def test_cooling_active_df_populated_when_enabled(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(100)
+        cooling_df = pd.DataFrame({"timestamp": energy_df["timestamp"], "cooling_active": [1] * len(energy_df)})
+        self._patch_retrain_deps(monkeypatch, energy_df, cooling_df)
+
+        stub = self._make_stub(tmp_path)
+        stub._cooling_mode_enabled = True
+
+        EnergyForecast._retrain(stub)
+
+        passed = stub._ml_model.train.call_args.kwargs["cooling_active_df"]
+        assert passed is not None and not passed.empty, (
+            "cooling_active_df must reach train() populated when cooling_mode_enabled is True"
+        )
+        assert (passed["cooling_active"] == 1).all()
 
 
 class TestRetrainEvCachePathBug:
@@ -4937,6 +5032,65 @@ class TestFetchHvacActiveHistory:
         assert heating_df.empty
         assert cooling_df.empty
 
+    def test_binary_entities_use_recent_fetch_for_days_le_2(self, tmp_path, monkeypatch):
+        """Final whole-branch review finding #2: days=2 (the hourly _update_sensors()
+        refresh) must route Option B through the lightweight fetch_recent_generic_sensor,
+        not the 30-day-hardcoded fetch_generic_sensor_history — otherwise every
+        Option-B deployment gets a full 30-day recorder query every hour."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self(
+            _heating_active_entity="binary_sensor.heating",
+            _cooling_active_entity="binary_sensor.cooling",
+            _generic_sensor_cache_path=lambda entity_id, prefix="sensor": tmp_path / f"{prefix}.csv",
+        )
+        recent_calls: list[str] = []
+        history_calls: list[str] = []
+
+        def _fake_recent(app, entity_id, path, column_name, timezone):
+            recent_calls.append(column_name)
+            return pd.DataFrame(columns=["timestamp", column_name])
+
+        def _fake_history(app, entity_id, path, column_name, timezone):
+            history_calls.append(column_name)
+            return pd.DataFrame(columns=["timestamp", column_name])
+
+        monkeypatch.setattr(ha_data, "fetch_recent_generic_sensor", _fake_recent)
+        monkeypatch.setattr(ha_data, "fetch_generic_sensor_history", _fake_history)
+
+        EnergyForecast._fetch_hvac_active_history(fake, days=2)
+
+        assert set(recent_calls) == {"heating_active", "cooling_active"}
+        assert history_calls == []
+
+    def test_binary_entities_use_full_history_fetch_for_days_gt_2(self, tmp_path, monkeypatch):
+        """days=30 (the weekly _retrain() call) must keep using the full-history fetch."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self(
+            _heating_active_entity="binary_sensor.heating",
+            _cooling_active_entity="binary_sensor.cooling",
+            _generic_sensor_cache_path=lambda entity_id, prefix="sensor": tmp_path / f"{prefix}.csv",
+        )
+        recent_calls: list[str] = []
+        history_calls: list[str] = []
+
+        def _fake_recent(app, entity_id, path, column_name, timezone):
+            recent_calls.append(column_name)
+            return pd.DataFrame(columns=["timestamp", column_name])
+
+        def _fake_history(app, entity_id, path, column_name, timezone):
+            history_calls.append(column_name)
+            return pd.DataFrame(columns=["timestamp", column_name])
+
+        monkeypatch.setattr(ha_data, "fetch_recent_generic_sensor", _fake_recent)
+        monkeypatch.setattr(ha_data, "fetch_generic_sensor_history", _fake_history)
+
+        EnergyForecast._fetch_hvac_active_history(fake, days=30)
+
+        assert set(history_calls) == {"heating_active", "cooling_active"}
+        assert recent_calls == []
+
 
 class TestBuildCoolingActiveProjection:
     def _make_self(self, get_state_return: str):
@@ -4953,27 +5107,27 @@ class TestBuildCoolingActiveProjection:
         return fake
 
     def test_active_projects_flat_true_across_48h(self):
+        """Setpoints are always the configured values — no live-thermostat averaging
+        (final whole-branch review finding #3): climate_recent's setpoint (25.0 here,
+        distinct from both 24.0/28.0) must have zero effect on s_on/s_off."""
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = self._make_self("on")
-        climate_recent = {
-            "climate.test": pd.DataFrame(
-                {"timestamp": [pd.Timestamp.now()], "current_temp": [27.0], "setpoint": [25.0]}
-            )
-        }
-        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake, climate_recent)
+        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake)
         assert len(series) == 48
         assert (series == 1).all()
+        assert s_on == 24.0
         assert s_off == 28.0
 
     def test_inactive_projects_flat_false_across_48h(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
         fake = self._make_self("off")
-        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake, {})
+        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake)
         assert len(series) == 48
         assert (series == 0).all()
         assert s_on == 24.0
+        assert s_off == 28.0
 
     def test_hvac_mode_entity_takes_precedence_over_binary(self):
         from energy_forecast.energy_forecast import EnergyForecast
@@ -4981,6 +5135,8 @@ class TestBuildCoolingActiveProjection:
         fake = self._make_self("on")  # binary entity would read "on" if checked
         fake._hvac_mode_entity = "climate.living_room"
         fake.get_state = MagicMock(return_value="cool")
-        series, _, _ = EnergyForecast._build_cooling_active_projection(fake, {})
+        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake)
         assert (series == 1).all()
+        assert s_on == 24.0
+        assert s_off == 28.0
         fake.get_state.assert_called_with("climate.living_room")

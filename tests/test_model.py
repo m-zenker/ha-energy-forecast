@@ -7170,6 +7170,27 @@ class TestCoolingConflictResolution:
         assert list(result["cooling_active"]) == [0, 0, 1]
         assert list(result["heating_active"]) == [1, 1, 0]
 
+    def test_cooling_only_topology_not_defeated_by_heating_default(self):
+        """Final whole-branch review finding #1: a cooling-only household (Option B,
+        cooling_system_active_entity set but no heating_system_active_entity — e.g.
+        radiators + a window AC, or the Discussion #20 AC-only use case) has
+        heating_active_df=None at every call site. heating_active must still default
+        to 1 (the pre-existing conservative default), but that default-1 must NOT be
+        treated as an observed heating signal by §4.2's conflict gate — otherwise
+        cooling_active would be silently zeroed for every row, permanently defeating
+        cooling for exactly the topology this feature targets."""
+        ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1, 1, 1, 1]})
+
+        result = _engineer_features(df, w, None, cooling_active_df=ca_df, heating_active_df=None)
+
+        assert (result["heating_active"] == 1).all(), "heating_active must still default to 1"
+        assert (result["cooling_active"] == 1).all(), (
+            "cooling_active must NOT be zeroed by the conflict gate when heating was never observed"
+        )
+
     def test_no_conflict_leaves_both_series_unchanged(self):
         ts = pd.date_range("2026-06-01 08:00", periods=2, freq="1h")
         df = _make_bare_df(ts)

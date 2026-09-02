@@ -308,14 +308,23 @@ class EnergyForecast(hass.Hass):
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
 
         # ── Cooling mode / AC support (community contribution, #96) ───────────
-        # cooling_mode_enabled: master switch; False = zero new code paths execute.
+        # cooling_mode_enabled: master switch for COOLING-specific code paths;
+        #   False = zero new cooling code paths execute. It does NOT gate
+        #   hvac_mode_entity's heating-precedence effect below (Task 3,
+        #   Implementation Decision #4) — hvac_mode_entity must resolve heating
+        #   correctly even when cooling mode is off, so setting hvac_mode_entity
+        #   alone, with cooling_mode_enabled: false, still changes how
+        #   heating_active is fetched/resolved (final whole-branch review
+        #   finding #4).
         # hvac_mode_entity: single mode-string entity (preferred where available;
         #   e.g. a reversible heat pump's climate.hvac_mode). When set, it is the
         #   sole source of heating_active/cooling_active — mutually exclusive by
         #   construction, so §4.2's conflict rule never applies.
         # cooling_system_active_entity: alternative binary entity, mirrors
         #   heating_system_active_entity. Ignored (with a warning) if
-        #   hvac_mode_entity is also set.
+        #   hvac_mode_entity is also set — and symmetrically,
+        #   heating_system_active_entity is ignored (with a warning) if
+        #   hvac_mode_entity is set.
         self._cooling_mode_enabled: bool = bool(self.args.get("cooling_mode_enabled", False))
         self._hvac_mode_entity: str | None = self.args.get("hvac_mode_entity") or None
         self._cooling_active_entity: str | None = self.args.get("cooling_system_active_entity") or None
@@ -502,6 +511,14 @@ class EnergyForecast(hass.Hass):
             _LOGGER.warning(
                 "Both hvac_mode_entity and cooling_system_active_entity are configured — "
                 "hvac_mode_entity takes precedence and cooling_system_active_entity is ignored."
+            )
+        if self._hvac_mode_entity and self._heating_active_entity:
+            _LOGGER.warning(
+                "Both hvac_mode_entity and heating_system_active_entity are configured — "
+                "hvac_mode_entity takes precedence and heating_system_active_entity is ignored. "
+                "This applies even when cooling_mode_enabled is False (final whole-branch review "
+                "finding #4) — a heating-only install migrating to hvac_mode_entity loses its "
+                "existing heating_system_active_entity signal silently unless warned here."
             )
         if self._cooling_setpoint_on >= self._cooling_setpoint_off:
             raise ValueError(
@@ -1530,11 +1547,18 @@ class EnergyForecast(hass.Hass):
                 _LOGGER.warning("hvac_mode_entity %s fetch failed: %s", self._hvac_mode_entity, exc)
                 return empty_heating, empty_cooling
 
+        # Option B (independent binary entities): mirror _fetch_physics_sensor_histories'
+        # recent_only pattern — a lightweight 2-day fetch for the hourly _update_sensors()
+        # refresh, a full 30-day fetch for _retrain(). Without this, days was silently
+        # dropped and every Option-B household got a 30-day recorder query every hour
+        # (final whole-branch review finding #2).
+        generic_fetch = ha_data.fetch_recent_generic_sensor if days <= 2 else ha_data.fetch_generic_sensor_history
+
         heating_df = empty_heating
         if self._heating_active_entity:
             path = self._generic_sensor_cache_path(self._heating_active_entity, prefix="heating_active")
             try:
-                heating_df = ha_data.fetch_generic_sensor_history(
+                heating_df = generic_fetch(
                     self, self._heating_active_entity, path, column_name="heating_active", timezone=self._timezone
                 )
             except (OSError, KeyError, ValueError) as exc:
@@ -1544,7 +1568,7 @@ class EnergyForecast(hass.Hass):
         if self._cooling_active_entity:
             path = self._generic_sensor_cache_path(self._cooling_active_entity, prefix="cooling_active")
             try:
-                cooling_df = ha_data.fetch_generic_sensor_history(
+                cooling_df = generic_fetch(
                     self, self._cooling_active_entity, path, column_name="cooling_active", timezone=self._timezone
                 )
             except (OSError, KeyError, ValueError) as exc:
@@ -2008,7 +2032,7 @@ class EnergyForecast(hass.Hass):
         heating_active_series = None
         heating_setpoint_on = None
         heating_setpoint_off = None
-        if self._heating_active_entity and climate_recent:
+        if (self._heating_active_entity or self._hvac_mode_entity) and climate_recent:
             try:
                 heating_active_series, heating_setpoint_on, heating_setpoint_off = (
                     self._build_heating_active_projection(forecast_df, climate_recent)
@@ -2023,7 +2047,7 @@ class EnergyForecast(hass.Hass):
         if self._cooling_mode_enabled and (self._hvac_mode_entity or self._cooling_active_entity):
             try:
                 cooling_active_series, cooling_setpoint_on, cooling_setpoint_off = (
-                    self._build_cooling_active_projection(climate_recent)
+                    self._build_cooling_active_projection()
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Cooling active projection failed: %s", exc)
@@ -2385,7 +2409,7 @@ class EnergyForecast(hass.Hass):
         heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
         setpoint_on/off: live values derived from climate entities when available, else config defaults.
         Uses outdoor temp hysteresis to project future heating state.
-        Only call when _heating_active_entity is configured.
+        Only call when _heating_active_entity or _hvac_mode_entity is configured.
         """
         import numpy as np
         import pandas as pd
@@ -2393,7 +2417,19 @@ class EnergyForecast(hass.Hass):
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
-        active = self.get_state(self._heating_active_entity) in ("on", "1", "true", "True")
+        # Same hvac_mode_entity-first precedence as _get_cooling_active_state()/
+        # _build_cooling_active_projection() — an hvac_mode_entity-only household
+        # (no heating_system_active_entity configured) has no other live heating
+        # signal to read (final whole-branch review finding #1, part B). Inlined
+        # rather than delegated for the same duck-typed-`self` unit-testing reason
+        # given in _build_cooling_active_projection.
+        if self._hvac_mode_entity:
+            state = self.get_state(self._hvac_mode_entity)
+            active = str(state).strip().lower() in ("heat", "heating")
+        elif self._heating_active_entity:
+            active = self.get_state(self._heating_active_entity) in ("on", "1", "true", "True")
+        else:
+            active = False
 
         # Derive setpoint_on / setpoint_off from live climate entity data when available
         live_setpoints = []
@@ -2443,10 +2479,7 @@ class EnergyForecast(hass.Hass):
             return self.get_state(self._cooling_active_entity) in ("on", "1", "true", "True")
         return False
 
-    def _build_cooling_active_projection(
-        self,
-        climate_recent: dict[str, Any],
-    ) -> tuple[Any, float, float]:
+    def _build_cooling_active_projection(self) -> tuple[Any, float, float]:
         """Return (cooling_active_series, setpoint_on, setpoint_off) for the 48-hour window.
 
         Unlike heating's outdoor-temp hysteresis projection, cooling's live on/off
@@ -2454,10 +2487,17 @@ class EnergyForecast(hass.Hass):
         (spec §4.1a/§7, Implementation Decision #3): no cooling-specific outdoor-
         temp hysteresis thresholds exist in this spec's config, so the current
         entity reading is the best available signal for all future hours.
+
+        setpoint_on/off are always the configured cooling_setpoint_on/off values.
+        Unlike heating, climate_recent carries only heating TRV setpoints — there
+        is no cooling-specific live setpoint source to substitute in, so averaging
+        those readings here would silently invert the setpoint_on < setpoint_off
+        invariant _validate_config() enforces at startup (final whole-branch
+        review finding #3).
+
         Only call when cooling_mode_enabled and (hvac_mode_entity or
         cooling_system_active_entity) is configured.
         """
-        import numpy as np
         import pandas as pd
 
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
@@ -2475,25 +2515,8 @@ class EnergyForecast(hass.Hass):
         else:
             active = False
 
-        live_setpoints = []
-        for eid, cdf in (climate_recent or {}).items():
-            if cdf is not None and not cdf.empty and "setpoint" in cdf.columns:
-                latest_sp = cdf.sort_values("timestamp").iloc[-1]["setpoint"]
-                try:
-                    live_setpoints.append(float(latest_sp))
-                except (TypeError, ValueError):
-                    pass
-        live_setpoint = float(np.mean(live_setpoints)) if live_setpoints else None
-
-        if active:
-            s_on = live_setpoint if live_setpoint is not None else self._cooling_setpoint_on
-            s_off = self._cooling_setpoint_off
-        else:
-            s_off = live_setpoint if live_setpoint is not None else self._cooling_setpoint_off
-            s_on = self._cooling_setpoint_on
-
         cooling_active_series = pd.Series([int(active)] * len(future_hours), index=future_hours, dtype=int)
-        return cooling_active_series, float(s_on), float(s_off)
+        return cooling_active_series, float(self._cooling_setpoint_on), float(self._cooling_setpoint_off)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""

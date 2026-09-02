@@ -3216,7 +3216,18 @@ def _engineer_features(
     # either series reaches the climate_dfs loop below, so every consumer there
     # sees an already-resolved signal with no per-formula "and not heating_active"
     # term needed.
-    conflict_mask = (df["heating_active"] == 1) & (df["cooling_active"] == 1)
+    #
+    # Gated on heating_active_df actually being an OBSERVED signal, not on
+    # df["heating_active"] == 1 alone — heating_active defaults to 1 (see the
+    # "Default 1 ... conservative choice" block above) whenever heating_active_df
+    # is None/empty, e.g. a cooling-only household (Option B, no
+    # heating_system_active_entity) or an hvac_mode_entity household whose
+    # projected series wasn't threaded through at this call site. Without this
+    # guard, that default-1 would zero cooling_active for every row — permanently
+    # defeating cooling for exactly the topologies this feature targets (final
+    # whole-branch review finding #1).
+    heating_observed = heating_active_df is not None and not heating_active_df.empty
+    conflict_mask = heating_observed & (df["heating_active"] == 1) & (df["cooling_active"] == 1)
     if conflict_mask.any():
         df.loc[conflict_mask, "cooling_active"] = 0
         warn_once(
