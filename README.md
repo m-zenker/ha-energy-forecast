@@ -469,6 +469,15 @@ energy_forecast:
 | `heating_temp_off` | No | `18.0` | Outdoor temperature threshold (°C) above which heating is projected OFF. Dead-band between `heating_temp_on` and `heating_temp_off` holds the current heating state. |
 | `heating_setpoint_on` | No | `20.0` | Climate setpoint (°C) projected when heating is ON. Used to compute `thermal_pressure` for future hours. |
 | `heating_setpoint_off` | No | `12.0` | Climate setpoint (°C) projected when heating is OFF (e.g. night/summer setback). |
+| `cooling_mode_enabled` | No | `false` | Enable cooling-mode/AC support (ML-feature layer only — see [Thermal & DHW modeling](#thermal--dhw-modeling)). Gates `hvac_mode_entity`/`cooling_system_active_entity`; leaving it `false` (the default) keeps behaviour byte-identical to a heating-only install. |
+| `hvac_mode_entity` | No | — | Entity ID of a single mode-string `climate` entity (e.g. `climate.hvac_mode`) reporting `heat`/`heating`/`cool`/`cooling`/etc. When set, it is the sole source of both `heating_active` and `cooling_active` — mutually exclusive by construction. `dry`/`fan_only` and any unrecognized mode map to neither. Takes precedence over `heating_system_active_entity` and `cooling_system_active_entity` (a startup WARNING is logged if either is also set). |
+| `cooling_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when active cooling (AC/heat pump in cooling mode) is running. Alternative to `hvac_mode_entity` for installs without a single mode-string entity. Ignored (with a startup WARNING) if `hvac_mode_entity` is also set. Being a plain on/off signal, it cannot distinguish real cooling from `dry`/`fan_only` compressor modes — prefer `hvac_mode_entity` if your climate entity exposes mode strings. |
+| `cooling_setpoint_on` | No | `24.0` | Outdoor temperature threshold (°C) above which cooling is projected ON across the 48h forecast window. Must be `<` `cooling_setpoint_off` — startup raises immediately if inverted. |
+| `cooling_setpoint_off` | No | `28.0` | Outdoor temperature threshold (°C) above which cooling is projected OFF. Dead-band between `cooling_setpoint_on` and `cooling_setpoint_off` holds the current cooling state. |
+| `cooling_eer_slope` | No | `-0.05` | Slope of the linear EER-vs-outdoor-temperature proxy used to scale the cooling thermal-pressure signal. Unvalidated placeholder — see [Thermal & DHW modeling](#thermal--dhw-modeling). |
+| `cooling_eer_intercept` | No | `4.0` | Intercept of the linear EER-vs-outdoor-temperature proxy. |
+| `cooling_sanity_bound` | No | `20.0` | Per-hour cooling thermal-pressure sanity cap; logs a WARNING on violation. |
+| `cooling_load_sanity_bound` | No | `50.0` | Sanity cap on `cooling_load_sum_24h` (24h rolling accumulation); logs a WARNING on violation. |
 | `physics` | No | — | Optional block enabling Physics-ML Hybrid features. Omitting the block entirely leaves behaviour byte-identical to prior versions. Even `physics: {}` (empty) activates the feature. See [Physics-ML Hybrid (Phase 1)](#physics-ml-hybrid-phase-1-optional). |
 | `physics.cop_sensor` | No | — | Entity ID of a live COP sensor for the heat pump. Used by the thermal physics model to compute `physics_kwh`. |
 | `physics.dhw_tank_temp_sensor` | No | — | Entity ID of a DHW tank temperature sensor (°C). Also sourced as the `buffer_temp` column used for DHW calibration and schedule inference. |
@@ -640,6 +649,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
 | Heating system | `hp_heating_degree` (`max(0, 15 − temp_c)` — HP-calibrated heat demand threshold), `temp_in_neutral_zone` (binary: 1 when 15 ≤ temp_c ≤ 22 °C, i.e. HP dead-band), `heating_active` (seasonal binary flag from `heating_system_active_entity`; defaults to 1) |
+| Cooling system | `cooling_active` (binary flag from `hvac_mode_entity`/`cooling_system_active_entity`; constant-zero unless `cooling_mode_enabled: true` and one of those entities is configured), `cooling_load_sum_24h` (24h rolling sum of cooling-direction thermal pressure while `cooling_active == 1`; mirrors `heating_deg_sum_24h`; constant-zero on heating-only installs) |
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
 | Thermal & DHW intent | `thermal_pressure` (area-weighted HVAC setpoint − current temp; °C·h), `thermal_pressure_max` (largest per-room deficit), `thermal_pressure_std` (room temperature spread), `thermal_pressure_cop` (deficit scaled by inverse outdoor COP — electrical urgency), `thermal_pressure_net` (thermal pressure reduced by passive solar gain), `weighted_solar_gain` (direct radiation weighted by south-facing half-cosine window), `dhw_pressure` (buffer heat-loss urgency score); all zero when not configured |
 | Physics | `humidity` (relative humidity %), `infiltration_pressure` (wind speed × thermal gradient — cold-air infiltration proxy), `defrost_risk` (humidity-scaled Gaussian at +2 °C — heat-pump defrost cycle proxy) |
@@ -958,6 +968,8 @@ Both features are zero-safe — omitting the config keys leaves them at 0 for al
     - climate.bedroom
   dhw_buffer_sensor: sensor.dhw_buffer_temperature
   heating_system_active_entity: binary_sensor.heating_season  # optional
+  cooling_mode_enabled: false            # optional — set true to enable cooling/AC support
+  hvac_mode_entity: climate.hvac_mode    # optional — see full parameter reference above
 ```
 
 | Key | Required | Description |
@@ -966,6 +978,8 @@ Both features are zero-safe — omitting the config keys leaves them at 0 for al
 | `climate_room_areas` | No | Dict of `entity_id: area_m2`. Rooms not listed default to 15 m². |
 | `dhw_buffer_sensor` | No | Entity ID of a temperature sensor measuring the DHW buffer (°C). |
 | `heating_system_active_entity` | No | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run. Used for τ calibration and `thermal_pressure_cop`. |
+| `cooling_mode_enabled` | No | Enables cooling/AC support (default `false`, byte-identical heating-only behaviour when omitted). Gates `hvac_mode_entity`/`cooling_system_active_entity` below. See [Parameter reference](#parameter-reference) for the full cooling key set (`cooling_setpoint_on`/`off`, EER proxy, sanity bounds). |
+| `hvac_mode_entity` / `cooling_system_active_entity` | No | Drive `cooling_active` (and, for `hvac_mode_entity`, `heating_active` too) — mode-string entity vs. binary fallback, see [Parameter reference](#parameter-reference). |
 
 ### How it works
 
@@ -987,6 +1001,8 @@ The following features activate when the corresponding sensors are configured an
 | `thermal_pressure_cop` | `climate_entities` + `heating_system_active_entity` | `thermal_pressure / COP(T_outdoor)` — expresses the same heating deficit in *electrical urgency*: a 1°C deficit costs ~2× more electricity at −10°C than at +10°C outdoors. Denominator clamped at 0.5. |
 | `weighted_solar_gain` | weather (`direct_radiation_wm2`) | Direct radiation weighted by a half-cosine window peaking at 13:00, zero outside 09:00–17:00. Captures south-facing passive solar gain that reduces actual heating demand even when `thermal_pressure` is high. |
 | `dhw_pressure` | `dhw_buffer_sensor` | Heat-loss urgency: `1 / (max(0.5, buffer_temp − 40) + 1)²`. Rises steeply as the DHW buffer cools toward its reheat threshold. |
+
+**Cooling mode / AC support** (opt-in, `cooling_mode_enabled: false` by default): when enabled and `hvac_mode_entity` or `cooling_system_active_entity` is configured, `thermal_pressure`/`thermal_pressure_net`/`thermal_pressure_cop` invert direction on hours where `cooling_active == 1` (`indoor_temp − setpoint`, positive once above setpoint) instead of going negative/inert exactly when cooling load is highest. `defrost_risk` is forced to `0.0` during those hours. See [Parameter reference](#parameter-reference) for the full cooling key set and [Features used](#features-used) for the resulting `cooling_active`/`cooling_load_sum_24h` model features.
 
 **τ calibration** (building thermal time constant): when `heating_system_active_entity` is configured, the model periodically fits a log-linear OLS on passive-cooling windows (periods where the heating system is confirmed off and indoor temperature decays freely). The resulting τ (hours) scales `thermal_pressure` to express heating urgency in °C/h rather than a static °C delta. τ is persisted in `meta.pkl` and survives AppDaemon restarts; falls back to 24h if calibration fails or `heating_system_active_entity` is absent.
 

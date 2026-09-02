@@ -1,9 +1,9 @@
 """One-time baseline capture for the cooling-mode no-regression test (#96).
 
 Run this script from a pristine pre-cooling-change checkout (the `dev` branch,
-before Plan A's Task 1 of the cooling-mode-ac-support plan set
-(docs/superpowers/plans/2026-09-01-cooling-mode-ac-support-index.md) lands) to
-produce tests/fixtures/cooling_regression_baseline.json. The no-regression
+before Plan A's Task 1 of the cooling-mode-ac-support plan set — see the
+design spec docs/superpowers/specs/2026-09-01-cooling-mode-ac-support-design.md —
+lands) to produce tests/fixtures/cooling_regression_baseline.json. The no-regression
 test (tests/test_cooling_regression.py) then compares current code's output
 against this frozen baseline — it does NOT re-run this script.
 

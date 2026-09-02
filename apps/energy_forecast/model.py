@@ -3460,9 +3460,8 @@ def _engineer_features(
     # infrastructure for a feature whose real-world value is still unproven
     # (see spec §7's other cooling-feature caveats).
     #
-    # Currently inert: cooling_load_sum_24h is not yet registered in
-    # _FEATURES_BASE (deferred to Plan D's Task 1), so nothing consumes this
-    # column and there is zero prediction impact today.
+    # Registered in _FEATURES_BASE since #96 Plan D Task 1; constant-zero on
+    # heating-only installs.
     _cooling_pressure_only = pd.Series(np.where(df["cooling_active"] == 1, df["thermal_pressure"], 0.0), index=df.index)
     df["cooling_load_sum_24h"] = _cooling_pressure_only.rolling(24, min_periods=1).sum()
 

@@ -77,9 +77,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `apps/energy_forecast/ha_data.py` — Two new helpers for the `hvac_mode_entity` fetch path.
   `fetch_hvac_mode_history()` fetches and caches a mode-string entity's HA state history.
   `hvac_mode_to_active()` decodes the resulting DataFrame into a `(heating_active_df,
-  cooling_active_df)` pair: `heat`/`heat_cool` map to heating, `cool`/`cool_only` map to cooling —
-  mutually exclusive by construction, so the heating-takes-precedence conflict rule never applies to
-  `hvac_mode_entity` users. (#96)
+  cooling_active_df)` pair: `heat`/`heating` map to heating-active, `cool`/`cooling` map to
+  cooling-active — mutually exclusive by construction, so the heating-takes-precedence conflict rule
+  never applies to `hvac_mode_entity` users. `dry`/`fan_only` (and any other/unrecognized mode string)
+  map to neither, so a `heat_cool`/`auto`-mode reversible heat pump currently gets no thermal-pressure
+  inversion signal from either state — a known gap for that HVAC mode, not yet covered by this
+  implementation. (#96)
 - `apps/energy_forecast/model.py` — Several interlocking additions to make the ML
   feature-engineering and prediction pipeline cooling-aware. (#96)
 
@@ -119,7 +122,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `cooling_active` and `cooling_load_sum_24h` with `0.0` and logs a WARNING rather than raising
   `KeyError`. The forward direction (old model, new code) is safe by design — the new columns are
   simply unused extras.
-- `apps/energy_forecast/clustering.py` — `DailyProfileClusterer.find_optimal_k()` accepts a new
+- `apps/energy_forecast/clustering.py` — `find_optimal_k()` accepts a new
   optional `cooling_day_dates` parameter (a `set[datetime.date]`) alongside the existing
   `ev_day_dates`. Days in either set are excluded from centroid fitting but still assigned a cluster
   label afterward, for the same reason as EV days: AC-driven midday consumption spikes would distort

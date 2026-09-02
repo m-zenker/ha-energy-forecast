@@ -280,9 +280,9 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ---
 
-### #96 — Cooling Mode / AC Support (Tropical/Hot-Climate Thermal Pressure) — ✅ Implemented (ML-feature layer)
+### #96 — Cooling Mode / AC Support (Tropical/Hot-Climate Thermal Pressure) — ✅ Implemented (ML-feature layer, pending merge)
 
-**Priority:** Low — long-term, community-contribution candidate. **Status: ML-feature-layer implementation complete** (design spec `docs/superpowers/specs/2026-09-01-cooling-mode-ac-support-design.md`, 4-plan series + 1 interim fix — see `docs/superpowers/plans/2026-09-01-cooling-mode-ac-support-index.md`), pending merge to `dev`/`main`. Remains deprioritized/low-impact for the primary personal deployment (heating-dominated Swiss climate) — this was implemented as a community-contribution enabler, not because the maintainer's own install needs it.
+**Priority:** Low — long-term, community-contribution candidate. **Status: ML-feature-layer implementation complete** (design spec `docs/superpowers/specs/2026-09-01-cooling-mode-ac-support-design.md`, implemented across a 4-plan series + 1 interim fix), pending merge to `dev`/`main`. Remains deprioritized/low-impact for the primary personal deployment (heating-dominated Swiss climate) — this was implemented as a community-contribution enabler, not because the maintainer's own install needs it.
 
 **Source:** [GitHub Discussion #20](https://github.com/m-zenker/ha-energy-forecast/discussions/20), opened 2026-08-17 by @gabrieldelboniz.
 
@@ -291,8 +291,8 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 **What shipped (ML-feature layer, opt-in via `cooling_mode_enabled: false` by default)**:
 - `cooling_system_active_entity`/`hvac_mode_entity` — config flag/entity marking active cooling mode, threaded through the full train/predict call chain
 - Mode-aware `thermal_pressure`/`thermal_pressure_net`/`thermal_pressure_cop`: inverted while cooling (`indoor_temp − setpoint`, positive once above setpoint) instead of going negative/inert exactly when cooling load is highest
-- `cooling_load_sum_24h` — AC-active-gated rolling accumulation, mirroring `heating_deg_sum_24h`. (A `cooling_load_sum_168h` sibling, mirroring `heating_deg_sum_168h`, was also built but found to have a permanent train/serve window mismatch — its 168h window can't be seeded at prediction time — and was removed before being registered as a trained feature; see `docs/superpowers/plans/2026-09-02-cooling-load-sum-drop-168h.md`.)
-- Cooling-specific hysteresis (`cooling_temp_on`/`cooling_temp_off`) and an EER proxy (`cooling_eer_slope`/`cooling_eer_intercept`)
+- `cooling_load_sum_24h` — AC-active-gated rolling accumulation, mirroring `heating_deg_sum_24h`. (A `cooling_load_sum_168h` sibling, mirroring `heating_deg_sum_168h`, was also built but found to have a permanent train/serve window mismatch — its 168h window can't be seeded at prediction time — and was removed before being registered as a trained feature; see the design spec's §4.7 history note.)
+- Cooling-specific hysteresis (`cooling_setpoint_on`/`cooling_setpoint_off`) and an EER proxy (`cooling_eer_slope`/`cooling_eer_intercept`)
 - `defrost_risk` cooling exclusion, τ-calibration passive-window cooling exclusion, regime-clustering cooling-day exclusion, model-artifact rollback fallback, `_FEATURES_BASE`/SHAP label registration, and a no-regression test proving heating-only behavior is unaffected (holds `cooling_mode_enabled` absent/`false` against a pre-change baseline)
 
 **Not in scope / distinct follow-up**: `physics.py`'s baseline forecast path remains heating-only — a cooling-capable physics baseline (the spec's own §2 non-goal) is unscoped, separate future work, not part of this implementation.
@@ -334,7 +334,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 40 | Battery SoC | medium (battery) | 1 h | deferred |
 | 24 | Spot price | n/a | — | out of scope |
 | 94 | Remove vestigial `dhw_tank_volume_l` duplicate | none (dead field) | 10 min | opportunistic — clean up next time adjacent code is touched |
-| 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | 1 day+ | long-term — community PR candidate, see Discussion #20 |
+| 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | ~4 plans / 16 tasks + 1 interim fix, actual | ✅ implemented (ML-feature layer), pending merge to dev — see #96 detail |
 
 ---
 

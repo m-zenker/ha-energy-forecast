@@ -17,10 +17,10 @@ _BASELINE_PATH = Path(__file__).parent / "fixtures" / "cooling_regression_baseli
 
 
 def _build_fixture_dataset():
-    """Must stay byte-identical to scripts/capture_cooling_regression_baseline.py's
-    _build_fixture_dataset() — duplicated deliberately, since the capture script
-    must also run unmodified against a pre-change dev checkout that doesn't have
-    this test file."""
+    """Its function body must stay identical to scripts/capture_cooling_regression_baseline.py's
+    _build_fixture_dataset() (this docstring differs deliberately) — duplicated on purpose, since
+    the capture script must also run unmodified against a pre-change dev checkout that doesn't
+    have this test file."""
     rng = np.random.default_rng(96)
     ts = pd.date_range("2026-01-01", periods=24 * 120, freq="1h")
     hour = ts.hour.values
@@ -94,6 +94,10 @@ class TestCoolingModeNoRegression:
         current_cols = set(model.feature_cols)
         new_cooling_cols = {"cooling_active", "cooling_load_sum_24h"}
 
+        # NOTE: if you're here because you added a new column to _FEATURES_BASE and
+        # this test now fails — that's expected, not a cooling regression. Re-run
+        # scripts/capture_cooling_regression_baseline.py against a pristine pre-#96
+        # dev checkout (or extend new_cooling_cols here) to update the baseline.
         assert current_cols - baseline_cols == new_cooling_cols, (
             f"Unexpected column set change beyond the 2 cooling additions: "
             f"{(current_cols - baseline_cols) - new_cooling_cols}"
