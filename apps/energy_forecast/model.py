@@ -342,6 +342,9 @@ class EnergyForecastModel:
         dhw_df: pd.DataFrame | None = None,  # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
         cooling_active_df: pd.DataFrame | None = None,  # cols: timestamp, cooling_active (0/1) — #96
+        cooling_eer_slope: float = -0.05,
+        cooling_eer_intercept: float = 4.0,
+        cooling_sanity_bound: float = 20.0,
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
@@ -653,6 +656,10 @@ class EnergyForecastModel:
             heating_active_df=heating_active_df,
             cooling_active_df=cooling_active_df,
             cooling_conflict_warned=self._cooling_conflict_warned,
+            cooling_eer_slope=cooling_eer_slope,
+            cooling_eer_intercept=cooling_eer_intercept,
+            cooling_sanity_bound=cooling_sanity_bound,
+            is_training=True,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -1013,6 +1020,9 @@ class EnergyForecastModel:
         cooling_active_series: pd.Series | None = None,
         cooling_setpoint_on: float | None = None,
         cooling_setpoint_off: float | None = None,
+        cooling_eer_slope: float = -0.05,
+        cooling_eer_intercept: float = 4.0,
+        cooling_sanity_bound: float = 20.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
@@ -1141,6 +1151,9 @@ class EnergyForecastModel:
             heating_active_df=ha_df_for_features,
             cooling_active_df=ca_df_for_features,
             cooling_conflict_warned=self._cooling_conflict_warned,
+            cooling_eer_slope=cooling_eer_slope,
+            cooling_eer_intercept=cooling_eer_intercept,
+            cooling_sanity_bound=cooling_sanity_bound,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -1304,6 +1317,9 @@ class EnergyForecastModel:
         cooling_active_series: pd.Series | None = None,
         cooling_setpoint_on: float | None = None,
         cooling_setpoint_off: float | None = None,
+        cooling_eer_slope: float = -0.05,
+        cooling_eer_intercept: float = 4.0,
+        cooling_sanity_bound: float = 20.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         dhw_schedule_override: dict | None = None,
@@ -1335,6 +1351,9 @@ class EnergyForecastModel:
                 cooling_active_series=cooling_active_series,
                 cooling_setpoint_on=cooling_setpoint_on,
                 cooling_setpoint_off=cooling_setpoint_off,
+                cooling_eer_slope=cooling_eer_slope,
+                cooling_eer_intercept=cooling_eer_intercept,
+                cooling_sanity_bound=cooling_sanity_bound,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
@@ -1381,6 +1400,9 @@ class EnergyForecastModel:
         cooling_active_series: pd.Series | None = None,
         cooling_setpoint_on: float | None = None,
         cooling_setpoint_off: float | None = None,
+        cooling_eer_slope: float = -0.05,
+        cooling_eer_intercept: float = 4.0,
+        cooling_sanity_bound: float = 20.0,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
@@ -1413,6 +1435,9 @@ class EnergyForecastModel:
                 cooling_active_series=cooling_active_series,
                 cooling_setpoint_on=cooling_setpoint_on,
                 cooling_setpoint_off=cooling_setpoint_off,
+                cooling_eer_slope=cooling_eer_slope,
+                cooling_eer_intercept=cooling_eer_intercept,
+                cooling_sanity_bound=cooling_sanity_bound,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1584,6 +1609,9 @@ class EnergyForecastModel:
         cooling_active_series: pd.Series | None = None,
         cooling_setpoint_on: float | None = None,
         cooling_setpoint_off: float | None = None,
+        cooling_eer_slope: float = -0.05,
+        cooling_eer_intercept: float = 4.0,
+        cooling_sanity_bound: float = 20.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
@@ -1623,6 +1651,9 @@ class EnergyForecastModel:
                 cooling_active_series=cooling_active_series,
                 cooling_setpoint_on=cooling_setpoint_on,
                 cooling_setpoint_off=cooling_setpoint_off,
+                cooling_eer_slope=cooling_eer_slope,
+                cooling_eer_intercept=cooling_eer_intercept,
+                cooling_sanity_bound=cooling_sanity_bound,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
@@ -3014,6 +3045,10 @@ def _engineer_features(
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
     cooling_active_df: pd.DataFrame | None = None,  # cols: timestamp, cooling_active (0/1) — #96
     cooling_conflict_warned: set | None = None,  # §4.2 — dedup set for WARNING-once escalation
+    cooling_eer_slope: float = -0.05,
+    cooling_eer_intercept: float = 4.0,
+    cooling_sanity_bound: float = 20.0,
+    is_training: bool = False,  # gates training-time-only sanity warnings (§4.6/§4.7)
     physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
     heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
@@ -3383,8 +3418,36 @@ def _engineer_features(
     # Linear COP model: COP ≈ 0.11 × T_out + 3.0 (air-to-water HP, radiators).
     # Same °C heat debt costs ~2× more electricity at −10°C vs +10°C outdoors.
     # Denominator clamped at 0.5 to guard against extreme negative temps.
+    # §4.6: cooling EER proxy — config-exposed placeholder (units: °C -> dimensionless
+    # EER proxy). "placeholder, unvalidated — see §7". Default slope chosen to keep
+    # eer_proxy in the same 0.5-4 magnitude band as cop_proxy, for consistent
+    # LightGBM split-gain scaling — not derived from real EER curves.
     cop_proxy = (0.11 * df["temp_c"] + 3.0).clip(lower=0.5)
-    df["thermal_pressure_cop"] = df["thermal_pressure"] / cop_proxy
+    eer_proxy = (cooling_eer_slope * df["temp_c"] + cooling_eer_intercept).clip(lower=0.5)
+    cooling_mask = df["cooling_active"] == 1
+    divisor = np.where(cooling_mask, eer_proxy, cop_proxy)
+    df["thermal_pressure_cop"] = df["thermal_pressure"] / divisor
+
+    if cooling_mask.any():
+        warn_once(
+            _LOGGER,
+            cooling_conflict_warned,
+            ("cooling_placeholder_unvalidated",),
+            "cooling_active observed true — thermal_pressure_cop now uses the "
+            "cooling_eer_slope/cooling_eer_intercept placeholder constants "
+            "(unvalidated, see spec §7). Recalibrate via config once real EER data "
+            "is available.",
+        )
+        if is_training:
+            _cop_exceeds = df.loc[cooling_mask, "thermal_pressure_cop"] > cooling_sanity_bound
+            if _cop_exceeds.any():
+                _LOGGER.warning(
+                    "thermal_pressure_cop exceeds cooling_sanity_bound (%.1f) for %d cooling-active "
+                    "hour(s) at training time — possible bad EER calibration "
+                    "(cooling_eer_slope/cooling_eer_intercept).",
+                    cooling_sanity_bound,
+                    int(_cop_exceeds.sum()),
+                )
 
     # ── §3: Physics feature scaling rationale ─────────────────────────────────
     # Constants below are empirical, chosen to keep each feature in a ~0–5 range

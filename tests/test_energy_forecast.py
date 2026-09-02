@@ -4143,6 +4143,9 @@ class _FakeRetrain:
         self._cooling_mode_enabled = False
         self._hvac_mode_entity = None
         self._cooling_active_entity = None
+        self._cooling_eer_slope = -0.05
+        self._cooling_eer_intercept = 4.0
+        self._cooling_sanity_bound = 20.0
         self._ml_model = MagicMock()
         self._ml_model.last_trained = datetime.min  # matches EnergyForecastModel's real default
         self._weight_halflife = 90.0
@@ -4438,6 +4441,9 @@ class _FakeUpdateSensors:
         self._cooling_mode_enabled = False
         self._hvac_mode_entity = None
         self._cooling_active_entity = None
+        self._cooling_eer_slope = -0.05
+        self._cooling_eer_intercept = 4.0
+        self._cooling_sanity_bound = 20.0
         self._climate_room_areas = None
         self._shap_top_n = 0
         self._physics_model = None

@@ -7449,3 +7449,126 @@ class TestPredictCoolingIntegration:
         # unit-tested in isolation by TestProjectIndoorTempsCooling; here we confirm
         # the chain actually delivers a cooling-active projection to it end to end.
         assert (captured["result"]["climate.test"]["setpoint"] == 24.0).all()
+
+
+class TestCoolingEerProxy:
+    def test_cooling_active_uses_eer_proxy_not_cop_proxy(self):
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=30.0)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+        result = _engineer_features(
+            df,
+            w,
+            None,
+            climate_dfs=climate_dfs,
+            cooling_active_df=ca_df,
+            cooling_eer_slope=-0.05,
+            cooling_eer_intercept=4.0,
+        )
+        # thermal_pressure = 3.0; eer_proxy = -0.05*30 + 4.0 = 2.5
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(3.0 / 2.5)
+
+    def test_heating_path_still_uses_cop_proxy(self):
+        ts = pd.date_range("2026-01-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=-5.0)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [18.0], "setpoint": [21.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [0]})
+
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        # thermal_pressure = 3.0; cop_proxy = 0.11*-5 + 3.0 = 2.45
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(3.0 / 2.45)
+
+    def test_custom_eer_constants_are_used(self):
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=35.0)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [30.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+        result = _engineer_features(
+            df,
+            w,
+            None,
+            climate_dfs=climate_dfs,
+            cooling_active_df=ca_df,
+            cooling_eer_slope=-0.1,
+            cooling_eer_intercept=5.0,
+        )
+        # thermal_pressure = 6.0; eer_proxy = -0.1*35 + 5.0 = 1.5
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(6.0 / 1.5)
+
+    def test_eer_proxy_clipped_at_0_5(self):
+        """Extreme slope*temp could drive eer_proxy negative — clipped like cop_proxy."""
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=50.0)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [30.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+        result = _engineer_features(
+            df,
+            w,
+            None,
+            climate_dfs=climate_dfs,
+            cooling_active_df=ca_df,
+            cooling_eer_slope=-1.0,
+            cooling_eer_intercept=1.0,  # -1.0*50+1.0 = -49 -> clipped to 0.5
+        )
+        assert result.iloc[0]["thermal_pressure_cop"] == pytest.approx(6.0 / 0.5)
+
+    def test_first_cooling_observation_warns_once(self, caplog):
+        import logging
+
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=30.0)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+        warned: set = set()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df, cooling_conflict_warned=warned
+            )
+        assert any("placeholder" in r.message.lower() or "unvalidated" in r.message.lower() for r in caplog.records)
+
+    def test_sanity_bound_exceeded_warns_only_at_training_time(self, caplog):
+        import logging
+
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts, temp=30.0)
+        # Huge delta -> thermal_pressure way above a tiny sanity bound
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [40.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df,
+                w,
+                None,
+                climate_dfs=climate_dfs,
+                cooling_active_df=ca_df,
+                cooling_sanity_bound=0.1,
+                is_training=True,
+            )
+        assert any("sanity_bound" in r.message.lower() or "sanity bound" in r.message.lower() for r in caplog.records)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df,
+                w,
+                None,
+                climate_dfs=climate_dfs,
+                cooling_active_df=ca_df,
+                cooling_sanity_bound=0.1,
+                is_training=False,
+            )
+        assert not any(
+            "sanity_bound" in r.message.lower() or "sanity bound" in r.message.lower() for r in caplog.records
+        )
