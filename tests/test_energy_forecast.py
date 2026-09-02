@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 import pytest
+from energy_forecast import ha_data
 from energy_forecast.energy_forecast import (
     EnergyForecast,
     _apply_target_correction,
@@ -4111,6 +4112,9 @@ class _FakeRetrain:
         self._climate_entities = []
         self._dhw_buffer_sensor = None
         self._heating_active_entity = None
+        self._cooling_mode_enabled = False
+        self._hvac_mode_entity = None
+        self._cooling_active_entity = None
         self._ml_model = MagicMock()
         self._ml_model.last_trained = datetime.min  # matches EnergyForecastModel's real default
         self._weight_halflife = 90.0
@@ -4148,6 +4152,15 @@ class _FakeRetrain:
         from energy_forecast.energy_forecast import EnergyForecast
 
         return EnergyForecast._ev_charging_cache_path(self)
+
+    def _fetch_hvac_active_history(self, days=30):
+        # _retrain() calls this unconditionally (#96). Delegate to the real
+        # implementation; with _heating_active_entity/_hvac_mode_entity/
+        # _cooling_active_entity all None above, it short-circuits to two empty
+        # DataFrames without touching _generic_sensor_cache_path.
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._fetch_hvac_active_history(self, days=days)
 
 
 def _make_energy_df(n=100):
@@ -4394,6 +4407,9 @@ class _FakeUpdateSensors:
         self._climate_entities = []
         self._dhw_buffer_sensor = None
         self._heating_active_entity = None
+        self._cooling_mode_enabled = False
+        self._hvac_mode_entity = None
+        self._cooling_active_entity = None
         self._climate_room_areas = None
         self._shap_top_n = 0
         self._physics_model = None
@@ -4860,3 +4876,63 @@ class TestTimezoneAlignmentWarning:
         app.get_timezone = MagicMock(return_value="America/New_York")
         app.initialize()
         assert app._timezone == "America/New_York"
+
+
+class TestFetchHvacActiveHistory:
+    """§3 precedence: hvac_mode_entity is sole source when set; otherwise the two
+    independent binary entities each drive their own series."""
+
+    def _make_self(self, **overrides):
+        class _Fake:
+            pass
+
+        fake = _Fake()
+        fake._timezone = "Europe/Zurich"
+        fake._hvac_mode_entity = None
+        fake._heating_active_entity = None
+        fake._cooling_active_entity = None
+        fake._generic_sensor_cache_path = lambda entity_id, prefix="sensor": Path(f"/tmp/{prefix}.csv")
+        for k, v in overrides.items():
+            setattr(fake, k, v)
+        return fake
+
+    def test_hvac_mode_entity_is_sole_source(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self(
+            _hvac_mode_entity="climate.living_room",
+            _heating_active_entity="binary_sensor.heating",  # must be ignored per §3
+            _generic_sensor_cache_path=lambda entity_id, prefix="sensor": tmp_path / f"{prefix}.csv",
+        )
+        mode_df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00"]), "hvac_mode": ["cool"]})
+        monkeypatch.setattr(ha_data, "fetch_hvac_mode_history", lambda *a, **kw: mode_df)
+        heating_df, cooling_df = EnergyForecast._fetch_hvac_active_history(fake, days=30)
+        assert list(cooling_df["cooling_active"]) == [1]
+        assert list(heating_df["heating_active"]) == [0]
+
+    def test_binary_entities_are_independent_when_no_hvac_mode_entity(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self(
+            _heating_active_entity="binary_sensor.heating",
+            _cooling_active_entity="binary_sensor.cooling",
+            _generic_sensor_cache_path=lambda entity_id, prefix="sensor": tmp_path / f"{prefix}.csv",
+        )
+        heating_hist = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00"]), "heating_active": [1]})
+        cooling_hist = pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-01 08:00"]), "cooling_active": [1]})
+
+        def _fake_fetch(app, entity_id, path, column_name, timezone):
+            return heating_hist if column_name == "heating_active" else cooling_hist
+
+        monkeypatch.setattr(ha_data, "fetch_generic_sensor_history", _fake_fetch)
+        heating_df, cooling_df = EnergyForecast._fetch_hvac_active_history(fake, days=30)
+        assert list(heating_df["heating_active"]) == [1]
+        assert list(cooling_df["cooling_active"]) == [1]
+
+    def test_neither_entity_configured_returns_empty(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self()
+        heating_df, cooling_df = EnergyForecast._fetch_hvac_active_history(fake, days=30)
+        assert heating_df.empty
+        assert cooling_df.empty

@@ -1130,6 +1130,111 @@ def fetch_recent_generic_sensor(
     return combined
 
 
+def fetch_hvac_mode_history(
+    app: hass.Hass,
+    entity_id: str,
+    cache_path: Path,
+    days: int = 30,
+    timezone: str = "Europe/Zurich",
+) -> pd.DataFrame:
+    """Pull raw HVAC mode-string history (climate.* hvac_mode state), merging
+    local CSV cache with fresh HA data.
+
+    Unlike fetch_generic_sensor_history, this keeps the raw state string
+    (not coerced to on/off/float via _fetch_history) — hvac_mode_entity states
+    are mode strings ("heating"/"cooling"/"off"/"dry"/"fan_only"/...), not
+    binary. Returns columns [timestamp, hvac_mode], hourly-resampled
+    (last state per hour, forward-filled).
+    """
+    import pandas as pd
+
+    df_cache = pd.DataFrame(columns=["timestamp", "hvac_mode"])
+    if cache_path.exists():
+        try:
+            df_cache = pd.read_csv(cache_path)
+            ts = pd.to_datetime(df_cache["timestamp"], format="mixed")
+            if ts.dt.tz is not None:
+                ts = ts.dt.tz_convert(timezone).dt.tz_localize(None)
+            df_cache["timestamp"] = ts
+        except (OSError, pd.errors.ParserError, ValueError) as e:
+            _LOGGER.warning(f"Failed to load hvac_mode cache {cache_path.name}: {e}")
+
+    try:
+        raw = app.get_history(entity_id=entity_id, days=days)
+    except Exception as exc:
+        _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
+        raw = {}
+
+    if isinstance(raw, dict):
+        states = raw.get(entity_id, [])
+    elif isinstance(raw, list) and raw:
+        states = raw[0] if isinstance(raw[0], list) else raw
+    else:
+        states = []
+
+    rows = []
+    for state in states:
+        try:
+            ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
+            rows.append({"timestamp": ts, "hvac_mode": str(state["state"])})
+        except (ValueError, KeyError, TypeError):
+            continue
+    raw_df = pd.DataFrame(rows)
+
+    if raw_df.empty and df_cache.empty:
+        _LOGGER.warning(f"No hvac_mode history found for {entity_id} — skipping.")
+        return pd.DataFrame(columns=["timestamp", "hvac_mode"])
+
+    if not raw_df.empty:
+        hourly = raw_df.set_index("timestamp")["hvac_mode"].resample("1h").last().ffill().reset_index()
+        hourly.columns = ["timestamp", "hvac_mode"]
+        if hourly["timestamp"].dt.tz is not None:
+            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+        df_new = hourly.copy()
+    else:
+        df_new = pd.DataFrame(columns=["timestamp", "hvac_mode"])
+
+    combined = (
+        pd.concat([df_cache, df_new], ignore_index=True)
+        .drop_duplicates(subset="timestamp", keep="last")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    try:
+        combined.to_csv(cache_path, index=False)
+    except OSError as e:
+        _LOGGER.warning(f"Failed to write hvac_mode cache {cache_path.name}: {e}")
+
+    return combined
+
+
+_HVAC_COOLING_STATES = {"cool", "cooling"}
+_HVAC_HEATING_STATES = {"heat", "heating"}
+# dry/fan_only run the compressor for humidity control without pursuing a heating
+# or cooling setpoint — treating them as either would inject a spurious pressure
+# value (spec §4.3). Anything else (off, unrecognized) also maps to neither.
+_HVAC_NON_CONDITIONING_STATES = {"dry", "fan_only"}
+
+
+def hvac_mode_to_active(df: pd.DataFrame, mode_col: str = "hvac_mode") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Map a raw hvac_mode-string DataFrame to (heating_active_df, cooling_active_df).
+
+    df: cols [timestamp, mode_col] as returned by fetch_hvac_mode_history.
+    Returns two DataFrames, each cols [timestamp, {heating,cooling}_active] (0/1 int).
+    """
+    import pandas as pd
+
+    modes = df[mode_col].astype(str).str.strip().str.lower()
+    heating_df = pd.DataFrame(
+        {"timestamp": df["timestamp"], "heating_active": modes.isin(_HVAC_HEATING_STATES).astype(int)}
+    )
+    cooling_df = pd.DataFrame(
+        {"timestamp": df["timestamp"], "cooling_active": modes.isin(_HVAC_COOLING_STATES).astype(int)}
+    )
+    return heating_df, cooling_df
+
+
 def fetch_climate_history(
     app: hass.Hass,
     entity_id: str,

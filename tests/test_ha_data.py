@@ -2444,3 +2444,61 @@ class TestFetchRecentEnergy15m:
         saved_ts = set(pd.to_datetime(saved["timestamp"]))
         expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
         assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
+
+class TestFetchHvacModeHistory:
+    def test_maps_raw_states_hourly(self, tmp_path):
+        app = MagicMock()
+        app.get_history.return_value = {
+            "climate.living_room": [
+                {"last_updated": "2026-06-01T08:00:00+00:00", "state": "cool"},
+                {"last_updated": "2026-06-01T09:00:00+00:00", "state": "heat"},
+                {"last_updated": "2026-06-01T10:00:00+00:00", "state": "off"},
+            ]
+        }
+        cache_path = tmp_path / "hvac_mode.csv"
+        result = ha_data.fetch_hvac_mode_history(app, "climate.living_room", cache_path, timezone="UTC")
+        assert list(result["hvac_mode"]) == ["cool", "heat", "off"]
+
+    def test_empty_history_returns_empty_df(self, tmp_path):
+        app = MagicMock()
+        app.get_history.return_value = {"climate.living_room": []}
+        cache_path = tmp_path / "hvac_mode.csv"
+        result = ha_data.fetch_hvac_mode_history(app, "climate.living_room", cache_path, timezone="UTC")
+        assert result.empty
+        assert list(result.columns) == ["timestamp", "hvac_mode"]
+
+
+class TestHvacModeToActive:
+    def test_cool_and_heat_map_to_respective_active(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 09:00"]),
+                "hvac_mode": ["cool", "heat"],
+            }
+        )
+        heating_df, cooling_df = ha_data.hvac_mode_to_active(df)
+        assert list(heating_df["heating_active"]) == [0, 1]
+        assert list(cooling_df["cooling_active"]) == [1, 0]
+
+    def test_dry_and_fan_only_map_to_neither(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 09:00"]),
+                "hvac_mode": ["dry", "fan_only"],
+            }
+        )
+        heating_df, cooling_df = ha_data.hvac_mode_to_active(df)
+        assert list(heating_df["heating_active"]) == [0, 0]
+        assert list(cooling_df["cooling_active"]) == [0, 0]
+
+    def test_off_and_unrecognized_map_to_neither(self):
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-01 08:00", "2026-06-01 09:00"]),
+                "hvac_mode": ["off", "auto"],
+            }
+        )
+        heating_df, cooling_df = ha_data.hvac_mode_to_active(df)
+        assert list(heating_df["heating_active"]) == [0, 0]
+        assert list(cooling_df["cooling_active"]) == [0, 0]

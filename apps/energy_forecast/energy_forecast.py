@@ -1503,6 +1503,55 @@ class EnergyForecast(hass.Hass):
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
+    def _fetch_hvac_active_history(self, days: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Return (heating_active_df, cooling_active_df) per §3's config precedence.
+
+        hvac_mode_entity (Option A), when set, is the sole source for both series —
+        mutually exclusive by construction. Otherwise heating_system_active_entity
+        drives heating_active and cooling_system_active_entity drives cooling_active
+        independently (Option B).
+        """
+        import pandas as pd
+
+        empty_heating = pd.DataFrame(columns=["timestamp", "heating_active"])
+        empty_cooling = pd.DataFrame(columns=["timestamp", "cooling_active"])
+
+        if self._hvac_mode_entity:
+            path = self._generic_sensor_cache_path(self._hvac_mode_entity, prefix="hvac_mode")
+            try:
+                mode_df = ha_data.fetch_hvac_mode_history(
+                    self, self._hvac_mode_entity, path, days=days, timezone=self._timezone
+                )
+                if mode_df.empty:
+                    return empty_heating, empty_cooling
+                heating_df, cooling_df = ha_data.hvac_mode_to_active(mode_df)
+                return heating_df, cooling_df
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("hvac_mode_entity %s fetch failed: %s", self._hvac_mode_entity, exc)
+                return empty_heating, empty_cooling
+
+        heating_df = empty_heating
+        if self._heating_active_entity:
+            path = self._generic_sensor_cache_path(self._heating_active_entity, prefix="heating_active")
+            try:
+                heating_df = ha_data.fetch_generic_sensor_history(
+                    self, self._heating_active_entity, path, column_name="heating_active", timezone=self._timezone
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
+
+        cooling_df = empty_cooling
+        if self._cooling_active_entity:
+            path = self._generic_sensor_cache_path(self._cooling_active_entity, prefix="cooling_active")
+            try:
+                cooling_df = ha_data.fetch_generic_sensor_history(
+                    self, self._cooling_active_entity, path, column_name="cooling_active", timezone=self._timezone
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Cooling active %s fetch failed: %s", self._cooling_active_entity, exc)
+
+        return heating_df, cooling_df
+
     def _retrain(self) -> None:
         import pandas as pd
 
@@ -1745,22 +1794,14 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("DHW %s history fetch failed: %s", self._dhw_buffer_sensor, exc)
 
-        # ── Stage 2 / #55: Heating active sensor (τ calibration) ─────────────
-        heating_active_df = pd.DataFrame()
-        if self._heating_active_entity:
-            ha_path = self._generic_sensor_cache_path(self._heating_active_entity, prefix="heating_active")
-            try:
-                heating_active_df = ha_data.fetch_generic_sensor_history(
-                    self,
-                    self._heating_active_entity,
-                    ha_path,
-                    column_name="heating_active",
-                    timezone=self._timezone,
-                )
-                if not heating_active_df.empty:
-                    heating_active_df = _strip_tz(heating_active_df, self._timezone)
-            except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
+        # ── Stage 2 / #55 / #96: Heating + cooling active sensors (τ calibration) ──
+        heating_active_df, cooling_active_df = self._fetch_hvac_active_history(days=30)
+        if not heating_active_df.empty:
+            heating_active_df = _strip_tz(heating_active_df, self._timezone)
+        if not cooling_active_df.empty:
+            cooling_active_df = _strip_tz(cooling_active_df, self._timezone)
+        if not self._cooling_mode_enabled:
+            cooling_active_df = pd.DataFrame(columns=["timestamp", "cooling_active"])
 
         # Physics recalibrate_physics service: cache the fully-processed training data (post
         # EV-subtraction/target-correction for baseline_df, post-stitch for weather_df) so an
@@ -1952,18 +1993,11 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("DHW %s recent fetch failed: %s", self._dhw_buffer_sensor, exc)
 
-        if self._heating_active_entity:
-            ha_path = self._generic_sensor_cache_path(self._heating_active_entity, prefix="heating_active")
+        if self._heating_active_entity or self._hvac_mode_entity:
             try:
-                ha_data.fetch_recent_generic_sensor(
-                    self,
-                    self._heating_active_entity,
-                    ha_path,
-                    column_name="heating_active",
-                    timezone=self._timezone,
-                )
+                self._fetch_hvac_active_history(days=2)  # side effect: refreshes on-disk caches
             except (OSError, KeyError, ValueError) as exc:
-                _LOGGER.warning("Heating active %s recent fetch failed: %s", self._heating_active_entity, exc)
+                _LOGGER.warning("Heating/cooling active recent fetch failed: %s", exc)
 
         # ── Physics: keep DHW tank / heating buffer / COP / room-thermostat data
         # fresh every hourly cycle, independent of the weekly/adaptive retrain ──

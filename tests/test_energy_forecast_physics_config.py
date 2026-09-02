@@ -64,6 +64,12 @@ def _make_app(args: dict):
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
     app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
     app._model_phase_attr = EnergyForecast._model_phase_attr.__get__(app, type(app))
+    # #96: _retrain() now calls this unconditionally. Bind the real implementation
+    # (like the two above) rather than letting it fall through to a bare MagicMock —
+    # with _hvac_mode_entity/_heating_active_entity/_cooling_active_entity all set to
+    # None by the real initialize() call below (no such args in full_args), it
+    # short-circuits to two empty DataFrames.
+    app._fetch_hvac_active_history = EnergyForecast._fetch_hvac_active_history.__get__(app, type(app))
     return app
 
 
