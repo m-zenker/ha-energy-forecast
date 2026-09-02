@@ -99,3 +99,19 @@ def resolve_timezone(configured: str | None, ha_timezone: Any, logger: logging.L
             )
         return configured
     return ha_timezone or "Europe/Zurich"
+
+
+def warn_once(logger: logging.Logger, warned: set | None, key: tuple, msg: str, *args) -> None:
+    """Log at WARNING the first time `key` is seen, INFO on repeats.
+
+    `warned` is an optional dedup set shared across an app instance's call
+    sites (see ha_data.load_excluded_ranges/filter_excluded_ranges, and
+    model.py's cooling-conflict logging). `warned=None` disables dedup —
+    always logs at WARNING.
+    """
+    if warned is not None and key in warned:
+        logger.info(msg, *args)
+    else:
+        logger.warning(msg, *args)
+        if warned is not None:
+            warned.add(key)

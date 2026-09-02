@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     import hassapi as hass
     import pandas as pd
 
-from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH
+from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH, warn_once
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -114,21 +114,6 @@ def validate_energy_cache(df: pd.DataFrame, logger: logging.Logger) -> None:
 _EXCLUDED_RANGE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$")
 
 
-def _warn_once(logger: logging.Logger, warned: set | None, key: tuple, msg: str, *args) -> None:
-    """Log at WARNING the first time `key` is seen, INFO on repeats.
-
-    `warned` is an optional dedup set shared across an app instance's call
-    sites (see load_excluded_ranges/filter_excluded_ranges). `warned=None`
-    disables dedup — always logs at WARNING, matching pre-#95 behavior.
-    """
-    if warned is not None and key in warned:
-        logger.info(msg, *args)
-    else:
-        logger.warning(msg, *args)
-        if warned is not None:
-            warned.add(key)
-
-
 def load_excluded_ranges(
     path: Path, timezone: str, logger: logging.Logger, warned: set | None = None
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
@@ -169,7 +154,7 @@ def load_excluded_ranges(
     try:
         raw = pd.read_csv(path, dtype=str)
     except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        _warn_once(
+        warn_once(
             logger,
             warned,
             ("csv_unreadable", str(path)),
@@ -182,7 +167,7 @@ def load_excluded_ranges(
         return []
 
     if "start" not in raw.columns or "end" not in raw.columns:
-        _warn_once(
+        warn_once(
             logger,
             warned,
             ("missing_columns", tuple(raw.columns)),
@@ -204,7 +189,7 @@ def load_excluded_ranges(
             reason = str(row["reason"]).strip()
 
             if not _EXCLUDED_RANGE_TS_RE.match(start_raw) or not _EXCLUDED_RANGE_TS_RE.match(end_raw):
-                _warn_once(
+                warn_once(
                     logger,
                     warned,
                     ("bad_format", row_num, start_raw, end_raw),
@@ -223,7 +208,7 @@ def load_excluded_ranges(
                 end = end + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
             if end < start:
-                _warn_once(
+                warn_once(
                     logger,
                     warned,
                     ("end_before_start", row_num, start_raw, end_raw),
@@ -239,7 +224,7 @@ def load_excluded_ranges(
                     ts.tz_localize(timezone, nonexistent="raise", ambiguous="raise")
                 except ValueError as exc:
                     if "nonexistent" in str(exc):
-                        _warn_once(
+                        warn_once(
                             logger,
                             warned,
                             ("dst_gap", row_num, label, str(ts)),
@@ -256,7 +241,7 @@ def load_excluded_ranges(
 
             ranges.append((start, end, reason))
         except (ValueError, TypeError, AttributeError) as exc:
-            _warn_once(
+            warn_once(
                 logger,
                 warned,
                 ("row_error", row_num, str(exc)),
@@ -324,7 +309,7 @@ def filter_excluded_ranges(
                 msg = "Excluded range %s -> %s (%s): dropped %d row(s)."
                 msg_args = (start, end, reason or "no reason given", n_dropped)
                 if escalate:
-                    _warn_once(logger, warned, ("escalate", start, end, reason), msg, *msg_args)
+                    warn_once(logger, warned, ("escalate", start, end, reason), msg, *msg_args)
                 else:
                     logger.info(msg, *msg_args)
             union_mask = union_mask | range_mask

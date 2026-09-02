@@ -76,3 +76,36 @@ class TestResolveTimezone:
             result = resolve_timezone("Europe/Zurich", ZoneInfo("Europe/Zurich"), logging.getLogger("test_const"))
         assert result == "Europe/Zurich"
         assert not caplog.records
+
+
+class TestWarnOnce:
+    def test_first_occurrence_logs_warning(self, caplog):
+        from energy_forecast.const import warn_once
+
+        logger = logging.getLogger("energy_forecast.test_warn_once")
+        warned: set = set()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.test_warn_once"):
+            warn_once(logger, warned, ("k1",), "first %s", "occurrence")
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert ("k1",) in warned
+
+    def test_repeat_occurrence_logs_info_not_warning(self, caplog):
+        from energy_forecast.const import warn_once
+
+        logger = logging.getLogger("energy_forecast.test_warn_once")
+        warned: set = {("k1",)}
+        with caplog.at_level(logging.INFO, logger="energy_forecast.test_warn_once"):
+            warn_once(logger, warned, ("k1",), "repeat %s", "occurrence")
+        records = [r for r in caplog.records if r.message.startswith("repeat")]
+        assert len(records) == 1
+        assert records[0].levelno == logging.INFO
+
+    def test_warned_none_disables_dedup_always_warns(self, caplog):
+        from energy_forecast.const import warn_once
+
+        logger = logging.getLogger("energy_forecast.test_warn_once")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.test_warn_once"):
+            warn_once(logger, None, ("k1",), "msg one")
+            warn_once(logger, None, ("k1",), "msg two")
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
