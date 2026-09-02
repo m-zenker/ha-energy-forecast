@@ -7217,9 +7217,21 @@ class TestProjectIndoorTempsCooling:
 
 
 class TestPredictCoolingIntegration:
-    def test_predict_uses_cooling_setpoint_when_projected_active(self, tmp_path):
-        """End-to-end: predict() with cooling_active_series=all-1s produces
-        thermal_pressure computed against the cooling setpoint, not heating's."""
+    def test_predict_uses_cooling_setpoint_when_projected_active(self, tmp_path, monkeypatch):
+        """End-to-end: predict()'s cooling_active_series/cooling_setpoint_on/off kwargs
+        actually reach _project_indoor_temps() via _prepare_prediction_X() — the real
+        call-chain wiring this task delivers. Spies on _project_indoor_temps (calling
+        through to the real implementation) to assert both the kwargs it receives and
+        its returned setpoint projection.
+
+        Note: this does NOT assert on thermal_pressure — that feature stays a heating-only
+        deficit (max(0, setpoint - current_temp)) until Plan B makes it cooling-aware, so
+        it is structurally 0 in a cooling scenario (current_temp > setpoint) regardless of
+        whether the cooling wiring works. TestProjectIndoorTempsCooling already proves the
+        setpoint-projection logic itself in isolation; this test's job is proving the
+        parameter hand-off through the chain, not re-proving that logic.
+        """
+        from energy_forecast import model as model_module
         from energy_forecast.model import EnergyForecastModel
 
         ts = pd.date_range("2026-07-01 00:00", periods=200, freq="1h")
@@ -7246,6 +7258,17 @@ class TestPredictCoolingIntegration:
         climate_recent = {"climate.test": climate_dfs["climate.test"].tail(1)}
         cooling_active_series = pd.Series([1] * 48, index=future_ts)
 
+        real_project_indoor_temps = model_module._project_indoor_temps
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            out = real_project_indoor_temps(*args, **kwargs)
+            captured["kwargs"] = kwargs
+            captured["result"] = out
+            return out
+
+        monkeypatch.setattr(model_module, "_project_indoor_temps", _spy)
+
         result = model.predict(
             forecast_df,
             live_temp=None,
@@ -7256,3 +7279,13 @@ class TestPredictCoolingIntegration:
             cooling_setpoint_off=28.0,
         )
         assert not result.empty  # no exception — full chain executes end to end
+
+        assert "kwargs" in captured, "_project_indoor_temps was never called"
+        assert captured["kwargs"]["cooling_active_series"] is cooling_active_series
+        assert captured["kwargs"]["cooling_setpoint_on"] == 24.0
+        assert captured["kwargs"]["cooling_setpoint_off"] == 28.0
+
+        # The real _project_indoor_temps' own setpoint-resolution logic is already
+        # unit-tested in isolation by TestProjectIndoorTempsCooling; here we confirm
+        # the chain actually delivers a cooling-active projection to it end to end.
+        assert (captured["result"]["climate.test"]["setpoint"] == 24.0).all()
