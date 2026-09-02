@@ -280,25 +280,26 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ---
 
-### #96 — Cooling Mode / AC Support (Tropical/Hot-Climate Thermal Pressure)
+### #96 — Cooling Mode / AC Support (Tropical/Hot-Climate Thermal Pressure) — ✅ Implemented (ML-feature layer)
 
-**Priority:** Low — long-term, community-contribution candidate.
+**Priority:** Low — long-term, community-contribution candidate. **Status: ML-feature-layer implementation complete** (design spec `docs/superpowers/specs/2026-09-01-cooling-mode-ac-support-design.md`, 4-plan series + 1 interim fix — see `docs/superpowers/plans/2026-09-01-cooling-mode-ac-support-index.md`), pending merge to `dev`/`main`. Remains deprioritized/low-impact for the primary personal deployment (heating-dominated Swiss climate) — this was implemented as a community-contribution enabler, not because the maintainer's own install needs it.
 
 **Source:** [GitHub Discussion #20](https://github.com/m-zenker/ha-energy-forecast/discussions/20), opened 2026-08-17 by @gabrieldelboniz.
 
 **Problem**: The physics thermal-pressure model (`setpoint − indoor_temp`) is heating-only. In cooling-dominated climates, thermal pressure goes negative once AC engages, which effectively disables the thermal signal exactly when cooling load is highest. Passive cooling is already modeled via `infiltration_pressure` (#57); active AC is not.
 
-**Proposed additions (from the discussion)**:
-- `cooling_system_active_entity` — config flag/entity marking active cooling mode
-- Inverted thermal pressure while cooling: `indoor_temp − setpoint` (positive once above setpoint)
-- Cooling-degree metrics, mirroring the existing heating-degree-hour features (`heating_deg_sum_24h/168h`, #50)
-- Cooling-specific hysteresis config (`cooling_temp_on`/`cooling_temp_off`, paralleling existing heating hysteresis)
+**What shipped (ML-feature layer, opt-in via `cooling_mode_enabled: false` by default)**:
+- `cooling_system_active_entity`/`hvac_mode_entity` — config flag/entity marking active cooling mode, threaded through the full train/predict call chain
+- Mode-aware `thermal_pressure`/`thermal_pressure_net`/`thermal_pressure_cop`: inverted while cooling (`indoor_temp − setpoint`, positive once above setpoint) instead of going negative/inert exactly when cooling load is highest
+- `cooling_load_sum_24h` — AC-active-gated rolling accumulation, mirroring `heating_deg_sum_24h`. (A `cooling_load_sum_168h` sibling, mirroring `heating_deg_sum_168h`, was also built but found to have a permanent train/serve window mismatch — its 168h window can't be seeded at prediction time — and was removed before being registered as a trained feature; see `docs/superpowers/plans/2026-09-02-cooling-load-sum-drop-168h.md`.)
+- Cooling-specific hysteresis (`cooling_temp_on`/`cooling_temp_off`) and an EER proxy (`cooling_eer_slope`/`cooling_eer_intercept`)
+- `defrost_risk` cooling exclusion, τ-calibration passive-window cooling exclusion, regime-clustering cooling-day exclusion, model-artifact rollback fallback, `_FEATURES_BASE`/SHAP label registration, and a no-regression test proving heating-only behavior is unaffected (holds `cooling_mode_enabled` absent/`false` against a pre-change baseline)
 
-**Maintainer response (2026-08-18)**: acknowledged, added to roadmap; deprioritized behind scenario-API work (see #93), no timeline committed; open to community PRs.
+**Not in scope / distinct follow-up**: `physics.py`'s baseline forecast path remains heating-only — a cooling-capable physics baseline (the spec's own §2 non-goal) is unscoped, separate future work, not part of this implementation.
 
-**Note**: doesn't fit the current Design Decisions — this deployment and its calibration (τ, `UA_eff`, hysteresis defaults) are tuned for a heating-dominated Swiss climate. Should land as an opt-in mode behind a config flag so heating-mode behavior for existing users is provably unaffected, not a default-on branch in the shared thermal-pressure calculation.
+**Maintainer response (2026-08-18)**: acknowledged, added to roadmap; deprioritized behind scenario-API work (see #93), no timeline committed; open to community PRs. (Implemented 2026-09 as a community-contribution enabler despite the low personal-deployment priority — see the design spec for full rationale.)
 
-**Effort:** unscoped — likely 1 day+ (new features, config, dual hysteresis paths, tests, docs). **Impact:** N/A for the primary personal deployment (heating-dominated); relevant mainly for community/HACS adoption in hot climates.
+**Effort:** ~4 plans / 16 tasks + 1 interim fix, actual. **Impact:** N/A for the primary personal deployment (heating-dominated); relevant mainly for community/HACS adoption in hot climates.
 
 ---
 

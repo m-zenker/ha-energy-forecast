@@ -50,6 +50,81 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that coverage window and falls back to threshold detection outside it, so pre-wallbox EV
   sessions are correctly excluded from training rather than silently retained as normal
   household load.
+- `apps/energy_forecast/energy_forecast.py` — Opt-in cooling/AC support for reversible heat pumps
+  and AC units (issue #96). Disabled by default (`cooling_mode_enabled: false`); existing
+  heating-only deployments are provably unaffected — a dedicated no-regression test compares
+  `X.columns` composition and holdout MAE against a pre-change baseline.
+
+  Nine new config keys. **Activation:** `cooling_mode_enabled` (master switch, default `false`).
+  **AC-active signal (choose one):** `hvac_mode_entity` — preferred for reversible heat pumps that
+  expose a single mode-string entity (e.g. `climate.hvac_mode`); when set it is the sole source for
+  both `heating_active` and `cooling_active`, mutually exclusive by construction;
+  `cooling_system_active_entity` — binary fallback, mirrors `heating_system_active_entity`, silently
+  ignored (with a startup WARNING) if `hvac_mode_entity` is also set. A symmetric WARNING fires if
+  `hvac_mode_entity` and `heating_system_active_entity` are both set — `hvac_mode_entity` supersedes
+  the heating entity too, even when `cooling_mode_enabled: false`. **Hysteresis:**
+  `cooling_setpoint_on`/`cooling_setpoint_off` (defaults `24.0`/`28.0` °C); startup raises
+  immediately if they are inverted. **EER proxy:** `cooling_eer_slope`/`cooling_eer_intercept` — a
+  linear EER-vs-temperature proxy for feature scaling; defaults `−0.05`/`4.0`. **Sanity caps:**
+  `cooling_sanity_bound` (per-hour thermal pressure cap, default `20.0`) and
+  `cooling_load_sanity_bound` (rolling-sum cap, default `50.0`), each logging a WARNING on
+  violation. A new `_fetch_hvac_active_history()` method centralises the entity-precedence logic for
+  both train and predict paths. For Option-B (independent binary entities) it dispatches to a
+  lightweight 2-day fetch in the hourly `_update_sensors()` cycle instead of issuing a full 30-day
+  recorder query every hour. `cooling_active` and `cooling_load_sum_24h` are added to
+  `_SHAP_FEATURE_LABELS` so the "Why today?" narrative card shows human-readable labels for these
+  features. (#96)
+- `apps/energy_forecast/ha_data.py` — Two new helpers for the `hvac_mode_entity` fetch path.
+  `fetch_hvac_mode_history()` fetches and caches a mode-string entity's HA state history.
+  `hvac_mode_to_active()` decodes the resulting DataFrame into a `(heating_active_df,
+  cooling_active_df)` pair: `heat`/`heat_cool` map to heating, `cool`/`cool_only` map to cooling —
+  mutually exclusive by construction, so the heating-takes-precedence conflict rule never applies to
+  `hvac_mode_entity` users. (#96)
+- `apps/energy_forecast/model.py` — Several interlocking additions to make the ML
+  feature-engineering and prediction pipeline cooling-aware. (#96)
+
+  **Thermal pressure sign (§4.3/§4.4):** `_engineer_features()` now resolves per-room
+  `thermal_pressure` as `indoor − setpoint` (clipped at zero) when `cooling_active == 1`, and as
+  `setpoint − indoor` (unchanged) otherwise. Without this inversion the cooling-load signal goes
+  negative/inert exactly when it matters most. `thermal_pressure_net` follows symmetrically: during
+  cooling, solar gain is added to the pressure (increasing cooling load) rather than subtracted from
+  it; the heating path is unchanged. `thermal_pressure_cop` is also routing through the same
+  mode-aware sign.
+
+  **Defrost risk (§4.8):** `defrost_risk` (a Gaussian frost-icing curve, heating-mode-only physics)
+  is forced to `0.0` on all `cooling_active == 1` rows. Defrost is inapplicable to AC operation;
+  leaving it non-zero during cooling hours would inject a spurious frost-risk signal into summer
+  predictions.
+
+  **`cooling_load_sum_24h` (§4.7):** a 24h rolling sum of cooling-direction thermal pressure, gated
+  on `cooling_active == 1` (zero on all heating/inactive hours). Mirrors the `heating_deg_sum_24h`
+  pattern. A `cooling_load_sum_168h` variant was designed but removed before registration: its 168h
+  window structurally cannot be seeded at prediction time — `_prepare_prediction_X()` always builds
+  a 48-row future frame with no historical tail prepended, unlike `heating_deg_sum_168h`'s
+  `self._weather_tail` extension — creating a permanent ~3.5× scale mismatch between training and
+  serving. Only the 24h variant shipped.
+
+  **`_FEATURES_BASE` registration (Plan D §5):** `cooling_active` and `cooling_load_sum_24h` are
+  now unconditionally registered as trained model features. On a heating-only install (the current
+  install base) both columns are constant-zero — LightGBM/TreeSHAP handle a constant column with no
+  meaningful training cost, and the no-regression test confirms holdout MAE is unaffected.
+
+  **τ-calibration cooling guard (§4.9):** `_calibrate_tau()` now accepts `cooling_active_df` and
+  excludes cooling-active hours from its passive-decay window detection. Active cooling creates a
+  forced-cooling thermal regime distinct from passive decay; including those hours would bias the τ
+  estimate downward.
+
+  **Rollback fallback (§4.11):** if a model artifact trained with the new cooling columns is served
+  by code rolled back to a pre-cooling version (code-only rollback), `_prepare_prediction_X()` fills
+  `cooling_active` and `cooling_load_sum_24h` with `0.0` and logs a WARNING rather than raising
+  `KeyError`. The forward direction (old model, new code) is safe by design — the new columns are
+  simply unused extras.
+- `apps/energy_forecast/clustering.py` — `DailyProfileClusterer.find_optimal_k()` accepts a new
+  optional `cooling_day_dates` parameter (a `set[datetime.date]`) alongside the existing
+  `ev_day_dates`. Days in either set are excluded from centroid fitting but still assigned a cluster
+  label afterward, for the same reason as EV days: AC-driven midday consumption spikes would distort
+  heating-regime centroids if included in the fit. The two sets are unioned so a day that is both an
+  EV day and a cooling day is excluded only once. (#96 §4.10)
 
 ### Fixed
 - `ha_appdaemon_config.yaml`, `README.md` — Updated add-on Configuration for AppDaemon add-on **v0.19.0** (Alpine → Debian base image). On v0.19.0 the old config causes a fatal install error that prevents the add-on from starting: `system_packages` listed Alpine apk names (`build-base`, `g++`, `gfortran`, `openblas-dev`, `python3-dev`) that do not exist on Debian apt, and `init_commands` shelled out to `pip install` with the alpine-wheels mirror — `pip` is no longer on `PATH` in v0.19.0's uv-managed runtime. On Debian/glibc, PyPI's standard manylinux wheels install pandas, numpy, scikit-learn, and LightGBM without a compiler or third-party wheel index: all four move to `python_packages`. `system_packages` is reduced to `libgomp1` (Debian's OpenMP runtime, required by scikit-learn at import). `init_commands: []` is set explicitly — the add-on schema rejects the block if the key is missing entirely, even unused. armv7 fallback block (no prebuilt LightGBM wheel on PyPI) updated in parallel: drop `lightgbm` from `python_packages`, no build toolchain needed. README timing note updated: prebuilt wheels install well under a minute on v0.19.0, replacing the previous first-start 5–10 minute LightGBM source compile. A compatibility callout with a link to the pre-v0.19.0 instructions is added for users still on v0.18.x.
