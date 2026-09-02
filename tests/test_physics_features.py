@@ -70,6 +70,51 @@ def test_defrost_risk_with_empty_weather_df():
     assert feat_df["defrost_risk"].isna().all()
 
 
+def test_defrost_risk_forced_to_zero_when_cooling_active():
+    """§4.8: defrost_risk is heating-mode-only physics — zeroed on cooling-active hours
+    even when the Gaussian icing curve would otherwise be non-zero."""
+    ts = pd.to_datetime(["2026-07-15 12:00"])
+    weather_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [2.0],  # peak of the icing curve — would be maximal defrost_risk
+            "humidity": [80.0],
+            "precipitation_mm": [0],
+            "sunshine_min": [0],
+            "wind_kmh": [0],
+            "cloud_cover_pct": [0],
+            "direct_radiation_wm2": [0],
+        }
+    )
+    df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0]})
+    cooling_active_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+
+    feat_df = _engineer_features(df, weather_df, None, cooling_active_df=cooling_active_df)
+    assert feat_df.iloc[0]["defrost_risk"] == 0.0
+
+
+def test_defrost_risk_unchanged_when_cooling_inactive():
+    """Same icing-peak conditions, cooling_active=0 -> defrost_risk computed normally."""
+    ts = pd.to_datetime(["2026-01-15 12:00"])
+    weather_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "temp_c": [2.0],
+            "humidity": [80.0],
+            "precipitation_mm": [0],
+            "sunshine_min": [0],
+            "wind_kmh": [0],
+            "cloud_cover_pct": [0],
+            "direct_radiation_wm2": [0],
+        }
+    )
+    df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0]})
+    cooling_active_df = pd.DataFrame({"timestamp": ts, "cooling_active": [0]})
+
+    feat_df = _engineer_features(df, weather_df, None, cooling_active_df=cooling_active_df)
+    assert feat_df.iloc[0]["defrost_risk"] > 0.0
+
+
 def test_solar_compensation():
     df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-04-15 13:00"]), "gross_kwh": [1.0]})
     # Cold but sunny

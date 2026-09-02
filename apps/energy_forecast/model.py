@@ -3526,6 +3526,12 @@ def _engineer_features(
     defrost_temp_curve = np.exp(-((df["temp_c"] - 2.0) ** 2) / 10.0)
     df["defrost_risk"] = (df["humidity"] / 100.0) * defrost_temp_curve
 
+    # §4.8: heating-mode-only physics (outdoor-coil frost) — inapplicable to
+    # cooling. Zero latent-load/dehumidification signal for cooling as a result
+    # (§7 known limitation, weighted equal to the EER placeholder — not a lesser
+    # concern; no humidity_load_proxy attempted in v1).
+    df.loc[df["cooling_active"] == 1, "defrost_risk"] = 0.0
+
     # ── Daily Regime Profile (optional) ──────────────────────────────────────
     if regime_kwh_series is not None:
         # Merge hourly profile by timestamp
