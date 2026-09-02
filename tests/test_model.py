@@ -23,6 +23,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
+from energy_forecast import ha_data
 from energy_forecast.model import (
     _BRIDGE_CAP,
     _FEATURES_BASE,
@@ -5304,6 +5305,80 @@ class TestAreaWeightedThermalPressure:
             ),
         }
         result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert (result["thermal_pressure"] == 0.0).all()
+
+
+class TestThermalPressureModeAware:
+    """§4.3: cooling reverses the sign; heating path is unchanged when cooling_active=0."""
+
+    def test_current_temp_at_cooling_setpoint_gives_zero(self):
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [24.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        assert result.iloc[0]["thermal_pressure"] == 0.0
+
+    def test_3c_above_setpoint_with_cooling_active_gives_positive_pressure(self):
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        assert result.iloc[0]["thermal_pressure"] == 3.0
+
+    def test_same_row_with_cooling_inactive_uses_heating_path(self):
+        """Same 3°C-above-setpoint row, but cooling_active=0 -> heating formula
+        (setpoint - current_temp, clipped) applies: 24 - 27 clipped to 0."""
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [0]})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        assert result.iloc[0]["thermal_pressure"] == 0.0
+
+    def test_cooling_active_below_setpoint_clips_to_zero(self):
+        """current_temp below cooling setpoint while cooling_active=1 -> no cooling
+        debt (already cool enough), clipped to 0, not negative."""
+        ts = pd.date_range("2026-07-10 14:00", periods=1, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {"climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [22.0], "setpoint": [24.0]})}
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1]})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        assert result.iloc[0]["thermal_pressure"] == 0.0
+
+    def test_heating_path_unchanged_when_no_cooling_active_df_provided(self):
+        """Backward compatibility: omitting cooling_active_df entirely reproduces
+        pre-change heating-only thermal_pressure exactly."""
+        ts = pd.date_range("2026-03-12 08:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room1": pd.DataFrame({"timestamp": ts, "current_temp": [20.0, 20.0], "setpoint": [21.0, 21.0]}),
+            "climate.room2": pd.DataFrame({"timestamp": ts, "current_temp": [18.0, 18.0], "setpoint": [22.0, 22.0]}),
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        assert (result["thermal_pressure"] == 2.5).all()
+
+    def test_dry_and_fan_only_states_never_trigger_cooling_formula(self):
+        """Integration: hvac_mode 'dry'/'fan_only' map to cooling_active=0 at the
+        source (Plan A's Task 3), so thermal_pressure stays on the heating path even though
+        the compressor is nominally running."""
+        ts = pd.date_range("2026-07-10 14:00", periods=2, freq="1h")
+        mode_df = pd.DataFrame({"timestamp": ts, "hvac_mode": ["dry", "fan_only"]})
+        _, cooling_df = ha_data.hvac_mode_to_active(mode_df)
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        # current_temp above setpoint — would show cooling pressure if misclassified as cooling
+        climate_dfs = {
+            "climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [27.0, 27.0], "setpoint": [24.0, 24.0]})
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=cooling_df)
+        # heating path: setpoint(24) - current_temp(27) clipped to 0
         assert (result["thermal_pressure"] == 0.0).all()
 
 

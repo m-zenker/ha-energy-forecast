@@ -3271,6 +3271,18 @@ def _engineer_features(
     # thermal_pressure_max  — largest per-room deficit (cold outlier room)
     # thermal_pressure_std  — spread across rooms (imbalance signal)
     if climate_dfs:
+        # §4.3: household-level cooling_active, already conflict-resolved (§4.2),
+        # reindexed per entity below — mirrors the nearest-match pattern
+        # _project_indoor_temps() uses for its own future-hour reindex.
+        cooling_active_hourly = None
+        if "cooling_active" in df.columns:
+            cooling_active_hourly = (
+                df[["timestamp", "cooling_active"]]
+                .assign(timestamp=df["timestamp"].dt.floor("1h"))
+                .drop_duplicates(subset="timestamp", keep="last")
+                .set_index("timestamp")["cooling_active"]
+            )
+
         delta_series: dict[str, pd.Series] = {}  # entity_id → per-timestamp delta Series
         ts_index = None
         for eid, c_df in climate_dfs.items():
@@ -3279,8 +3291,23 @@ def _engineer_features(
             c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
             c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
             c = c.sort_values("timestamp")
-            delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
-            delta.index = c["timestamp"]
+
+            if cooling_active_hourly is not None:
+                c_cooling_active = (
+                    cooling_active_hourly.reindex(c["timestamp"], method="nearest").fillna(0).values.astype(bool)
+                )
+            else:
+                c_cooling_active = np.zeros(len(c), dtype=bool)
+
+            # cooling_setpoint_resolved is c["setpoint"] itself — already the
+            # per-row resolved value at both training time (real HA data) and
+            # prediction time (Plan A's Task 5's _project_indoor_temps() projection);
+            # no separate variable needed (Implementation Decision #2).
+            delta_heating = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)  # unchanged heating path
+            delta_cooling = (c["current_temp"] - c["setpoint"]).clip(lower=0.0)  # positive once above setpoint
+            delta = pd.Series(
+                np.where(c_cooling_active, delta_cooling.values, delta_heating.values), index=c["timestamp"]
+            )
             delta_series[eid] = delta
             if ts_index is None:
                 ts_index = c["timestamp"]
