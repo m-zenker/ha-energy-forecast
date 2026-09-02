@@ -35,6 +35,7 @@ data/
 CLAUDE.md
 MEMORY.md
 memory/
-scripts/
+scripts/*
+!scripts/capture_cooling_regression_baseline.py
 .worktrees/
 .superpowers/
