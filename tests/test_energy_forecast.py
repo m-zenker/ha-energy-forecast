@@ -5148,3 +5148,11 @@ class TestBuildCoolingActiveProjection:
         assert s_on == 24.0
         assert s_off == 28.0
         fake.get_state.assert_called_with("climate.living_room")
+
+
+class TestCoolingShapLabels:
+    def test_cooling_labels_present(self):
+        from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
+
+        assert "cooling_active" in _SHAP_FEATURE_LABELS
+        assert "cooling_load_sum_24h" in _SHAP_FEATURE_LABELS

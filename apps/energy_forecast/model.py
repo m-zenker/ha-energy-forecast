@@ -110,12 +110,14 @@ _FEATURES_BASE = [
     "hp_heating_degree",  # HP-calibrated cutoff: max(0, 15 − temp_c)
     "temp_in_neutral_zone",  # dead-band flag: 1 when 15 ≤ temp_c ≤ 22
     "heating_active",  # seasonal on/off from heating_system_active_entity
+    "cooling_active",  # AC on/off from hvac_mode_entity/cooling_system_active_entity — #96
     "temp_rolling_3d",  # thermal mass proxy (rectangular 72h)
     # Thermal modelling features (#49–#52)
     "temp_ewma_24h",
     "temp_ewma_72h",  # #49 EWMA — RC-circuit thermal mass
     "heating_deg_sum_24h",
     "heating_deg_sum_168h",  # #50 accumulated heating debt
+    "cooling_load_sum_24h",  # #96 accumulated cooling debt (AC-active-gated)
     "temp_delta_1h",
     "temp_delta_24h",  # #51 temperature rate of change
     "temp_lag_24h",

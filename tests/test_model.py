@@ -7833,7 +7833,11 @@ class TestCoolingRollbackFallback:
 
         model = EnergyForecastModel(model_dir=tmp_path)
         model.train(energy_df, weather_df, outdoor_df=None)
-        model.feature_cols = list(model.feature_cols) + ["cooling_active", "cooling_load_sum_24h"]
+        # Since #96/Task 1, both cooling columns are unconditionally in _FEATURES_BASE,
+        # so any trained model.feature_cols already contains them natively — no manual
+        # append needed (and appending here would create duplicate column entries).
+        assert "cooling_active" in model.feature_cols
+        assert "cooling_load_sum_24h" in model.feature_cols
 
         _real_engineer_features = model_module._engineer_features
 
@@ -7852,3 +7856,22 @@ class TestCoolingRollbackFallback:
         assert (X["cooling_active"] == 0.0).all()
         assert (X["cooling_load_sum_24h"] == 0.0).all()
         assert any("cooling" in r.message.lower() for r in caplog.records)
+
+
+class TestCoolingFeaturesRegistered:
+    def test_cooling_columns_in_features_base(self):
+        assert "cooling_active" in _FEATURES_BASE
+        assert "cooling_load_sum_24h" in _FEATURES_BASE
+
+    def test_training_with_constant_zero_cooling_columns_does_not_crash(self, tmp_path):
+        """No cooling entities configured -> both columns are constant-zero;
+        LightGBM/TreeSHAP must handle this without error (spec §5's cost claim)."""
+        from energy_forecast.model import EnergyForecastModel
+
+        ts = pd.date_range("2026-01-01", periods=200, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(3).uniform(0.5, 2.0, len(ts))})
+        weather_df = _make_weather_df(ts)
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model.train(energy_df, weather_df, outdoor_df=None)
+        assert "cooling_active" in model.feature_cols
+        assert "cooling_load_sum_24h" in model.feature_cols
