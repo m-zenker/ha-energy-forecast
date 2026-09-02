@@ -7764,9 +7764,13 @@ class TestCoolingLoadSum:
         w = _make_weather_df(ts)
         result = _engineer_features(df, w, None)  # no climate_dfs, no cooling_active_df
         assert (result["cooling_load_sum_24h"] == 0.0).all()
-        assert (result["cooling_load_sum_168h"] == 0.0).all()
+        assert "cooling_load_sum_168h" not in result.columns
 
-    def test_168h_window_wider_than_24h(self):
+    def test_24h_window_caps_correctly(self):
+        """A run longer than 24h must still cap the rolling sum at the 24h window
+        (min_periods=1 semantics unchanged) — this is the behavior the old
+        168h-vs-24h comparison test exercised for 24h; kept, with the 168h half
+        removed since that column no longer exists."""
         ts = pd.date_range("2026-07-10 00:00", periods=30, freq="1h")
         df = _make_bare_df(ts)
         w = _make_weather_df(ts)
@@ -7775,10 +7779,8 @@ class TestCoolingLoadSum:
         }
         ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1] * 30})
         result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
-        # constant 2.0/hour cooling pressure; 24h window caps at 24*2=48, 168h window
-        # (min_periods=1, only 30 hours available) keeps accumulating to 30*2=60
+        # constant 2.0/hour cooling pressure; 24h window caps at 24*2=48
         assert result["cooling_load_sum_24h"].iloc[-1] == pytest.approx(48.0)
-        assert result["cooling_load_sum_168h"].iloc[-1] == pytest.approx(60.0)
 
     def test_sanity_bound_exceeded_warns_only_at_training_time(self, caplog):
         import logging
@@ -7819,7 +7821,7 @@ class TestCoolingLoadSum:
 
 class TestCoolingRollbackFallback:
     def test_missing_cooling_columns_filled_with_zero_no_keyerror(self, tmp_path, monkeypatch, caplog):
-        """Simulates a code-only rollback: a model trained with the 3 cooling
+        """Simulates a code-only rollback: a model trained with the 2 cooling
         columns in feature_cols, then code reverted to a version whose
         _engineer_features() no longer produces them."""
         from energy_forecast import model as model_module
@@ -7831,19 +7833,13 @@ class TestCoolingRollbackFallback:
 
         model = EnergyForecastModel(model_dir=tmp_path)
         model.train(energy_df, weather_df, outdoor_df=None)
-        model.feature_cols = list(model.feature_cols) + [
-            "cooling_active",
-            "cooling_load_sum_24h",
-            "cooling_load_sum_168h",
-        ]
+        model.feature_cols = list(model.feature_cols) + ["cooling_active", "cooling_load_sum_24h"]
 
         _real_engineer_features = model_module._engineer_features
 
         def _stripped_engineer_features(*args, **kwargs):
             result = _real_engineer_features(*args, **kwargs)
-            return result.drop(
-                columns=["cooling_active", "cooling_load_sum_24h", "cooling_load_sum_168h"], errors="ignore"
-            )
+            return result.drop(columns=["cooling_active", "cooling_load_sum_24h"], errors="ignore")
 
         monkeypatch.setattr(model_module, "_engineer_features", _stripped_engineer_features)
 
@@ -7855,5 +7851,4 @@ class TestCoolingRollbackFallback:
         assert "cooling_active" in X.columns
         assert (X["cooling_active"] == 0.0).all()
         assert (X["cooling_load_sum_24h"] == 0.0).all()
-        assert (X["cooling_load_sum_168h"] == 0.0).all()
         assert any("cooling" in r.message.lower() for r in caplog.records)
