@@ -334,6 +334,7 @@ class EnergyForecastModel:
         climate_dfs: dict[str, pd.DataFrame] | None = None,  # {entity_id: DataFrame[timestamp, current_temp, setpoint]}
         dhw_df: pd.DataFrame | None = None,  # cols: timestamp, buffer_temp
         heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+        cooling_active_df: pd.DataFrame | None = None,  # cols: timestamp, cooling_active (0/1) — #96
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
@@ -643,6 +644,7 @@ class EnergyForecastModel:
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
             heating_active_df=heating_active_df,
+            cooling_active_df=cooling_active_df,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -2960,6 +2962,7 @@ def _engineer_features(
     room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+    cooling_active_df: pd.DataFrame | None = None,  # cols: timestamp, cooling_active (0/1) — #96
     physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
     heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
@@ -3135,6 +3138,25 @@ def _engineer_features(
         df["heating_active"] = df["heating_active"].fillna(1).astype(int)
     else:
         df["heating_active"] = 1
+
+    # ── Cooling system active (AC on/off) — #96 ──────────────────────────────
+    # Binary feature from hvac_mode_entity/cooling_system_active_entity. Defaults
+    # to 0 (never cooling) when unconfigured — the fetch pipeline in
+    # energy_forecast.py never populates cooling_active_df when
+    # cooling_mode_enabled is False (Implementation Decision #1), so "absent" and
+    # "explicitly disabled" collapse to the same code path here. Unlike
+    # heating_active's default-1 ("conservative": assume heating unless told
+    # otherwise), cooling defaults to 0 — assuming cooling is inapplicable is the
+    # conservative choice for a deployment that hasn't opted in.
+    if cooling_active_df is not None and not cooling_active_df.empty:
+        ca = cooling_active_df[["timestamp", "cooling_active"]].copy()
+        ca["timestamp"] = pd.to_datetime(ca["timestamp"]).dt.floor("1h")
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(ca, left_on="_ts_floor", right_on="timestamp", how="left", suffixes=("", "_ca"))
+        df.drop(columns=["timestamp_ca", "_ts_floor"], errors="ignore", inplace=True)
+        df["cooling_active"] = df["cooling_active"].fillna(0).astype(int)
+    else:
+        df["cooling_active"] = 0
 
     # ── Temperature-delta gated lags ─────────────────────────────────────
     # Suppress lag features proportionally when today is warmer than the lag

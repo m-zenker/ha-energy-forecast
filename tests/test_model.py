@@ -7104,3 +7104,44 @@ class TestActiveLagsBoundaryAcrossRetrains:
         energy_narrow = self._energy_df(170)  # 170 - 72 = 98 < 100: lag_72h now inactive
         m.train(energy_narrow, self._weather_df(energy_narrow["timestamp"]), outdoor_df=None, weight_halflife_days=0)
         assert "lag_72h" not in m.feature_cols
+
+
+class TestCoolingActiveFeature:
+    """cooling_active feature (#96) — mirrors heating_active's merge/default pattern,
+    but defaults to 0 (never cooling) rather than heating's default-1."""
+
+    def test_cooling_active_uses_provided_df(self):
+        ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1, 1, 0, 0]})
+        result = _engineer_features(df, w, None, cooling_active_df=ca_df)
+        assert list(result["cooling_active"]) == [1, 1, 0, 0]
+
+    def test_cooling_active_defaults_to_0_when_not_provided(self):
+        ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)
+        assert (result["cooling_active"] == 0).all()
+
+    def test_cooling_active_fills_missing_timestamps_with_0(self):
+        """Timestamps not covered by cooling_active_df fill with 0 (never cooling) —
+        the inverse of heating_active's fill-with-1 default."""
+        ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ca_df = pd.DataFrame({"timestamp": ts[:2], "cooling_active": [1, 1]})
+        result = _engineer_features(df, w, None, cooling_active_df=ca_df)
+        assert result["cooling_active"].iloc[0] == 1
+        assert result["cooling_active"].iloc[1] == 1
+        assert result["cooling_active"].iloc[2] == 0  # filled with default
+        assert result["cooling_active"].iloc[3] == 0
+
+    def test_cooling_active_empty_df_defaults_to_0(self):
+        ts = pd.date_range("2026-07-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        ca_df = pd.DataFrame(columns=["timestamp", "cooling_active"])
+        result = _engineer_features(df, w, None, cooling_active_df=ca_df)
+        assert (result["cooling_active"] == 0).all()

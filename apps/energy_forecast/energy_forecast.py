@@ -1826,6 +1826,7 @@ class EnergyForecast(hass.Hass):
             climate_dfs=climate_dfs or None,
             dhw_df=dhw_df if not dhw_df.empty else None,
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
+            cooling_active_df=cooling_active_df if not cooling_active_df.empty else None,
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
