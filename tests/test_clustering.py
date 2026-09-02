@@ -723,6 +723,68 @@ def test_clusterer_fit_unions_ev_and_cooling_exclusions():
 
 
 @pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_clusterer_fit_staged_fallback_preserves_ev_protection_when_union_too_small():
+    """Final-review fix (#96): when cooling days alone push the union of
+    EV+cooling exclusions below the 14-day minimum, the fallback must be staged
+    — falling back to EV-only exclusion — rather than collapsing straight to
+    "fit on all days" (which would silently reintroduce EV-day contamination,
+    the exact problem issue #82's ev_day_dates exclusion exists to prevent).
+
+    Reproduces the reviewer's empirical scenario: 30 total days — 12 normal,
+    12 cooling-only (spike at hour 15), and 6 days that are BOTH EV and cooling
+    days (spike at hour 20 AND hour 15). ev_day_dates = 6 days (all also
+    cooling days) -> union == cooling_day_dates == 18 days -> only 12 remain
+    (< 14), so the union-based exclusion alone is insufficient. EV-only
+    exclusion drops just the 6 EV days -> 24 remain (>= 14), so the staged
+    fallback must land there: EV protection survives, cooling protection does
+    not (12 of the 24 fit days still carry the h15 cooling spike).
+    """
+    dates = pd.date_range("2024-01-01", periods=30, freq="D")
+    normal_dates = dates[:12]
+    cooling_only_dates = dates[12:24]
+    ev_and_cooling_dates = dates[24:30]
+
+    ev_day_set = {d.date() for d in ev_and_cooling_dates}
+    cooling_day_set = {d.date() for d in cooling_only_dates} | {d.date() for d in ev_and_cooling_dates}
+    assert len(ev_day_set) == 6
+    assert len(cooling_day_set) == 18
+    assert len(ev_day_set | cooling_day_set) == 18  # union == cooling_day_set (EV ⊆ cooling)
+
+    rows = []
+    for dt in normal_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 0.3})
+    for dt in cooling_only_dates:
+        for h in range(24):
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": 8.0 if h == 15 else 0.3})
+    for dt in ev_and_cooling_dates:
+        for h in range(24):
+            val = 0.3
+            if h == 15:
+                val = 8.0  # cooling spike
+            if h == 20:
+                val = 8.0  # EV spike
+            rows.append({"timestamp": dt + pd.Timedelta(hours=h), "gross_kwh": val})
+
+    df = pd.DataFrame(rows)
+    clusterer = DailyProfileClusterer(n_clusters=2)
+    labels = clusterer.fit(df, ev_day_dates=ev_day_set, cooling_day_dates=cooling_day_set)
+
+    assert labels is not None
+    assert len(labels) == 30
+    for d in ev_day_set | cooling_day_set:
+        assert d in labels.index
+        assert labels[d] >= 0
+
+    assert clusterer.centroids is not None
+    max_h20 = clusterer.centroids[:, 20].max()
+    assert max_h20 < 2.0, (
+        f"EV-day spike (h20={max_h20:.2f}) leaked into centroid fitting — staged fallback "
+        "should have preserved EV-day exclusion even though the union was too small."
+    )
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
 def test_regime_predictor_timeseries_cv_logged(caplog):
     """RegimePredictor.fit() logs TimeSeriesCV accuracy alongside OOB."""
     import logging

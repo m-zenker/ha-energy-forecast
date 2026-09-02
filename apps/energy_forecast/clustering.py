@@ -64,6 +64,10 @@ class DailyProfileClusterer:
                 (#96 §4.10). Unioned with ev_day_dates and excluded from centroid fitting
                 for the same reason — AC-driven midday spikes would otherwise distort
                 regime centroids. Cooling days are still assigned a label afterward.
+                If the union leaves fewer than 14 fit days (e.g. a heavy-cooling summer),
+                the fallback is staged rather than all-or-nothing: EV-only exclusion is
+                tried next (preserving the pre-existing EV-day protection from #82) before
+                giving up and fitting on all days — see the staged fallback below.
 
         Returns:
             A Series of cluster labels indexed by date, or None if failed.
@@ -92,18 +96,40 @@ class DailyProfileClusterer:
             # 2. Determine which days to fit on (exclude EV/cooling days from centroid learning)
             # #96 §4.10: union with cooling_day_dates — a day can be both an EV
             # day and a cooling day; both need excluding from centroid fitting.
-            excluded_set = (ev_day_dates or set()) | (cooling_day_dates or set())
+            #
+            # Staged fallback (final-review fix, #96): a summer with heavy AC usage can
+            # push the *union* below the 14-day minimum even though EV days alone would
+            # not. Collapsing straight to "fit on all days" in that case would silently
+            # reintroduce EV-day centroid contamination (the exact problem issue #82's
+            # ev_day_dates exclusion exists to prevent). So: try the union first; if that
+            # leaves too few days, fall back to excluding EV days only (preserving EV
+            # protection); only if even that leaves too few days, fit on everything.
+            ev_set = ev_day_dates or set()
+            cooling_set = cooling_day_dates or set()
+            excluded_set = ev_set | cooling_set
             fit_index = [d for d in pivoted.index if d not in excluded_set]
             n_excluded = len(pivoted) - len(fit_index)
 
             if n_excluded > 0 and len(fit_index) < 14:
-                _LOGGER.info(
-                    "Clustering: only %d non-excluded days (< 14); including all %d days for fitting.",
-                    len(fit_index),
-                    len(pivoted),
-                )
-                fit_index = list(pivoted.index)
-                n_excluded = 0
+                ev_only_index = [d for d in pivoted.index if d not in ev_set]
+                if len(ev_only_index) >= 14:
+                    _LOGGER.info(
+                        "Clustering: only %d non-excluded days (< 14) after EV+cooling exclusion; "
+                        "falling back to EV-only exclusion (%d days) to preserve EV-day protection.",
+                        len(fit_index),
+                        len(ev_only_index),
+                    )
+                    fit_index = ev_only_index
+                    n_excluded = len(pivoted) - len(fit_index)
+                else:
+                    _LOGGER.info(
+                        "Clustering: only %d non-excluded days (< 14) even with EV-only exclusion; "
+                        "including all %d days for fitting.",
+                        len(ev_only_index),
+                        len(pivoted),
+                    )
+                    fit_index = list(pivoted.index)
+                    n_excluded = 0
 
             if n_excluded > 0:
                 _LOGGER.info("Clustering: excluding %d EV/cooling day(s) from centroid fitting.", n_excluded)
@@ -276,16 +302,34 @@ def find_optimal_k(
 
         # Exclude EV/cooling days from inertia computation so EV session timing and
         # AC-driven spikes do not inflate the apparent number of meaningful clusters.
-        excluded_set = (ev_day_dates or set()) | (cooling_day_dates or set())
+        #
+        # Staged fallback (final-review fix, #96): mirrors DailyProfileClusterer.fit() —
+        # try the union first; if that drops below 14 days, fall back to EV-only
+        # exclusion (preserving EV-day protection even when cooling days alone would
+        # push the count under budget); only then fall back to all days.
+        ev_set = ev_day_dates or set()
+        cooling_set = cooling_day_dates or set()
+        excluded_set = ev_set | cooling_set
         if excluded_set:
             fit_days = [d for d in valid_days if d not in excluded_set]
             if len(fit_days) >= 14:
                 valid_days = fit_days
             else:
-                _LOGGER.info(
-                    "Auto-K: only %d non-excluded days (< 14); including all days for K selection.",
-                    len(fit_days),
-                )
+                ev_only_days = [d for d in valid_days if d not in ev_set]
+                if len(ev_only_days) >= 14:
+                    _LOGGER.info(
+                        "Auto-K: only %d non-excluded days (< 14) after EV+cooling exclusion; "
+                        "falling back to EV-only exclusion (%d days) to preserve EV-day protection.",
+                        len(fit_days),
+                        len(ev_only_days),
+                    )
+                    valid_days = ev_only_days
+                else:
+                    _LOGGER.info(
+                        "Auto-K: only %d non-excluded days (< 14) even with EV-only exclusion; "
+                        "including all days for K selection.",
+                        len(ev_only_days),
+                    )
 
         pivoted = daily[daily["date"].isin(valid_days)].pivot(index="date", columns="hour", values="gross_kwh")
         pivoted = pivoted.reindex(columns=range(24)).interpolate(axis=1).ffill(axis=1).bfill(axis=1)

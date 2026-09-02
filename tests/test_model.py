@@ -5120,9 +5120,9 @@ class TestCalibrateTauCoolingGuard:
 
         result = model._calibrate_tau(climate_dfs, heating_df, weather_df, cooling_active_df=cooling_df)
         assert result is not None
-        # Without guard, this would be ~1-2h; with guard, the bad window is excluded and
-        # result stays close to TRUE_TAU (the remaining 1-2 good passive windows).
-        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20
+        # Without guard, this would be ~1-2h (~48.9% error); with guard, the bad window is
+        # excluded and result stays close to TRUE_TAU (measured actual error ~0.115%).
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.15
 
     def test_no_cooling_active_df_matches_pre_change_behavior(self, tmp_path):
         """Backward compatibility: omitting cooling_active_df reproduces the exact
@@ -6408,6 +6408,111 @@ class TestAutoKRegimeSelection:
         assert "predicted_kwh" in result.columns
         assert result["predicted_kwh"].notna().all(), "predicted_kwh contains NaN"
         assert (result["predicted_kwh"] >= 0).all(), "predicted_kwh contains negative values"
+
+
+# ── train() cooling_active_df integration (final-review fix, #96) ────────────
+
+
+class TestTrainCoolingActiveDfIntegration:
+    """Integration coverage for train()'s cooling_day_dates derivation and its
+    threading into regime clustering — the two train()-level glue points this
+    plan added, previously exercised only via their downstream functions'
+    direct unit tests (test_clustering.py), never as an integration path
+    through train() itself. Also pins the cooling_active_df / cooling_active
+    column contract between Plan A and this plan."""
+
+    SPIKE_HOUR = 13
+    N_NORMAL_DAYS = 20
+    N_COOLING_DAYS = 6
+
+    def _make_train_data(self):
+        """(energy_df, weather_df, cooling_active_df) — 20 flat normal days plus
+        6 days with a large midday consumption spike (simulating AC load) marked
+        cooling-active for a few hours around the spike."""
+        n_days = self.N_NORMAL_DAYS + self.N_COOLING_DAYS
+        dates = pd.date_range("2024-01-01", periods=n_days, freq="D")
+        cooling_dates = set(dates[self.N_NORMAL_DAYS :])
+
+        ts = pd.date_range(dates[0], periods=n_days * 24, freq="1h")
+        rows = []
+        cooling_rows = []
+        for dt in dates:
+            is_cooling_day = dt in cooling_dates
+            for h in range(24):
+                t = dt + pd.Timedelta(hours=h)
+                spike = is_cooling_day and h == self.SPIKE_HOUR
+                rows.append({"timestamp": t, "gross_kwh": 8.0 if spike else 0.3})
+                is_active = 1 if (is_cooling_day and 10 <= h <= 16) else 0
+                cooling_rows.append({"timestamp": t, "cooling_active": is_active})
+
+        energy_df = pd.DataFrame(rows)
+        cooling_active_df = pd.DataFrame(cooling_rows)
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": 20.0,
+                "precipitation_mm": 0.0,
+                "sunshine_min": 30.0,
+                "wind_kmh": 10.0,
+                "cloud_cover_pct": 50.0,
+                "direct_radiation_wm2": 100.0,
+            }
+        )
+        return energy_df, weather_df, cooling_active_df
+
+    def test_cooling_active_df_keeps_spike_out_of_centroids(self, tmp_path):
+        """With cooling_active_df supplied, the midday AC spike must not leak into
+        regime centroids — cooling_day_dates derived in train() must reach
+        DailyProfileClusterer.fit() and exclude the spike days from fitting."""
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        energy_df, weather_df, cooling_active_df = self._make_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df,
+            weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=2,
+            cooling_active_df=cooling_active_df,
+        )
+        assert m._clusterer is not None and m._clusterer.is_fitted
+        max_spike_hour = m._clusterer.centroids[:, self.SPIKE_HOUR].max()
+        assert max_spike_hour < 2.0, (
+            f"centroid at spike hour {self.SPIKE_HOUR}={max_spike_hour:.2f} — cooling_active_df's "
+            "spike days should have been excluded from centroid fitting."
+        )
+
+    def test_without_cooling_active_df_spike_leaks_into_centroids(self, tmp_path):
+        """Negative control: with cooling_active_df omitted, the same spike days are
+        NOT excluded and the spike shows up in a centroid — proving the positive-case
+        test above would actually catch a regression in the train() glue code."""
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        energy_df, weather_df, _ = self._make_train_data()
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df,
+            weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=2,
+            cooling_active_df=None,
+        )
+        assert m._clusterer is not None and m._clusterer.is_fitted
+        max_spike_hour = m._clusterer.centroids[:, self.SPIKE_HOUR].max()
+        assert max_spike_hour > 4.0, (
+            f"centroid at spike hour {self.SPIKE_HOUR}={max_spike_hour:.2f} — expected the spike to "
+            "leak into a centroid when cooling_active_df is not supplied (negative control)."
+        )
 
 
 # ── Stage 1: Algorithmic correctness tests ────────────────────────────────────

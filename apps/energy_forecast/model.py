@@ -586,7 +586,9 @@ class EnergyForecastModel:
             ev_day_dates: set = set(ev_df["timestamp"].dt.date) if ev_df is not None and len(ev_df) > 0 else set()
             cooling_day_dates: set = (
                 set(
-                    pd.to_datetime(cooling_active_df.loc[cooling_active_df["cooling_active"] == 1, "timestamp"]).dt.date
+                    pd.to_datetime(
+                        cooling_active_df.loc[cooling_active_df["cooling_active"] > 0.5, "timestamp"]
+                    ).dt.date
                 )
                 if cooling_active_df is not None and len(cooling_active_df) > 0
                 else set()
