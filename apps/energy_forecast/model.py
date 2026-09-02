@@ -3401,12 +3401,33 @@ def _engineer_features(
     # pre-existing, unrelated cooling_degree weather feature (line ~3087).
     # Accumulates cooling-direction thermal_pressure only (0 during heating-mode
     # or cooling-inactive hours) — mirrors heating_deg_sum_24h/168h's rolling-sum
-    # pattern. Note: unlike heating_deg_sum (computed from weather_df, which at
-    # prediction time is extended with a historical tail), this is computed from
-    # df/thermal_pressure, which has no such extension — the 168h window is
-    # under-populated for the first ~167 prediction hours, an existing
-    # architectural limitation of thermal_pressure-family features generally,
-    # not new to this task.
+    # pattern.
+    #
+    # KNOWN GAP — no historical seed at prediction time: this is computed
+    # straight from df/thermal_pressure, which at prediction time is always the
+    # 48-row future_df built by _prepare_prediction_X() (pd.date_range(...,
+    # periods=48, ...)) with no historical tail concatenated onto it. That means
+    # cooling_load_sum_168h can never accumulate more than ~48 hours of signal
+    # at serve time, vs. a true 168-hour accumulation at training time — a
+    # systematic ~3.5x scale mismatch on every single prediction cycle, not a
+    # transient cold-start issue that fades after the first ~167 hours.
+    #
+    # This is NOT the same situation as its siblings, both of which solve this
+    # for themselves: heating_deg_sum_24h/168h is computed from an `_extended`
+    # frame that concatenates self._weather_tail (a ~400-row historical tail)
+    # onto the forecast before rolling; rolling_mean_24h/rolling_std_24h are
+    # seeded from recent_actuals (see the comment above, ~line 2419) describing
+    # the identical failure mode for a single broadcast value. cooling_load_sum
+    # has no equivalent seeding mechanism — this is a gap, not a shared
+    # pre-existing pattern.
+    #
+    # Currently inert: cooling_load_sum_24h/168h are not yet registered in
+    # _FEATURES_BASE (deferred to Plan D's Task 1), so nothing consumes these
+    # columns and there is zero prediction impact today. Plan D MUST resolve
+    # this seeding gap (e.g. a cooling-load equivalent of self._weather_tail)
+    # before registering these columns as model features — otherwise the model
+    # trains on a 168h-scaled signal and is served a signal that can never
+    # exceed a 48h window, baking in a systematic bias from day one.
     _cooling_pressure_only = pd.Series(np.where(df["cooling_active"] == 1, df["thermal_pressure"], 0.0), index=df.index)
     df["cooling_load_sum_24h"] = _cooling_pressure_only.rolling(24, min_periods=1).sum()
     df["cooling_load_sum_168h"] = _cooling_pressure_only.rolling(168, min_periods=1).sum()
