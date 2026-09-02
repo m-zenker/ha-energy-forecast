@@ -1196,6 +1196,18 @@ class EnergyForecastModel:
                 "heating_buffer_temp in trained feature list but sensor unavailable at predict time — filling with 0.0"
             )
 
+        # #96 §4.11: same portability guarantee for the 3 cooling columns — guards
+        # the code-only-rollback direction specifically (forward direction, old
+        # model + new code, is already safe: these are just unused extra columns).
+        for _cooling_col in ("cooling_active", "cooling_load_sum_24h", "cooling_load_sum_168h"):
+            if _cooling_col in self.feature_cols and _cooling_col not in feat_df.columns:
+                feat_df[_cooling_col] = 0.0
+                _LOGGER.warning(
+                    "%s in trained feature list but not produced by current code (likely a code-only "
+                    "rollback after a cooling-enabled retrain) — filling with 0.0",
+                    _cooling_col,
+                )
+
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
             try:

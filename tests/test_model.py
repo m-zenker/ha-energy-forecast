@@ -7710,3 +7710,45 @@ class TestCoolingLoadSum:
                 is_training=False,
             )
         assert not any("cooling_load_sanity_bound" in r.message for r in caplog.records)
+
+
+class TestCoolingRollbackFallback:
+    def test_missing_cooling_columns_filled_with_zero_no_keyerror(self, tmp_path, monkeypatch, caplog):
+        """Simulates a code-only rollback: a model trained with the 3 cooling
+        columns in feature_cols, then code reverted to a version whose
+        _engineer_features() no longer produces them."""
+        from energy_forecast import model as model_module
+        from energy_forecast.model import EnergyForecastModel
+
+        ts = pd.date_range("2026-01-01", periods=50, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(2).uniform(0.5, 2.0, len(ts))})
+        weather_df = _make_weather_df(ts)
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model.train(energy_df, weather_df, outdoor_df=None)
+        model.feature_cols = list(model.feature_cols) + [
+            "cooling_active",
+            "cooling_load_sum_24h",
+            "cooling_load_sum_168h",
+        ]
+
+        _real_engineer_features = model_module._engineer_features
+
+        def _stripped_engineer_features(*args, **kwargs):
+            result = _real_engineer_features(*args, **kwargs)
+            return result.drop(
+                columns=["cooling_active", "cooling_load_sum_24h", "cooling_load_sum_168h"], errors="ignore"
+            )
+
+        monkeypatch.setattr(model_module, "_engineer_features", _stripped_engineer_features)
+
+        future_ts = pd.date_range(ts[-1] + pd.Timedelta(hours=1), periods=48, freq="1h")
+        forecast_df = _make_weather_df(future_ts)
+        with caplog.at_level("WARNING"):
+            _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=energy_df.tail(48))
+
+        assert "cooling_active" in X.columns
+        assert (X["cooling_active"] == 0.0).all()
+        assert (X["cooling_load_sum_24h"] == 0.0).all()
+        assert (X["cooling_load_sum_168h"] == 0.0).all()
+        assert any("cooling" in r.message.lower() for r in caplog.records)
