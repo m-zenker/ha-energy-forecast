@@ -2016,6 +2016,18 @@ class EnergyForecast(hass.Hass):
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
 
+        # ── Cooling active projection (§4.1a, #96) ────────────────────────────
+        cooling_active_series = None
+        cooling_setpoint_on = None
+        cooling_setpoint_off = None
+        if self._cooling_mode_enabled and (self._hvac_mode_entity or self._cooling_active_entity):
+            try:
+                cooling_active_series, cooling_setpoint_on, cooling_setpoint_off = (
+                    self._build_cooling_active_projection(climate_recent)
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Cooling active projection failed: %s", exc)
+
         # ── Hand-configured known-bad date ranges (hardware faults, etc.) ────
         # Applied to recent_actuals (feeds lag/rolling features for live
         # prediction) so an active fault doesn't feed the model corrupted
@@ -2057,6 +2069,9 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=cooling_setpoint_on,
+            cooling_setpoint_off=cooling_setpoint_off,
             physics_model=self._physics_model,
             heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
@@ -2074,6 +2089,9 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=cooling_setpoint_on,
+            cooling_setpoint_off=cooling_setpoint_off,
             physics_model=self._physics_model,
             heating_buffer_temp_recent=self._physics_heating_buffer_df,
             _prepared=_prepared,
@@ -2139,6 +2157,9 @@ class EnergyForecast(hass.Hass):
             heating_active_series=heating_active_series,
             setpoint_on=heating_setpoint_on,
             setpoint_off=heating_setpoint_off,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=cooling_setpoint_on,
+            cooling_setpoint_off=cooling_setpoint_off,
             _prepared=_prepared,
         )
         if intervals is not None:
@@ -2412,6 +2433,67 @@ class EnergyForecast(hass.Hass):
 
         heating_active_series = pd.Series(states, index=future_hours, dtype=int)
         return heating_active_series, float(s_on), float(s_off)
+
+    def _get_cooling_active_state(self) -> bool:
+        """Resolve the current cooling-active boolean per §3's config precedence."""
+        if self._hvac_mode_entity:
+            state = self.get_state(self._hvac_mode_entity)
+            return str(state).strip().lower() in ("cool", "cooling")
+        if self._cooling_active_entity:
+            return self.get_state(self._cooling_active_entity) in ("on", "1", "true", "True")
+        return False
+
+    def _build_cooling_active_projection(
+        self,
+        climate_recent: dict[str, Any],
+    ) -> tuple[Any, float, float]:
+        """Return (cooling_active_series, setpoint_on, setpoint_off) for the 48-hour window.
+
+        Unlike heating's outdoor-temp hysteresis projection, cooling's live on/off
+        state is held flat across the horizon — a documented v1 approximation
+        (spec §4.1a/§7, Implementation Decision #3): no cooling-specific outdoor-
+        temp hysteresis thresholds exist in this spec's config, so the current
+        entity reading is the best available signal for all future hours.
+        Only call when cooling_mode_enabled and (hvac_mode_entity or
+        cooling_system_active_entity) is configured.
+        """
+        import numpy as np
+        import pandas as pd
+
+        now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
+
+        # Same precedence rule as _get_cooling_active_state(), inlined rather than
+        # delegated: this method is unit-tested via a plain duck-typed `self`
+        # (not an EnergyForecast instance), so an internal `self._get_cooling_active_state()`
+        # call would look up that method on the fake's own class and fail.
+        if self._hvac_mode_entity:
+            state = self.get_state(self._hvac_mode_entity)
+            active = str(state).strip().lower() in ("cool", "cooling")
+        elif self._cooling_active_entity:
+            active = self.get_state(self._cooling_active_entity) in ("on", "1", "true", "True")
+        else:
+            active = False
+
+        live_setpoints = []
+        for eid, cdf in (climate_recent or {}).items():
+            if cdf is not None and not cdf.empty and "setpoint" in cdf.columns:
+                latest_sp = cdf.sort_values("timestamp").iloc[-1]["setpoint"]
+                try:
+                    live_setpoints.append(float(latest_sp))
+                except (TypeError, ValueError):
+                    pass
+        live_setpoint = float(np.mean(live_setpoints)) if live_setpoints else None
+
+        if active:
+            s_on = live_setpoint if live_setpoint is not None else self._cooling_setpoint_on
+            s_off = self._cooling_setpoint_off
+        else:
+            s_off = live_setpoint if live_setpoint is not None else self._cooling_setpoint_off
+            s_on = self._cooling_setpoint_on
+
+        cooling_active_series = pd.Series([int(active)] * len(future_hours), index=future_hours, dtype=int)
+        return cooling_active_series, float(s_on), float(s_off)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
         """Trigger an early retrain if live MAE exceeds threshold × CV MAE."""

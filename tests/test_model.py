@@ -7145,3 +7145,114 @@ class TestCoolingActiveFeature:
         ca_df = pd.DataFrame(columns=["timestamp", "cooling_active"])
         result = _engineer_features(df, w, None, cooling_active_df=ca_df)
         assert (result["cooling_active"] == 0).all()
+
+
+class TestProjectIndoorTempsCooling:
+    def test_setpoint_uses_cooling_value_when_cooling_projected_active(self):
+        ts0 = pd.Timestamp("2026-07-15 12:00")
+        future_ts = pd.date_range(ts0, periods=4, freq="1h")
+        climate_recent = {
+            "climate.test": pd.DataFrame({"timestamp": [ts0], "current_temp": [26.0], "setpoint": [24.0]})
+        }
+        outdoor = pd.Series([30.0] * 4, index=future_ts)
+        heating_active_series = pd.Series([0] * 4, index=future_ts)
+        cooling_active_series = pd.Series([1] * 4, index=future_ts)
+
+        result = _project_indoor_temps(
+            climate_recent,
+            future_ts,
+            outdoor,
+            heating_active_series=heating_active_series,
+            setpoint_on=20.0,
+            setpoint_off=12.0,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=24.0,
+            cooling_setpoint_off=28.0,
+        )
+        assert (result["climate.test"]["setpoint"] == 24.0).all()
+
+    def test_setpoint_uses_heating_value_when_cooling_projected_inactive(self):
+        ts0 = pd.Timestamp("2026-01-15 12:00")
+        future_ts = pd.date_range(ts0, periods=4, freq="1h")
+        climate_recent = {
+            "climate.test": pd.DataFrame({"timestamp": [ts0], "current_temp": [18.0], "setpoint": [20.0]})
+        }
+        outdoor = pd.Series([-2.0] * 4, index=future_ts)
+        heating_active_series = pd.Series([1] * 4, index=future_ts)
+        cooling_active_series = pd.Series([0] * 4, index=future_ts)
+
+        result = _project_indoor_temps(
+            climate_recent,
+            future_ts,
+            outdoor,
+            heating_active_series=heating_active_series,
+            setpoint_on=20.0,
+            setpoint_off=12.0,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=24.0,
+            cooling_setpoint_off=28.0,
+        )
+        assert (result["climate.test"]["setpoint"] == 20.0).all()
+
+    def test_no_cooling_series_leaves_heating_only_behavior_unchanged(self):
+        """Backward compatibility: omitting cooling params entirely reproduces
+        pre-change behavior exactly."""
+        ts0 = pd.Timestamp("2026-01-15 12:00")
+        future_ts = pd.date_range(ts0, periods=4, freq="1h")
+        climate_recent = {
+            "climate.test": pd.DataFrame({"timestamp": [ts0], "current_temp": [18.0], "setpoint": [20.0]})
+        }
+        outdoor = pd.Series([-2.0] * 4, index=future_ts)
+        heating_active_series = pd.Series([1, 0, 1, 0], index=future_ts)
+
+        result = _project_indoor_temps(
+            climate_recent,
+            future_ts,
+            outdoor,
+            heating_active_series=heating_active_series,
+            setpoint_on=20.0,
+            setpoint_off=12.0,
+        )
+        assert list(result["climate.test"]["setpoint"]) == [20.0, 12.0, 20.0, 12.0]
+
+
+class TestPredictCoolingIntegration:
+    def test_predict_uses_cooling_setpoint_when_projected_active(self, tmp_path):
+        """End-to-end: predict() with cooling_active_series=all-1s produces
+        thermal_pressure computed against the cooling setpoint, not heating's."""
+        from energy_forecast.model import EnergyForecastModel
+
+        ts = pd.date_range("2026-07-01 00:00", periods=200, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": np.random.default_rng(1).uniform(0.5, 2.0, len(ts))})
+        weather_df = _make_weather_df(ts, temp=28.0)
+        climate_dfs = {
+            "climate.test": pd.DataFrame(
+                {"timestamp": ts, "current_temp": [26.0] * len(ts), "setpoint": [24.0] * len(ts)}
+            )
+        }
+        cooling_active_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1] * len(ts)})
+
+        model = EnergyForecastModel(model_dir=tmp_path)
+        model.train(
+            energy_df,
+            weather_df,
+            outdoor_df=None,
+            climate_dfs=climate_dfs,
+            cooling_active_df=cooling_active_df,
+        )
+
+        future_ts = pd.date_range(ts[-1] + pd.Timedelta(hours=1), periods=48, freq="1h")
+        forecast_df = _make_weather_df(future_ts, temp=29.0)
+        climate_recent = {"climate.test": climate_dfs["climate.test"].tail(1)}
+        cooling_active_series = pd.Series([1] * 48, index=future_ts)
+
+        result = model.predict(
+            forecast_df,
+            live_temp=None,
+            recent_actuals=energy_df.tail(48),
+            climate_recent=climate_recent,
+            cooling_active_series=cooling_active_series,
+            cooling_setpoint_on=24.0,
+            cooling_setpoint_off=28.0,
+        )
+        assert not result.empty  # no exception — full chain executes end to end

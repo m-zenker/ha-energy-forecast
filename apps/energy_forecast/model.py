@@ -1002,6 +1002,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        cooling_active_series: pd.Series | None = None,
+        cooling_setpoint_on: float | None = None,
+        cooling_setpoint_off: float | None = None,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
@@ -1053,11 +1056,18 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                cooling_active_series=cooling_active_series,
+                cooling_setpoint_on=cooling_setpoint_on,
+                cooling_setpoint_off=cooling_setpoint_off,
             )
 
         ha_df_for_features = None
         if heating_active_series is not None:
             ha_df_for_features = heating_active_series.rename_axis("timestamp").rename("heating_active").reset_index()
+
+        ca_df_for_features = None
+        if cooling_active_series is not None:
+            ca_df_for_features = cooling_active_series.rename_axis("timestamp").rename("cooling_active").reset_index()
 
         # Extend the 48h forecast with recent historical weather so that
         # shift(168) and shift(336) in _engineer_features produce real values
@@ -1121,6 +1131,7 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
+            cooling_active_df=ca_df_for_features,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -1281,6 +1292,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        cooling_active_series: pd.Series | None = None,
+        cooling_setpoint_on: float | None = None,
+        cooling_setpoint_off: float | None = None,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         dhw_schedule_override: dict | None = None,
@@ -1309,6 +1323,9 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                cooling_active_series=cooling_active_series,
+                cooling_setpoint_on=cooling_setpoint_on,
+                cooling_setpoint_off=cooling_setpoint_off,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
@@ -1352,6 +1369,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        cooling_active_series: pd.Series | None = None,
+        cooling_setpoint_on: float | None = None,
+        cooling_setpoint_off: float | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
@@ -1381,6 +1401,9 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                cooling_active_series=cooling_active_series,
+                cooling_setpoint_on=cooling_setpoint_on,
+                cooling_setpoint_off=cooling_setpoint_off,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1549,6 +1572,9 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        cooling_active_series: pd.Series | None = None,
+        cooling_setpoint_on: float | None = None,
+        cooling_setpoint_off: float | None = None,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
@@ -1585,6 +1611,9 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                cooling_active_series=cooling_active_series,
+                cooling_setpoint_on=cooling_setpoint_on,
+                cooling_setpoint_off=cooling_setpoint_off,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
@@ -2878,6 +2907,9 @@ def _project_indoor_temps(
     heating_active_series: pd.Series | None = None,
     setpoint_on: float | None = None,
     setpoint_off: float | None = None,
+    cooling_active_series: pd.Series | None = None,
+    cooling_setpoint_on: float | None = None,
+    cooling_setpoint_off: float | None = None,
 ) -> dict[str, pd.Series]:
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
@@ -2931,6 +2963,15 @@ def _project_indoor_temps(
             setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
         else:
             setpoint_arr = np.full(len(future_timestamps), setpoint_val)
+
+        # #96: cooling setpoint overrides the heating/default setpoint on hours
+        # projected cooling-active. "projected flat" per spec §4.1a — the live
+        # on/off reading is held constant across the horizon (Implementation
+        # Decision #3), unlike heating's outdoor-temp hysteresis simulation.
+        if cooling_active_series is not None and cooling_setpoint_on is not None and cooling_setpoint_off is not None:
+            ca_arr = cooling_active_series.reindex(future_timestamps, method="nearest").fillna(0).values.astype(bool)
+            cooling_setpoint_arr = np.where(ca_arr, cooling_setpoint_on, cooling_setpoint_off)
+            setpoint_arr = np.where(ca_arr, cooling_setpoint_arr, setpoint_arr)
 
         projected_df = pd.DataFrame(
             {

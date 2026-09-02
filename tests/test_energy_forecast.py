@@ -4936,3 +4936,51 @@ class TestFetchHvacActiveHistory:
         heating_df, cooling_df = EnergyForecast._fetch_hvac_active_history(fake, days=30)
         assert heating_df.empty
         assert cooling_df.empty
+
+
+class TestBuildCoolingActiveProjection:
+    def _make_self(self, get_state_return: str):
+        class _Fake:
+            pass
+
+        fake = _Fake()
+        fake._timezone = "Europe/Zurich"
+        fake._hvac_mode_entity = None
+        fake._cooling_active_entity = "binary_sensor.ac_active"
+        fake._cooling_setpoint_on = 24.0
+        fake._cooling_setpoint_off = 28.0
+        fake.get_state = MagicMock(return_value=get_state_return)
+        return fake
+
+    def test_active_projects_flat_true_across_48h(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self("on")
+        climate_recent = {
+            "climate.test": pd.DataFrame(
+                {"timestamp": [pd.Timestamp.now()], "current_temp": [27.0], "setpoint": [25.0]}
+            )
+        }
+        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake, climate_recent)
+        assert len(series) == 48
+        assert (series == 1).all()
+        assert s_off == 28.0
+
+    def test_inactive_projects_flat_false_across_48h(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self("off")
+        series, s_on, s_off = EnergyForecast._build_cooling_active_projection(fake, {})
+        assert len(series) == 48
+        assert (series == 0).all()
+        assert s_on == 24.0
+
+    def test_hvac_mode_entity_takes_precedence_over_binary(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = self._make_self("on")  # binary entity would read "on" if checked
+        fake._hvac_mode_entity = "climate.living_room"
+        fake.get_state = MagicMock(return_value="cool")
+        series, _, _ = EnergyForecast._build_cooling_active_projection(fake, {})
+        assert (series == 1).all()
+        fake.get_state.assert_called_with("climate.living_room")
