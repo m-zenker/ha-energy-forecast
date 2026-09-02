@@ -441,7 +441,9 @@ class EnergyForecastModel:
 
         # ── Thermal time constant calibration (#55) ──────────────────────────
         if climate_dfs and heating_active_df is not None and not heating_active_df.empty:
-            self._tau_hours = self._calibrate_tau(climate_dfs, heating_active_df, weather_df)
+            self._tau_hours = self._calibrate_tau(
+                climate_dfs, heating_active_df, weather_df, cooling_active_df=cooling_active_df
+            )
         else:
             if not climate_dfs:
                 _LOGGER.debug("τ calibration skipped: no climate_entities configured.")
@@ -1894,6 +1896,7 @@ class EnergyForecastModel:
         climate_dfs: dict[str, pd.DataFrame],
         heating_active_df: pd.DataFrame,  # cols: timestamp, heating_active (0/1)
         weather_df: pd.DataFrame,  # cols: timestamp, temp_c
+        cooling_active_df: pd.DataFrame | None = None,  # §4.9 — #96
     ) -> float | None:
         """Estimate building thermal time constant τ (hours) from passive-cooling windows.
 
@@ -1953,11 +1956,19 @@ class EnergyForecastModel:
         active["timestamp"] = pd.to_datetime(active["timestamp"]).dt.floor("1h")
         active_series = (active.set_index("timestamp")["heating_active"] > 0.5).astype(int)
 
+        cooling_active_series = None
+        if cooling_active_df is not None and not cooling_active_df.empty:
+            cooling = cooling_active_df[["timestamp", "cooling_active"]].copy()
+            cooling["timestamp"] = pd.to_datetime(cooling["timestamp"]).dt.floor("1h")
+            cooling_active_series = (cooling.set_index("timestamp")["cooling_active"] > 0.5).astype(int)
+
         combined_data: dict[str, pd.Series] = {
             "T_indoor": T_indoor_series,
             "T_outdoor": T_outdoor_series,
             "heating_active": active_series,
         }
+        if cooling_active_series is not None:
+            combined_data["cooling_active"] = cooling_active_series
         if rad_series is not None:
             combined_data["direct_radiation_wm2"] = rad_series
 
@@ -1966,7 +1977,15 @@ class EnergyForecastModel:
         if combined.empty:
             return None
 
-        combined["off"] = (combined["heating_active"] == 0).astype(int)
+        # §4.9: once a cooling system exists, every summer hour has heating_active==0
+        # — without this guard, cooling_active==1 hours (compressor actively forcing
+        # T_in down, violating passive-decay physics) would be misclassified as
+        # passive candidates and corrupt τ.
+        if "cooling_active" in combined.columns:
+            combined["cooling_active"] = combined["cooling_active"].fillna(0).astype(int)
+            combined["off"] = ((combined["heating_active"] == 0) & (combined["cooling_active"] == 0)).astype(int)
+        else:
+            combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
 
         combined_reset = combined.reset_index().rename(columns={"index": "timestamp"})

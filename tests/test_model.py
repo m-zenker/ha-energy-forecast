@@ -5093,6 +5093,63 @@ class TestCalibrateTau:
         np.testing.assert_allclose(non_zero.values, 3.0, atol=1e-6)
 
 
+class TestCalibrateTauCoolingGuard:
+    """§4.9: cooling-active hours must not be misclassified as passive-decay windows."""
+
+    def test_cooling_active_hours_excluded_from_passive_window(self, tmp_path):
+        """AC-active hours with rapid temperature decline (aggressive cooling) must not be
+        misclassified as passive decay when cooling_active_df is supplied. Without the guard,
+        the steep, fast decline would be interpreted as a high-quality passive-decay candidate
+        (apparent τ << true value), corrupting the median τ estimate. The guard prevents this
+        by excluding cooling_active==1 hours from the passive-window mask."""
+        TRUE_TAU = 4.0
+        model = EnergyForecastModel(model_dir=tmp_path)
+        # Use only 2 passive windows (weaker candidate pool) so the corrupted cooling window
+        # can significantly affect the median if it's not properly guarded.
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(TRUE_TAU, n_windows=2)
+
+        c_df = climate_dfs["climate.test"].copy()
+        # Inject aggressive AC cooling into the first off-window: 22→5.5°C in 8h
+        # (i.e., compressor forcing temp toward outdoor in ~1h apparent decay, τ_apparent ~ 1h)
+        off_idx = heating_df.index[heating_df["heating_active"] == 0][:8]
+        c_df.loc[off_idx, "current_temp"] = np.linspace(22.0, 5.5, len(off_idx))
+        climate_dfs = {"climate.test": c_df}
+
+        cooling_df = pd.DataFrame({"timestamp": heating_df["timestamp"], "cooling_active": 0})
+        cooling_df.loc[off_idx, "cooling_active"] = 1
+
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df, cooling_active_df=cooling_df)
+        assert result is not None
+        # Without guard, this would be ~1-2h; with guard, the bad window is excluded and
+        # result stays close to TRUE_TAU (the remaining 1-2 good passive windows).
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.20
+
+    def test_no_cooling_active_df_matches_pre_change_behavior(self, tmp_path):
+        """Backward compatibility: omitting cooling_active_df reproduces the exact
+        pre-change heating-active-only passive-window mask."""
+        TRUE_TAU = 4.0
+        model = EnergyForecastModel(model_dir=tmp_path)
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(TRUE_TAU)
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df)
+        assert result is not None
+        assert abs(result - TRUE_TAU) / TRUE_TAU < 0.10
+
+    def test_all_off_hours_also_cooling_returns_none(self, tmp_path):
+        """If every heating-off hour is also cooling-active, no true passive window
+        remains -> no candidate blocks -> None."""
+        TRUE_TAU = 4.0
+        model = EnergyForecastModel(model_dir=tmp_path)
+        climate_dfs, heating_df, weather_df = _make_tau_fixtures(TRUE_TAU)
+        cooling_df = pd.DataFrame(
+            {
+                "timestamp": heating_df["timestamp"],
+                "cooling_active": (heating_df["heating_active"] == 0).astype(int),
+            }
+        )
+        result = model._calibrate_tau(climate_dfs, heating_df, weather_df, cooling_active_df=cooling_df)
+        assert result is None
+
+
 # ── Tests: indoor temperature projection + area-weighted thermal pressure ─────
 
 
