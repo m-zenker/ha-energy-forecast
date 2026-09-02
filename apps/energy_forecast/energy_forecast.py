@@ -1854,6 +1854,7 @@ class EnergyForecast(hass.Hass):
             cooling_eer_slope=self._cooling_eer_slope,
             cooling_eer_intercept=self._cooling_eer_intercept,
             cooling_sanity_bound=self._cooling_sanity_bound,
+            cooling_load_sanity_bound=self._cooling_load_sanity_bound,
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
@@ -2102,6 +2103,7 @@ class EnergyForecast(hass.Hass):
             cooling_eer_slope=self._cooling_eer_slope,
             cooling_eer_intercept=self._cooling_eer_intercept,
             cooling_sanity_bound=self._cooling_sanity_bound,
+            cooling_load_sanity_bound=self._cooling_load_sanity_bound,
             physics_model=self._physics_model,
             heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
@@ -2125,6 +2127,7 @@ class EnergyForecast(hass.Hass):
             cooling_eer_slope=self._cooling_eer_slope,
             cooling_eer_intercept=self._cooling_eer_intercept,
             cooling_sanity_bound=self._cooling_sanity_bound,
+            cooling_load_sanity_bound=self._cooling_load_sanity_bound,
             physics_model=self._physics_model,
             heating_buffer_temp_recent=self._physics_heating_buffer_df,
             _prepared=_prepared,
@@ -2196,6 +2199,7 @@ class EnergyForecast(hass.Hass):
             cooling_eer_slope=self._cooling_eer_slope,
             cooling_eer_intercept=self._cooling_eer_intercept,
             cooling_sanity_bound=self._cooling_sanity_bound,
+            cooling_load_sanity_bound=self._cooling_load_sanity_bound,
             _prepared=_prepared,
         )
         if intervals is not None:

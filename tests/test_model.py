@@ -7572,3 +7572,84 @@ class TestCoolingEerProxy:
         assert not any(
             "sanity_bound" in r.message.lower() or "sanity bound" in r.message.lower() for r in caplog.records
         )
+
+
+class TestCoolingLoadSum:
+    def test_accumulates_cooling_direction_pressure_only(self):
+        ts = pd.date_range("2026-07-10 00:00", periods=5, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        # Hours 0-1: cooling active, 2°C over setpoint each -> pressure=2.0 each.
+        # Hours 2-3: cooling inactive (heating path, setpoint > current_temp -> 0).
+        # Hour 4: cooling active again, 3°C over -> pressure=3.0.
+        climate_dfs = {
+            "climate.test": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": [26.0, 26.0, 20.0, 20.0, 27.0],
+                    "setpoint": [24.0, 24.0, 21.0, 21.0, 24.0],
+                }
+            )
+        }
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1, 1, 0, 0, 1]})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        # rolling sum, min_periods=1: [2, 4, 4, 4, 7]
+        np.testing.assert_allclose(result["cooling_load_sum_24h"].values, [2.0, 4.0, 4.0, 4.0, 7.0])
+
+    def test_zero_when_never_cooling(self):
+        ts = pd.date_range("2026-01-10 00:00", periods=3, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        result = _engineer_features(df, w, None)  # no climate_dfs, no cooling_active_df
+        assert (result["cooling_load_sum_24h"] == 0.0).all()
+        assert (result["cooling_load_sum_168h"] == 0.0).all()
+
+    def test_168h_window_wider_than_24h(self):
+        ts = pd.date_range("2026-07-10 00:00", periods=30, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [26.0] * 30, "setpoint": [24.0] * 30})
+        }
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1] * 30})
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs, cooling_active_df=ca_df)
+        # constant 2.0/hour cooling pressure; 24h window caps at 24*2=48, 168h window
+        # (min_periods=1, only 30 hours available) keeps accumulating to 30*2=60
+        assert result["cooling_load_sum_24h"].iloc[-1] == pytest.approx(48.0)
+        assert result["cooling_load_sum_168h"].iloc[-1] == pytest.approx(60.0)
+
+    def test_sanity_bound_exceeded_warns_only_at_training_time(self, caplog):
+        import logging
+
+        ts = pd.date_range("2026-07-10 00:00", periods=3, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.test": pd.DataFrame({"timestamp": ts, "current_temp": [40.0] * 3, "setpoint": [24.0] * 3})
+        }
+        ca_df = pd.DataFrame({"timestamp": ts, "cooling_active": [1] * 3})
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df,
+                w,
+                None,
+                climate_dfs=climate_dfs,
+                cooling_active_df=ca_df,
+                cooling_load_sanity_bound=1.0,
+                is_training=True,
+            )
+        assert any("cooling_load_sanity_bound" in r.message for r in caplog.records)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            _engineer_features(
+                df,
+                w,
+                None,
+                climate_dfs=climate_dfs,
+                cooling_active_df=ca_df,
+                cooling_load_sanity_bound=1.0,
+                is_training=False,
+            )
+        assert not any("cooling_load_sanity_bound" in r.message for r in caplog.records)

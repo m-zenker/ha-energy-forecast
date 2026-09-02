@@ -345,6 +345,7 @@ class EnergyForecastModel:
         cooling_eer_slope: float = -0.05,
         cooling_eer_intercept: float = 4.0,
         cooling_sanity_bound: float = 20.0,
+        cooling_load_sanity_bound: float = 50.0,
         program_histories: dict | None = None,  # {prefix: DataFrame[timestamp, program]}
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
@@ -659,6 +660,7 @@ class EnergyForecastModel:
             cooling_eer_slope=cooling_eer_slope,
             cooling_eer_intercept=cooling_eer_intercept,
             cooling_sanity_bound=cooling_sanity_bound,
+            cooling_load_sanity_bound=cooling_load_sanity_bound,
             is_training=True,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
@@ -1023,6 +1025,7 @@ class EnergyForecastModel:
         cooling_eer_slope: float = -0.05,
         cooling_eer_intercept: float = 4.0,
         cooling_sanity_bound: float = 20.0,
+        cooling_load_sanity_bound: float = 50.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
@@ -1154,6 +1157,7 @@ class EnergyForecastModel:
             cooling_eer_slope=cooling_eer_slope,
             cooling_eer_intercept=cooling_eer_intercept,
             cooling_sanity_bound=cooling_sanity_bound,
+            cooling_load_sanity_bound=cooling_load_sanity_bound,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
@@ -1320,6 +1324,7 @@ class EnergyForecastModel:
         cooling_eer_slope: float = -0.05,
         cooling_eer_intercept: float = 4.0,
         cooling_sanity_bound: float = 20.0,
+        cooling_load_sanity_bound: float = 50.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         dhw_schedule_override: dict | None = None,
@@ -1354,6 +1359,7 @@ class EnergyForecastModel:
                 cooling_eer_slope=cooling_eer_slope,
                 cooling_eer_intercept=cooling_eer_intercept,
                 cooling_sanity_bound=cooling_sanity_bound,
+                cooling_load_sanity_bound=cooling_load_sanity_bound,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
@@ -1403,6 +1409,7 @@ class EnergyForecastModel:
         cooling_eer_slope: float = -0.05,
         cooling_eer_intercept: float = 4.0,
         cooling_sanity_bound: float = 20.0,
+        cooling_load_sanity_bound: float = 50.0,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
@@ -1438,6 +1445,7 @@ class EnergyForecastModel:
                 cooling_eer_slope=cooling_eer_slope,
                 cooling_eer_intercept=cooling_eer_intercept,
                 cooling_sanity_bound=cooling_sanity_bound,
+                cooling_load_sanity_bound=cooling_load_sanity_bound,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1612,6 +1620,7 @@ class EnergyForecastModel:
         cooling_eer_slope: float = -0.05,
         cooling_eer_intercept: float = 4.0,
         cooling_sanity_bound: float = 20.0,
+        cooling_load_sanity_bound: float = 50.0,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
@@ -1654,6 +1663,7 @@ class EnergyForecastModel:
                 cooling_eer_slope=cooling_eer_slope,
                 cooling_eer_intercept=cooling_eer_intercept,
                 cooling_sanity_bound=cooling_sanity_bound,
+                cooling_load_sanity_bound=cooling_load_sanity_bound,
                 physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
@@ -3048,6 +3058,7 @@ def _engineer_features(
     cooling_eer_slope: float = -0.05,
     cooling_eer_intercept: float = 4.0,
     cooling_sanity_bound: float = 20.0,
+    cooling_load_sanity_bound: float = 50.0,
     is_training: bool = False,  # gates training-time-only sanity warnings (§4.6/§4.7)
     physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
     heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
@@ -3384,6 +3395,31 @@ def _engineer_features(
         df["thermal_pressure"] = 0.0
         df["thermal_pressure_max"] = 0.0
         df["thermal_pressure_std"] = 0.0
+
+    # ── §4.7: cooling_load_sum_24h/168h ───────────────────────────────────────
+    # Renamed from rev.1's cooling_deg_sum to avoid colliding with the
+    # pre-existing, unrelated cooling_degree weather feature (line ~3087).
+    # Accumulates cooling-direction thermal_pressure only (0 during heating-mode
+    # or cooling-inactive hours) — mirrors heating_deg_sum_24h/168h's rolling-sum
+    # pattern. Note: unlike heating_deg_sum (computed from weather_df, which at
+    # prediction time is extended with a historical tail), this is computed from
+    # df/thermal_pressure, which has no such extension — the 168h window is
+    # under-populated for the first ~167 prediction hours, an existing
+    # architectural limitation of thermal_pressure-family features generally,
+    # not new to this task.
+    _cooling_pressure_only = pd.Series(np.where(df["cooling_active"] == 1, df["thermal_pressure"], 0.0), index=df.index)
+    df["cooling_load_sum_24h"] = _cooling_pressure_only.rolling(24, min_periods=1).sum()
+    df["cooling_load_sum_168h"] = _cooling_pressure_only.rolling(168, min_periods=1).sum()
+
+    if is_training and (df["cooling_active"] == 1).any():
+        _load_exceeds = df["cooling_load_sum_168h"] > cooling_load_sanity_bound
+        if _load_exceeds.any():
+            _LOGGER.warning(
+                "cooling_load_sum_168h exceeds cooling_load_sanity_bound (%.1f) for %d hour(s) "
+                "at training time — possible bad EER calibration or misclassified cooling_active.",
+                cooling_load_sanity_bound,
+                int(_load_exceeds.sum()),
+            )
 
     # ── Stage 2: DHW Pressure ───────────────────────────────────────────
     if dhw_df is not None and not dhw_df.empty:
