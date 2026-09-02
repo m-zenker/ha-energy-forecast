@@ -105,12 +105,15 @@ cooling_eer_slope: -0.05               # placeholder — see §4.6, §7. Exposed
 cooling_eer_intercept: 4.0             # so a real cooling deployment can recalibrate without a code change.
 cooling_sanity_bound: 20.0             # plausible-range ceiling for thermal_pressure_cop (a per-
                                         # hour ratio, ~0.5-4 by construction). NOT reused for
-                                        # cooling_load_sum_168h — a 168h rolling accumulation is a
+                                        # cooling_load_sum_24h — a rolling accumulation is a
                                         # different natural magnitude; that check uses its own
                                         # bound, cooling_load_sanity_bound (default 50.0), so one
                                         # threshold can't be spuriously tight for one quantity and
                                         # permanently silent for the other.
-cooling_load_sanity_bound: 50.0        # plausible-range ceiling for cooling_load_sum_168h; see above.
+cooling_load_sanity_bound: 50.0        # plausible-range ceiling for cooling_load_sum_24h; see above.
+                                        # (#96: originally sized loosely for a since-removed 168h
+                                        # variant — see §7's history note — revisit once real
+                                        # cooling-active data establishes typical 24h magnitudes.)
 ```
 
 Config precedence: if `hvac_mode_entity` is set, it is the sole source of `heating_active`/
@@ -279,20 +282,29 @@ real EER curves).
 `cooling_active` is observed `true` in production, log a WARNING once naming the unvalidated
 constants and pointing at §7 (reuses the `_warn_once` promotion from §4.2). Additionally, at
 training time, log a WARNING if `thermal_pressure_cop` exceeds `cooling_sanity_bound` or
-`cooling_load_sum_168h` (§4.7) exceeds `cooling_load_sanity_bound` (§3) — this surfaces a bad
+`cooling_load_sum_24h` (§4.7) exceeds `cooling_load_sanity_bound` (§3) — this surfaces a bad
 calibration in logs rather than only as silently-degraded MAE.
 
-### 4.7 New: `cooling_load_sum_24h` / `cooling_load_sum_168h` (mirrors #50)
+### 4.7 New: `cooling_load_sum_24h` (mirrors #50)
 
-**Renamed from rev. 1's `cooling_deg_sum_24h/168h`** — the codebase already has an unrelated,
+**Renamed from rev. 1's `cooling_deg_sum_24h`** — the codebase already has an unrelated,
 pre-existing `cooling_degree` feature (`model.py:3087`, `max(0, temp_c - 22.0)`, a plain weather
 proxy always non-zero in summer regardless of `cooling_mode_enabled`). This is, in fact, the exact
 formula Discussion #20 proposed under the name "cooling degree" — it already exists and needs no
 new work; §10 covers this. `cooling_deg_sum` was close enough to `cooling_degree` to be a real
 interpretability trap in SHAP output (two similarly-named, semantically different signals), hence
-the rename to `cooling_load_sum_24h/168h` for the AC-active-gated rolling sum proposed here. Same
-rolling-sum pattern as `heating_deg_sum_24h/168h` (`model.py:3036-3037`): accumulates
-cooling-direction `thermal_pressure` only (0 during heating-mode or cooling-inactive hours).
+the rename to `cooling_load_sum_24h` for the AC-active-gated rolling sum proposed here. Same
+rolling-sum pattern as `heating_deg_sum_24h` (`model.py:3036`): accumulates cooling-direction
+`thermal_pressure` only (0 during heating-mode or cooling-inactive hours).
+
+**History note (#96):** a `cooling_load_sum_168h` sibling was originally proposed alongside this
+column (mirroring `heating_deg_sum_168h`) but was removed before release — its 168-hour window
+cannot be seeded at prediction time the way `heating_deg_sum_168h` is (via `self._weather_tail`),
+since `cooling_load_sum` is derived from `climate_dfs`/`cooling_active` on the primary prediction
+frame itself, not from the weather side-channel `_weather_tail` extends. That made it a permanent,
+structural train/serve scale mismatch rather than a fixable gap — see the original §7 finding this
+note replaces. `cooling_load_sum_24h` has no such problem (its window fits entirely inside the
+48-row prediction horizon) and was kept.
 
 ### 4.8 `defrost_risk` — forced to 0 while `cooling_active`
 
@@ -338,26 +350,26 @@ The existing "Model-artifact portability fallback" pattern (`model.py:1126-1146`
 `feature_cols` references a column `_engineer_features()` doesn't currently produce (e.g. sensor
 outage, config change). This is safe for `cooling_active`/`cooling_load_sum_*` in the *forward*
 direction (old model + new code = column just unused) but not for a **code-only rollback**: if a
-model is retrained after this feature ships (feature_cols now includes the 3 cooling columns) and
+model is retrained after this feature ships (feature_cols now includes the 2 cooling columns) and
 the code is then rolled back to a pre-cooling-feature commit, `_engineer_features()` no longer
 emits those columns and `feat_df[self.feature_cols]` raises `KeyError` with no fallback. Fix: add
-the identical fill-with-`0.0`-and-warn guard for `cooling_active`, `cooling_load_sum_24h`,
-`cooling_load_sum_168h` alongside the existing two blocks.
+the identical fill-with-`0.0`-and-warn guard for `cooling_active`, `cooling_load_sum_24h`
+alongside the existing two blocks.
 
 ## 5. `_FEATURES_BASE` and SHAP labels (model.py, energy_forecast.py)
 
-Add `cooling_active`, `cooling_load_sum_24h`, `cooling_load_sum_168h` unconditionally to
+Add `cooling_active`, `cooling_load_sum_24h` unconditionally to
 `_FEATURES_BASE`. **Correction from rev. 1:** these are not "the same pattern as `heating_active`"
 — `heating_active` defaults to 1 only for the *unconfigured* subset and is a genuinely variable
-signal for deployments that configure it; the three new columns will be constant-zero for
+signal for deployments that configure it; the two new columns will be constant-zero for
 effectively the *entire* current install base (heating-only Central European users), by design,
 indefinitely. In practice this costs nothing at training time — LightGBM's split-gain search is
 free on a truly constant column and TreeSHAP attributes it exactly 0 — but the spec should say so
 plainly rather than lean on an analogy that doesn't hold.
 
-`_SHAP_FEATURE_LABELS` (`energy_forecast.py:63-146`) gets three new entries
-(`cooling_active`, `cooling_load_sum_24h`, `cooling_load_sum_168h` → human labels mirroring the
-existing heating ones). Additionally, the existing `thermal_pressure*` labels are heating-flavored
+`_SHAP_FEATURE_LABELS` (`energy_forecast.py:63-146`) gets two new entries
+(`cooling_active`, `cooling_load_sum_24h` → human labels mirroring the existing heating ones).
+Additionally, the existing `thermal_pressure*` labels are heating-flavored
 ("heat debt (area-weighted)", "heat debt electrical cost") — once cooling is active the same keys
 represent cooling load/EER cost, so the per-prediction "why today?" narrative (single-hour SHAP
 attribution) should condition these labels on that hour's `cooling_active`. For any *aggregate*
@@ -399,7 +411,7 @@ collapse to the same Python `False` before any downstream code runs via the exis
 - **§4.10 clustering exclusion:** a test mirroring the existing `ev_day_dates` test, confirming
   `cooling_day_dates` are excluded from centroid fitting.
 - **§4.11 rollback fallback:** a test asserting `feat_df[self.feature_cols]` doesn't raise when
-  the three cooling columns are absent from `feat_df` but present in `self.feature_cols`.
+  the two cooling columns are absent from `feat_df` but present in `self.feature_cols`.
 - **§3 config validation:** tests for both new `_validate_config()` checks (missing active entity
   when enabled; inverted `cooling_setpoint_on >= cooling_setpoint_off`).
 - **No forecast-accuracy simulation ships with this spec.** There is no real cooling-climate
@@ -429,19 +441,6 @@ collapse to the same Python `False` before any downstream code runs via the exis
   `cooling_eer_intercept` defaults) are heating-climate-tuned or unvalidated guesses; a real
   cooling deployment's data should recalibrate them via the new config keys rather than trust the
   defaults long-term.
-- §4.7: **`cooling_load_sum_24h/168h` has no historical seed at prediction time.** Unlike
-  `heating_deg_sum_24h/168h` (computed from an `_extended` frame that concatenates
-  `self._weather_tail`, a ~400-row historical tail, onto the forecast) and `rolling_mean_24h`/
-  `rolling_std_24h` (seeded from `recent_actuals`), `cooling_load_sum` is computed straight from
-  `df`/`thermal_pressure`, which at prediction time is always the exact 48-row `future_df` built by
-  `_prepare_prediction_X()` with no tail extension. `cooling_load_sum_168h` can therefore never
-  accumulate more than ~48 hours of signal at serve time, vs. a true 168-hour accumulation at
-  training time — a systematic, permanent scale mismatch on every prediction cycle (not a
-  transient cold-start effect), and a genuine gap rather than a pattern shared with its siblings.
-  Currently inert (these columns are not yet in `_FEATURES_BASE`; §5 defers that registration to a
-  later task), but this gap must be resolved — e.g. a cooling-load equivalent of
-  `self._weather_tail` — before registering the columns as model features, or the model will train
-  on a 168h-scaled signal while being served one capped at 48h.
 
 ## 8. Effort Estimate
 
@@ -492,7 +491,7 @@ Re-read against the original post (@gabrieldelboniz, 2026-08-17) point by point:
 3. **"Cooling Degrees: `max(0, temp_c - 22)`"** — this formula **already exists** in the codebase
    as `cooling_degree` (`model.py:3087`), unrelated to AC-active state, added independently of
    this spec. §4.7 cross-references it explicitly and renames this spec's new AC-gated rolling-sum
-   feature (`cooling_load_sum_24h/168h`) to avoid colliding with it — a contributor implementing
+   feature (`cooling_load_sum_24h`) to avoid colliding with it — a contributor implementing
    this spec should not re-add the discussion's literal formula; it's a no-op, already shipped.
 4. **"Parameter Duplication: `cooling_temp_on/off`"** — §3 provides
    `cooling_setpoint_on`/`cooling_setpoint_off` (see the naming note in §3 for why "setpoint" was
