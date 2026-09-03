@@ -340,6 +340,7 @@ class EnergyForecastModel:
         regime_count: int = 5,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        heating_sub_meter_df: pd.DataFrame | None = None,  # cols: timestamp, kwh — space-heating sub-meter (#92)
         use_physics_residual: bool = False,
     ) -> None:
         """Train/retrain the model on historical data."""
@@ -458,6 +459,8 @@ class EnergyForecastModel:
                     dhw_df,
                     holdout_cutoff=energy_df["timestamp"].max() - pd.Timedelta(days=int(_span_days * 0.1) or 1),
                     heating_active_df=heating_active_df,
+                    heating_sub_meter_df=heating_sub_meter_df,
+                    ev_df=ev_df,
                     away_df=away_df,
                 )
             physics_model._tau_hours = self._tau_hours

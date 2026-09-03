@@ -1140,6 +1140,42 @@ class TestTrainWithPhysics:
             _make_trained_model(tmp_path / "model", physics_model=pm)
             mock_calibrate.assert_called_once()
 
+    def test_train_forwards_ev_df_and_heating_sub_meter_to_calibrate(self, tmp_path):
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": np.full(n, 1.0)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": np.full(n, 5.0),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        ev_df = pd.DataFrame({"timestamp": ts[:5]})
+        heating_sub_meter_df = pd.DataFrame({"timestamp": ts, "kwh": np.full(n, 0.5)})
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch.object(pm, "calibrate") as mock_calibrate:
+            m.train(
+                energy_df,
+                weather_df,
+                outdoor_df=None,
+                weight_halflife_days=0,
+                physics_model=pm,
+                ev_df=ev_df,
+                heating_sub_meter_df=heating_sub_meter_df,
+            )
+        mock_calibrate.assert_called_once()
+        assert mock_calibrate.call_args.kwargs["ev_df"] is ev_df
+        assert mock_calibrate.call_args.kwargs["heating_sub_meter_df"] is heating_sub_meter_df
+
     def test_calibrate_skipped_when_fresh(self, tmp_path):
         from energy_forecast.physics import ThermalPhysicsModel, _atomic_write_json, _default_calibration
 

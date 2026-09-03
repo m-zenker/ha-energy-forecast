@@ -318,6 +318,7 @@ class EnergyForecast(hass.Hass):
             "dhw_tank_temp_sensor": None,
             "heating_buffer_temp_sensor": None,
             "heating_curve_sensor": None,
+            "heating_sub_meter_sensor": None,  # entity_id of the space-heating-only kWh sub-meter (#92)
             "cop_formula": {"a": 2.5, "b": 0.07},
             "dhw_tank_volume_l": 200,
             "dhw_power_w": 4000,
@@ -385,6 +386,10 @@ class EnergyForecast(hass.Hass):
         # to refetch history. None until the first _retrain() completes.
         self._cached_energy_df: Any = None
         self._cached_weather_df: Any = None
+        self._cached_heating_active_df: Any = None  # (#92) cached alongside energy/weather for recalibrate_physics
+        self._cached_ev_df: Any = None
+        self._cached_away_df: Any = None
+        self._cached_heating_sub_meter_df: Any = None
 
         # MQTT Discovery (opt-in)
         self._mqtt_discovery: bool = bool(self.args.get("mqtt_discovery", False))
@@ -1409,6 +1414,10 @@ class EnergyForecast(hass.Hass):
                 climate_dfs=self._physics_climate_dfs,
                 dhw_df=self._physics_dhw_tank_df,
                 holdout_cutoff=holdout_cutoff,
+                heating_active_df=self._cached_heating_active_df,
+                heating_sub_meter_df=self._cached_heating_sub_meter_df,
+                ev_df=self._cached_ev_df,
+                away_df=self._cached_away_df,
             )
             _LOGGER.info("Physics recalibration complete")
         except Exception as exc:  # noqa: BLE001
@@ -1731,6 +1740,19 @@ class EnergyForecast(hass.Hass):
         # on-demand recalibration doesn't need to refetch history.
         self._cached_energy_df = baseline_df
         self._cached_weather_df = weather_df
+        # (#92) Cache the additional calibrate() inputs so an on-demand
+        # recalibrate_physics call doesn't need to re-derive ev_df (which needs the
+        # full EV-detection pipeline) or re-fetch heating_active/away/sub-meter
+        # history independently — same rationale as the two lines above.
+        self._cached_heating_active_df = heating_active_df if not heating_active_df.empty else None
+        self._cached_away_df = away_df if not away_df.empty else None
+        self._cached_ev_df = ev_df
+        heating_sub_meter_entity = self._physics_config.get("heating_sub_meter_sensor")
+        self._cached_heating_sub_meter_df = (
+            sub_sensors_dict.get(self._sub_sensor_prefix(heating_sub_meter_entity))
+            if heating_sub_meter_entity
+            else None
+        )
 
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
@@ -1749,6 +1771,7 @@ class EnergyForecast(hass.Hass):
             climate_dfs=climate_dfs or None,
             dhw_df=dhw_df if not dhw_df.empty else None,
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
+            heating_sub_meter_df=self._cached_heating_sub_meter_df,
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,

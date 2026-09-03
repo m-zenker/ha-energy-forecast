@@ -1129,6 +1129,7 @@ class ThermalPhysicsModel:
         dhw_df: pd.DataFrame | None,
         holdout_cutoff: pd.Timestamp,
         heating_active_df: pd.DataFrame | None = None,
+        heating_sub_meter_df: pd.DataFrame | None = None,
         ev_df: pd.DataFrame | None = None,
         away_df: pd.DataFrame | None = None,
     ) -> None:
@@ -1136,12 +1137,23 @@ class ThermalPhysicsModel:
             q_base_el = self._calibrate_base_load(energy_df, away_df, ev_df, holdout_cutoff)
             if q_base_el is not None:
                 self._calib["Q_base_el"] = q_base_el
+                self._calib["q_base_el_calibrated"] = True  # distinguishes real calibration from the 0.35 default
 
             q_dhw_daily = self._calibrate_dhw_daily(energy_df, self._calib["Q_base_el"], holdout_cutoff)
             if q_dhw_daily is not None:
                 self._calib["Q_dhw_daily"] = q_dhw_daily
 
-            ua_eff, n_windows = self._calibrate_ua_eff(energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff)
+            ua_eff, n_windows = self._calibrate_ua_eff(
+                energy_df,
+                weather_df,
+                climate_dfs,
+                dhw_df,
+                holdout_cutoff,
+                heating_active_df=heating_active_df,
+                heating_sub_meter_df=heating_sub_meter_df,
+                ev_df=ev_df,
+                away_df=away_df,
+            )
             self._calib["n_calibration_windows_ua_eff"] = n_windows
             if ua_eff is not None:
                 self._calib["UA_eff"] = ua_eff
