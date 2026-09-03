@@ -2839,6 +2839,7 @@ def _find_passive_windows(
     *,
     min_delta_t: float = 8.0,
     min_hp_off_hours: int = 2,
+    dhw_rising_precomputed: pd.Series | None = None,
 ) -> pd.Index:
     """Return the index of rows suitable for passive-cooling calibration (τ, UA_eff).
 
@@ -2847,7 +2848,21 @@ def _find_passive_windows(
     T_outdoor ≥ ``min_delta_t``, and ``dhw_tank_temp`` is not rising into that
     row (rising tank temp indicates an active DHW cycle, which would inflate
     UA_eff / shorten apparent τ if included).
+
+    ``dhw_rising_precomputed``: optional, keyword-only. A boolean Series indexed
+    by timestamp, precomputed by the caller over a temporally-complete series
+    (real adjacent hours, not rows already thinned by an eligibility filter) —
+    used instead of recomputing ``.diff()`` on this function's own (possibly
+    gapped) ``dhw_tank_temp`` column, which would compare non-adjacent real
+    hours across the gaps and reintroduce false "DHW rising" positives/negatives.
+    Reindexed here against this function's internally re-sorted ``d``, not the
+    caller's ``df`` — by timestamp value, so the caller's row order or any
+    extra/missing timestamps can't misalign it. Default ``None`` preserves the
+    original per-call behavior for ``_calibrate_ua_dhw`` and the open-window
+    detector, which don't pass it.
     """
+    import pandas as pd
+
     d = df.sort_values("timestamp").reset_index(drop=True)
 
     off = (~d["hp_running"].astype(bool)).astype(int)
@@ -2858,7 +2873,10 @@ def _find_passive_windows(
     delta_t = d["T_indoor"] - d["T_outdoor"]
     enough_delta = delta_t >= min_delta_t
 
-    dhw_rising = d["dhw_tank_temp"].diff() > 0
+    if dhw_rising_precomputed is not None:
+        dhw_rising = pd.Series(dhw_rising_precomputed.reindex(d["timestamp"]).to_numpy(), index=d.index)
+    else:
+        dhw_rising = d["dhw_tank_temp"].diff() > 0
     not_dhw_active = ~dhw_rising.fillna(False)
 
     mask = enough_off & enough_delta & not_dhw_active

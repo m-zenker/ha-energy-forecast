@@ -829,6 +829,62 @@ class TestFindPassiveWindows:
         idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
         assert len(idx) == 0
 
+    def test_accepts_precomputed_dhw_rising_mask(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [45.0, 50.0, 50.0],  # rising 45->50 at row 1 -- would exclude
+                #                                        row 1 if the default .diff() path ran
+            }
+        )
+        # Precomputed mask says nothing is rising -> overrides the (otherwise-excluding)
+        # dhw_tank_temp column entirely. min_hp_off_hours=0 matches how
+        # _calibrate_ua_eff always calls this function, isolating the dhw-rising
+        # behavior from the off-run-length gate.
+        precomputed = pd.Series([False, False, False], index=ts)
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [0, 1, 2]
+
+    def test_precomputed_mask_reindexed_by_timestamp_not_position(self):
+        # Out of order, plus an extra timestamp df doesn't have -- reindexing by real
+        # timestamp value (not position) must still find each row's correct entry.
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [np.nan] * 3,
+            }
+        )
+        precomputed = pd.Series(
+            [True, False, True, False],
+            index=[ts[2], ts[0], pd.Timestamp("2026-01-15 05:00"), ts[1]],
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [0, 1]  # ts[2] -> True (rising) -> excluded; ts[0], ts[1] -> False -> included
+
+    def test_default_behavior_unchanged_when_precomputed_mask_omitted(self):
+        """Regression test for the spec §3.5 default-preserves-behavior claim: identical
+        input/output to the pre-existing test_excludes_rising_dhw_tank_temp_hours."""
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [45.0, 50.0, 50.0],
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert 1 not in idx
+
 
 class TestCalibrateBaseLoad:
     def test_recovers_median_within_5_percent(self, tmp_path):
