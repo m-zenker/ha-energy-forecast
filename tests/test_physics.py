@@ -1350,17 +1350,26 @@ class TestCalibrateUAEff:
         # naive .dt.date.nunique() sees 10 distinct calendar dates (Nov 1-10) and would
         # wrongly clear the 10-night floor; the 6h-shifted night label correctly counts
         # 9 physical nights and rejects.
-        ua_eff_true, t_indoor, cop = 150.0, 20.0, 3.0
+        #
+        # t_outdoor varies per night (all still < the 8°C tier-3 threshold, all still
+        # clearing the 8K ΔT gate) so the data has real x-variance -- if a naive
+        # night-count bug let it reach the regression (10 nights >= floor), the
+        # noise-free, formula-consistent data would produce R²≈1.0 and a non-None
+        # ua_eff, failing this test's `ua_eff is None` assertion. With the correct
+        # 6h-shift (9 nights), the night floor rejects before the regression ever runs,
+        # so this only passes for the intended reason.
+        ua_eff_true, t_indoor = 150.0, 20.0
+        t_outdoor_by_night = [-15.0, -3.0, -18.0, -6.0, -12.0, -1.0, -9.0, -20.0, -5.0]  # 9 nights
         energy_rows, weather_rows, climate_rows, dhw_rows = [], [], [], []
-        n_nights = 9
-        for night in range(n_nights):
+        for night, t_outdoor in enumerate(t_outdoor_by_night):
             base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=night)
             for h in [22, 23, 0, 1]:
                 ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
-                delta_t = t_indoor - 0.0
+                delta_t = t_indoor - t_outdoor
+                cop = pm._cop_formula_value(t_outdoor, None)
                 q_heat_el = ua_eff_true * delta_t / cop / 1000.0
                 energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
-                weather_rows.append({"timestamp": ts, "temp_c": 0.0, "direct_radiation_wm2": 0.0})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
                 climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
                 dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0})
         energy_df = pd.DataFrame(energy_rows)
