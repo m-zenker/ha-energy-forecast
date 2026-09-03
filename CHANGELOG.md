@@ -9,6 +9,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `apps/energy_forecast/physics.py`, `model.py`, `energy_forecast.py`, `const.py` — UA_eff
+  calibration eligibility rework (ROADMAP #92): replaces the old November–March month-list gate
+  with a three-tier eligibility resolver, `_resolve_heating_eligibility()`. **Tier 1
+  (`sub_meter`)**: when a `heating_sub_meter_sensor` (space-heating-only kWh) is configured, night
+  windows are gated on measured sub-meter draw exceeding `HEATING_SUB_METER_MIN_KWH`, and the
+  regression target switches to the sub-meter's own kWh series instead of
+  `gross_kwh - Q_base_el` — the most direct measurement available. **Tier 2 (`heating_active`)**:
+  falls back to the existing `heating_active_entity` boolean when no sub-meter is configured.
+  **Tier 3 (`temperature_fallback`)**: last resort when neither sensor exists — gates on outdoor
+  temperature alone until `Q_base_el` has been calibrated at least once (`q_base_el_calibrated`
+  flag, newly set in `calibrate()` immediately after a successful base-load fit), then adds a
+  load-floor condition (`gross_kwh - Q_base_el > UA_EFF_FALLBACK_MIN_LOAD_KWH`) once that
+  calibration is trustworthy. `_calibrate_ua_eff()` also now excludes EV-charging and away hours
+  from its candidate windows (previously only `_calibrate_dhw_daily`/`_calibrate_base_load` did),
+  requires ≥10 distinct calibration nights (not just ≥30 rows, which a single long night could
+  satisfy on its own), and sanity-bounds the fitted UA_eff to
+  `[UA_EFF_SANITY_MIN_W_PER_K, UA_EFF_SANITY_MAX_W_PER_K]`, discarding and logging a WARNING on
+  violation. `_find_passive_windows()` (`model.py`) accepts a `dhw_rising_precomputed` mask so the
+  DHW-rising diff is computed on contiguous nighttime data before eligibility filtering, not on
+  the already-gapped eligible subset (which would compare non-adjacent hours across a gap).
+  `calibrate()`, `EnergyForecastModel.train()`, and both `EnergyForecast` call sites
+  (`_retrain()`'s `self._ml_model.train(...)` and the on-demand `recalibrate_physics` service)
+  now thread `heating_active_df`, the new `heating_sub_meter_df`, `ev_df`, and `away_df` through
+  to `_calibrate_ua_eff()` end to end; `_retrain()` caches all four alongside the existing
+  energy/weather cache so `recalibrate_physics` resolves the same eligibility tier the scheduled
+  path would, rather than silently falling back to a weaker one. New `heating_sub_meter_sensor`
+  config key (default `None`) under `physics:`. **Manual step required to activate tier 1 on the
+  live instance**: add `heating_sub_meter_sensor: sensor.em_kermi_bridge_kermi_electricity_heating`
+  to the live `apps.yaml`'s `physics:` block — without it the install falls through to tier 2
+  (`heating_active`, already configured via `heating_system_active_entity`), a strict improvement
+  over the old month-list gate on its own but not the sub-meter-measured target this feature
+  exists for.
 - `apps/energy_forecast/energy_forecast.py`, `const.py` — daily update-check: compares the running `__version__` against the latest GitHub release tag (`GET /repos/m-zenker/ha-energy-forecast/releases/latest`) once a day at 09:00 local time, and creates a `persistent_notification` when a newer release is available. Skipped entirely on `-alpha`/`-beta` builds (the maintainer's own dev instance always runs ahead of `main`). Dedup state persisted to `update_check_state.json` so each new version notifies at most once. New `update_check_enabled` config key (default `true`) disables the check entirely — no scheduling, no network calls. #91
 - `apps/energy_forecast/physics.py` — DHW Override Deterministic Forecast Correction, Phase A
   (closes ROADMAP #93 / #84). Three interlocking additions. **(1)** `override_history` — the

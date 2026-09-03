@@ -64,6 +64,7 @@ def _make_app(args: dict):
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
     app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
     app._model_phase_attr = EnergyForecast._model_phase_attr.__get__(app, type(app))
+    app._sub_sensor_prefix = EnergyForecast._sub_sensor_prefix.__get__(app, type(app))
     return app
 
 
@@ -639,6 +640,57 @@ class TestRecalibratePhysicsService:
         with patch.object(app._physics_model, "calibrate") as mock_calibrate:
             app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
             mock_calibrate.assert_called_once()
+
+    def test_sub_sensor_prefix_key_matches_heating_sub_meter_lookup(self):
+        app = _make_app(
+            {
+                "energy_sensor": "sensor.grid_import",
+                "physics": {"heating_sub_meter_sensor": "sensor.em_kermi_bridge_kermi_electricity_heating"},
+            }
+        )
+        app.initialize()
+        prefix = app._sub_sensor_prefix(app._physics_config["heating_sub_meter_sensor"])
+        assert prefix == "sub_em_kermi_bridge_kermi_electricity_heating"
+
+    def test_calibrate_via_recalibrate_physics_matches_scheduled_retrain(self, tmp_path):
+        """The on-demand recalibrate_physics path must forward the same
+        heating_active/ev/away/heating-sub-meter data _retrain() cached for it —
+        not silently resolve a weaker tier than the scheduled path would."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._recalibrate_physics_cb = EnergyForecast._recalibrate_physics_cb.__get__(app, type(app))
+        app._fetch_physics_sensor_histories = MagicMock()
+        app._physics_climate_dfs = {}
+        app._physics_dhw_tank_df = None
+        app._cached_energy_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-01-01", periods=10, freq="1h"), "gross_kwh": [1.0] * 10}
+        )
+        app._cached_weather_df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=10, freq="1h"),
+                "temp_c": [5.0] * 10,
+                "direct_radiation_wm2": [0.0] * 10,
+            }
+        )
+        heating_active_sentinel = pd.DataFrame({"timestamp": [], "heating_active": []})
+        ev_sentinel = pd.DataFrame({"timestamp": []})
+        away_sentinel = pd.DataFrame({"timestamp": [], "is_away": []})
+        sub_meter_sentinel = pd.DataFrame({"timestamp": [], "kwh": []})
+        app._cached_heating_active_df = heating_active_sentinel
+        app._cached_ev_df = ev_sentinel
+        app._cached_away_df = away_sentinel
+        app._cached_heating_sub_meter_df = sub_meter_sentinel
+
+        with patch.object(app._physics_model, "calibrate") as mock_calibrate:
+            app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
+            mock_calibrate.assert_called_once()
+            kwargs = mock_calibrate.call_args.kwargs
+            assert kwargs["heating_active_df"] is heating_active_sentinel
+            assert kwargs["ev_df"] is ev_sentinel
+            assert kwargs["away_df"] is away_sentinel
+            assert kwargs["heating_sub_meter_df"] is sub_meter_sentinel
 
     def test_recalibrate_service_before_first_retrain_logs_warning_and_does_not_crash(self, caplog):
         """No _cached_energy_df/_cached_weather_df yet (never retrained) — must not raise."""

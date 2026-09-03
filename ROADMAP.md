@@ -250,15 +250,19 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ### #92 — Temperature-Based UA_eff Calibration Window (replace hardcoded month list)
 
+**Status (2026-09-03): implemented on `fix/ua-eff-calibration-window`, not yet merged to `dev`.** Design spec (`docs/superpowers/specs/2026-09-03-ua-eff-calibration-window-design.md`, rev. 3, 3 review rounds) and implementation plan (`docs/superpowers/plans/2026-09-03-ua-eff-calibration-window.md`) both landed. Built via subagent-driven-development: 3 tasks + a final whole-branch review + one fix wave, all clean. Full suite 1060 passed / 11 skipped / 0 failed. See `memory/project_ua_eff_calibration_window_fix.md` for the summary and the manual apps.yaml step still needed to activate tier 1 on the live instance.
+
 **Priority:** Medium — land before/during this coming winter so the switch is in effect when there's real cold-weather data to calibrate from.
 
-**Problem**: `_calibrate_ua_eff` (`physics.py:437`) gates its input rows to `timestamp.dt.month.isin([11, 12, 1, 2, 3])` — a hardcoded Northern-Hemisphere heating-season proxy. It's brittle in two ways: it can't react to genuinely cold shoulder-season data (a cold October or April), and it silently assumes a hemisphere/climate. Confirmed 2026-08-04 as a contributing cause of `UA_eff` staying `null` (space-heating term hard-zeroed, `physics.py:186-188`) — no calibration run has yet fallen inside a matching month since this feature went live. See `memory/project_physics_kwh_low_importance.md`.
+**Problem**: `_calibrate_ua_eff` (`physics.py:437`) gated its input rows to `timestamp.dt.month.isin([11, 12, 1, 2, 3])` — a hardcoded Northern-Hemisphere heating-season proxy. It's brittle in two ways: it can't react to genuinely cold shoulder-season data (a cold October or April), and it silently assumes a hemisphere/climate. Confirmed 2026-08-04 as a contributing cause of `UA_eff` staying `null` (space-heating term hard-zeroed, `physics.py:186-188`) — no calibration run had yet fallen inside a matching month since this feature went live. See `memory/project_physics_kwh_low_importance.md`.
 
-**Design (draft — needs its own short brainstorm before implementing)**: replace the calendar-month filter with a temperature/heating-degree threshold applied to the same candidate rows (e.g. `T_outdoor` below some margin under the heating setpoint) so eligibility tracks actual weather rather than the calendar. Keep the existing acceptance gates (≥30 valid passive windows, R²≥0.5) unchanged — this only changes which rows are eligible to be counted.
+**Design (implemented, superseding the original draft below)**: a three-tier eligibility resolver (sub-meter → `heating_active` → temperature-fallback), not the single temperature-threshold sketch originally proposed here — a multi-stakeholder spec review found the temperature-only approach too weak on its own. See the spec for the full rationale, the real-data validation run (§4 — floors clear, but R² doesn't yet with ~5 months of data; expected to actually calibrate once real winter data arrives), and the explicitly deferred items (§8: defrost exclusion, live COP sensor, thermal-mass regression redesign, out-of-sample R² eval, the other 3 NH-hardcoded gates).
+
+~~**Design (draft — needs its own short brainstorm before implementing)**: replace the calendar-month filter with a temperature/heating-degree threshold applied to the same candidate rows (e.g. `T_outdoor` below some margin under the heating setpoint) so eligibility tracks actual weather rather than the calendar. Keep the existing acceptance gates (≥30 valid passive windows, R²≥0.5) unchanged — this only changes which rows are eligible to be counted.~~ (superseded, see above)
 
 **Not required for this**: the local climate CSV cache (`climate_<entity>.csv`) already accumulates indefinitely via merge-on-fetch (verified live: `climate_wohnzimmer.csv` has been growing since 2026-03-31, independent of HA's own recorder — confirmed via `configuration.yaml` and the HA history API that the live recorder itself only retains ~10 days, default `purge_keep_days`). No separate data-retention work is needed here.
 
-**Effort:** ~2 h (filter logic + tests). **Impact:** MEDIUM — removes a real hardcoded-assumption smell, but its practical effect (does `UA_eff` actually calibrate?) is only verifiable once real winter rows exist in the cache, ~Dec 2026/Jan 2027.
+**Effort:** ~~~2 h (filter logic + tests)~~ — actual: a multi-day spec (3 review rounds) + a 3-task subagent-driven implementation (found and fixed 3 real bugs across per-task and final review) — the original estimate badly undersized the eligibility-tier design and plumbing work once reviewed. **Impact:** MEDIUM — removes a real hardcoded-assumption smell and closes the plumbing gaps so `UA_eff` will now be *evaluated* against real winter data as it arrives, but whether it actually calibrates to a value is only verifiable once real winter rows exist, ~Dec 2026/Jan 2027.
 
 ---
 
@@ -320,7 +324,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | ✅ done (v0.11.0-alpha-16) |
 | 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
-| 92 | Temperature-based UA_eff calibration window | medium | 2 h | ready — needs short brainstorm on threshold design first |
+| 92 | Temperature-based UA_eff calibration window | medium | 2 h (est.) / multi-day (actual) | **implemented on `fix/ua-eff-calibration-window`, not yet merged to `dev`** (2026-09-03) |
 | 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | both phases deployed live 2026-08-27 (hef `v0.12.0-alpha-13`, EM `v0.15.1-alpha-51`) — kill-switch pending exit-gate observation, see `memory/project_dhw_comfort_boost_commit_spec.md` |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |

@@ -829,6 +829,81 @@ class TestFindPassiveWindows:
         idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
         assert len(idx) == 0
 
+    def test_accepts_precomputed_dhw_rising_mask(self):
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [45.0, 50.0, 50.0],  # rising 45->50 at row 1 -- would exclude
+                #                                        row 1 if the default .diff() path ran
+            }
+        )
+        # Precomputed mask says nothing is rising -> overrides the (otherwise-excluding)
+        # dhw_tank_temp column entirely. min_hp_off_hours=0 matches how
+        # _calibrate_ua_eff always calls this function, isolating the dhw-rising
+        # behavior from the off-run-length gate.
+        precomputed = pd.Series([False, False, False], index=ts)
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [0, 1, 2]
+
+    def test_precomputed_mask_reindexed_by_timestamp_not_position(self):
+        # Out of order, plus an extra timestamp df doesn't have -- reindexing by real
+        # timestamp value (not position) must still find each row's correct entry.
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [np.nan] * 3,
+            }
+        )
+        precomputed = pd.Series(
+            [True, False, True, False],
+            index=[ts[2], ts[0], pd.Timestamp("2026-01-15 05:00"), ts[1]],
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [0, 1]  # ts[2] -> True (rising) -> excluded; ts[0], ts[1] -> False -> included
+
+    def test_default_behavior_unchanged_when_precomputed_mask_omitted(self):
+        """Regression test for the spec §3.5 default-preserves-behavior claim: identical
+        input/output to the pre-existing test_excludes_rising_dhw_tank_temp_hours."""
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [45.0, 50.0, 50.0],
+            }
+        )
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
+        assert 1 not in idx
+
+    def test_precomputed_mask_missing_coverage_excludes_only_that_row(self):
+        # The opposite direction from the test above: df has a timestamp the
+        # precomputed mask does NOT cover. This must fill as "not rising" for
+        # that one row only -- not corrupt the whole column.
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [np.nan] * 3,
+            }
+        )
+        # ts[2] is not covered by the precomputed mask at all.
+        precomputed = pd.Series([True, False], index=[ts[0], ts[1]])
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [1, 2]  # ts[0] -> True (rising) -> excluded; ts[1], ts[2] (uncovered) -> included
+
 
 class TestCalibrateBaseLoad:
     def test_recovers_median_within_5_percent(self, tmp_path):
@@ -1019,6 +1094,377 @@ class TestCalibrateUAEff:
             energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
         )
         assert ua_eff is None
+
+    def test_calibrate_ua_eff_prefers_sub_meter_when_available(self, tmp_path, caplog):
+        import logging
+
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        sub_meter_df = pd.DataFrame({"timestamp": energy_df["timestamp"], "kwh": energy_df["gross_kwh"] - 0.35})
+        with caplog.at_level(logging.INFO, logger="energy_forecast.physics"):
+            ua_eff, n_windows = pm._calibrate_ua_eff(
+                energy_df,
+                weather_df,
+                climate_dfs,
+                dhw_df,
+                holdout_cutoff=pd.Timestamp("2026-06-01"),
+                heating_sub_meter_df=sub_meter_df,
+            )
+        assert ua_eff is not None
+        assert ua_eff == pytest.approx(150.0, rel=0.20)
+        assert any("sub_meter tier" in r.message for r in caplog.records)
+
+    def test_calibrate_ua_eff_y_override_aligned_after_passive_window_filter(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ua_eff_true, t_indoor = 150.0, 20.0
+        # A different, hand-picked outdoor temp per night gives the fit real x-variance --
+        # a silent y_override/x misalignment (regressing one night's sub-meter reading
+        # against a different night's ΔT/COP) would then produce a clearly wrong slope,
+        # not one masked by all-nights-look-alike data.
+        t_outdoor_by_night = [
+            -15.0,
+            -2.0,
+            -20.0,
+            -5.0,
+            -12.0,
+            -18.0,
+            -1.0,
+            -9.0,
+            -14.0,
+            -6.0,
+            -19.0,
+            -3.0,
+            -11.0,
+            -17.0,
+            -7.0,
+        ]
+        n_nights = len(t_outdoor_by_night)
+
+        energy_rows, weather_rows, climate_rows, dhw_rows, sub_rows = [], [], [], [], []
+        for night, t_outdoor_night in enumerate(t_outdoor_by_night):
+            base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=night)
+            for h in list(range(22, 24)) + list(range(0, 6)):
+                ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
+                # Night 0's first two hours: a mild-air anomaly drops ΔT below the 8K
+                # passive-window gate -- excluded there, not by tier 1.
+                t_outdoor = 15.0 if (night == 0 and h in (22, 23)) else t_outdoor_night
+                delta_t = t_indoor - t_outdoor
+                cop = pm._cop_formula_value(t_outdoor, None)
+                q_heat_el = ua_eff_true * delta_t / cop / 1000.0
+                energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
+                climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
+                dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0})
+                # Night 1's first hour: the heat pump short-cycles below the sub-meter's
+                # 0.3 kWh eligibility floor -- excluded by tier 1, not by the ΔT gate.
+                sub_kwh = 0.0 if (night == 1 and h == 22) else q_heat_el
+                sub_rows.append({"timestamp": ts, "kwh": sub_kwh})
+
+        energy_df = pd.DataFrame(energy_rows)
+        weather_df = pd.DataFrame(weather_rows)
+        climate_dfs = {"climate.living_room": pd.DataFrame(climate_rows)}
+        dhw_df = pd.DataFrame(dhw_rows)
+        sub_meter_df = pd.DataFrame(sub_rows)
+
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            heating_sub_meter_df=sub_meter_df,
+        )
+        assert ua_eff is not None
+        # Exact (COP-formula-consistent, noise-free) data: a correctly-aligned fit
+        # recovers UA_eff almost exactly. A silent row-shift would regress a row's
+        # sub-meter reading against a different row's ΔT/COP, which the wide
+        # night-to-night x-spread here would turn into a clearly wrong slope.
+        assert ua_eff == pytest.approx(150.0, rel=0.02)
+        assert n_windows == n_nights * 8 - 2 - 1  # 120 - 2 (ΔT-gated) - 1 (tier-1-gated) = 117
+
+    def test_calibrate_ua_eff_falls_back_to_heating_active_without_sub_meter(self, tmp_path, caplog):
+        import logging
+
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ua_eff_true, t_indoor = 150.0, 20.0
+        rng = np.random.default_rng(3)
+        energy_rows, weather_rows, climate_rows, dhw_rows, heating_active_rows = [], [], [], [], []
+        n_nights = 35
+        for night in range(n_nights):
+            # April, not in the old {11,12,1,2,3} month list -- proves the gate is no
+            # longer calendar-based.
+            base_day = pd.Timestamp("2026-04-01") + pd.Timedelta(days=night)
+            for h in list(range(22, 24)) + list(range(0, 6)):
+                ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
+                t_outdoor = -1.0 + rng.normal(0, 0.3)
+                delta_t = t_indoor - t_outdoor
+                cop = pm._cop_formula_value(t_outdoor, None)
+                q_heat_el = ua_eff_true * delta_t / cop / 1000.0
+                energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
+                climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
+                dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0})
+                heating_active_rows.append({"timestamp": ts, "heating_active": 1})
+        energy_df = pd.DataFrame(energy_rows)
+        weather_df = pd.DataFrame(weather_rows)
+        climate_dfs = {"climate.living_room": pd.DataFrame(climate_rows)}
+        dhw_df = pd.DataFrame(dhw_rows)
+        heating_active_df = pd.DataFrame(heating_active_rows)
+
+        with caplog.at_level(logging.INFO, logger="energy_forecast.physics"):
+            ua_eff, n_windows = pm._calibrate_ua_eff(
+                energy_df,
+                weather_df,
+                climate_dfs,
+                dhw_df,
+                holdout_cutoff=pd.Timestamp("2026-09-01"),
+                heating_active_df=heating_active_df,
+            )
+        assert ua_eff is not None
+        assert ua_eff == pytest.approx(150.0, rel=0.20)
+        assert any("heating_active tier" in r.message for r in caplog.records)
+
+    def test_calibrate_ua_eff_temperature_fallback_requires_calibrated_q_base_el_for_load_floor(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ua_eff_true, t_indoor = 150.0, 20.0
+        rng = np.random.default_rng(4)
+        energy_rows, weather_rows, climate_rows, dhw_rows = [], [], [], []
+        n_nights = 35
+        for night in range(n_nights):
+            base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=night)
+            for h in list(range(22, 24)) + list(range(0, 6)):
+                ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
+                t_outdoor = -1.0 + rng.normal(0, 0.3)
+                delta_t = t_indoor - t_outdoor
+                cop = pm._cop_formula_value(t_outdoor, None)
+                q_heat_el = ua_eff_true * delta_t / cop / 1000.0
+                energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
+                climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
+                dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0})
+        energy_df = pd.DataFrame(energy_rows)
+        weather_df = pd.DataFrame(weather_rows)
+        climate_dfs = {"climate.living_room": pd.DataFrame(climate_rows)}
+        dhw_df = pd.DataFrame(dhw_rows)
+
+        # Uncalibrated Q_base_el (fresh model): temperature-only eligibility, no load
+        # floor -> all rows pass regardless of load.
+        assert pm._calib.get("q_base_el_calibrated", False) is False
+        ua_eff_uncal, n_windows_uncal = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff_uncal is not None
+        assert n_windows_uncal == n_nights * 8
+
+        # Calibrated: the load floor now applies. Zero out net load for one night so
+        # its rows fall below UA_EFF_FALLBACK_MIN_LOAD_KWH and are excluded, while
+        # every other night still clears it.
+        pm._calib["q_base_el_calibrated"] = True
+        pm._calib["Q_base_el"] = 0.35
+        energy_df_cal = energy_df.copy()
+        zeroed_night = (energy_df_cal["timestamp"] >= pd.Timestamp("2025-11-01 22:00")) & (
+            energy_df_cal["timestamp"] < pd.Timestamp("2025-11-02 06:00")
+        )
+        energy_df_cal.loc[zeroed_night, "gross_kwh"] = 0.35  # load == Q_base_el -> zero net load
+        ua_eff_cal, n_windows_cal = pm._calibrate_ua_eff(
+            energy_df_cal, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff_cal is not None
+        assert n_windows_cal == n_windows_uncal - 8  # one full night's rows excluded by the load floor
+
+    def test_calibrate_ua_eff_old_month_only_rows_no_longer_special_cased(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2025-11-01 22:00", periods=8 * 35, freq="1h")
+        ts = ts[(ts.hour >= 22) | (ts.hour < 6)]
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [0.5] * len(ts)})
+        weather_df = pd.DataFrame(
+            {"timestamp": ts, "temp_c": [12.0] * len(ts), "direct_radiation_wm2": [0.0] * len(ts)}
+        )
+        climate_dfs = {"climate.living_room": pd.DataFrame({"timestamp": ts, "current_temp": [20.0] * len(ts)})}
+        dhw_df = pd.DataFrame({"timestamp": ts, "buffer_temp": [50.0] * len(ts)})
+
+        # 12°C is inside the old {11,12,1,2,3} month list but above tier 3's 8°C
+        # threshold, and no sub-meter/heating_active is configured -- no tier fires.
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff is None
+        assert n_windows == 0
+
+    def test_calibrate_ua_eff_reindex_tolerance_excludes_stale_matches(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        # heating_active reports are 3h apart -- most nighttime hours have no reading
+        # within the 1h reindex tolerance and must be excluded, not matched to a stale
+        # value from up to 3h away.
+        all_ts = pd.to_datetime(energy_df["timestamp"])
+        sparse_ts = all_ts.iloc[::3]
+        heating_active_df = pd.DataFrame({"timestamp": sparse_ts, "heating_active": [1] * len(sparse_ts)})
+
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            heating_active_df=heating_active_df,
+        )
+        assert 0 < n_windows < len(energy_df)
+
+    def test_calibrate_ua_eff_excludes_ev_and_away_hours(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        all_ts = pd.to_datetime(energy_df["timestamp"])
+        ev_night = all_ts[(all_ts >= pd.Timestamp("2025-11-01 22:00")) & (all_ts < pd.Timestamp("2025-11-02 06:00"))]
+        away_night = all_ts[(all_ts >= pd.Timestamp("2025-11-02 22:00")) & (all_ts < pd.Timestamp("2025-11-03 06:00"))]
+        ev_df = pd.DataFrame({"timestamp": ev_night})
+        away_df = pd.DataFrame({"timestamp": away_night, "is_away": [1] * len(away_night)})
+
+        ua_eff_base, n_windows_base = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        ua_eff_excl, n_windows_excl = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            ev_df=ev_df,
+            away_df=away_df,
+        )
+        assert n_windows_excl == n_windows_base - 16  # two full nights (8 rows each) removed
+
+    def test_calibrate_ua_eff_ev_gap_does_not_corrupt_adjacent_dhw_diff(self, tmp_path):
+        # Regression test: dhw_rising_full must be computed on `e` right after the
+        # nighttime-hour filter -- BEFORE EV/away exclusion -- not after. Otherwise
+        # an EV-excluded hour in the middle of a night leaves a >1h gap in the index,
+        # and .diff() on the (now gapped) series compares non-adjacent real hours.
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        n_nights = 35
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=n_nights)
+
+        # Target night: 2025-11-11 22:00 -> 2025-11-12 06:00 (night index 10).
+        target_base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=10)
+        t01 = target_base_day + pd.Timedelta(days=1, hours=1)
+        t02 = target_base_day + pd.Timedelta(days=1, hours=2)
+        t03 = target_base_day + pd.Timedelta(days=1, hours=3)
+
+        dhw_df = dhw_df.copy()
+        # Genuine DHW rise at t02: real-adjacent diff t01->t02 = +5 -> t02 is
+        # genuinely DHW-rising. t03 is flat relative to t02 (diff = 0) -> t03 is
+        # genuinely NOT DHW-rising and must remain eligible for the passive window.
+        dhw_df.loc[dhw_df["timestamp"] == t01, "buffer_temp"] = 50.0
+        dhw_df.loc[dhw_df["timestamp"] == t02, "buffer_temp"] = 55.0
+        dhw_df.loc[dhw_df["timestamp"] == t03, "buffer_temp"] = 55.0
+
+        # EV charging excludes t02 -- the genuinely-rising row itself -- from `e`.
+        # If dhw_rising_full were (re)computed AFTER this exclusion (the bug), t03's
+        # diff would instead be taken against t01 (2h prior, since t02 is gone):
+        # 55 - 50 = +5 > 0, wrongly flagging t03 as DHW-rising too and excluding it
+        # from the passive window on top of the EV-excluded t02.
+        ev_df = pd.DataFrame({"timestamp": [t02]})
+
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            ev_df=ev_df,
+        )
+        assert ua_eff is not None
+        # Only t02 is lost, to the EV exclusion. t03 must remain: with the fix,
+        # n_windows == n_nights*8 - 1. Under the reintroduced-gap bug it would
+        # instead be n_nights*8 - 2 (t03 wrongly also excluded as DHW-rising).
+        assert n_windows == n_nights * 8 - 1
+
+    def test_calibrate_ua_eff_requires_distinct_nights_not_just_rows(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=5)
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert ua_eff is None
+        assert n_windows == 40  # 5 nights * 8 rows -> clears the 30-row floor, not the 10-night floor
+
+    def test_calibrate_ua_eff_midnight_crossing_night_label(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        # 9 consecutive physical nights, each spanning 22:00-01:00 (4 rows/night) so each
+        # touches two calendar dates, and consecutive nights share a boundary date. A
+        # naive .dt.date.nunique() sees 10 distinct calendar dates (Nov 1-10) and would
+        # wrongly clear the 10-night floor; the 6h-shifted night label correctly counts
+        # 9 physical nights and rejects.
+        #
+        # t_outdoor varies per night (all still < the 8°C tier-3 threshold, all still
+        # clearing the 8K ΔT gate) so the data has real x-variance -- if a naive
+        # night-count bug let it reach the regression (10 nights >= floor), the
+        # noise-free, formula-consistent data would produce R²≈1.0 and a non-None
+        # ua_eff, failing this test's `ua_eff is None` assertion. With the correct
+        # 6h-shift (9 nights), the night floor rejects before the regression ever runs,
+        # so this only passes for the intended reason.
+        ua_eff_true, t_indoor = 150.0, 20.0
+        t_outdoor_by_night = [-15.0, -3.0, -18.0, -6.0, -12.0, -1.0, -9.0, -20.0, -5.0]  # 9 nights
+        energy_rows, weather_rows, climate_rows, dhw_rows = [], [], [], []
+        for night, t_outdoor in enumerate(t_outdoor_by_night):
+            base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=night)
+            for h in [22, 23, 0, 1]:
+                ts = base_day + pd.Timedelta(hours=h) if h >= 22 else base_day + pd.Timedelta(days=1, hours=h)
+                delta_t = t_indoor - t_outdoor
+                cop = pm._cop_formula_value(t_outdoor, None)
+                q_heat_el = ua_eff_true * delta_t / cop / 1000.0
+                energy_rows.append({"timestamp": ts, "gross_kwh": q_heat_el + 0.35})
+                weather_rows.append({"timestamp": ts, "temp_c": t_outdoor, "direct_radiation_wm2": 0.0})
+                climate_rows.append({"timestamp": ts, "current_temp": t_indoor})
+                dhw_rows.append({"timestamp": ts, "buffer_temp": 50.0})
+        energy_df = pd.DataFrame(energy_rows)
+        weather_df = pd.DataFrame(weather_rows)
+        climate_dfs = {"climate.living_room": pd.DataFrame(climate_rows)}
+        dhw_df = pd.DataFrame(dhw_rows)
+
+        assert energy_df["timestamp"].dt.date.nunique() == 10  # sanity-check the naive-count claim above
+
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+        )
+        assert n_windows == 36  # 9 nights * 4 rows -> clears the 30-row floor
+        assert ua_eff is None  # but only 9 distinct physical nights -> rejected by the night floor
+
+    def test_calibrate_ua_eff_rejects_implausible_ua_eff(self, tmp_path, caplog):
+        import logging
+
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=700.0, n_nights=35)
+        with caplog.at_level(logging.WARNING, logger="energy_forecast.physics"):
+            ua_eff, n_windows = pm._calibrate_ua_eff(
+                energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01")
+            )
+        assert ua_eff is None
+        assert n_windows >= 30
+        assert any("outside plausible range" in r.message for r in caplog.records)
+
+    def test_calibrate_ua_eff_heating_active_df_empty_vs_none(self, tmp_path):
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=35)
+        empty_heating_active = pd.DataFrame(columns=["timestamp", "heating_active"])
+
+        ua_eff_none, n_windows_none = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            heating_active_df=None,
+        )
+        ua_eff_empty, n_windows_empty = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            heating_active_df=empty_heating_active,
+        )
+        assert n_windows_none == n_windows_empty
+        assert ua_eff_none == pytest.approx(ua_eff_empty)
 
 
 class TestCalibrateSolarGainArea:
