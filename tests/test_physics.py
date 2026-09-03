@@ -885,6 +885,25 @@ class TestFindPassiveWindows:
         idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=2)
         assert 1 not in idx
 
+    def test_precomputed_mask_missing_coverage_excludes_only_that_row(self):
+        # The opposite direction from the test above: df has a timestamp the
+        # precomputed mask does NOT cover. This must fill as "not rising" for
+        # that one row only -- not corrupt the whole column.
+        ts = pd.date_range("2026-01-15 00:00", periods=3, freq="1h")
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "T_outdoor": [0.0, 0.0, 0.0],
+                "T_indoor": [20.0, 20.0, 20.0],
+                "hp_running": [False, False, False],
+                "dhw_tank_temp": [np.nan] * 3,
+            }
+        )
+        # ts[2] is not covered by the precomputed mask at all.
+        precomputed = pd.Series([True, False], index=[ts[0], ts[1]])
+        idx = _find_passive_windows(df, min_delta_t=8.0, min_hp_off_hours=0, dhw_rising_precomputed=precomputed)
+        assert list(idx) == [1, 2]  # ts[0] -> True (rising) -> excluded; ts[1], ts[2] (uncovered) -> included
+
 
 class TestCalibrateBaseLoad:
     def test_recovers_median_within_5_percent(self, tmp_path):

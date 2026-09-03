@@ -2874,7 +2874,8 @@ def _find_passive_windows(
     enough_delta = delta_t >= min_delta_t
 
     if dhw_rising_precomputed is not None:
-        dhw_rising = pd.Series(dhw_rising_precomputed.reindex(d["timestamp"]).to_numpy(), index=d.index)
+        reindexed = dhw_rising_precomputed.reindex(d["timestamp"], fill_value=False)
+        dhw_rising = pd.Series(reindexed.to_numpy(), index=d.index)
     else:
         dhw_rising = d["dhw_tank_temp"].diff() > 0
     not_dhw_active = ~dhw_rising.fillna(False)
