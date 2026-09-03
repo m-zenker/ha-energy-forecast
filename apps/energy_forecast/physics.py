@@ -733,13 +733,6 @@ class ThermalPhysicsModel:
         e = e[e["timestamp"] < holdout_cutoff]
         e = e[(e["timestamp"].dt.hour >= 22) | (e["timestamp"].dt.hour < 6)]
 
-        if away_df is not None and not away_df.empty:
-            away_ts = set(pd.to_datetime(away_df.loc[away_df["is_away"] > 0, "timestamp"]).dt.floor("1h"))
-            e = e[~e["timestamp"].dt.floor("1h").isin(away_ts)]
-        if ev_df is not None and not ev_df.empty:
-            ev_ts = set(pd.to_datetime(ev_df["timestamp"]).dt.floor("1h"))
-            e = e[~e["timestamp"].dt.floor("1h").isin(ev_ts)]
-
         if e.empty:
             return None, 0
 
@@ -753,11 +746,28 @@ class ThermalPhysicsModel:
             dhw_tank_temp_full = pd.Series(np.nan, index=e["timestamp"].values)
             min_delta_t = 12.0
             _LOGGER.warning("DHW tank sensor absent — UA_eff calibration may be inflated")
-        # Computed on the pre-eligibility-filter e (still gapped only by night
-        # boundaries, not by which nights pass the tier gate) so .diff() compares
-        # real temporally-adjacent hours — see _find_passive_windows's
-        # dhw_rising_precomputed parameter (Task 1).
+        # Computed on e right after the nighttime-hour filter — BEFORE the
+        # EV/away exclusion below — so .diff() compares real temporally-adjacent
+        # hours (e is still gapped only by night boundaries at this point). If
+        # this were computed after EV/away exclusion, an excluded hour in the
+        # middle of a night would leave a 2+ hour gap in the index, and .diff()
+        # would compare non-adjacent real hours — exactly the "gapped .diff()"
+        # bug that _find_passive_windows's dhw_rising_precomputed parameter
+        # (Task 1) was built to eliminate, reintroduced one level up here.
+        # _find_passive_windows reindexes dhw_rising_precomputed by timestamp
+        # value against its own (possibly EV/away-filtered) frame, so it
+        # tolerates timestamps present here but later excluded below.
         dhw_rising_full = dhw_tank_temp_full.diff() > 0
+
+        if away_df is not None and not away_df.empty:
+            away_ts = set(pd.to_datetime(away_df.loc[away_df["is_away"] > 0, "timestamp"]).dt.floor("1h"))
+            e = e[~e["timestamp"].dt.floor("1h").isin(away_ts)]
+        if ev_df is not None and not ev_df.empty:
+            ev_ts = set(pd.to_datetime(ev_df["timestamp"]).dt.floor("1h"))
+            e = e[~e["timestamp"].dt.floor("1h").isin(ev_ts)]
+
+        if e.empty:
+            return None, 0
 
         eligible, tier, y_override = self._resolve_heating_eligibility(
             e, heating_sub_meter_df, heating_active_df, weather_df

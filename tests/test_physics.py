@@ -1334,6 +1334,50 @@ class TestCalibrateUAEff:
         )
         assert n_windows_excl == n_windows_base - 16  # two full nights (8 rows each) removed
 
+    def test_calibrate_ua_eff_ev_gap_does_not_corrupt_adjacent_dhw_diff(self, tmp_path):
+        # Regression test: dhw_rising_full must be computed on `e` right after the
+        # nighttime-hour filter -- BEFORE EV/away exclusion -- not after. Otherwise
+        # an EV-excluded hour in the middle of a night leaves a >1h gap in the index,
+        # and .diff() on the (now gapped) series compares non-adjacent real hours.
+        pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        n_nights = 35
+        energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=n_nights)
+
+        # Target night: 2025-11-11 22:00 -> 2025-11-12 06:00 (night index 10).
+        target_base_day = pd.Timestamp("2025-11-01") + pd.Timedelta(days=10)
+        t01 = target_base_day + pd.Timedelta(days=1, hours=1)
+        t02 = target_base_day + pd.Timedelta(days=1, hours=2)
+        t03 = target_base_day + pd.Timedelta(days=1, hours=3)
+
+        dhw_df = dhw_df.copy()
+        # Genuine DHW rise at t02: real-adjacent diff t01->t02 = +5 -> t02 is
+        # genuinely DHW-rising. t03 is flat relative to t02 (diff = 0) -> t03 is
+        # genuinely NOT DHW-rising and must remain eligible for the passive window.
+        dhw_df.loc[dhw_df["timestamp"] == t01, "buffer_temp"] = 50.0
+        dhw_df.loc[dhw_df["timestamp"] == t02, "buffer_temp"] = 55.0
+        dhw_df.loc[dhw_df["timestamp"] == t03, "buffer_temp"] = 55.0
+
+        # EV charging excludes t02 -- the genuinely-rising row itself -- from `e`.
+        # If dhw_rising_full were (re)computed AFTER this exclusion (the bug), t03's
+        # diff would instead be taken against t01 (2h prior, since t02 is gone):
+        # 55 - 50 = +5 > 0, wrongly flagging t03 as DHW-rising too and excluding it
+        # from the passive window on top of the EV-excluded t02.
+        ev_df = pd.DataFrame({"timestamp": [t02]})
+
+        ua_eff, n_windows = pm._calibrate_ua_eff(
+            energy_df,
+            weather_df,
+            climate_dfs,
+            dhw_df,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+            ev_df=ev_df,
+        )
+        assert ua_eff is not None
+        # Only t02 is lost, to the EV exclusion. t03 must remain: with the fix,
+        # n_windows == n_nights*8 - 1. Under the reintroduced-gap bug it would
+        # instead be n_nights*8 - 2 (t03 wrongly also excluded as DHW-rising).
+        assert n_windows == n_nights * 8 - 1
+
     def test_calibrate_ua_eff_requires_distinct_nights_not_just_rows(self, tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         energy_df, weather_df, climate_dfs, dhw_df = self._synthetic_winter_data(ua_eff_true=150.0, n_nights=5)

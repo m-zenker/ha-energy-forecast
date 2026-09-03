@@ -1753,6 +1753,16 @@ class EnergyForecast(hass.Hass):
             if heating_sub_meter_entity
             else None
         )
+        if heating_sub_meter_entity and self._cached_heating_sub_meter_df is None:
+            # physics.heating_sub_meter_sensor and sub_energy_sensors are two independent
+            # config lists with no cross-check -- if the entity isn't also listed under
+            # sub_energy_sensors, sub_sensors_dict.get() above silently returns None and
+            # UA_eff tier 1 never fires (falls through to tier 2/3 with no diagnostic).
+            _LOGGER.warning(
+                "physics.heating_sub_meter_sensor=%s configured but not found in sub_energy_sensors "
+                "— UA_eff tier 1 will never fire; add it to sub_energy_sensors too",
+                heating_sub_meter_entity,
+            )
 
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
