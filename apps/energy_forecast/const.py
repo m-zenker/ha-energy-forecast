@@ -42,6 +42,15 @@ SENSOR_BLEND_HOURS = 6
 DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
+# Physics UA_eff calibration eligibility (#92) — deliberately not shared with
+# model.py's hp_heating_degree literal, which serves a different purpose (an ML
+# feature hinge, not a calibration-eligibility threshold).
+HEATING_SUB_METER_MIN_KWH = 0.3  # tier 1: below this, a hour reads as heat-pump-off/short-cycling
+UA_EFF_FALLBACK_MAX_OUTDOOR_C = 8.0  # tier 3: colder than the ML feature's 15°C knee (wants precision, not recall)
+UA_EFF_FALLBACK_MIN_LOAD_KWH = 0.3  # tier 3: load floor, applied only once Q_base_el is genuinely calibrated
+UA_EFF_SANITY_MIN_W_PER_K = 50.0  # implausible-result guard on the recovered UA_eff
+UA_EFF_SANITY_MAX_W_PER_K = 500.0
+
 # Supported energy sensor units and their kWh conversion factors.
 UNIT_TO_KWH: dict[str, float] = {"kWh": 1.0, "MWh": 1000.0, "Wh": 0.001}
 
