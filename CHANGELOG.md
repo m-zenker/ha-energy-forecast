@@ -8,6 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `README.md`, `standalone/` — added a Standalone Docker Deployment section and example files (`Dockerfile`, `docker-compose.yml`, `appdaemon.yaml.example`, `secrets.yaml.example`) for running AppDaemon outside the HA Supervisor add-on. Uses a plain `python:3.12-slim` base rather than an Alpine image, and wires credentials through AppDaemon's `!secret` mechanism against a gitignored `secrets.yaml` instead of typing them directly into `appdaemon.yaml`. Addresses discussion #6.
+
 ---
 
 ## [0.11.13] - 2026-09-17

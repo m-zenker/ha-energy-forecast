@@ -45,6 +45,7 @@ Dashboard YAML is in `dashboard/`.
 - [Scenario / What-If API](#scenario--what-if-api)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Standalone Docker Deployment](#standalone-docker-deployment)
 - [Configuration](#configuration)
 - [Published sensors](#published-sensors)
 - [How it works](#how-it-works)
@@ -192,7 +193,7 @@ All sensors carry `unit_of_measurement: kWh`. Invalid or unknown schedule entrie
 
 ### Home Assistant side
 - Home Assistant with a cumulative grid-import energy sensor (`state_class: total_increasing`, unit `kWh`)
-- [AppDaemon 4.x](https://github.com/AppDaemon/appdaemon) installed as an HA add-on or standalone
+- [AppDaemon 4.x](https://github.com/AppDaemon/appdaemon) installed as an HA add-on, or standalone (see [Standalone Docker Deployment](#standalone-docker-deployment))
 
 ### AppDaemon add-on configuration
 The HA AppDaemon add-on does **not** read `requirements.txt`. Dependencies must be declared in the add-on's own configuration, edited via **Settings → Add-ons → AppDaemon → Configuration** in the HA UI:
@@ -283,6 +284,58 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
 5. **Initial training** runs ~10 seconds after startup. If you have fewer than 48 hours of history the app will log a warning and skip training until more data accumulates. See [Backfilling history](#backfilling-history) to import years of history from the HA SQLite database.
 
    **Verify it's working:** after ~2 minutes, check `sensor.energy_forecast_setup_status` in **Developer Tools → States** — it should read `ok`. See also the [Troubleshooting quick sanity check](#troubleshooting).
+
+---
+
+## Standalone Docker Deployment
+
+Everything above assumes the official HA AppDaemon add-on. Running AppDaemon
+standalone — outside HA Supervisor, e.g. in your own `docker-compose` stack — works
+too, but differs in two ways the add-on handles for you:
+
+- **No add-on config schema.** There's no `python_packages`/`system_packages`
+  Configuration tab — dependencies are baked into your own image instead.
+- **No auto-injected auth.** The add-on gets a Supervisor-managed token
+  automatically; standalone you create your own **long-lived access token** (Home
+  Assistant → your profile → Security tab → Long-Lived Access Tokens → Create
+  Token) and store it yourself.
+
+Example files are in [`standalone/`](standalone/): a `Dockerfile`,
+`docker-compose.yml`, `appdaemon.yaml.example`, and `secrets.yaml.example`.
+
+**Build your own image (recommended)** using [`standalone/Dockerfile`](standalone/Dockerfile) —
+a plain `python:3.12-slim` (Debian/glibc) base with `pip install appdaemon` plus the
+same dependencies as the [add-on configuration](#appdaemon-add-on-configuration)
+above. AppDaemon is a normal PyPI package, so this installs everything as prebuilt
+manylinux wheels with no compiler and no third-party wheel index — the Alpine/musl
+wheel-mirror complications older add-on versions had simply don't apply here.
+
+Alternatively, a community-maintained image exists —
+[`martinlindelow/appdaemon-ha-energy-forecast`](https://hub.docker.com/r/martinlindelow/appdaemon-ha-energy-forecast)
+on Docker Hub (see [discussion #6](https://github.com/m-zenker/ha-energy-forecast/discussions/6)) —
+built on an Alpine-based AppDaemon image. Less setup, but check its update cadence
+against the version you need.
+
+**Setup:**
+1. Copy `standalone/Dockerfile`, `docker-compose.yml`, `appdaemon.yaml.example`, and
+   `secrets.yaml.example` into your own deployment repo/directory.
+2. Copy `appdaemon.yaml.example` → `conf/appdaemon.yaml` and `secrets.yaml.example` →
+   `conf/secrets.yaml` (add `secrets.yaml` to your own `.gitignore` — never commit
+   it), then fill in your values. Copy `apps/apps.yaml.example` → `conf/apps/apps.yaml`
+   as in [Installation](#installation) above.
+3. Create the long-lived access token described above and put it in `secrets.yaml`,
+   not directly in `appdaemon.yaml` — AppDaemon resolves `!secret <key>` in any YAML
+   config file against `secrets.yaml` automatically.
+4. `docker compose up -d --build`.
+
+**Do you need MQTT?** No — the `HASS` plugin block in `appdaemon.yaml` alone is the
+complete interface to Home Assistant: it reads your energy/weather/EV history to
+train the model and writes the forecast back via `set_state()`. Forecast sensors
+work immediately with just that (visible in **Developer Tools → States**, usable in
+dashboards/automations) — no MQTT broker involved at all. See
+[MQTT Discovery (optional)](#mqtt-discovery-optional) if you additionally want
+entity-registry features (area assignment, renaming); it's an enhancement, not a
+requirement, standalone or otherwise.
 
 ---
 
