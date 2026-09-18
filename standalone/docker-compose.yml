@@ -1,0 +1,11 @@
+# Standalone AppDaemon deployment for ha-energy-forecast.
+# See ../README.md#standalone-docker-deployment for the full setup walkthrough.
+services:
+  appdaemon:
+    build: .
+    container_name: ha-energy-forecast
+    restart: unless-stopped
+    volumes:
+      - ./conf:/conf
+    environment:
+      - TZ=Europe/Zurich   # ← change to your timezone
