@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `README.md`, `standalone/` — added a Standalone Docker Deployment section and example files (`Dockerfile`, `docker-compose.yml`, `appdaemon.yaml.example`, `secrets.yaml.example`) for running AppDaemon outside the HA Supervisor add-on. Uses a plain `python:3.12-slim` base rather than an Alpine image, and wires credentials through AppDaemon's `!secret` mechanism against a gitignored `secrets.yaml` instead of typing them directly into `appdaemon.yaml`. Addresses discussion #6. (Ported from GitHub PR #23 by @housemaister.)
 - `apps/energy_forecast/physics.py`, `model.py`, `energy_forecast.py`, `const.py` — UA_eff
   calibration eligibility rework (ROADMAP #92): replaces the old November–March month-list gate
   with a three-tier eligibility resolver, `_resolve_heating_eligibility()`. **Tier 1
@@ -82,6 +83,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that coverage window and falls back to threshold detection outside it, so pre-wallbox EV
   sessions are correctly excluded from training rather than silently retained as normal
   household load.
+
+---
+
+## [0.11.13] - 2026-09-17
+
+### Fixed
+- `apps/energy_forecast/model.py` — `_prepare_prediction_X()` was calling `_engineer_features()` without `country=self._country`, so predictions silently used CH holidays regardless of the user's configured country/canton. Training (`train()`) already passed `country` correctly, making training and prediction inconsistent. Fixed by adding the missing `country=` argument. Regression test added to `TestHolidayCountry`. (Ported from GitHub PR #22 by @GreenNothing.)
+
+---
+
+## [0.11.12] - 2026-08-30
 
 ### Added
 - `scripts/backfill_compare_solaredge.py` — one-off analysis and apply tool (gitignored) used to

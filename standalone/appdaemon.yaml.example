@@ -1,0 +1,40 @@
+# Standalone AppDaemon core config — NOT needed for the HA add-on (which manages
+# this for you). See ../README.md#standalone-docker-deployment.
+#
+# Copy to conf/appdaemon.yaml (alongside this repo's own apps/apps.yaml.example,
+# which goes to conf/apps/apps.yaml) and fill in your values.
+#
+# Unlike the add-on — which gets an auto-injected Supervisor token, no manual auth
+# needed — a standalone deployment has no such mechanism. You create your own
+# long-lived access token (Home Assistant → your profile → Security tab →
+# Long-Lived Access Tokens → Create Token) and store it in secrets.yaml
+# (see secrets.yaml.example), never directly in this file.
+
+appdaemon:
+  latitude: 47.0             # ← change this
+  longitude: 8.0              # ← change this
+  elevation: 0                 # ← change this
+  time_zone: Europe/Zurich  # ← change this (IANA timezone name)
+
+  plugins:
+    # Required. This alone is the complete interface to Home Assistant: it reads
+    # your energy/weather/EV history to train the model, and writes the forecast
+    # back via set_state(). Forecast sensors work immediately with just this —
+    # visible in Developer Tools → States, usable in dashboards/automations —
+    # with no MQTT broker involved at all.
+    HASS:
+      type: hass
+      namespace: default
+      ha_url: http://homeassistant.local:8123   # ← change this
+      token: !secret hass_token
+
+    # Optional — only needed if you enable `mqtt_discovery: true` in apps.yaml.
+    # Registers proper HA entities (area assignment, renaming) instead of bare
+    # states. See ../README.md#mqtt-discovery-optional for the full walkthrough.
+    # MQTT:
+    #   type: mqtt
+    #   namespace: mqtt
+    #   client_host: 192.168.1.x
+    #   client_port: 1883
+    #   client_user: your_mqtt_username
+    #   client_password: !secret mqtt_password
