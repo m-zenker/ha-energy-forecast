@@ -21,6 +21,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - `README.md`, `standalone/` — added a Standalone Docker Deployment section and example files (`Dockerfile`, `docker-compose.yml`, `appdaemon.yaml.example`, `secrets.yaml.example`) for running AppDaemon outside the HA Supervisor add-on. Uses a plain `python:3.12-slim` base rather than an Alpine image, and wires credentials through AppDaemon's `!secret` mechanism against a gitignored `secrets.yaml` instead of typing them directly into `appdaemon.yaml`. Addresses discussion #6. (Ported from GitHub PR #23 by @housemaister.)
 
+### Fixed
+- `apps/energy_forecast/model.py`, `tests/test_setpoint_projection.py` — `sensor.energy_forecast_thermal_pressure_net` could report a stale, non-zero deficit when heating was genuinely off (e.g. summer mode), because indoor-temperature projection used the seasonal hysteresis-projected setpoint instead of the live thermostat setpoint for the current hour — a manual override (thermostats set to 7°C) was masked by the model's own "should be on" projection, producing a spurious ~7.2 reading. Fixed by blending the live setpoint (near-term, full trust) with the hysteresis-projected setpoint (far-term forecast) in `_project_indoor_temps()`/`_engineer_features()`.
+
 ---
 
 ## [0.11.13] - 2026-09-17

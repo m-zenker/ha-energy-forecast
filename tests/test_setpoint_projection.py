@@ -325,8 +325,37 @@ def _make_weather_df(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.DataFrame:
 
 
 class TestThermalPressureWithHysteresis:
-    def test_pressure_zero_when_off(self):
-        """Setpoint 12 °C, T_indoor ~19 °C → setpoint < indoor → thermal_pressure = 0."""
+    def test_pressure_zero_when_off_and_live_setpoint_agrees(self):
+        """Setpoint 12°C live AND hysteresis-off, T_indoor ~19°C → genuinely no
+        deficit anywhere → thermal_pressure = 0."""
+        ts = _future_ts(n=6)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [0] * 6)
+
+        climate_dfs = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
+        weather_df = _make_weather_df(ts, temp=5.0)
+        feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
+        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
+            "Live setpoint (12) and hysteresis-off setpoint (12) agree — no deficit should exist anywhere"
+        )
+
+    def test_live_deficit_not_masked_by_hysteresis_off(self):
+        """Live setpoint 21°C (thermostat genuinely calling for heat) but
+        hysteresis projects OFF (setpoint_off=12) because outdoor temp is mild.
+        The full-trust window must surface the real, live deficit instead of
+        the hysteresis model's zero — this is the bug from the original
+        7.2 °C·m² sensor report (live summer setpoint overridden by a stale
+        seasonal projection)."""
         ts = _future_ts(n=6)
         outdoor = _outdoor_series(ts, temp=5.0)
         cr = _climate_recent(ts, setpoint=21.0, current=19.0)
@@ -344,8 +373,9 @@ class TestThermalPressureWithHysteresis:
         future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
         weather_df = _make_weather_df(ts, temp=5.0)
         feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
-        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
-            "Heating OFF → setpoint(12) < T_indoor → thermal_pressure must be 0"
+        assert feat["thermal_pressure"].iloc[0] == pytest.approx(2.0, abs=1e-6), (
+            "Hour 0 (published sensor value) must use the live setpoint (21) "
+            "against indoor (~19), giving a real ~2.0 deficit — not 0"
         )
 
     def test_pressure_positive_when_on(self):
