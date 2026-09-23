@@ -85,7 +85,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   household load.
 
 ### Fixed
-- `apps/energy_forecast/model.py`, `tests/test_setpoint_projection.py` — `sensor.energy_forecast_thermal_pressure_net` could report a stale, non-zero deficit when heating was genuinely off (e.g. summer mode), because indoor-temperature projection used the seasonal hysteresis-projected setpoint instead of the live thermostat setpoint for the current hour — a manual override (thermostats set to 7°C) was masked by the model's own "should be on" projection, producing a spurious ~7.2 reading. Fixed by blending the live setpoint (near-term, full trust) with the hysteresis-projected setpoint (far-term forecast) in `_project_indoor_temps()`/`_engineer_features()`.
+- `apps/energy_forecast/model.py`, `tests/test_setpoint_projection.py` — `sensor.energy_forecast_thermal_pressure_net` could report a stale, non-zero deficit when heating was genuinely off (e.g. summer mode), because indoor-temperature projection used the seasonal hysteresis-projected setpoint instead of the live thermostat setpoint for the current hour — a manual override (thermostats set to 7°C) was masked by the model's own "should be on" projection, producing a spurious ~7.2 reading. Fixed by blending the live setpoint (near-term, full trust) with the hysteresis-projected setpoint (far-term forecast) in `_project_indoor_temps()`/`_engineer_features()`. The multi-hour-ahead forecast horizon (beyond the blend window) still transitions to the seasonal hysteresis projection as before — only the current-hour published sensor and the near-term blend window are affected by this fix.
 
 ---
 

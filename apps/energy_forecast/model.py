@@ -2899,7 +2899,7 @@ def _project_indoor_temps(
     heating_active_series: pd.Series | None = None,
     setpoint_on: float | None = None,
     setpoint_off: float | None = None,
-) -> dict[str, pd.Series]:
+) -> dict[str, pd.DataFrame]:
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
@@ -2908,10 +2908,15 @@ def _project_indoor_temps(
     Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
     otherwise falls back to the most-recent ``setpoint``.
 
-    Returns a dict ``{entity_id: pd.Series}`` with ``current_temp`` projections
-    indexed by *future_timestamps*. These can be passed as *climate_dfs* to
+    Returns a dict ``{entity_id: pd.DataFrame}`` with ``timestamp``,
+    ``current_temp``, ``setpoint`` and ``deficit`` columns indexed by
+    *future_timestamps*. ``setpoint`` is the pure hysteresis-projected
+    trajectory; ``deficit`` blends the live setpoint (near-term, full trust)
+    with that hysteresis-projected setpoint (far-term) — see the blend block
+    below. These DataFrames can be passed as *climate_dfs* to
     ``_engineer_features()`` so that prediction-time thermal pressure reflects
-    projected — rather than stale — indoor temperatures.
+    projected — rather than stale — indoor temperatures, using ``deficit``
+    directly when present.
     """
     import numpy as np
     import pandas as pd
