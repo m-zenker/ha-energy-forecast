@@ -326,10 +326,7 @@ def _make_weather_df(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.DataFrame:
 
 class TestThermalPressureWithHysteresis:
     def test_pressure_zero_when_off(self):
-        """When heating OFF and live setpoint equals hysteresis-projected setpoint,
-        thermal_pressure reflects the deficit. When live is 21 but heating is OFF
-        (setpoint_off=12), the blended deficit reflects the live setpoint in the
-        near-term, so pressure should be non-zero (not zero as in pre-blending era)."""
+        """Setpoint 12 °C, T_indoor ~19 °C → setpoint < indoor → thermal_pressure = 0."""
         ts = _future_ts(n=6)
         outdoor = _outdoor_series(ts, temp=5.0)
         cr = _climate_recent(ts, setpoint=21.0, current=19.0)
@@ -347,10 +344,8 @@ class TestThermalPressureWithHysteresis:
         future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
         weather_df = _make_weather_df(ts, temp=5.0)
         feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
-        # With deficit blending (Task 1), live setpoint 21 > indoor 19 produces non-zero
-        # pressure in near-term, transitioning towards 0 as hysteresis takes over.
-        assert feat["thermal_pressure"].iloc[0] > 0.0, (
-            "Near-term thermal pressure should reflect live setpoint (21 > 19)"
+        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
+            "Heating OFF → setpoint(12) < T_indoor → thermal_pressure must be 0"
         )
 
     def test_pressure_positive_when_on(self):
