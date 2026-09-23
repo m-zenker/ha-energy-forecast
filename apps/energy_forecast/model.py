@@ -3210,10 +3210,17 @@ def _engineer_features(
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
                 continue
-            c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
+            has_deficit = "deficit" in c_df.columns
+            cols = ["timestamp", "current_temp", "setpoint"] + (["deficit"] if has_deficit else [])
+            c = c_df[cols].copy()
             c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
             c = c.sort_values("timestamp")
-            delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
+            if has_deficit:
+                # Precomputed by _project_indoor_temps: blends the live setpoint
+                # (near-term) with the hysteresis-projected setpoint (far-term).
+                delta = c["deficit"].clip(lower=0.0)
+            else:
+                delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
             delta.index = c["timestamp"]
             delta_series[eid] = delta
             if ts_index is None:
