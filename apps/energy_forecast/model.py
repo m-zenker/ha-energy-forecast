@@ -2899,7 +2899,7 @@ def _project_indoor_temps(
     heating_active_series: pd.Series | None = None,
     setpoint_on: float | None = None,
     setpoint_off: float | None = None,
-) -> dict[str, pd.Series]:
+) -> dict[str, pd.DataFrame]:
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
@@ -2908,10 +2908,15 @@ def _project_indoor_temps(
     Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
     otherwise falls back to the most-recent ``setpoint``.
 
-    Returns a dict ``{entity_id: pd.Series}`` with ``current_temp`` projections
-    indexed by *future_timestamps*. These can be passed as *climate_dfs* to
+    Returns a dict ``{entity_id: pd.DataFrame}`` with ``timestamp``,
+    ``current_temp``, ``setpoint`` and ``deficit`` columns indexed by
+    *future_timestamps*. ``setpoint`` is the pure hysteresis-projected
+    trajectory; ``deficit`` blends the live setpoint (near-term, full trust)
+    with that hysteresis-projected setpoint (far-term) — see the blend block
+    below. These DataFrames can be passed as *climate_dfs* to
     ``_engineer_features()`` so that prediction-time thermal pressure reflects
-    projected — rather than stale — indoor temperatures.
+    projected — rather than stale — indoor temperatures, using ``deficit``
+    directly when present.
     """
     import numpy as np
     import pandas as pd
@@ -2953,11 +2958,27 @@ def _project_indoor_temps(
         else:
             setpoint_arr = np.full(len(future_timestamps), setpoint_val)
 
+        # ── Deficit blend: live setpoint (near-term) → hysteresis-projected
+        # setpoint (far-term) ────────────────────────────────────────────
+        # The published sensor reads hour 0 of this projection, so hour 0 (and
+        # the full-trust window around it) must reflect what the thermostat is
+        # ACTUALLY set to right now — not what a seasonal on/off hysteresis model
+        # thinks it *should* be set to. Beyond SENSOR_BLEND_HOURS we trust the
+        # hysteresis projection fully, same rationale as the outdoor-temp blend
+        # in _build_prediction_temp_df.
+        live_deficit_arr = np.maximum(0.0, setpoint_val - t_in_arr)
+        hyst_deficit_arr = np.maximum(0.0, setpoint_arr - t_in_arr)
+        hours_ahead = np.arange(len(future_timestamps), dtype=float)
+        blend_span = max(SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS, 1)
+        alpha = np.clip((hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_span, 0.0, 1.0)
+        deficit_arr = live_deficit_arr * (1.0 - alpha) + hyst_deficit_arr * alpha
+
         projected_df = pd.DataFrame(
             {
                 "timestamp": future_timestamps,
                 "current_temp": t_in_arr,
                 "setpoint": setpoint_arr,
+                "deficit": deficit_arr,
             }
         )
         result[eid] = projected_df
@@ -3194,10 +3215,17 @@ def _engineer_features(
         for eid, c_df in climate_dfs.items():
             if c_df.empty:
                 continue
-            c = c_df[["timestamp", "current_temp", "setpoint"]].copy()
+            has_deficit = "deficit" in c_df.columns
+            cols = ["timestamp", "current_temp", "setpoint"] + (["deficit"] if has_deficit else [])
+            c = c_df[cols].copy()
             c["timestamp"] = pd.to_datetime(c["timestamp"]).dt.floor("1h")
             c = c.sort_values("timestamp")
-            delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
+            if has_deficit:
+                # Precomputed by _project_indoor_temps: blends the live setpoint
+                # (near-term) with the hysteresis-projected setpoint (far-term).
+                delta = c["deficit"].clip(lower=0.0)
+            else:
+                delta = (c["setpoint"] - c["current_temp"]).clip(lower=0.0)
             delta.index = c["timestamp"]
             delta_series[eid] = delta
             if ts_index is None:
