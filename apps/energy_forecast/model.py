@@ -2953,11 +2953,27 @@ def _project_indoor_temps(
         else:
             setpoint_arr = np.full(len(future_timestamps), setpoint_val)
 
+        # ── Deficit blend: live setpoint (near-term) → hysteresis-projected
+        # setpoint (far-term) ────────────────────────────────────────────
+        # The published sensor reads hour 0 of this projection, so hour 0 (and
+        # the full-trust window around it) must reflect what the thermostat is
+        # ACTUALLY set to right now — not what a seasonal on/off hysteresis model
+        # thinks it *should* be set to. Beyond SENSOR_BLEND_HOURS we trust the
+        # hysteresis projection fully, same rationale as the outdoor-temp blend
+        # in _build_prediction_temp_df.
+        live_deficit_arr = np.maximum(0.0, setpoint_val - t_in_arr)
+        hyst_deficit_arr = np.maximum(0.0, setpoint_arr - t_in_arr)
+        hours_ahead = np.arange(len(future_timestamps), dtype=float)
+        blend_span = max(SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS, 1)
+        alpha = np.clip((hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_span, 0.0, 1.0)
+        deficit_arr = live_deficit_arr * (1.0 - alpha) + hyst_deficit_arr * alpha
+
         projected_df = pd.DataFrame(
             {
                 "timestamp": future_timestamps,
                 "current_temp": t_in_arr,
                 "setpoint": setpoint_arr,
+                "deficit": deficit_arr,
             }
         )
         result[eid] = projected_df
