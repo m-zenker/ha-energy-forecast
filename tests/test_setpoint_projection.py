@@ -257,6 +257,55 @@ class TestDeficitBlending:
         np.testing.assert_allclose(deficit, expected, atol=1e-9)
 
 
+# ── _engineer_features: prefers the precomputed 'deficit' column ───────────────
+
+
+def _make_bare_df(timestamps) -> pd.DataFrame:
+    """Minimal energy df with gross_kwh for _engineer_features input."""
+    n = len(timestamps)
+    return pd.DataFrame({"timestamp": pd.to_datetime(timestamps), "gross_kwh": [1.5] * n})
+
+
+class TestThermalPressurePrefersDeficitColumn:
+    def test_uses_deficit_column_when_present(self):
+        """When climate_dfs carries a precomputed 'deficit' column (as produced
+        by _project_indoor_temps' blending), _engineer_features must use it
+        directly instead of recomputing (setpoint - current_temp)."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": [19.0] * 2,
+                    "setpoint": [21.0] * 2,  # would give delta=2.0 if recomputed
+                    "deficit": [5.0] * 2,  # pre-blended value — must win
+                }
+            )
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        np.testing.assert_allclose(result["thermal_pressure"].values, 5.0)
+
+    def test_falls_back_to_setpoint_minus_current_when_no_deficit_column(self):
+        """Historical/training-time climate_dfs (no 'deficit' column) keep the
+        original setpoint-minus-current_temp calculation, unchanged."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": [19.0] * 2,
+                    "setpoint": [21.0] * 2,
+                }
+            )
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        np.testing.assert_allclose(result["thermal_pressure"].values, 2.0)
+
+
 # ── thermal_pressure via _engineer_features ────────────────────────────────────
 
 
@@ -277,7 +326,10 @@ def _make_weather_df(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.DataFrame:
 
 class TestThermalPressureWithHysteresis:
     def test_pressure_zero_when_off(self):
-        """Setpoint 12 °C, T_indoor ~19 °C → setpoint < indoor → thermal_pressure = 0."""
+        """When heating OFF and live setpoint equals hysteresis-projected setpoint,
+        thermal_pressure reflects the deficit. When live is 21 but heating is OFF
+        (setpoint_off=12), the blended deficit reflects the live setpoint in the
+        near-term, so pressure should be non-zero (not zero as in pre-blending era)."""
         ts = _future_ts(n=6)
         outdoor = _outdoor_series(ts, temp=5.0)
         cr = _climate_recent(ts, setpoint=21.0, current=19.0)
@@ -295,8 +347,10 @@ class TestThermalPressureWithHysteresis:
         future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
         weather_df = _make_weather_df(ts, temp=5.0)
         feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
-        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
-            "Heating OFF → setpoint(12) < T_indoor → thermal_pressure must be 0"
+        # With deficit blending (Task 1), live setpoint 21 > indoor 19 produces non-zero
+        # pressure in near-term, transitioning towards 0 as hysteresis takes over.
+        assert feat["thermal_pressure"].iloc[0] > 0.0, (
+            "Near-term thermal pressure should reflect live setpoint (21 > 19)"
         )
 
     def test_pressure_positive_when_on(self):
