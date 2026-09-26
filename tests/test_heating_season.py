@@ -11,6 +11,7 @@ from energy_forecast.heating_season import (
     HeatingThresholds,
     daily_heating_label,
     daily_mean_temp,
+    heating_feature_df,
     hourly_label_df,
     learn_thresholds,
     load_thresholds,
@@ -58,7 +59,7 @@ class TestDailyHeatingLabel:
     def test_meter_label_threshold(self):
         # day 1: 0.1 kWh/h * 24 = 2.4 kWh -> 1 ; day 2: 0.01 * 24 = 0.24 kWh -> 0
         m = _hourly("2026-01-01", 2, lambda t: 0.1 if t.day == 1 else 0.01).rename(columns={"v": "kwh"})
-        label, src = daily_heating_label(m, None)
+        label, src = daily_heating_label(m, None, min_meter_days=1)
         assert src == "meter"
         assert list(label.values) == [1, 0]
 
@@ -213,3 +214,36 @@ class TestPersistence:
 
     def test_rule_matches_default_constants(self):
         assert DEFAULT_ON_BELOW == pytest.approx(12.0) and DEFAULT_OFF_ABOVE == pytest.approx(16.0)
+
+
+class TestReviewFixes:
+    def test_short_meter_history_falls_back_to_entity(self):
+        """A freshly added sub-meter (10 days) must not displace a long switch history."""
+        meter = _hourly("2026-06-01", 10, lambda t: 0.0).rename(columns={"v": "kwh"})
+        entity = _hourly("2026-03-01", 100, lambda t: 1.0 if t.month < 5 else 0.0).rename(
+            columns={"v": "heating_active"}
+        )
+        label, src = daily_heating_label(meter, entity)
+        assert src == "entity"
+        assert len(label) == 100
+
+    def test_feature_layers_meter_then_entity_then_carry(self):
+        """Meter days win; gaps and pre-meter history come from the switch; trailing hours carry the last label."""
+        label = pd.Series([1, 0], index=pd.DatetimeIndex(["2026-01-02", "2026-01-04"]))  # 01-03 is a meter outage day
+        entity = _hourly("2026-01-01", 5, lambda t: 1.0 if t.day in (1, 3) else 0.0).rename(
+            columns={"v": "heating_active"}
+        )
+        df = heating_feature_df(label, entity, until=pd.Timestamp("2026-01-05 10:00"))
+        s = df.set_index("timestamp")["heating_active"]
+        assert s.loc["2026-01-01 05:00"] == 1  # pre-meter: switch
+        assert s.loc["2026-01-02 05:00"] == 1  # meter day
+        assert s.loc["2026-01-03 05:00"] == 1  # outage day: switch
+        assert s.loc["2026-01-04 05:00"] == 0  # meter day
+        assert s.loc["2026-01-05 10:00"] == 0  # after last label: carried, not switch (0 here too) and not fillna(1)
+
+    def test_feature_carry_forward_beats_default_on(self):
+        """Summer retrain at 10:00: today's partial hours must not become heating ON."""
+        label = pd.Series([0, 0], index=pd.date_range("2026-07-01", periods=2, freq="D"))
+        df = heating_feature_df(label, None, until=pd.Timestamp("2026-07-03 10:00"))
+        s = df.set_index("timestamp")["heating_active"]
+        assert (s.loc["2026-07-03 00:00":"2026-07-03 10:00"] == 0).all()

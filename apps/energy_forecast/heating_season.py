@@ -68,11 +68,14 @@ def daily_heating_label(
     heating_sub_meter_df: pd.DataFrame | None,
     heating_active_df: pd.DataFrame | None,
     meter_day_kwh: float = METER_DAY_KWH,
+    min_meter_days: int = MIN_LABEL_DAYS,
 ) -> tuple[pd.Series, str]:
+    """Daily 0/1 heating label. The meter tier needs min_meter_days labelled days — a freshly
+    added sub-meter must not displace a long switch history (it falls through to the entity)."""
     if heating_sub_meter_df is not None and not heating_sub_meter_df.empty:
         m = heating_sub_meter_df.set_index(pd.to_datetime(heating_sub_meter_df["timestamp"]))["kwh"].astype(float)
         daily = _daily(m, "sum")
-        if not daily.empty:
+        if len(daily) >= min_meter_days:
             return (daily > meter_day_kwh).astype(int), "meter"
     if heating_active_df is not None and not heating_active_df.empty:
         e = heating_active_df.set_index(pd.to_datetime(heating_active_df["timestamp"]))["heating_active"].astype(float)
@@ -138,6 +141,32 @@ def hourly_label_df(label: pd.Series) -> pd.DataFrame:
     df = df.dropna(subset=["heating_active"])
     df["heating_active"] = df["heating_active"].astype(int)
     return df.reset_index(drop=True)
+
+
+def heating_feature_df(
+    label: pd.Series, heating_active_df: pd.DataFrame | None, until: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Hourly heating_active training feature for the meter tier, layered:
+    meter-label day > switch entity (pre-meter history and meter outage days) > last label carried
+    forward to `until` (today's partial day). Hours covered by none are absent (model fills 1)."""
+    parts = [hourly_label_df(label)]
+    if heating_active_df is not None and not heating_active_df.empty:
+        e = heating_active_df.set_index(pd.to_datetime(heating_active_df["timestamp"]))["heating_active"].astype(float)
+        parts.append(pd.DataFrame({"timestamp": (h := e.resample("1h").last().ffill()).index, "entity": h.values}))
+    start = min(p["timestamp"].min() for p in parts if not p.empty) if any(not p.empty for p in parts) else None
+    if start is None:
+        return pd.DataFrame(columns=["timestamp", "heating_active"])
+    end = max([p["timestamp"].max() for p in parts if not p.empty] + ([until.floor("1h")] if until is not None else []))
+    hours = pd.date_range(start, end, freq="1h")
+    out = pd.Series(np.nan, index=hours)
+    if not label.empty:
+        out[:] = label.reindex(hours.normalize()).values
+        after_last = hours >= label.index.max() + pd.Timedelta(days=1)
+        out[after_last] = float(label.iloc[-1])
+    if len(parts) > 1:
+        out = out.fillna(parts[1].set_index("timestamp")["entity"].reindex(hours).round())
+    out = out.dropna()
+    return pd.DataFrame({"timestamp": out.index, "heating_active": out.values.astype(int)})
 
 
 def meter_prior_and_today(

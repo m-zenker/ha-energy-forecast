@@ -395,6 +395,8 @@ class EnergyForecast(hass.Hass):
         self._cached_sub_sensors: Any = None
         self._cached_away_series: Any = None
         self._cached_people_home: Any = None
+        self._cached_heating_active_series: Any = None
+        self._cached_heating_setpoints: tuple[float | None, float | None] = (None, None)
         self._cached_climate_recent: Any = None
         self._cached_dhw_recent: Any = None
 
@@ -1132,6 +1134,9 @@ class EnergyForecast(hass.Hass):
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
                 room_areas=self._climate_room_areas or None,
+                heating_active_series=self._cached_heating_active_series,
+                setpoint_on=self._cached_heating_setpoints[0],
+                setpoint_off=self._cached_heating_setpoints[1],
                 physics_model=self._physics_model,
                 heating_buffer_temp_recent=self._physics_heating_buffer_df,
                 dhw_schedule_override=dhw_schedule,
@@ -1804,7 +1809,15 @@ class EnergyForecast(hass.Hass):
             self._heating_thresholds.n_days,
             self._heating_thresholds.mismatch_rate,
         )
-        heating_feature_df = heating_season.hourly_label_df(heating_label) if heating_label_source == "meter" else None
+        heating_feature_df = (
+            heating_season.heating_feature_df(
+                heating_label,
+                heating_active_df if not heating_active_df.empty else None,
+                until=pd.Timestamp.now(tz=self._timezone).tz_localize(None),
+            )
+            if heating_label_source == "meter"
+            else None
+        )
 
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
@@ -2046,6 +2059,8 @@ class EnergyForecast(hass.Hass):
         self._cached_people_home = people_home_series
         self._cached_climate_recent = climate_recent or None
         self._cached_dhw_recent = dhw_recent if not dhw_recent.empty else None
+        self._cached_heating_active_series = heating_active_series
+        self._cached_heating_setpoints = (heating_setpoint_on, heating_setpoint_off)
 
         # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
         # all receive the pre-computed result to avoid triple feature engineering.

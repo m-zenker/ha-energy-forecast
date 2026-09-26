@@ -29,6 +29,8 @@ def _make_app(cached_df=None):
     app._cached_people_home = None
     app._cached_climate_recent = None
     app._cached_dhw_recent = None
+    app._cached_heating_active_series = None
+    app._cached_heating_setpoints = (None, None)
     app._climate_room_areas = {}
     app._timezone = "Europe/Zurich"
     app._mqtt_discovery = False
@@ -618,3 +620,24 @@ class TestPublishScenarioMqtt:
         EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
         app._mqtt_publish_discovery.assert_not_called()
         assert app._mqtt_set_sensor.call_count == 11
+
+
+class TestGetScenarioHeatingProjection:
+    def test_scenario_receives_cached_heating_projection(self):
+        """Scenarios must use the same heating_active projection as the main forecast, not the default 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        series = pd.Series(0, index=pd.DatetimeIndex(cached_df["timestamp"]))
+        app._cached_heating_active_series = series
+        app._cached_heating_setpoints = (20.0, 12.0)
+        result = cached_df.copy()
+        result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = result
+
+        EnergyForecast._get_scenario_cb(app, "homeassistant", "energy_forecast", "get_scenario", {"schedule": {}})
+
+        kwargs = app._ml_model.predict_scenario.call_args.kwargs
+        assert kwargs["heating_active_series"] is series
+        assert (kwargs["setpoint_on"], kwargs["setpoint_off"]) == (20.0, 12.0)
