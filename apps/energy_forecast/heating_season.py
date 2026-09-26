@@ -57,6 +57,8 @@ def _daily(series: pd.Series, how: str) -> pd.Series:
 
 
 def daily_mean_temp(weather_df: pd.DataFrame) -> pd.Series:
+    if "temp_c" not in weather_df.columns:
+        return pd.Series(dtype=float)
     w = weather_df[["timestamp", "temp_c"]].dropna()
     s = w.set_index(pd.to_datetime(w["timestamp"]))["temp_c"].astype(float)
     return _daily(s, "mean")

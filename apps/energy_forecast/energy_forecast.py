@@ -32,7 +32,7 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, ha_data, weather
+from . import __version__, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
     EV_CHARGING_THRESHOLD_KWH,
@@ -302,8 +302,25 @@ class EnergyForecast(hass.Hass):
         self._dhw_buffer_sensor: str | None = self.args.get("dhw_buffer_sensor") or None
         self._heating_active_entity: str | None = self.args.get("heating_system_active_entity") or None
         self._climate_room_areas: dict[str, float] = self._parse_room_areas(self.args.get("climate_room_areas") or {})
-        self._heating_temp_on: float = float(self.args.get("heating_temp_on", 14.0))
-        self._heating_temp_off: float = float(self.args.get("heating_temp_off", 18.0))
+        # Optional manual override of the learned DAILY-MEAN thresholds (heating_season.py).
+        # Both must be set; one alone is ignored so a stale single key can't pin half the rule.
+        _temp_on = self.args.get("heating_temp_on")
+        _temp_off = self.args.get("heating_temp_off")
+        if (_temp_on is None) != (_temp_off is None):
+            _LOGGER.warning(
+                "heating_temp_on/heating_temp_off must be set together (daily-mean °C) — ignoring %s, "
+                "thresholds will be learned from history",
+                "heating_temp_on" if _temp_on is not None else "heating_temp_off",
+            )
+            _temp_on = _temp_off = None
+        self._heating_temp_on_cfg: float | None = float(_temp_on) if _temp_on is not None else None
+        self._heating_temp_off_cfg: float | None = float(_temp_off) if _temp_off is not None else None
+        self._heating_thresholds_path = Path(__file__).parent / "models" / "heating_thresholds.json"
+        self._heating_thresholds = heating_season.resolve_thresholds(
+            self._heating_temp_on_cfg,
+            self._heating_temp_off_cfg,
+            heating_season.load_thresholds(self._heating_thresholds_path) or heating_season.default_thresholds(),
+        )
         self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
 
@@ -1764,6 +1781,31 @@ class EnergyForecast(hass.Hass):
                 heating_sub_meter_entity,
             )
 
+        # ── Heating season: daily label (meter > switch > none) + learned daily-mean thresholds ──
+        # The label also becomes the heating_active training feature when it comes from the meter,
+        # so training and the daily-rule projection in _build_heating_active_projection agree.
+        heating_label, heating_label_source = heating_season.daily_heating_label(
+            self._cached_heating_sub_meter_df,
+            heating_active_df if not heating_active_df.empty else None,
+        )
+        learned_thresholds = heating_season.learn_thresholds(
+            heating_label, heating_season.daily_mean_temp(weather_df), heating_label_source
+        )
+        self._heating_thresholds = heating_season.resolve_thresholds(
+            self._heating_temp_on_cfg, self._heating_temp_off_cfg, learned_thresholds
+        )
+        heating_season.save_thresholds(self._heating_thresholds, self._heating_thresholds_path)
+        _LOGGER.info(
+            "Heating season: on < %.1f °C, off > %.1f °C daily mean (%s, label=%s, %d days, mismatch=%s)",
+            self._heating_thresholds.on_below,
+            self._heating_thresholds.off_above,
+            self._heating_thresholds.source,
+            self._heating_thresholds.label_source,
+            self._heating_thresholds.n_days,
+            self._heating_thresholds.mismatch_rate,
+        )
+        heating_feature_df = heating_season.hourly_label_df(heating_label) if heating_label_source == "meter" else None
+
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
 
@@ -1789,6 +1831,7 @@ class EnergyForecast(hass.Hass):
             physics_model=self._physics_model,
             heating_buffer_temp_df=self._physics_heating_buffer_df,
             use_physics_residual=self._effective_use_physics_residual(),
+            heating_feature_df=heating_feature_df,
         )
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
         self._last_adaptive_retrain = self._last_trained_local()
@@ -2355,8 +2398,8 @@ class EnergyForecast(hass.Hass):
             s_off = live_setpoint if live_setpoint is not None else self._heating_setpoint_off
             s_on = self._heating_setpoint_on
 
-        temp_on = self._heating_temp_on
-        temp_off = self._heating_temp_off
+        temp_on = self._heating_thresholds.on_below
+        temp_off = self._heating_thresholds.off_above
 
         # Align outdoor forecast temps to future hours
         forecast_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]

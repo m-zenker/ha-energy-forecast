@@ -7168,3 +7168,35 @@ class TestActiveLagsBoundaryAcrossRetrains:
         energy_narrow = self._energy_df(170)  # 170 - 72 = 98 < 100: lag_72h now inactive
         m.train(energy_narrow, self._weather_df(energy_narrow["timestamp"]), outdoor_df=None, weight_halflife_days=0)
         assert "lag_72h" not in m.feature_cols
+
+
+class TestHeatingFeatureDf:
+    def test_feature_df_overrides_heating_active_column(self, tmp_path, monkeypatch):
+        """heating_feature_df (meter label) must drive the heating_active feature, not the raw switch."""
+        import energy_forecast.model as model_mod
+
+        captured = {}
+        real = model_mod._engineer_features
+
+        def spy(*args, **kwargs):
+            captured["heating_active_df"] = kwargs.get("heating_active_df")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(model_mod, "_engineer_features", spy)
+        n = 24 * 40
+        ts = pd.date_range("2026-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = _make_weather_df(ts)
+        switch = pd.DataFrame({"timestamp": ts, "heating_active": 0})
+        feature = pd.DataFrame({"timestamp": ts, "heating_active": 1})
+        m = model_mod.EnergyForecastModel(tmp_path)
+        m.train(
+            energy,
+            weather,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            heating_active_df=switch,
+            heating_feature_df=feature,
+        )
+        assert captured["heating_active_df"] is feature

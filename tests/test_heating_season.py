@@ -45,6 +45,10 @@ class TestDailyMeanTemp:
         assert list(m.values) == [5.0, 10.0]
         assert m.index[0] == pd.Timestamp("2026-01-01")
 
+    def test_missing_temp_column_yields_empty(self):
+        """A weather frame without temp_c (e.g. an empty fetch) must not break retrain — defaults apply."""
+        assert daily_mean_temp(pd.DataFrame(columns=["timestamp"])).empty
+
     def test_drops_short_days(self):
         w = _weather("2026-01-01", 2, [5.0, 10.0]).iloc[:30]  # day 2 has only 6 hours
         assert len(daily_mean_temp(w)) == 1

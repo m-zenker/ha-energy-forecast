@@ -4033,6 +4033,9 @@ class _FakeRetrain:
         self._physics_config: dict = {}
         self._fetch_physics_sensor_histories = lambda **kwargs: None
         self._excluded_range_warned = set()
+        self._heating_temp_on_cfg = None
+        self._heating_temp_off_cfg = None
+        self._heating_thresholds_path = Path(cache_path).parent / "heating_thresholds.json"
 
     def log(self, msg, level="INFO"):
         pass
@@ -4769,3 +4772,26 @@ class TestTimezoneAlignmentWarning:
         app.get_timezone = MagicMock(return_value="America/New_York")
         app.initialize()
         assert app._timezone == "America/New_York"
+
+
+class TestHeatingSeasonConfig:
+    """heating_temp_on/off are optional daily-mean overrides; set together or not at all (plan 2026-09-25)."""
+
+    def test_thresholds_default_when_unset(self):
+        app = _make_app({})
+        app.initialize()
+        assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
+        assert app._heating_thresholds.source in ("default", "learned")
+
+    def test_both_thresholds_become_config_override(self):
+        app = _make_app({"heating_temp_on": 11.0, "heating_temp_off": 15.0})
+        app.initialize()
+        assert (app._heating_thresholds.on_below, app._heating_thresholds.off_above) == (11.0, 15.0)
+        assert app._heating_thresholds.source == "config"
+
+    def test_single_threshold_override_ignored(self):
+        app = _make_app({"heating_temp_on": 12.0})
+        app.initialize()
+        assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
+        warnings = [str(c.args[0]) for c in app.logger.warning.call_args_list if c.args]
+        assert any("must be set together" in w for w in warnings)
