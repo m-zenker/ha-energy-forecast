@@ -37,3 +37,13 @@ def _clear_srg_caches():
     weather._srg_token = None
     weather._srg_token_expires_at = 0.0
     weather._srg_geo_id.clear()
+
+
+@pytest.fixture(autouse=True)
+def _heating_thresholds_to_tmp(tmp_path, monkeypatch):
+    """Tests that run the real initialize()+_retrain() resolve the real apps/.../models path —
+    redirect heating_season.save_thresholds into tmp_path so no test writes into the repo."""
+    from energy_forecast import heating_season
+
+    real_save = heating_season.save_thresholds
+    monkeypatch.setattr(heating_season, "save_thresholds", lambda t, path: real_save(t, tmp_path / path.name))

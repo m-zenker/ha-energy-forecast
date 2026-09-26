@@ -342,6 +342,7 @@ class EnergyForecastModel:
         heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         heating_sub_meter_df: pd.DataFrame | None = None,  # cols: timestamp, kwh — space-heating sub-meter (#92)
         use_physics_residual: bool = False,
+        heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -645,7 +646,7 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
-            heating_active_df=heating_active_df,
+            heating_active_df=heating_feature_df if heating_feature_df is not None else heating_active_df,
             physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )

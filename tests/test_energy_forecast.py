@@ -26,6 +26,7 @@ from energy_forecast.energy_forecast import (
     _compute_live_mae,
     _subtract_sub_sensors,
 )
+from energy_forecast.heating_season import default_thresholds
 from energy_forecast.model import EnergyForecastModel
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -1170,6 +1171,8 @@ class _FakeMqttSelf:
         self._mqtt_discovery_prefix = mqtt_discovery_prefix
         self._mqtt_intervals_discovered = False
         self._physics_model = None
+        self._heating_active_entity = None
+        self._heating_thresholds = default_thresholds()
         self._publishes: list[dict] = []  # records all mqtt_publish() calls
         self._warnings: list[str] = []
         self._removed_entities: list[str] = []
@@ -1212,6 +1215,11 @@ class _FakeMqttSelf:
         from energy_forecast.energy_forecast import EnergyForecast
 
         return EnergyForecast._model_phase_attr(self)
+
+    def _heating_season_attr(self) -> dict | None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._heating_season_attr(self)
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
@@ -4033,6 +4041,9 @@ class _FakeRetrain:
         self._physics_config: dict = {}
         self._fetch_physics_sensor_histories = lambda **kwargs: None
         self._excluded_range_warned = set()
+        self._heating_temp_on_cfg = None
+        self._heating_temp_off_cfg = None
+        self._heating_thresholds_path = Path(cache_path).parent / "heating_thresholds.json"
 
     def log(self, msg, level="INFO"):
         pass
@@ -4303,6 +4314,7 @@ class _FakeUpdateSensors:
         self._climate_entities = []
         self._dhw_buffer_sensor = None
         self._heating_active_entity = None
+        self._heating_thresholds = default_thresholds()
         self._climate_room_areas = None
         self._shap_top_n = 0
         self._physics_model = None
@@ -4386,6 +4398,11 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._model_phase_attr(self)
 
+    def _heating_season_attr(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._heating_season_attr(self)
+
     def _aggregate(self, *args, **kwargs):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -4449,8 +4466,8 @@ class TestUpdateSensorsExcludedRanges:
             self._dhw_buffer_sensor / self._heating_active_entity are set
             (energy_forecast.py:1874, 1885).
           - self._build_heating_active_projection(): only called if
-            self._heating_active_entity and climate_recent are both truthy
-            (energy_forecast.py:1906).
+            self._heating_active_entity is set or the heating label source
+            is "meter".
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
             (energy_forecast.py:2058).
           - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
@@ -4769,3 +4786,26 @@ class TestTimezoneAlignmentWarning:
         app.get_timezone = MagicMock(return_value="America/New_York")
         app.initialize()
         assert app._timezone == "America/New_York"
+
+
+class TestHeatingSeasonConfig:
+    """heating_temp_on/off are optional daily-mean overrides; set together or not at all (plan 2026-09-25)."""
+
+    def test_thresholds_default_when_unset(self):
+        app = _make_app({})
+        app.initialize()
+        assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
+        assert app._heating_thresholds.source in ("default", "learned")
+
+    def test_both_thresholds_become_config_override(self):
+        app = _make_app({"heating_temp_on": 11.0, "heating_temp_off": 15.0})
+        app.initialize()
+        assert (app._heating_thresholds.on_below, app._heating_thresholds.off_above) == (11.0, 15.0)
+        assert app._heating_thresholds.source == "config"
+
+    def test_single_threshold_override_ignored(self):
+        app = _make_app({"heating_temp_on": 12.0})
+        app.initialize()
+        assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
+        warnings = [str(c.args[0]) for c in app.logger.warning.call_args_list if c.args]
+        assert any("must be set together" in w for w in warnings)

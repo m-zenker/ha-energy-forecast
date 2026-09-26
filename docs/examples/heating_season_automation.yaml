@@ -1,0 +1,71 @@
+# Example: daily heating-season switch for use with heating_system_active_entity.
+#
+# Decides once per day (17:00) from the forecast daily mean ((high + low) / 2) instead of
+# instantaneous outdoor readings, which fire on every cold dawn and flap. Keeps the switch
+# stable for at least 48 h, with an immediate frost override. Tune on_below / off_above to the
+# `heating_season` attribute hef publishes on sensor.energy_forecast_today after a few weeks.
+#
+# Replace: weather.home, input_boolean.heating_season, sensor.outdoor_temperature.
+id: heating_season_daily
+alias: Heating season (daily mean)
+mode: single
+triggers:
+  - trigger: time
+    at: "17:00:00"
+    id: daily
+  - trigger: numeric_state
+    entity_id: sensor.outdoor_temperature
+    below: 3
+    for:
+      hours: 2
+    id: frost
+variables:
+  weather_entity: weather.home
+  season_entity: input_boolean.heating_season
+  on_below: 13
+  off_above: 15
+  min_dwell_h: 48
+actions:
+  - action: weather.get_forecasts
+    target:
+      entity_id: "{{ weather_entity }}"
+    data:
+      type: daily
+    response_variable: fc
+  - variables:
+      means: >-
+        {% set ns = namespace(out={}) %}
+        {% for f in fc[weather_entity].forecast %}
+          {% if f.templow is defined and f.templow is not none %}
+            {% set d = (as_local(as_datetime(f.datetime)).date()) | string %}
+            {% set ns.out = dict(ns.out, **{d: ((f.temperature + f.templow) / 2) | round(1)}) %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.out }}
+      mean_today: "{{ means.get(now().date() | string) }}"
+      mean_tomorrow: "{{ means.get((now() + timedelta(days=1)).date() | string) }}"
+      is_on: "{{ is_state(season_entity, 'on') }}"
+      hours_since_change: "{{ ((now() - states[season_entity].last_changed).total_seconds() / 3600) | round(1) }}"
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ not is_on and (trigger.id == 'frost' or (
+                   mean_today is number and mean_tomorrow is number
+                   and mean_today < on_below and mean_tomorrow < on_below
+                   and hours_since_change >= min_dwell_h)) }}
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ season_entity }}"
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ is_on and trigger.id == 'daily'
+                 and mean_today is number and mean_tomorrow is number
+                 and mean_today > off_above and mean_tomorrow > off_above
+                 and hours_since_change >= min_dwell_h }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ season_entity }}"
