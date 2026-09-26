@@ -6,7 +6,9 @@ Current: **v0.11.4** — 2026-06-16, main. 627 tests.
 
 ## Current Status
 
-**dev:** v0.11.4-alpha-2 (same codebase — release commit was made on main only). **main:** v0.11.4 released 2026-06-16.
+**dev:** v0.12.0-alpha-23 (2026-09-26). **main:** v0.11.14 released 2026-09-21 (Rule-3 curated releases off main — dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season work).
+
+**Heating-season projection live (#98, 2026-09-26) — bias recheck due ~2026-10-03:** rising autumn MAE (`mae_7d` 0.234 → 0.298, bias ≈ +0.3 kWh/h below 12 °C) was traced to `heating_active` being projected ON from hourly outdoor temps while the heating stayed off. Now a once-per-day daily-mean rule with thresholds learned from the heating sub-meter (live: on < 13.5 °C / off > 14.5 °C, 192 labelled days). The HA winter-mode automations were replaced by the daily `automation.heizsaison_tagesmittel` at the same time. Recheck: `scripts/analyze_forecast_bias.py` → 5–15 °C bins' bias ≈ 0, `mae_7d` back below ~0.24. Follow-ups tracked as #99.
 
 Recent releases:
 - v0.11.4 — 15-minute energy history cache (#85), strip partial day from clustering (#86), tomorrow block P10/P90 interval sensors, code review batch 1–5 (all open findings closed).
@@ -306,6 +308,32 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 
 ---
 
+### #97 — Open-Meteo Archive Retry/Backoff on Transient 5xx
+
+**Source:** GitHub Issue #21 (2026-09-17) — a user hit a 503 from the Open-Meteo archive API during backfill/retrain. The reporter's diagnosis (`sunshine_duration` being daily-only) was verified wrong by replaying the exact request; the real gap is that `weather.fetch_historical_weather()` has no retry on transient 5xx/timeouts, so one flaky response fails the whole fetch.
+
+**Proposal:** bounded retry (e.g. 3 attempts, exponential backoff 2/4/8 s) on HTTP 5xx and connection timeouts only; 4xx fails immediately. Log each retry at INFO and the final failure at WARNING (existing fallback path unchanged).
+
+**Effort:** ~1 h incl. tests (mock `requests.get` raising/returning 503 then 200).
+
+---
+
+### #99 — Heating-Season Projection Follow-ups
+
+Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026-09-25-heating-season-projection.md`, local). None block correctness on the live system; most matter for other users.
+
+1. **Bias recheck (~2026-10-03):** confirm the 5–15 °C forecast bias ≈ 0 and `mae_7d` < ~0.24 after a clean week. Confounders: any other deploy in the window.
+2. **Zero-width threshold band:** the learner's grid allows `on == off`, and ties resolve to the lowest/narrowest pair (the switch label learned 10.5/11.0 in the backtest). Add a minimum band width (e.g. 1 K) or break ties toward the widest band, so the projection can't flip daily around a single threshold.
+3. **Stale config override:** `_retrain` persists the *resolved* thresholds, so a removed `heating_temp_on/off` override is reloaded at init until the next retrain. Persist `learned_thresholds` instead.
+4. **Unavailable entity prior:** an `unknown`/`unavailable` switch falls back to prior 0; use the last recorded `heating_active` value (already fetched hourly).
+5. **Skip learning when unused:** users with no sub-meter and no switch still learn, save and log default thresholds on every retrain.
+6. **Test gaps:** no `_retrain` wiring test per label tier; no serve-gate test for a meter-only user without a switch; `test_thresholds_default_when_unset` reads the real `models/heating_thresholds.json` (conftest only redirects writes).
+7. **Docs:** the CHANGELOG says the frost override is < 4 °C, but `docs/examples/heating_season_automation.yaml` uses 3 °C. The CHANGELOG also mentions the gitignored `scripts/backtest_heating_feature.py`.
+
+**Effort:** 2–3 h total; items 2–4 are small TDD fixes in `heating_season.py` / `energy_forecast.py`.
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -324,7 +352,7 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 82 | Fix EV contamination in clustering | high (regime_kwh #1 feature) | 2 h | ✅ done (v0.11.0-alpha-16) |
 | 83 | `predicted_day_total` scale feature | medium | 3 h | SHAP check first — may be redundant |
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
-| 92 | Temperature-based UA_eff calibration window | medium | 2 h (est.) / multi-day (actual) | **implemented on `fix/ua-eff-calibration-window`, not yet merged to `dev`** (2026-09-03) |
+| 92 | Temperature-based UA_eff calibration window | medium | 2 h (est.) / multi-day (actual) | ✅ done (v0.12.0-alpha-19); tier 1 (`heating_sub_meter_sensor`) activated live 2026-09-26 |
 | 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | both phases deployed live 2026-08-27 (hef `v0.12.0-alpha-13`, EM `v0.15.1-alpha-51`) — kill-switch pending exit-gate observation, see `memory/project_dhw_comfort_boost_commit_spec.md` |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | ready |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | simulated — see #88 detail |
@@ -338,6 +366,9 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 24 | Spot price | n/a | — | out of scope |
 | 94 | Remove vestigial `dhw_tank_volume_l` duplicate | none (dead field) | 10 min | opportunistic — clean up next time adjacent code is touched |
 | 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | 1 day+ | long-term — community PR candidate, see Discussion #20 |
+| 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ready — GitHub Issue #21 |
+| 98 | Daily-mean heating-season projection with learned thresholds | high (autumn/spring MAE) | ~1 day | ✅ done (v0.12.0-alpha-23) |
+| 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | recheck ~2026-10-03, then minors opportunistically |
 
 ---
 
@@ -442,3 +473,4 @@ Lag-feature pollution to the following day is modest (~0.1–0.3 kWh/h for 24–
 | 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents | Unreleased |
 | 91 | Daily update-check + notification — compares `__version__` against latest GitHub release tag daily at 09:00, fires `persistent_notification` when `main`-track users are behind; `update_check_enabled` config flag | v0.12.0-alpha-10 |
 | 95 | Dedupe hourly excluded-range escalation/malformed-CSV warnings — `_warn_once()` in `ha_data.py` fires WARNING once per condition per AppDaemon process lifetime via `self._excluded_range_warned`, then INFO on repeats; resets on restart. **Follow-up correction:** alpha-11 only demoted severity — `filter_excluded_ranges()` still logged an INFO line every hourly cycle for a range matching zero rows (e.g. once it ages out of the data window), which was the actual source of ongoing noise reported live. Now gated on `n_dropped > 0`; a no-op range logs nothing. | v0.12.0-alpha-11 |
+| 98 | Daily-mean heating-season projection — `heating_active` projected once per calendar day from the forecast daily mean instead of hourly outdoor temps (which projected ON on every cold night while heating stayed off); per-installation thresholds learned at retrain from a daily heating label (sub-meter > switch > defaults); meter heating-day label as training feature; projection no longer requires climate entities and is passed to `get_scenario`; `heating_season` attribute on `sensor.energy_forecast_today`; example daily HA automation in `docs/examples/` | v0.12.0-alpha-23 |
