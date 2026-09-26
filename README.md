@@ -445,8 +445,8 @@ energy_forecast:
 
   # Thermal setpoint projection — hysteresis thresholds (optional).
   # Controls when heating is projected on/off across the 48h forecast window.
-  # heating_temp_on:      14.0   # outdoor °C below which heating is projected ON
-  # heating_temp_off:     18.0   # outdoor °C above which heating is projected OFF
+  # heating_temp_on:      12.0   # optional override: DAILY-MEAN °C below which heating is projected ON (set with heating_temp_off; learned from history when unset)
+  # heating_temp_off:     16.0   # optional override: DAILY-MEAN °C above which heating is projected OFF
   # heating_setpoint_on:  20.0   # climate setpoint (°C) used when heating is ON
   # heating_setpoint_off: 12.0   # climate setpoint (°C) used when heating is OFF
 
@@ -507,7 +507,7 @@ energy_forecast:
 | `climate_entities` | No | `[]` | List of HA `climate` entity IDs. Used to derive `thermal_pressure` (area-weighted setpoint − current temp, in °C·h). See [Thermal & DHW modeling](#thermal--dhw-modeling). |
 | `climate_room_areas` | No | `{}` | Dict mapping `climate` entity IDs to floor areas in m² (e.g. `climate.living_room: 30`). Used to area-weight `thermal_pressure` so larger rooms have more influence. Rooms not listed default to 15 m². |
 | `dhw_buffer_sensor` | No | — | Entity ID of a DHW buffer temperature sensor (°C). Used to derive `dhw_pressure`. See [Thermal & DHW modeling](#thermal--dhw-modeling). |
-| `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-cooling windows for τ calibration (log-linear OLS fit on periods where the building decays freely). Enables `thermal_pressure_cop`. Accepts `input_boolean` entities (`"on"`/`"off"` states). |
+| `heating_system_active_entity` | No | — | Binary sensor or `input_boolean` that is `"on"` only when the heating system is permitted to run (e.g. a Summer Mode switch). Used to isolate passive-cooling windows for τ calibration (log-linear OLS fit on periods where the building decays freely). Enables `thermal_pressure_cop`. Accepts `input_boolean` entities (`"on"`/`"off"` states). See `docs/examples/heating_season_automation.yaml` for a stable daily switch. |
 | `away_mode_entity` | No | — | Entity ID of a boolean entity (e.g. `input_boolean.vacation_mode`). When `"on"`, the model learns lower vacation-period consumption from history and predicts accordingly via the `is_away` feature. |
 | `away_return_entity` | No | — | Entity ID of a datetime entity (e.g. `input_datetime.vacation_return`). When set, `is_away` flips to 0 at the return hour within the 48-hour forecast window. Requires `away_mode_entity`. |
 | `anomaly_sigma_threshold` | No | `3.0` | Std-deviation multiplier for `binary_sensor.energy_forecast_unusual_consumption`. Fires when the latest actual–prediction residual exceeds this multiple of the historical residual std. Must be `> 0`. Typical range: 2.5–4.0. Silent until ≥ 10 matched hours accumulate. |
@@ -518,8 +518,8 @@ energy_forecast:
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
 | `mqtt_discovery_prefix` | No | `homeassistant` | HA MQTT discovery prefix. Change only if your HA instance uses a non-default discovery prefix |
-| `heating_temp_on` | No | `14.0` | Outdoor temperature threshold (°C) below which heating is projected ON across the 48h window. Used by `_build_heating_active_projection()`. Requires `heating_system_active_entity`. |
-| `heating_temp_off` | No | `18.0` | Outdoor temperature threshold (°C) above which heating is projected OFF. Dead-band between `heating_temp_on` and `heating_temp_off` holds the current heating state. |
+| `heating_temp_on` | No | learned (fallback `12.0`) | Daily-mean outdoor temperature (°C) below which heating is projected ON for a forecast day. Set **together with** `heating_temp_off` to override the thresholds hef learns at each retrain from the heating label (`physics.heating_sub_meter_sensor` if configured, else `heating_system_active_entity`). Setting only one is ignored with a warning. Learned values are shown in the `heating_season` attribute of `sensor.energy_forecast_today`. |
+| `heating_temp_off` | No | learned (fallback `16.0`) | Daily-mean outdoor temperature (°C) above which heating is projected OFF. Between the two thresholds the previous day's state is held. |
 | `heating_setpoint_on` | No | `20.0` | Climate setpoint (°C) projected when heating is ON. Used to compute `thermal_pressure` for future hours. |
 | `heating_setpoint_off` | No | `12.0` | Climate setpoint (°C) projected when heating is OFF (e.g. night/summer setback). |
 | `physics` | No | — | Optional block enabling Physics-ML Hybrid features. Omitting the block entirely leaves behaviour byte-identical to prior versions. Even `physics: {}` (empty) activates the feature. See [Physics-ML Hybrid (Phase 1)](#physics-ml-hybrid-phase-1-optional). |
@@ -692,7 +692,7 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 | Cyclical encodings | sin/cos of hour, day-of-week, month, day-of-year (`doy_sin`/`doy_cos`) |
 | Horizon | `hours_ahead` (0–47, how far into the future the row is) |
 | Weather | temp, precipitation, sunshine, wind, cloud cover, direct solar radiation, heating/cooling degree hours, 3-day rolling temperature anchored in measured data |
-| Heating system | `hp_heating_degree` (`max(0, 15 − temp_c)` — HP-calibrated heat demand threshold), `temp_in_neutral_zone` (binary: 1 when 15 ≤ temp_c ≤ 22 °C, i.e. HP dead-band), `heating_active` (seasonal binary flag from `heating_system_active_entity`; defaults to 1) |
+| Heating system | `hp_heating_degree` (`max(0, 15 − temp_c)` — HP-calibrated heat demand threshold), `temp_in_neutral_zone` (binary: 1 when 15 ≤ temp_c ≤ 22 °C, i.e. HP dead-band), `heating_active` (daily heating-season flag: from `physics.heating_sub_meter_sensor` (a day with > 0.5 kWh space heating) when configured, else `heating_system_active_entity`; defaults to 1; projected with a daily-mean rule, see `heating_temp_on`) |
 | Thermal modelling | `temp_ewma_24h/72h` (thermal mass), `heating_deg_sum_24h/168h` (accumulated heating debt), `temp_delta_1h/24h` (trends), `temp_lag_24h/168h` |
 | Thermal & DHW intent | `thermal_pressure` (area-weighted HVAC setpoint − current temp; °C·h), `thermal_pressure_max` (largest per-room deficit), `thermal_pressure_std` (room temperature spread), `thermal_pressure_cop` (deficit scaled by inverse outdoor COP — electrical urgency), `thermal_pressure_net` (thermal pressure reduced by passive solar gain), `weighted_solar_gain` (direct radiation weighted by south-facing half-cosine window), `dhw_pressure` (buffer heat-loss urgency score); all zero when not configured |
 | Physics | `humidity` (relative humidity %), `infiltration_pressure` (wind speed × thermal gradient — cold-air infiltration proxy), `defrost_risk` (humidity-scaled Gaussian at +2 °C — heat-pump defrost cycle proxy) |
