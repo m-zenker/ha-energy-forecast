@@ -2013,10 +2013,10 @@ class EnergyForecast(hass.Hass):
         heating_active_series = None
         heating_setpoint_on = None
         heating_setpoint_off = None
-        if self._heating_active_entity and climate_recent:
+        if self._heating_active_entity or self._heating_thresholds.label_source == "meter":
             try:
                 heating_active_series, heating_setpoint_on, heating_setpoint_off = (
-                    self._build_heating_active_projection(forecast_df, climate_recent)
+                    self._build_heating_active_projection(forecast_df, climate_recent, sub_sensors_recent)
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
@@ -2359,25 +2359,61 @@ class EnergyForecast(hass.Hass):
 
         return pd.Series(n_home, index=future_hours, dtype=int)
 
+    def _heating_prior_and_today(self, sub_sensors_recent: dict | None) -> tuple[int, int | None]:
+        """(prior_state, today_state) for heating_season.project_heating_active.
+
+        Meter tier: prior = yesterday's meter heating-day label, today = 1 once today's heating
+        energy passes METER_DAY_KWH. Entity tier: the live switch state is both. An unknown /
+        unavailable entity yields prior 0 and lets the daily rule decide today.
+        """
+        import pandas as pd
+
+        entity_state: int | None = None
+        if self._heating_active_entity:
+            raw = self.get_state(self._heating_active_entity)
+            if raw in ("on", "1", "true", "True"):
+                entity_state = 1
+            elif raw in ("off", "0", "false", "False"):
+                entity_state = 0
+        if self._heating_thresholds.label_source == "meter":
+            meter_entity = self._physics_config.get("heating_sub_meter_sensor")
+            meter_df = (sub_sensors_recent or {}).get(self._sub_sensor_prefix(meter_entity)) if meter_entity else None
+            now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+            prior, today = heating_season.meter_prior_and_today(meter_df, now)
+            if prior is None:
+                prior = entity_state if entity_state is not None else 0
+            return prior, today
+        return (entity_state if entity_state is not None else 0), entity_state
+
+    def _heating_season_attr(self) -> dict | None:
+        """Learned/config heating thresholds for the energy_forecast_today attributes (None when unused)."""
+        from dataclasses import asdict
+
+        t = self._heating_thresholds
+        if not self._heating_active_entity and t.label_source != "meter":
+            return None
+        return asdict(t)
+
     def _build_heating_active_projection(
         self,
         forecast_df: Any,
         climate_recent: dict[str, Any],
+        sub_sensors_recent: dict | None = None,
     ) -> tuple[Any, float, float]:
         """Return (heating_active_series, setpoint_on, setpoint_off) for 48-hour window.
 
         heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
         setpoint_on/off: live values derived from climate entities when available, else config defaults.
-        Uses outdoor temp hysteresis to project future heating state.
-        Only call when _heating_active_entity is configured.
+        Projects future heating state with the daily-mean rule in heating_season.py
+        (learned or configured thresholds in self._heating_thresholds).
         """
         import numpy as np
         import pandas as pd
 
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
-        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
-        active = self.get_state(self._heating_active_entity) in ("on", "1", "true", "True")
+        prior_state, today_state = self._heating_prior_and_today(sub_sensors_recent)
+        active = bool(today_state if today_state is not None else prior_state)
 
         # Derive setpoint_on / setpoint_off from live climate entity data when available
         live_setpoints = []
@@ -2398,24 +2434,9 @@ class EnergyForecast(hass.Hass):
             s_off = live_setpoint if live_setpoint is not None else self._heating_setpoint_off
             s_on = self._heating_setpoint_on
 
-        temp_on = self._heating_thresholds.on_below
-        temp_off = self._heating_thresholds.off_above
-
-        # Align outdoor forecast temps to future hours
-        forecast_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
-        outdoor_temps = forecast_indexed.reindex(future_hours, method="nearest").ffill().bfill().values
-
-        # Hysteresis projection
-        state = int(active)
-        states: list[int] = []
-        for temp in outdoor_temps:
-            if temp < temp_on:
-                state = 1
-            elif temp > temp_off:
-                state = 0
-            states.append(state)
-
-        heating_active_series = pd.Series(states, index=future_hours, dtype=int)
+        heating_active_series = heating_season.project_heating_active(
+            now_naive, forecast_df, prior_state, self._heating_thresholds, today_state=today_state
+        )
         return heating_active_series, float(s_on), float(s_off)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
@@ -2684,6 +2705,7 @@ class EnergyForecast(hass.Hass):
         shap_features = data.get("shap_top_features") or {}
         shap_narrative = data.get("shap_narrative") or ""
         model_phase = self._model_phase_attr()
+        heating_season_attr = self._heating_season_attr()
         for key, label in [
             ("next_1h", "Next 1h"),
             ("next_3h", "Next 3h"),
@@ -2699,6 +2721,8 @@ class EnergyForecast(hass.Hass):
                     extra["shap_narrative"] = shap_narrative
                 if model_phase is not None:
                     extra["model_phase"] = model_phase
+                if heating_season_attr is not None:
+                    extra["heating_season"] = heating_season_attr
                 if not extra:  # if no attributes, set to None
                     extra = None
             safe_set(
@@ -2710,7 +2734,9 @@ class EnergyForecast(hass.Hass):
             )
         # In MQTT mode, publish shap_top_features, shap_narrative, and model_phase as
         # json_attributes for energy_forecast_today
-        if self._mqtt_discovery and (shap_features or shap_narrative or model_phase is not None):
+        if self._mqtt_discovery and (
+            shap_features or shap_narrative or model_phase is not None or heating_season_attr is not None
+        ):
             attrs = {}
             if shap_features:
                 attrs["shap_top_features"] = shap_features
@@ -2718,6 +2744,8 @@ class EnergyForecast(hass.Hass):
                 attrs["shap_narrative"] = shap_narrative
             if model_phase is not None:
                 attrs["model_phase"] = model_phase
+            if heating_season_attr is not None:
+                attrs["heating_season"] = heating_season_attr
             if attrs:
                 self._mqtt_publish_sensor_attributes(
                     "energy_forecast_today",

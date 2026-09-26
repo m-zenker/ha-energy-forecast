@@ -26,6 +26,7 @@ from energy_forecast.energy_forecast import (
     _compute_live_mae,
     _subtract_sub_sensors,
 )
+from energy_forecast.heating_season import default_thresholds
 from energy_forecast.model import EnergyForecastModel
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -1170,6 +1171,8 @@ class _FakeMqttSelf:
         self._mqtt_discovery_prefix = mqtt_discovery_prefix
         self._mqtt_intervals_discovered = False
         self._physics_model = None
+        self._heating_active_entity = None
+        self._heating_thresholds = default_thresholds()
         self._publishes: list[dict] = []  # records all mqtt_publish() calls
         self._warnings: list[str] = []
         self._removed_entities: list[str] = []
@@ -1212,6 +1215,11 @@ class _FakeMqttSelf:
         from energy_forecast.energy_forecast import EnergyForecast
 
         return EnergyForecast._model_phase_attr(self)
+
+    def _heating_season_attr(self) -> dict | None:
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._heating_season_attr(self)
 
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         from energy_forecast.energy_forecast import EnergyForecast
@@ -4306,6 +4314,7 @@ class _FakeUpdateSensors:
         self._climate_entities = []
         self._dhw_buffer_sensor = None
         self._heating_active_entity = None
+        self._heating_thresholds = default_thresholds()
         self._climate_room_areas = None
         self._shap_top_n = 0
         self._physics_model = None
@@ -4389,6 +4398,11 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._model_phase_attr(self)
 
+    def _heating_season_attr(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._heating_season_attr(self)
+
     def _aggregate(self, *args, **kwargs):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -4452,8 +4466,8 @@ class TestUpdateSensorsExcludedRanges:
             self._dhw_buffer_sensor / self._heating_active_entity are set
             (energy_forecast.py:1874, 1885).
           - self._build_heating_active_projection(): only called if
-            self._heating_active_entity and climate_recent are both truthy
-            (energy_forecast.py:1906).
+            self._heating_active_entity is set or the heating label source
+            is "meter".
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
             (energy_forecast.py:2058).
           - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
