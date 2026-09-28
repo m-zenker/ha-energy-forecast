@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import hassapi as hass
@@ -455,6 +455,12 @@ def fetch_energy_history(
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
+    if raw_ha.empty:
+        _LOGGER.warning(
+            f"30-day history resync for {entity_id} returned no data — cache not refreshed. "
+            "Rows written since the last successful resync stay uncorrected; forecasts may be degraded."
+        )
+
     # 3. Process HA data into hourly gross kWh
     df_new = _raw_to_kwh_diff(
         raw_ha,
@@ -471,20 +477,21 @@ def fetch_energy_history(
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
     validate_energy_cache(combined, _LOGGER)
 
-    # 5. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
-    # This also corrects any stale values that slipped through fetch_recent_energy's
-    # append-only path (HA-wins corrections are applied here on the next retrain).
+    # 5. Strip the current (still-open) hourly bucket BEFORE writing (GitHub #24).
+    # A partial-hour row in the CSV is never corrected by fetch_recent_energy's
+    # append-only path, so it must not enter the cache at all.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
+    # 6. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
+    # This also corrects stale values in the append-only path's rows (HA-wins merge).
     try:
         combined.to_csv(cache_path, index=False)
         _LOGGER.info(f"Cache compacted. Total history: {len(combined)} hours.")
     except OSError as e:
         _LOGGER.error(f"Failed to save cache: {e}")
 
-    # Strip the current (still-open) hourly bucket so training never sees a
-    # partial-hour value.  The CSV write above retains it; the correct full-hour
-    # value overwrites it on the next weekly compaction via HA-wins merge.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 _FETCH_RECENT_TAIL_ROWS = 400  # 336 h max lag + buffer; limits memory use in hourly updates
@@ -553,9 +560,15 @@ def fetch_recent_energy(
     _check_dst_duplicates(combined, _LOGGER)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
-    # 5. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
-    # Timestamps already in the cache are not re-written; any HA-wins corrections for
-    # existing rows will be fixed during the next weekly fetch_energy_history compaction.
+    # 5. Strip the current (still-open) hourly bucket BEFORE appending (GitHub #24).
+    # The append below skips timestamps already in the CSV, so a partial row written
+    # here would never be corrected by later hourly runs.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
+    # 6. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
+    # Timestamps already in the cache are not re-written; HA-wins corrections for
+    # existing rows are applied by the next weekly fetch_energy_history compaction.
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
     new_rows = combined[~combined["timestamp"].isin(existing_ts)]
     if not new_rows.empty:
@@ -567,11 +580,7 @@ def fetch_recent_energy(
         except OSError as e:
             _LOGGER.error(f"Failed to save cache: {e}")
 
-    # Strip the current (still-open) hourly bucket — same guard as fetch_energy_history.
-    # The CSV append above may write a partial-hour row; it will be superseded by the
-    # next hourly HA fetch (HA-wins merge) and corrected on the next weekly compaction.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 def fetch_energy_history_15m(
@@ -605,6 +614,12 @@ def fetch_energy_history_15m(
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
+    if raw_ha.empty:
+        _LOGGER.warning(
+            "fetch_energy_history_15m: 30-day history resync for %s returned no data — cache not refreshed.",
+            entity_id,
+        )
+
     df_new = _raw_to_kwh_diff(
         raw_ha,
         "15min",
@@ -618,13 +633,16 @@ def fetch_energy_history_15m(
     _check_dst_duplicates(combined, _LOGGER)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
+    # Strip the still-open 15-min slot BEFORE writing (GitHub #24) — see fetch_energy_history.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
         _LOGGER.error("fetch_energy_history_15m: failed to save cache: %s", e)
 
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 _FETCH_RECENT_15M_TAIL_ROWS = 500  # 500 × 15 min = ~125 hours; no consumer needs more
@@ -678,6 +696,11 @@ def fetch_recent_energy_15m(
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
+
+    # Strip the still-open 15-min slot BEFORE appending (GitHub #24) — the append
+    # below never rewrites an existing timestamp, so a partial slot would stick.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
 
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
     new_rows = combined[~combined["timestamp"].isin(existing_ts)]
@@ -1480,45 +1503,110 @@ def fetch_program_sensor_history(
     )
 
 
+# AppDaemon's HA REST call has a hard 10 s timeout that get_history can't raise.  A 30-day
+# window for a meter updating every ~10 s (~260k states) exceeds it and AppDaemon returns
+# None (GitHub #24).  2 days is the window the hourly fetch_recent_* path already proves safe.
+_HISTORY_CHUNK_DAYS = 2
+
+
+def _history_states(raw: Any, entity_id: str) -> list[dict] | None:
+    """Extract one entity's state list from a get_history response.
+
+    Returns None when the call failed (AppDaemon returns None after swallowing an
+    HTTP error or timeout) and [] when the window genuinely holds no states.
+    """
+    if isinstance(raw, dict):
+        return raw.get(entity_id, [])
+    if not isinstance(raw, list):
+        return None
+    if not raw:
+        return []
+    if not isinstance(raw[0], list):
+        return raw
+    if len(raw) == 1:
+        return raw[0]
+    # Some AppDaemon 4.x versions document ignoring the entity filter when end_time is set.
+    for entity_states in raw:
+        if entity_states and isinstance(entity_states[0], dict) and entity_states[0].get("entity_id") == entity_id:
+            return entity_states
+    return None
+
+
 def _fetch_history(
     app: hass.Hass, entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False
 ) -> pd.DataFrame:
-    """Internal helper to call AppDaemon's get_history API."""
+    """Internal helper to call AppDaemon's get_history API.
+
+    Windows longer than _HISTORY_CHUNK_DAYS are fetched as contiguous chunks.
+    All-or-nothing: if any chunk fails, an empty DataFrame is returned — a missing
+    chunk would be forward-filled by _raw_to_kwh_diff into 0-kWh rows that then
+    overwrite good cache rows via the HA-wins merge.
+    """
     import pandas as pd
 
-    try:
-        raw = app.get_history(entity_id=entity_id, days=days)
-    except Exception as exc:
-        _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
-        return pd.DataFrame()
-
-    if isinstance(raw, dict):
-        states = raw.get(entity_id, [])
-    elif isinstance(raw, list) and raw:
-        states = raw[0] if isinstance(raw[0], list) else raw
+    if days <= _HISTORY_CHUNK_DAYS:
+        windows: list[tuple[pd.Timestamp, pd.Timestamp] | None] = [None]
     else:
-        return pd.DataFrame()
+        # Naive local datetimes: AppDaemon 4.2–4.4 pytz-localize start_time/end_time and fail
+        # on tz-aware values; 4.5 sends them as naive ISO, which HA reads in its own timezone.
+        # If AppDaemon's/HA's timezone differs from `timezone`, every window shifts equally
+        # (still contiguous); the final window's 1-day slack keeps the latest hours covered —
+        # HA returns nothing beyond now.
+        end = pd.Timestamp.now(tz=timezone).tz_localize(None)
+        w_start = end - pd.Timedelta(days=days)
+        windows = []
+        while w_start < end:
+            w_end = min(w_start + pd.Timedelta(days=_HISTORY_CHUNK_DAYS), end)
+            windows.append((w_start, w_end))
+            w_start = w_end
+        windows[-1] = (windows[-1][0], end + pd.Timedelta(days=1))
 
     rows = []
-    for state in states:
+    for window in windows:
         try:
-            ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
-            if include_attributes:
-                # Extract all attributes for specialized callers (e.g. climate)
-                attrs = state.get("attributes", {})
-                row = {"timestamp": ts}
-                row.update(attrs)
-                rows.append(row)
+            if window is None:
+                raw = app.get_history(entity_id=entity_id, days=days)
             else:
-                raw_state = state["state"]
-                if raw_state.lower() == "on":
-                    val = 1.0
-                elif raw_state.lower() == "off":
-                    val = 0.0
-                else:
-                    val = float(raw_state)
-                rows.append({"timestamp": ts, "value": val})
-        except (ValueError, KeyError, TypeError):
-            continue
+                raw = app.get_history(
+                    entity_id=entity_id,
+                    start_time=window[0].to_pydatetime(),
+                    end_time=window[1].to_pydatetime(),
+                )
+        except Exception as exc:
+            _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
+            return pd.DataFrame()
 
-    return pd.DataFrame(rows)
+        states = _history_states(raw, entity_id)
+        if states is None:
+            span = f"{window[0]:%Y-%m-%d %H:%M}–{window[1]:%Y-%m-%d %H:%M}" if window else f"last {days} d"
+            _LOGGER.warning(
+                f"get_history returned no usable response for {entity_id} ({span}) — likely an "
+                "AppDaemon/HA timeout; see the AppDaemon log. History fetch discarded."
+            )
+            return pd.DataFrame()
+
+        for state in states:
+            try:
+                ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
+                if include_attributes:
+                    # Extract all attributes for specialized callers (e.g. climate)
+                    attrs = state.get("attributes", {})
+                    row = {"timestamp": ts}
+                    row.update(attrs)
+                    rows.append(row)
+                else:
+                    raw_state = state["state"]
+                    if raw_state.lower() == "on":
+                        val = 1.0
+                    elif raw_state.lower() == "off":
+                        val = 0.0
+                    else:
+                        val = float(raw_state)
+                    rows.append({"timestamp": ts, "value": val})
+            except (ValueError, KeyError, TypeError):
+                continue
+
+    df = pd.DataFrame(rows)
+    if len(windows) > 1 and not df.empty:
+        df = df.drop_duplicates(subset=["timestamp"], keep="first").sort_values("timestamp").reset_index(drop=True)
+    return df

@@ -6,7 +6,7 @@
 *Know your electricity bill before the day begins.*
 
 ![Version](https://img.shields.io/badge/version-v0.12.0--alpha--15-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-1050%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-1146%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
@@ -223,6 +223,7 @@ All sensors carry `unit_of_measurement: kWh`. Invalid or unknown schedule entrie
 
 ### Home Assistant side
 - Home Assistant with a cumulative grid-import energy sensor (`state_class: total_increasing`, unit `kWh`)
+  - High-frequency meters (updating every few seconds) are supported. The weekly 30-day history resync is fetched in 2-day chunks to stay under AppDaemon's 10 s Home Assistant API timeout. If the AppDaemon log shows `30-day history resync ... returned no data`, the resync failed and the cache was not refreshed. Check the AppDaemon add-on log for timeout errors.
 - [AppDaemon 4.x](https://github.com/AppDaemon/appdaemon) installed as an HA add-on, or standalone (see [Standalone Docker Deployment](#standalone-docker-deployment))
 
 ### AppDaemon add-on configuration

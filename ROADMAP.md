@@ -334,6 +334,22 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 
 ---
 
+### #100 — Source Cumulative-kWh History from HA Long-Term Statistics *(long-term)*
+
+**Source:** GitHub Issue #24 (2026-09-27). A grid-import sensor updating every ~10 s produced ~120k recorder states; the 30-day `get_history` resync exceeded AppDaemon's hard 10 s HA REST timeout and silently returned nothing, which let partial-hour cache rows survive three retrains and collapse the forecast to ~0. The short-term fix (plan `docs/superpowers/plans/2026-09-28-partial-bucket-cache-poisoning.md`, local) never caches the open bucket and splits the fetch into 2-day chunks. The payload still grows with sensor update rate, though: about 8.6k states/day for such a sensor, when the app only needs 24 hourly values.
+
+**Proposal:** for `total_increasing` kWh sensors (grid import, solar, export, battery, EV, sub-meters), read hourly `sum`/`state` from HA's recorder long-term statistics instead of raw states. The recorder already aggregates these hourly, so 30 days is ~720 rows regardless of update rate. Statistics are also kept indefinitely, while raw states are purged after `purge_keep_days` (default 10), so a fresh install could backfill far more than 30 days.
+
+**Open questions:**
+- AppDaemon 4.5 has no statistics API. It would need the `recorder/statistics_during_period` websocket command, either through the HA plugin's internal websocket or a separate client using the existing long-lived token. Spike this first.
+- The hourly granularity rules out the 15-minute cache (`fetch_energy_history_15m`). Keep raw-state fetches there, or use 5-minute short-term statistics (kept only ~10 days).
+- Sensors without `state_class` have no statistics, so the raw-state path must stay as a fallback.
+- Statistics buckets are labelled by hour start in UTC. Verify they align with the naive-local `timestamp` convention and the DST handling in `_check_dst_duplicates`.
+
+**Effort:** ~1 day after a ~2 h feasibility spike. **Impact:** removes the whole class of history-size/timeout failures for high-frequency meters and speeds up retrain fetches for all users.
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -366,9 +382,10 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 24 | Spot price | n/a | — | out of scope |
 | 94 | Remove vestigial `dhw_tank_volume_l` duplicate | none (dead field) | 10 min | opportunistic — clean up next time adjacent code is touched |
 | 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | 1 day+ | long-term — community PR candidate, see Discussion #20 |
-| 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ready — GitHub Issue #21 |
+| 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ✅ implemented on `fix/openmeteo-archive-retry` (stacked on GitHub #24 fix) — unreleased, to ship bundled with #24 |
 | 98 | Daily-mean heating-season projection with learned thresholds | high (autumn/spring MAE) | ~1 day | ✅ done (v0.12.0-alpha-23) |
 | 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | recheck ~2026-10-03, then minors opportunistically |
+| 100 | Cumulative-kWh history from HA long-term statistics | robustness for high-frequency meters (community-reported) | ~1 day + 2 h spike | long-term — after the GitHub #24 short-term fix; spike websocket access first |
 
 ---
 
