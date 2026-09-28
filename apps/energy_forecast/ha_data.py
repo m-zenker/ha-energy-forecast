@@ -1539,13 +1539,19 @@ def _fetch_history(
     if days <= _HISTORY_CHUNK_DAYS:
         windows: list[tuple[pd.Timestamp, pd.Timestamp] | None] = [None]
     else:
-        end = pd.Timestamp.now(tz=timezone)
+        # Naive local datetimes: AppDaemon 4.2–4.4 pytz-localize start_time/end_time and fail
+        # on tz-aware values; 4.5 sends them as naive ISO, which HA reads in its own timezone.
+        # If AppDaemon's/HA's timezone differs from `timezone`, every window shifts equally
+        # (still contiguous); the final window's 1-day slack keeps the latest hours covered —
+        # HA returns nothing beyond now.
+        end = pd.Timestamp.now(tz=timezone).tz_localize(None)
         w_start = end - pd.Timedelta(days=days)
         windows = []
         while w_start < end:
             w_end = min(w_start + pd.Timedelta(days=_HISTORY_CHUNK_DAYS), end)
             windows.append((w_start, w_end))
             w_start = w_end
+        windows[-1] = (windows[-1][0], end + pd.Timedelta(days=1))
 
     rows = []
     for window in windows:
