@@ -328,6 +328,19 @@ class TestFetchHistoricalWeatherRetry:
         assert mock_get.call_count == 4
         assert sleeps == [2, 4, 8]
 
+    def test_attempt_count_follows_backoff_schedule(self, monkeypatch):
+        """Spec §3 invites hand-editing the backoff constant; a longer schedule must add
+        attempts, never IndexError (which the _retrain() caller does not catch)."""
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        monkeypatch.setattr(weather, "_ARCHIVE_BACKOFF_S", (1, 1, 1, 1))
+        with patch("requests.get", side_effect=[_http_error(503)] * 5) as mock_get:
+            with pytest.raises(requests.HTTPError):
+                weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert mock_get.call_count == 5
+        assert sleeps == [1, 1, 1, 1]
+
     def test_429_retried_like_5xx(self, monkeypatch):
         """New in rev. 2 — spec §7 finding SWE-3: 429 is the most realistic
         transient 4xx a free-tier API returns."""
