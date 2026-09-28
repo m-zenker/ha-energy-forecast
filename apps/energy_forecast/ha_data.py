@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import hassapi as hass
@@ -455,6 +455,12 @@ def fetch_energy_history(
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
 
+    if raw_ha.empty:
+        _LOGGER.warning(
+            f"30-day history resync for {entity_id} returned no data — cache not refreshed. "
+            "Rows written since the last successful resync stay uncorrected; forecasts may be degraded."
+        )
+
     # 3. Process HA data into hourly gross kWh
     df_new = _raw_to_kwh_diff(
         raw_ha,
@@ -607,6 +613,12 @@ def fetch_energy_history_15m(
 
     if raw_ha.empty and df_cache.empty:
         raise ValueError(f"No history found in HA or Cache for {entity_id}")
+
+    if raw_ha.empty:
+        _LOGGER.warning(
+            "fetch_energy_history_15m: 30-day history resync for %s returned no data — cache not refreshed.",
+            entity_id,
+        )
 
     df_new = _raw_to_kwh_diff(
         raw_ha,
@@ -1483,45 +1495,104 @@ def fetch_program_sensor_history(
     )
 
 
+# AppDaemon's HA REST call has a hard 10 s timeout that get_history can't raise.  A 30-day
+# window for a meter updating every ~10 s (~260k states) exceeds it and AppDaemon returns
+# None (GitHub #24).  2 days is the window the hourly fetch_recent_* path already proves safe.
+_HISTORY_CHUNK_DAYS = 2
+
+
+def _history_states(raw: Any, entity_id: str) -> list[dict] | None:
+    """Extract one entity's state list from a get_history response.
+
+    Returns None when the call failed (AppDaemon returns None after swallowing an
+    HTTP error or timeout) and [] when the window genuinely holds no states.
+    """
+    if isinstance(raw, dict):
+        return raw.get(entity_id, [])
+    if not isinstance(raw, list):
+        return None
+    if not raw:
+        return []
+    if not isinstance(raw[0], list):
+        return raw
+    if len(raw) == 1:
+        return raw[0]
+    # Some AppDaemon 4.x versions document ignoring the entity filter when end_time is set.
+    for entity_states in raw:
+        if entity_states and isinstance(entity_states[0], dict) and entity_states[0].get("entity_id") == entity_id:
+            return entity_states
+    return None
+
+
 def _fetch_history(
     app: hass.Hass, entity_id: str, days: int, timezone: str = "Europe/Zurich", include_attributes: bool = False
 ) -> pd.DataFrame:
-    """Internal helper to call AppDaemon's get_history API."""
+    """Internal helper to call AppDaemon's get_history API.
+
+    Windows longer than _HISTORY_CHUNK_DAYS are fetched as contiguous chunks.
+    All-or-nothing: if any chunk fails, an empty DataFrame is returned — a missing
+    chunk would be forward-filled by _raw_to_kwh_diff into 0-kWh rows that then
+    overwrite good cache rows via the HA-wins merge.
+    """
     import pandas as pd
 
-    try:
-        raw = app.get_history(entity_id=entity_id, days=days)
-    except Exception as exc:
-        _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
-        return pd.DataFrame()
-
-    if isinstance(raw, dict):
-        states = raw.get(entity_id, [])
-    elif isinstance(raw, list) and raw:
-        states = raw[0] if isinstance(raw[0], list) else raw
+    if days <= _HISTORY_CHUNK_DAYS:
+        windows: list[tuple[pd.Timestamp, pd.Timestamp] | None] = [None]
     else:
-        return pd.DataFrame()
+        end = pd.Timestamp.now(tz=timezone)
+        w_start = end - pd.Timedelta(days=days)
+        windows = []
+        while w_start < end:
+            w_end = min(w_start + pd.Timedelta(days=_HISTORY_CHUNK_DAYS), end)
+            windows.append((w_start, w_end))
+            w_start = w_end
 
     rows = []
-    for state in states:
+    for window in windows:
         try:
-            ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
-            if include_attributes:
-                # Extract all attributes for specialized callers (e.g. climate)
-                attrs = state.get("attributes", {})
-                row = {"timestamp": ts}
-                row.update(attrs)
-                rows.append(row)
+            if window is None:
+                raw = app.get_history(entity_id=entity_id, days=days)
             else:
-                raw_state = state["state"]
-                if raw_state.lower() == "on":
-                    val = 1.0
-                elif raw_state.lower() == "off":
-                    val = 0.0
-                else:
-                    val = float(raw_state)
-                rows.append({"timestamp": ts, "value": val})
-        except (ValueError, KeyError, TypeError):
-            continue
+                raw = app.get_history(
+                    entity_id=entity_id,
+                    start_time=window[0].to_pydatetime(),
+                    end_time=window[1].to_pydatetime(),
+                )
+        except Exception as exc:
+            _LOGGER.error(f"get_history failed for {entity_id}: {exc}")
+            return pd.DataFrame()
 
-    return pd.DataFrame(rows)
+        states = _history_states(raw, entity_id)
+        if states is None:
+            span = f"{window[0]:%Y-%m-%d %H:%M}–{window[1]:%Y-%m-%d %H:%M}" if window else f"last {days} d"
+            _LOGGER.warning(
+                f"get_history returned no usable response for {entity_id} ({span}) — likely an "
+                "AppDaemon/HA timeout; see the AppDaemon log. History fetch discarded."
+            )
+            return pd.DataFrame()
+
+        for state in states:
+            try:
+                ts = pd.to_datetime(state["last_updated"]).tz_convert(timezone)
+                if include_attributes:
+                    # Extract all attributes for specialized callers (e.g. climate)
+                    attrs = state.get("attributes", {})
+                    row = {"timestamp": ts}
+                    row.update(attrs)
+                    rows.append(row)
+                else:
+                    raw_state = state["state"]
+                    if raw_state.lower() == "on":
+                        val = 1.0
+                    elif raw_state.lower() == "off":
+                        val = 0.0
+                    else:
+                        val = float(raw_state)
+                    rows.append({"timestamp": ts, "value": val})
+            except (ValueError, KeyError, TypeError):
+                continue
+
+    df = pd.DataFrame(rows)
+    if len(windows) > 1 and not df.empty:
+        df = df.drop_duplicates(subset=["timestamp"], keep="first").sort_values("timestamp").reset_index(drop=True)
+    return df

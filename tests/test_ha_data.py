@@ -2516,3 +2516,146 @@ class TestOpenBucketNeverCached:
         saved = self._saved(cache_path)
         assert not saved.empty
         assert (saved["timestamp"] < self._cutoff("15min")).all(), "open 15-min slot was written by compaction"
+
+
+# ── GitHub #24: chunked, all-or-nothing history fetch ────────────────────────
+
+
+class TestFetchHistoryChunking:
+    """GitHub #24: AppDaemon's HA REST call times out after 10 s, which a 30-day
+    get_history for a ~10 s-interval meter (~260k states) exceeds — AppDaemon
+    then returns None and the weekly resync silently did nothing.  Windows
+    longer than 2 days are now fetched in ≤2-day chunks, all-or-nothing."""
+
+    ENTITY = "sensor.energy"
+
+    @classmethod
+    def _state(cls, ts_utc: str, value: float, entity_id: str | None = None) -> dict:
+        # Real AppDaemon 4.5 returns tz-aware datetimes for last_* keys.
+        return {"entity_id": entity_id or cls.ENTITY, "state": str(value), "last_updated": pd.Timestamp(ts_utc)}
+
+    def test_short_window_is_single_days_call(self, mock_app):
+        """The hourly 2-day path keeps its exact historical call shape."""
+        mock_app.get_history.return_value = [[self._state("2024-01-01T08:00:00Z", 1.0)]]
+
+        _fetch_history(mock_app, self.ENTITY, days=2)
+
+        mock_app.get_history.assert_called_once_with(entity_id=self.ENTITY, days=2)
+
+    def test_long_window_is_split_into_contiguous_two_day_chunks(self, mock_app):
+        mock_app.get_history.return_value = [[]]
+
+        _fetch_history(mock_app, self.ENTITY, days=30)
+
+        calls = mock_app.get_history.call_args_list
+        assert len(calls) == 15
+        for c in calls:
+            assert c.kwargs["entity_id"] == self.ENTITY
+            assert "days" not in c.kwargs
+            assert c.kwargs["start_time"].tzinfo is not None
+            assert c.kwargs["end_time"] - c.kwargs["start_time"] <= pd.Timedelta(days=2)
+        for prev, nxt in zip(calls, calls[1:]):
+            assert prev.kwargs["end_time"] == nxt.kwargs["start_time"], "chunks must be contiguous"
+        span = calls[-1].kwargs["end_time"] - calls[0].kwargs["start_time"]
+        assert span == pd.Timedelta(days=30)
+
+    def test_chunks_concatenated_sorted_and_deduplicated(self, mock_app):
+        """HA repeats the window-start state, so adjacent chunks share a boundary reading."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        s2 = self._state("2024-01-02T08:00:00Z", 2.0)
+        s3 = self._state("2024-01-03T08:00:00Z", 3.0)
+        mock_app.get_history.side_effect = [[[s1, s2]], [[s2, s3]]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [1.0, 2.0, 3.0]
+        assert result["timestamp"].is_monotonic_increasing
+
+    def test_empty_chunk_is_valid_not_failure(self, mock_app):
+        """A sensor created mid-window has no states in early chunks — that is not an error."""
+        s1 = self._state("2024-01-03T08:00:00Z", 5.0)
+        mock_app.get_history.side_effect = [[[]], [[s1]]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [5.0]
+
+    def test_any_chunk_returning_none_fails_whole_fetch(self, mock_app, caplog):
+        """A partial frame would be forward-filled into 0-kWh rows that overwrite good cache rows."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.side_effect = [[[s1]], None]
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert result.empty
+        assert any(self.ENTITY in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_any_chunk_raising_fails_whole_fetch(self, mock_app):
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.side_effect = [[[s1]], RuntimeError("timeout")]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert result.empty
+
+    def test_single_call_returning_none_warns(self, mock_app, caplog):
+        """Short-window path: a None response (AppDaemon swallowed an error) is now logged."""
+        mock_app.get_history.return_value = None
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = _fetch_history(mock_app, self.ENTITY, days=2)
+
+        assert result.empty
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_foreign_entity_lists_ignored(self, mock_app):
+        """Some AppDaemon 4.x versions document ignoring the entity filter when end_time is set."""
+        other = self._state("2024-01-01T08:00:00Z", 99.0, entity_id="sensor.other")
+        mine = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.return_value = [[other], [mine]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=2)
+
+        assert list(result["value"]) == [1.0]
+
+
+class TestEmptyResyncWarning:
+    """GitHub #24: a 30-day resync that returns nothing while a cache exists must WARN
+    (it previously left the poisoned cache in place with only INFO lines)."""
+
+    def test_fetch_energy_history_warns_when_resync_empty(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history.csv"
+        make_energy_df(["2024-01-01 10:00"], [1.5]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert any(
+            r.levelno == logging.WARNING and "sensor.energy" in r.getMessage() and "resync" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_fetch_energy_history_15m_warns_when_resync_empty(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        make_energy_df(["2024-01-01 10:00"], [0.4]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert any(
+            r.levelno == logging.WARNING and "sensor.energy" in r.getMessage() and "resync" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_no_warning_when_resync_returns_data(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history.csv"
+        ha_raw = make_ha_raw(["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"], [100.0, 101.0])
+
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert not any("resync" in r.getMessage() for r in caplog.records)
