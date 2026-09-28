@@ -2586,12 +2586,31 @@ class TestFetchHistoryChunking:
         for c in calls:
             assert c.kwargs["entity_id"] == self.ENTITY
             assert "days" not in c.kwargs
-            assert c.kwargs["start_time"].tzinfo is not None
+        for c in calls[:-1]:
             assert c.kwargs["end_time"] - c.kwargs["start_time"] <= pd.Timedelta(days=2)
         for prev, nxt in zip(calls, calls[1:]):
             assert prev.kwargs["end_time"] == nxt.kwargs["start_time"], "chunks must be contiguous"
+        # The final window's end carries 1 day of slack past "now" (HA returns nothing beyond
+        # now), so an AppDaemon/HA timezone mismatch can't cut off the most recent hours.
         span = calls[-1].kwargs["end_time"] - calls[0].kwargs["start_time"]
-        assert span == pd.Timedelta(days=30)
+        assert span == pd.Timedelta(days=31)
+
+    def test_chunk_datetimes_are_naive_for_appdaemon_4_4(self, mock_app):
+        """AppDaemon 4.2–4.4 pytz-localize start_time/end_time, which raises on tz-aware
+        datetimes; the plugin swallows it and returns None, failing every chunk."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+
+        def ad44_get_history(**kwargs):
+            for key in ("start_time", "end_time"):
+                if key in kwargs and kwargs[key].tzinfo is not None:
+                    return None  # pytz: "Not naive datetime (tzinfo is already set)" → swallowed
+            return [[s1]]
+
+        mock_app.get_history.side_effect = ad44_get_history
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [1.0]
 
     def test_chunks_concatenated_sorted_and_deduplicated(self, mock_app):
         """HA repeats the window-start state, so adjacent chunks share a boundary reading."""
