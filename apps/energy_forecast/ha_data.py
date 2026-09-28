@@ -471,20 +471,21 @@ def fetch_energy_history(
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
     validate_energy_cache(combined, _LOGGER)
 
-    # 5. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
-    # This also corrects any stale values that slipped through fetch_recent_energy's
-    # append-only path (HA-wins corrections are applied here on the next retrain).
+    # 5. Strip the current (still-open) hourly bucket BEFORE writing (GitHub #24).
+    # A partial-hour row in the CSV is never corrected by fetch_recent_energy's
+    # append-only path, so it must not enter the cache at all.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
+    # 6. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
+    # This also corrects stale values in the append-only path's rows (HA-wins merge).
     try:
         combined.to_csv(cache_path, index=False)
         _LOGGER.info(f"Cache compacted. Total history: {len(combined)} hours.")
     except OSError as e:
         _LOGGER.error(f"Failed to save cache: {e}")
 
-    # Strip the current (still-open) hourly bucket so training never sees a
-    # partial-hour value.  The CSV write above retains it; the correct full-hour
-    # value overwrites it on the next weekly compaction via HA-wins merge.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 _FETCH_RECENT_TAIL_ROWS = 400  # 336 h max lag + buffer; limits memory use in hourly updates
@@ -553,9 +554,15 @@ def fetch_recent_energy(
     _check_dst_duplicates(combined, _LOGGER)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
-    # 5. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
-    # Timestamps already in the cache are not re-written; any HA-wins corrections for
-    # existing rows will be fixed during the next weekly fetch_energy_history compaction.
+    # 5. Strip the current (still-open) hourly bucket BEFORE appending (GitHub #24).
+    # The append below skips timestamps already in the CSV, so a partial row written
+    # here would never be corrected by later hourly runs.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
+    # 6. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
+    # Timestamps already in the cache are not re-written; HA-wins corrections for
+    # existing rows are applied by the next weekly fetch_energy_history compaction.
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
     new_rows = combined[~combined["timestamp"].isin(existing_ts)]
     if not new_rows.empty:
@@ -567,11 +574,7 @@ def fetch_recent_energy(
         except OSError as e:
             _LOGGER.error(f"Failed to save cache: {e}")
 
-    # Strip the current (still-open) hourly bucket — same guard as fetch_energy_history.
-    # The CSV append above may write a partial-hour row; it will be superseded by the
-    # next hourly HA fetch (HA-wins merge) and corrected on the next weekly compaction.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 def fetch_energy_history_15m(
@@ -618,13 +621,16 @@ def fetch_energy_history_15m(
     _check_dst_duplicates(combined, _LOGGER)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
+    # Strip the still-open 15-min slot BEFORE writing (GitHub #24) — see fetch_energy_history.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
+
     try:
         combined.to_csv(cache_path, index=False)
     except OSError as e:
         _LOGGER.error("fetch_energy_history_15m: failed to save cache: %s", e)
 
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
-    return combined[combined["timestamp"] < completed_cutoff]
+    return combined
 
 
 _FETCH_RECENT_15M_TAIL_ROWS = 500  # 500 × 15 min = ~125 hours; no consumer needs more
@@ -678,6 +684,11 @@ def fetch_recent_energy_15m(
 
     combined = _merge_energy_frames(df_winner=df_new, df_loser=df_cache)
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
+
+    # Strip the still-open 15-min slot BEFORE appending (GitHub #24) — the append
+    # below never rewrites an existing timestamp, so a partial slot would stick.
+    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    combined = combined[combined["timestamp"] < completed_cutoff]
 
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
     new_rows = combined[~combined["timestamp"].isin(existing_ts)]
