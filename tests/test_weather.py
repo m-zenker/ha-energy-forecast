@@ -13,6 +13,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
+import requests
 from energy_forecast import weather
 from energy_forecast.weather import _supplement_from_open_meteo
 
@@ -264,6 +266,131 @@ class TestFetchHistoricalWeather:
                 47.0, 8.0, date(2026, 1, 1), date(2026, 1, 1), timezone=ZoneInfo("Europe/Zurich")
             )
         assert not df.empty
+
+
+# ── fetch_historical_weather retry/backoff (#97) ───────────────────────────────
+
+
+def _http_error(status: int) -> requests.HTTPError:
+    """Build an HTTPError carrying a real status code, matching what
+    res.raise_for_status() attaches on an actual requests.Response. The
+    bare-HTTPError("404")-style mocks used elsewhere in this file (see
+    TestFetchOpenMeteoNetworkErrors) leave .response as None and must NOT be
+    reused for these tests — see spec
+    2026-09-27-openmeteo-archive-retry-backoff-design.md §5/§7 (findings
+    SWE-1, Test-1, Test-2).
+    """
+    err = requests.HTTPError(f"{status} error")
+    err.response = MagicMock(status_code=status)
+    return err
+
+
+class TestFetchHistoricalWeatherRetry:
+    """#97 — bounded retry with exponential backoff on transient Archive API failures."""
+
+    def _archive_response(self, n: int = 3) -> MagicMock:
+        return TestFetchHistoricalWeather()._make_archive_response(n)
+
+    def _dates(self):
+        from datetime import date
+
+        return date(2026, 1, 1), date(2026, 1, 1)
+
+    def test_503_then_200_retries_once(self, monkeypatch):
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        with patch("requests.get", side_effect=[_http_error(503), self._archive_response()]):
+            df = weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert not df.empty
+        assert sleeps == [2]
+
+    def test_three_503s_then_200_succeeds_on_last_attempt(self, monkeypatch):
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        with patch(
+            "requests.get",
+            side_effect=[_http_error(503), _http_error(503), _http_error(503), self._archive_response()],
+        ) as mock_get:
+            df = weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert not df.empty
+        assert sleeps == [2, 4, 8]
+        assert mock_get.call_count == 4
+
+    def test_four_503s_exhausts_all_attempts(self, monkeypatch):
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        with patch("requests.get", side_effect=[_http_error(503)] * 4) as mock_get:
+            with pytest.raises(requests.HTTPError):
+                weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert mock_get.call_count == 4
+        assert sleeps == [2, 4, 8]
+
+    def test_429_retried_like_5xx(self, monkeypatch):
+        """New in rev. 2 — spec §7 finding SWE-3: 429 is the most realistic
+        transient 4xx a free-tier API returns."""
+        start, end = self._dates()
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        with patch("requests.get", side_effect=[_http_error(429), self._archive_response()]):
+            df = weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert not df.empty
+
+    def test_404_fails_immediately(self, monkeypatch):
+        """The actual regression test for the status_code < 500 comparison
+        (spec §7 finding Test-2) — must use _http_error(404), not a bare
+        HTTPError, or this would pass for the wrong reason."""
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        with patch("requests.get", side_effect=[_http_error(404)]) as mock_get:
+            with pytest.raises(requests.HTTPError):
+                weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert mock_get.call_count == 1
+        assert sleeps == []
+
+    def test_response_none_fails_immediately(self, monkeypatch):
+        """An HTTPError with no attached response object at all -- kept as its
+        own test, separate from the 404 case above (spec §7 finding Test-5)."""
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        bare_err = requests.HTTPError("unknown")  # .response defaults to None
+        with patch("requests.get", side_effect=[bare_err]) as mock_get:
+            with pytest.raises(requests.HTTPError):
+                weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert mock_get.call_count == 1
+        assert sleeps == []
+
+    def test_connection_error_then_200_retries(self, monkeypatch):
+        start, end = self._dates()
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        with patch("requests.get", side_effect=[requests.ConnectionError("no route"), self._archive_response()]):
+            df = weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert not df.empty
+
+    def test_timeout_then_200_retries(self, monkeypatch):
+        start, end = self._dates()
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        with patch("requests.get", side_effect=[requests.Timeout("timed out"), self._archive_response()]):
+            df = weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert not df.empty
+
+    def test_malformed_json_on_first_response_not_retried(self, monkeypatch):
+        """Missing 'hourly' key is outside the retry loop's try block --
+        must propagate immediately, not be retried (spec §2's stated scope)."""
+        start, end = self._dates()
+        sleeps = []
+        monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+        mock = MagicMock()
+        mock.raise_for_status = MagicMock()
+        mock.json.return_value = {"metadata": "no hourly key"}
+        with patch("requests.get", side_effect=[mock]) as mock_get:
+            with pytest.raises(KeyError):
+                weather.fetch_historical_weather(47.0, 8.0, start, end)
+        assert mock_get.call_count == 1
+        assert sleeps == []
 
 
 # ── _supplement_from_open_meteo ───────────────────────────────────────────────

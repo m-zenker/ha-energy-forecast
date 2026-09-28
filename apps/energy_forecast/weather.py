@@ -36,6 +36,9 @@ _WEATHER_COLUMNS = [
     "humidity",
 ]
 
+_ARCHIVE_MAX_ATTEMPTS = 4  # 1 initial + 3 retries
+_ARCHIVE_BACKOFF_S = (2, 4, 8)  # delay before each retry attempt (2nd, 3rd, 4th)
+
 
 def _parse_sunshine_min(sunshine_seconds: list) -> list:
     """Convert Open-Meteo sunshine_duration (seconds) to minutes, clamped to [0, 60].
@@ -83,8 +86,37 @@ def fetch_historical_weather(
         ",cloud_cover,direct_radiation,relative_humidity_2m"
         f"&timezone={tz_encoded}"
     )
-    res = requests.get(url, timeout=30)
-    res.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(_ARCHIVE_MAX_ATTEMPTS):
+        try:
+            res = requests.get(url, timeout=30)
+            res.raise_for_status()
+            break
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is None or (status < 500 and status != 429):
+                raise  # 4xx other than 429 (or no response object) — not transient, fail immediately
+            last_exc = exc
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+        if attempt < _ARCHIVE_MAX_ATTEMPTS - 1:
+            delay = _ARCHIVE_BACKOFF_S[attempt]
+            _LOGGER.info(
+                "Open-Meteo archive request failed (attempt %d/%d): %s — retrying in %ds",
+                attempt + 1,
+                _ARCHIVE_MAX_ATTEMPTS,
+                last_exc,
+                delay,
+            )
+            time.sleep(delay)
+    else:
+        _LOGGER.warning(
+            "Open-Meteo archive request failed after %d attempts: %s",
+            _ARCHIVE_MAX_ATTEMPTS,
+            last_exc,
+        )
+        raise last_exc
+
     h = res.json()["hourly"]
     n = len(h["time"])
     return pd.DataFrame(
