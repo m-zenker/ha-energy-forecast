@@ -12,7 +12,7 @@
 
 - Spec: `docs/superpowers/specs/2026-09-27-openmeteo-archive-retry-backoff-design.md` (rev. 2, multi-stakeholder-reviewed). Every task below implements a specific section of it — cited inline.
 - Run tests via this project's dedicated env: `/home/jovyan/my_envs/ha-energy-forecast/bin/python -m pytest tests/ -v` — never bare `python`/`pytest`.
-- **Known pre-existing baseline failure, unrelated to this feature:** `tests/test_ha_data.py::TestLoadExcludedRanges::test_different_timezone_changes_spring_forward_detection` failed on a clean `dev` checkout before any change in this plan (confirmed by running the full suite in a separate verification sandbox before writing this plan: `1 failed, 1103 passed, 11 skipped`). It belongs to the unrelated excluded-training-ranges feature (`docs/superpowers/plans/2026-07-19-excluded-training-ranges.md`). Do not attempt to fix it as part of this plan; each task's "run full suite" step should expect exactly this one pre-existing failure, not zero. Re-verify this count still holds on this machine's env before starting, since baselines can drift.
+- **Test baseline (re-verified 2026-09-28 on this machine):** the full suite is green: 1134 passed, 0 failed, on `fix/partial-bucket-cache-poisoning`, which this branch is stacked on. The cloud sandbox reported one pre-existing failure (`TestLoadExcludedRanges::test_different_timezone_changes_spring_forward_detection`, Python 3.11, 11 skipped), but it does not reproduce in the project env. Every full-suite step below expects **0 failures**.
 - All new tests go in `tests/test_weather.py` (Task 1) and `tests/test_energy_forecast.py` (Task 2) — no new test files.
 - Every HTTP-error mock in the new tests must attach a `response` with an explicit plain-`int` `status_code` (never a bare `HTTPError(...)` with no `.response`, and never an unconfigured `MagicMock()` as the response) — this is the exact rev.-1 mocking bug the spec's multi-stakeholder review caught (spec §5, §7 findings SWE-1/Test-1/Test-2/Test-4). Task 1 defines a shared `_http_error(status)` helper for this; use it, don't hand-roll a mock inline.
 - Terminal "success" responses in retry tests reuse `TestFetchHistoricalWeather()._make_archive_response(n)` (`tests/test_weather.py:208`), not a bare `MagicMock()` (spec §5, finding Test-6).
@@ -262,7 +262,7 @@ Expected: all tests pass (existing `TestFetchHistoricalWeather`, `TestFetchOpenM
 - [ ] **Step 6: Run the full suite to check for regressions project-wide**
 
 Run: `/home/jovyan/my_envs/ha-energy-forecast/bin/python -m pytest tests/ -v`
-Expected: same as the Global Constraints baseline plus the 10 new tests — `1 failed` (the known pre-existing `TestLoadExcludedRanges` failure), all else passed.
+Expected: baseline 1134 + 10 new = 1144 passed, 0 failed.
 
 - [ ] **Step 7: Commit**
 
@@ -364,7 +364,7 @@ Expected: both tests currently **pass already** — Task 1 didn't change `_retra
 - [ ] **Step 4: Run the full suite to check for regressions**
 
 Run: `/home/jovyan/my_envs/ha-energy-forecast/bin/python -m pytest tests/ -v`
-Expected: same as Task 1's Step 6 baseline plus these 2 new passing tests — `1 failed` (the known pre-existing failure), all else passed.
+Expected: 1146 passed, 0 failed.
 
 - [ ] **Step 5: Commit**
 
@@ -387,7 +387,7 @@ git commit -m "test: verify _retrain()'s median-imputation fallback still catche
 
 - [ ] **Step 1: Add a CHANGELOG.md entry**
 
-Add to the `### Added` section under `## [Unreleased]` (follow the existing entries' level of detail — see e.g. the #92/UA_eff entry for the house style):
+Add to the `### Fixed` section under `## [Unreleased]` (#97 is a robustness fix for reported GitHub Issue #21, and sits next to the #24 fix entries) (follow the existing entries' level of detail — see e.g. the #92/UA_eff entry for the house style):
 
 ```markdown
 - `apps/energy_forecast/weather.py` — `fetch_historical_weather()` (Open-Meteo Archive API,
