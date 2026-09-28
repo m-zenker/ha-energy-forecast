@@ -2444,3 +2444,109 @@ class TestFetchRecentEnergy15m:
         saved_ts = set(pd.to_datetime(saved["timestamp"]))
         expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
         assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
+
+# ── GitHub #24: open bucket must never be cached ─────────────────────────────
+
+
+class TestOpenBucketNeverCached:
+    """GitHub #24: the still-open bucket must never be written to a cache file.
+
+    The hourly append path skips timestamps already in the CSV, so a partial
+    bucket written at HH:01 (~1 min of consumption) was never corrected by
+    later hourly runs — only by the weekly compaction, which silently failed
+    for high-frequency meters.  Every test computes its cutoff *after* the
+    call: an hour rollover mid-test can then only make the assertion looser,
+    never flaky.
+    """
+
+    @staticmethod
+    def _ha_raw_through_now() -> pd.DataFrame:
+        """Cumulative readings every 5 min, +0.05 kWh each, from 3 h ago through now."""
+        now = pd.Timestamp.now(tz="Europe/Zurich")
+        ts = pd.date_range((now - pd.Timedelta(hours=3)).floor("5min"), now, freq="5min")
+        return pd.DataFrame({"timestamp": ts, "value": [100.0 + 0.05 * i for i in range(len(ts))]})
+
+    @staticmethod
+    def _saved(cache_path) -> pd.DataFrame:
+        saved = pd.read_csv(cache_path)
+        saved["timestamp"] = pd.to_datetime(saved["timestamp"], format="mixed")
+        return saved
+
+    @staticmethod
+    def _cutoff(res: str) -> pd.Timestamp:
+        return pd.Timestamp.now(tz="Europe/Zurich").floor(res).tz_localize(None)
+
+    def test_fetch_recent_energy_does_not_append_open_hour(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("1h")).all(), "open hourly bucket was appended to the cache"
+
+    def test_fetch_recent_energy_caches_previous_hour_at_full_value(self, mock_app, tmp_path):
+        """The last complete hour is cached with all 12 five-minute increments (0.6 kWh), not a stub."""
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        prev_hour = self._cutoff("1h") - pd.Timedelta(hours=1)
+        row = saved[saved["timestamp"] == prev_hour]
+        assert len(row) == 1
+        assert row.iloc[0]["gross_kwh"] == pytest.approx(0.6)
+
+    def test_fetch_energy_history_does_not_write_open_hour(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("1h")).all(), "open hourly bucket was written by compaction"
+
+    def test_fetch_energy_history_drops_stale_open_row_from_cache(self, mock_app, tmp_path):
+        """A pre-existing open-hour row in the cache is removed by compaction, even with no HA data."""
+        cache_path = tmp_path / "energy_history.csv"
+        current_hour = self._cutoff("1h")
+        prev_hour = current_hour - pd.Timedelta(hours=1)
+        make_energy_df([prev_hour.isoformat(), current_hour.isoformat()], [1.5, 0.01]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved_ts = set(self._saved(cache_path)["timestamp"])
+        assert prev_hour in saved_ts
+        assert current_hour not in saved_ts
+
+    def test_fetch_recent_energy_15m_does_not_append_open_slot(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("15min")).all(), "open 15-min slot was appended to the cache"
+
+    def test_fetch_recent_energy_15m_caches_previous_slot_at_full_value(self, mock_app, tmp_path):
+        """The last complete 15-min slot holds 3 five-minute increments (0.15 kWh)."""
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        prev_slot = self._cutoff("15min") - pd.Timedelta(minutes=15)
+        row = saved[saved["timestamp"] == prev_slot]
+        assert len(row) == 1
+        assert row.iloc[0]["gross_kwh"] == pytest.approx(0.15)
+
+    def test_fetch_energy_history_15m_does_not_write_open_slot(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("15min")).all(), "open 15-min slot was written by compaction"
