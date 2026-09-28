@@ -1,7 +1,7 @@
 # Open-Meteo Archive Retry/Backoff on Transient 5xx — Design Spec
 
 **Date:** 2026-09-27 (rev. 2 — post multi-stakeholder review)
-**Status:** Proposed — pending approval before implementation
+**Status:** Implemented (this plan) — see docs/superpowers/plans/2026-09-27-openmeteo-archive-retry-backoff.md
 **Branch base:** `dev`
 **Roadmap item:** #97
 **Source:** GitHub Issue #21 (2026-09-17)

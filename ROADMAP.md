@@ -382,7 +382,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 24 | Spot price | n/a | — | out of scope |
 | 94 | Remove vestigial `dhw_tank_volume_l` duplicate | none (dead field) | 10 min | opportunistic — clean up next time adjacent code is touched |
 | 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | 1 day+ | long-term — community PR candidate, see Discussion #20 |
-| 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ready — GitHub Issue #21 |
+| 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ✅ implemented on `fix/openmeteo-archive-retry` (stacked on GitHub #24 fix) — unreleased, to ship bundled with #24 |
 | 98 | Daily-mean heating-season projection with learned thresholds | high (autumn/spring MAE) | ~1 day | ✅ done (v0.12.0-alpha-23) |
 | 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | recheck ~2026-10-03, then minors opportunistically |
 | 100 | Cumulative-kWh history from HA long-term statistics | robustness for high-frequency meters (community-reported) | ~1 day + 2 h spike | long-term — after the GitHub #24 short-term fix; spike websocket access first |
