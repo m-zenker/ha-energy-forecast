@@ -36,8 +36,9 @@ _WEATHER_COLUMNS = [
     "humidity",
 ]
 
-_ARCHIVE_MAX_ATTEMPTS = 4  # 1 initial + 3 retries
-_ARCHIVE_BACKOFF_S = (2, 4, 8)  # delay before each retry attempt (2nd, 3rd, 4th)
+# Delay before each retry attempt; the attempt count is derived from it (1 initial + one per
+# delay), so hand-editing this tuple can never desynchronise the two.
+_ARCHIVE_BACKOFF_S = (2, 4, 8)
 
 
 def _parse_sunshine_min(sunshine_seconds: list) -> list:
@@ -86,8 +87,9 @@ def fetch_historical_weather(
         ",cloud_cover,direct_radiation,relative_humidity_2m"
         f"&timezone={tz_encoded}"
     )
+    max_attempts = len(_ARCHIVE_BACKOFF_S) + 1
     last_exc: Exception | None = None
-    for attempt in range(_ARCHIVE_MAX_ATTEMPTS):
+    for attempt in range(max_attempts):
         try:
             res = requests.get(url, timeout=30)
             res.raise_for_status()
@@ -99,12 +101,12 @@ def fetch_historical_weather(
             last_exc = exc
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
-        if attempt < _ARCHIVE_MAX_ATTEMPTS - 1:
+        if attempt < max_attempts - 1:
             delay = _ARCHIVE_BACKOFF_S[attempt]
             _LOGGER.info(
                 "Open-Meteo archive request failed (attempt %d/%d): %s — retrying in %ds",
                 attempt + 1,
-                _ARCHIVE_MAX_ATTEMPTS,
+                max_attempts,
                 last_exc,
                 delay,
             )
@@ -112,7 +114,7 @@ def fetch_historical_weather(
     else:
         _LOGGER.warning(
             "Open-Meteo archive request failed after %d attempts: %s",
-            _ARCHIVE_MAX_ATTEMPTS,
+            max_attempts,
             last_exc,
         )
         raise last_exc
