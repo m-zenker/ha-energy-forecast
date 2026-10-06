@@ -144,6 +144,195 @@ class TestSetpointProjection:
         assert np.all(sp == pytest.approx(19.5)), "Flat fallback should use entity setpoint"
 
 
+# ── _project_indoor_temps: deficit blending (live → hysteresis) ────────────────
+
+
+class TestDeficitBlending:
+    """`deficit` blends the live-setpoint deficit (near-term) into the
+    hysteresis-projected-setpoint deficit (far-term) over
+    SENSOR_FULL_TRUST_HOURS..SENSOR_BLEND_HOURS, mirroring the outdoor-temp
+    live/forecast blend in _build_prediction_temp_df."""
+
+    def test_near_term_uses_live_setpoint_even_when_hysteresis_projects_on(self):
+        """Live setpoint is 12 (e.g. summer/eco mode); hysteresis projects heating
+        ON (setpoint_on=21) for every hour because outdoor temp is cold. The
+        full-trust window (h <= SENSOR_FULL_TRUST_HOURS) must still be computed
+        against the LIVE setpoint (12), not the hysteresis setpoint (21) — this
+        is the bug this plan fixes."""
+        from apps.energy_forecast.const import SENSOR_BLEND_HOURS, SENSOR_FULL_TRUST_HOURS
+
+        ts = _future_ts(n=8)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [1] * 8)
+
+        result = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=1e6,  # effectively no cooling — indoor stays ~19 for all 8h
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        deficit = result["climate.room"]["deficit"].values
+        assert np.allclose(deficit[: SENSOR_FULL_TRUST_HOURS + 1], 0.0), (
+            "Full-trust window (h=0..SENSOR_FULL_TRUST_HOURS) must use the live "
+            "setpoint (12 < indoor 19 → deficit 0), not the hysteresis setpoint (21)"
+        )
+        t_in = result["climate.room"]["current_temp"].values
+        far = SENSOR_BLEND_HOURS + 1
+        assert deficit[far] == pytest.approx(max(0.0, 21.0 - t_in[far]), abs=1e-6), (
+            "Beyond SENSOR_BLEND_HOURS the deficit must be purely hysteresis-based"
+        )
+        assert deficit[far] > 0
+
+    def test_interpolates_between_full_trust_and_blend_hours(self):
+        """Between SENSOR_FULL_TRUST_HOURS and SENSOR_BLEND_HOURS, deficit is a
+        linear blend of the live-setpoint deficit and the hysteresis-setpoint
+        deficit."""
+        from apps.energy_forecast.const import SENSOR_BLEND_HOURS, SENSOR_FULL_TRUST_HOURS
+
+        ts = _future_ts(n=8)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [1] * 8)
+
+        result = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=1e6,
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        t_in = result["climate.room"]["current_temp"].values
+        deficit = result["climate.room"]["deficit"].values
+        mid = (SENSOR_FULL_TRUST_HOURS + SENSOR_BLEND_HOURS) // 2  # hour 4
+        alpha = (mid - SENSOR_FULL_TRUST_HOURS) / (SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS)
+        live_deficit = max(0.0, 12.0 - t_in[mid])
+        hyst_deficit = max(0.0, 21.0 - t_in[mid])
+        expected = live_deficit * (1 - alpha) + hyst_deficit * alpha
+        assert deficit[mid] == pytest.approx(expected, abs=1e-6)
+
+    def test_alpha_reaches_one_exactly_at_blend_hours(self):
+        """At h == SENSOR_BLEND_HOURS exactly, alpha must equal 1.0 — deficit is
+        purely the hysteresis-projected value, with no live-setpoint contribution."""
+        from apps.energy_forecast.const import SENSOR_BLEND_HOURS
+
+        ts = _future_ts(n=8)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [1] * 8)
+
+        result = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=1e6,
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        t_in = result["climate.room"]["current_temp"].values
+        deficit = result["climate.room"]["deficit"].values
+        expected = max(0.0, 21.0 - t_in[SENSOR_BLEND_HOURS])
+        assert deficit[SENSOR_BLEND_HOURS] == pytest.approx(expected, abs=1e-6)
+
+    def test_setpoint_column_unaffected_by_blending(self):
+        """The raw 'setpoint' column still reflects the pure hysteresis
+        trajectory (kept for diagnostics/backward-compat) — only the new
+        'deficit' column is blended."""
+        ts = _future_ts(n=8)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [1] * 8)
+
+        result = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        sp = result["climate.room"]["setpoint"].values
+        assert np.all(sp == pytest.approx(21.0))
+
+    def test_no_hysteresis_configured_deficit_matches_flat_live_setpoint(self):
+        """Without heating_active_series/setpoint_on/off, 'deficit' equals the
+        flat live-setpoint deficit for every hour (blending is a no-op since
+        live == hysteresis in this branch)."""
+        ts = _future_ts(n=6)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=21.0, current=19.0)
+
+        result = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
+            heating_active_series=None,
+            setpoint_on=None,
+            setpoint_off=None,
+        )
+        t_in = result["climate.room"]["current_temp"].values
+        deficit = result["climate.room"]["deficit"].values
+        expected = np.maximum(0.0, 21.0 - t_in)
+        np.testing.assert_allclose(deficit, expected, atol=1e-9)
+
+
+# ── _engineer_features: prefers the precomputed 'deficit' column ───────────────
+
+
+def _make_bare_df(timestamps) -> pd.DataFrame:
+    """Minimal energy df with gross_kwh for _engineer_features input."""
+    n = len(timestamps)
+    return pd.DataFrame({"timestamp": pd.to_datetime(timestamps), "gross_kwh": [1.5] * n})
+
+
+class TestThermalPressurePrefersDeficitColumn:
+    def test_uses_deficit_column_when_present(self):
+        """When climate_dfs carries a precomputed 'deficit' column (as produced
+        by _project_indoor_temps' blending), _engineer_features must use it
+        directly instead of recomputing (setpoint - current_temp)."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": [19.0] * 2,
+                    "setpoint": [21.0] * 2,  # would give delta=2.0 if recomputed
+                    "deficit": [5.0] * 2,  # pre-blended value — must win
+                }
+            )
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        np.testing.assert_allclose(result["thermal_pressure"].values, 5.0)
+
+    def test_falls_back_to_setpoint_minus_current_when_no_deficit_column(self):
+        """Historical/training-time climate_dfs (no 'deficit' column) keep the
+        original setpoint-minus-current_temp calculation, unchanged."""
+        ts = pd.date_range("2026-01-15 10:00", periods=2, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts)
+        climate_dfs = {
+            "climate.room": pd.DataFrame(
+                {
+                    "timestamp": ts,
+                    "current_temp": [19.0] * 2,
+                    "setpoint": [21.0] * 2,
+                }
+            )
+        }
+        result = _engineer_features(df, w, None, climate_dfs=climate_dfs)
+        np.testing.assert_allclose(result["thermal_pressure"].values, 2.0)
+
+
 # ── thermal_pressure via _engineer_features ────────────────────────────────────
 
 
@@ -163,8 +352,38 @@ def _make_weather_df(ts: pd.DatetimeIndex, temp: float = 5.0) -> pd.DataFrame:
 
 
 class TestThermalPressureWithHysteresis:
-    def test_pressure_zero_when_off(self):
-        """Setpoint 12 °C, T_indoor ~19 °C → setpoint < indoor → thermal_pressure = 0."""
+    def test_pressure_zero_when_off_and_live_setpoint_agrees(self):
+        """Setpoint 12°C live AND hysteresis-off, T_indoor ~19°C → genuinely no
+        deficit anywhere → thermal_pressure = 0."""
+        ts = _future_ts(n=6)
+        outdoor = _outdoor_series(ts, temp=5.0)
+        cr = _climate_recent(ts, setpoint=12.0, current=19.0)
+        ha_series = _heating_active_series(ts, [0] * 6)
+
+        climate_dfs = _project_indoor_temps(
+            cr,
+            ts,
+            outdoor,
+            tau_hours=24.0,
+            heating_active_series=ha_series,
+            setpoint_on=21.0,
+            setpoint_off=12.0,
+        )
+        future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
+        weather_df = _make_weather_df(ts, temp=5.0)
+        feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
+        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
+            "Live setpoint (12) and hysteresis-off setpoint (12) agree — no deficit should exist anywhere"
+        )
+
+    def test_live_deficit_not_masked_by_hysteresis_off(self):
+        """Live setpoint 21°C (thermostat genuinely calling for heat) but
+        hysteresis projects OFF (setpoint_off=12) because outdoor temp is mild
+        — the mirror-image direction of the original bug report (there, live
+        was LOW and hysteresis projected HIGH; see test_pressure_positive_when_on
+        for that exact scenario). This test guards the opposite direction: the
+        full-trust window must surface a real live deficit instead of the
+        hysteresis model's zero, regardless of which way the mismatch runs."""
         ts = _future_ts(n=6)
         outdoor = _outdoor_series(ts, temp=5.0)
         cr = _climate_recent(ts, setpoint=21.0, current=19.0)
@@ -182,12 +401,19 @@ class TestThermalPressureWithHysteresis:
         future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
         weather_df = _make_weather_df(ts, temp=5.0)
         feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
-        assert np.allclose(feat["thermal_pressure"].values, 0.0), (
-            "Heating OFF → setpoint(12) < T_indoor → thermal_pressure must be 0"
+        assert feat["thermal_pressure"].iloc[0] == pytest.approx(2.0, abs=1e-6), (
+            "Hour 0 (published sensor value) must use the live setpoint (21) "
+            "against indoor (~19), giving a real ~2.0 deficit — not 0"
         )
 
     def test_pressure_positive_when_on(self):
-        """Setpoint 21 °C, T_indoor cooling from 19 °C → pressure > 0 for early hours."""
+        """Live setpoint 12°C (e.g. actual summer/eco setpoint) but hysteresis
+        projects heating ON (setpoint_on=21) because outdoor temp looks cold to
+        the seasonal model — the real-world direction of the original bug report
+        (live setpoint low, hysteresis projecting a high heating-season setpoint).
+        Hour 0 must show NO phantom deficit (live 12 < indoor 19 → 0); later
+        hours transition to the hysteresis-projected setpoint and go positive
+        once the blend hands off to it."""
         ts = _future_ts(n=6)
         outdoor = _outdoor_series(ts, temp=5.0)
         cr = _climate_recent(ts, setpoint=12.0, current=19.0)
@@ -205,8 +431,13 @@ class TestThermalPressureWithHysteresis:
         future_df = pd.DataFrame({"timestamp": ts, "gross_kwh": [np.nan] * 6})
         weather_df = _make_weather_df(ts, temp=5.0)
         feat = _engineer_features(future_df, weather_df, None, climate_dfs=climate_dfs)
-        assert (feat["thermal_pressure"] > 0).any(), (
-            "Heating ON → setpoint(21) > T_indoor(19) → thermal_pressure must be > 0"
+        pressure = feat["thermal_pressure"].values
+        assert pressure[0] == pytest.approx(0.0, abs=1e-6), (
+            "Hour 0 must use the live setpoint (12 < indoor 19) — no phantom "
+            "deficit despite hysteresis projecting heating ON"
+        )
+        assert pressure[5] > 0, (
+            "By hour 5 (blend window) the hysteresis-projected setpoint (21) should dominate, producing a real deficit"
         )
 
     def test_pressure_drops_after_off_transition(self):

@@ -4011,6 +4011,70 @@ import logging as _logging_for_excluded_ranges_tests  # noqa: E402
 _EXCLUDED_RANGES_TEST_LOGGER = _logging_for_excluded_ranges_tests.getLogger("energy_forecast")
 
 
+class TestRetrainWeatherFetchRetryExhaustion:
+    """#97 — after fetch_historical_weather() exhausts its retries and re-raises,
+    _retrain()'s existing except (OSError, KeyError, ValueError) fallback must
+    still catch it and let the retrain proceed on median-imputed weather
+    features, exactly as it does today for any other archive-fetch failure.
+    Spec §7 finding Test-3: this was previously asserted only as prose about
+    requests.RequestException subclassing OSError, never actually tested."""
+
+    def _patch_retrain_deps(self, monkeypatch, energy_df, weather_exc):
+        import energy_forecast.ha_data as ha_data_mod
+        import energy_forecast.weather as weather_mod
+
+        empty_df = pd.DataFrame()
+
+        def _raise_weather_exc(*a, **kw):
+            raise weather_exc
+
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
+        monkeypatch.setattr(ha_data_mod, "split_ev_charging", lambda df, *a, **kw: (df, empty_df))
+        monkeypatch.setattr(weather_mod, "fetch_historical_weather", _raise_weather_exc)
+        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: _empty_weather())
+        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
+        monkeypatch.setattr(ha_data_mod, "fetch_energy_history_15m", lambda *a, **kw: None)
+
+    def test_http_error_after_retry_exhaustion_falls_back_to_median_imputation(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import requests
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(200)
+        exhausted_exc = requests.HTTPError("503 error after 4 attempts")
+        self._patch_retrain_deps(monkeypatch, energy_df, exhausted_exc)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._retrain(stub)  # must not raise
+
+        assert any("historical weather fetch failed" in r.message.lower() for r in caplog.records)
+        stub._ml_model.train.assert_called_once()
+
+    def test_connection_error_after_retry_exhaustion_falls_back_to_median_imputation(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Same as above but for the other retried-then-exhausted exception type
+        (ConnectionError/Timeout branch, not the HTTPError branch)."""
+        import logging
+
+        import requests
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        energy_df = _make_energy_df(200)
+        exhausted_exc = requests.ConnectionError("no route after 4 attempts")
+        self._patch_retrain_deps(monkeypatch, energy_df, exhausted_exc)
+
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._retrain(stub)  # must not raise
+
+        assert any("historical weather fetch failed" in r.message.lower() for r in caplog.records)
+        stub._ml_model.train.assert_called_once()
+
+
 class _FakeMLModelForUpdateSensors:
     """Minimal stand-in for EnergyForecastModel, used to drive
     EnergyForecast._update_sensors() end-to-end without a real trained model.

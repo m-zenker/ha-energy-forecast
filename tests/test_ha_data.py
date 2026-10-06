@@ -2410,3 +2410,271 @@ class TestFetchRecentEnergy15m:
         saved_ts = set(pd.to_datetime(saved["timestamp"]))
         expected = (last_real_slot + pd.Timedelta(minutes=15)).tz_localize(None)
         assert expected in saved_ts, f"slot {expected} missing — trailing silence wasn't backfilled"
+
+
+# ── GitHub #24: open bucket must never be cached ─────────────────────────────
+
+
+class TestOpenBucketNeverCached:
+    """GitHub #24: the still-open bucket must never be written to a cache file.
+
+    The hourly append path skips timestamps already in the CSV, so a partial
+    bucket written at HH:01 (~1 min of consumption) was never corrected by
+    later hourly runs — only by the weekly compaction, which silently failed
+    for high-frequency meters.  Every test computes its cutoff *after* the
+    call: an hour rollover mid-test can then only make the assertion looser,
+    never flaky.
+    """
+
+    @staticmethod
+    def _ha_raw_through_now() -> pd.DataFrame:
+        """Cumulative readings every 5 min, +0.05 kWh each, from 3 h ago through now."""
+        now = pd.Timestamp.now(tz="Europe/Zurich")
+        ts = pd.date_range((now - pd.Timedelta(hours=3)).floor("5min"), now, freq="5min")
+        return pd.DataFrame({"timestamp": ts, "value": [100.0 + 0.05 * i for i in range(len(ts))]})
+
+    @staticmethod
+    def _saved(cache_path) -> pd.DataFrame:
+        saved = pd.read_csv(cache_path)
+        saved["timestamp"] = pd.to_datetime(saved["timestamp"], format="mixed")
+        return saved
+
+    @staticmethod
+    def _cutoff(res: str) -> pd.Timestamp:
+        return pd.Timestamp.now(tz="Europe/Zurich").floor(res).tz_localize(None)
+
+    def test_fetch_recent_energy_does_not_append_open_hour(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("1h")).all(), "open hourly bucket was appended to the cache"
+
+    def test_fetch_recent_energy_caches_previous_hour_at_full_value(self, mock_app, tmp_path):
+        """The last complete hour is cached with all 12 five-minute increments (0.6 kWh), not a stub."""
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        prev_hour = self._cutoff("1h") - pd.Timedelta(hours=1)
+        row = saved[saved["timestamp"] == prev_hour]
+        assert len(row) == 1
+        assert row.iloc[0]["gross_kwh"] == pytest.approx(0.6)
+
+    def test_fetch_energy_history_does_not_write_open_hour(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("1h")).all(), "open hourly bucket was written by compaction"
+
+    def test_fetch_energy_history_drops_stale_open_row_from_cache(self, mock_app, tmp_path):
+        """A pre-existing open-hour row in the cache is removed by compaction, even with no HA data."""
+        cache_path = tmp_path / "energy_history.csv"
+        current_hour = self._cutoff("1h")
+        prev_hour = current_hour - pd.Timedelta(hours=1)
+        make_energy_df([prev_hour.isoformat(), current_hour.isoformat()], [1.5, 0.01]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved_ts = set(self._saved(cache_path)["timestamp"])
+        assert prev_hour in saved_ts
+        assert current_hour not in saved_ts
+
+    def test_fetch_recent_energy_15m_does_not_append_open_slot(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("15min")).all(), "open 15-min slot was appended to the cache"
+
+    def test_fetch_recent_energy_15m_caches_previous_slot_at_full_value(self, mock_app, tmp_path):
+        """The last complete 15-min slot holds 3 five-minute increments (0.15 kWh)."""
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        prev_slot = self._cutoff("15min") - pd.Timedelta(minutes=15)
+        row = saved[saved["timestamp"] == prev_slot]
+        assert len(row) == 1
+        assert row.iloc[0]["gross_kwh"] == pytest.approx(0.15)
+
+    def test_fetch_energy_history_15m_does_not_write_open_slot(self, mock_app, tmp_path):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with patch.object(ha_data, "_fetch_history", return_value=self._ha_raw_through_now()):
+            ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = self._saved(cache_path)
+        assert not saved.empty
+        assert (saved["timestamp"] < self._cutoff("15min")).all(), "open 15-min slot was written by compaction"
+
+
+# ── GitHub #24: chunked, all-or-nothing history fetch ────────────────────────
+
+
+class TestFetchHistoryChunking:
+    """GitHub #24: AppDaemon's HA REST call times out after 10 s, which a 30-day
+    get_history for a ~10 s-interval meter (~260k states) exceeds — AppDaemon
+    then returns None and the weekly resync silently did nothing.  Windows
+    longer than 2 days are now fetched in ≤2-day chunks, all-or-nothing."""
+
+    ENTITY = "sensor.energy"
+
+    @classmethod
+    def _state(cls, ts_utc: str, value: float, entity_id: str | None = None) -> dict:
+        # Real AppDaemon 4.5 returns tz-aware datetimes for last_* keys.
+        return {"entity_id": entity_id or cls.ENTITY, "state": str(value), "last_updated": pd.Timestamp(ts_utc)}
+
+    def test_short_window_is_single_days_call(self, mock_app):
+        """The hourly 2-day path keeps its exact historical call shape."""
+        mock_app.get_history.return_value = [[self._state("2024-01-01T08:00:00Z", 1.0)]]
+
+        _fetch_history(mock_app, self.ENTITY, days=2)
+
+        mock_app.get_history.assert_called_once_with(entity_id=self.ENTITY, days=2)
+
+    def test_long_window_is_split_into_contiguous_two_day_chunks(self, mock_app):
+        mock_app.get_history.return_value = [[]]
+
+        _fetch_history(mock_app, self.ENTITY, days=30)
+
+        calls = mock_app.get_history.call_args_list
+        assert len(calls) == 15
+        for c in calls:
+            assert c.kwargs["entity_id"] == self.ENTITY
+            assert "days" not in c.kwargs
+        for c in calls[:-1]:
+            assert c.kwargs["end_time"] - c.kwargs["start_time"] <= pd.Timedelta(days=2)
+        for prev, nxt in zip(calls, calls[1:]):
+            assert prev.kwargs["end_time"] == nxt.kwargs["start_time"], "chunks must be contiguous"
+        # The final window's end carries 1 day of slack past "now" (HA returns nothing beyond
+        # now), so an AppDaemon/HA timezone mismatch can't cut off the most recent hours.
+        span = calls[-1].kwargs["end_time"] - calls[0].kwargs["start_time"]
+        assert span == pd.Timedelta(days=31)
+
+    def test_chunk_datetimes_are_naive_for_appdaemon_4_4(self, mock_app):
+        """AppDaemon 4.2–4.4 pytz-localize start_time/end_time, which raises on tz-aware
+        datetimes; the plugin swallows it and returns None, failing every chunk."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+
+        def ad44_get_history(**kwargs):
+            for key in ("start_time", "end_time"):
+                if key in kwargs and kwargs[key].tzinfo is not None:
+                    return None  # pytz: "Not naive datetime (tzinfo is already set)" → swallowed
+            return [[s1]]
+
+        mock_app.get_history.side_effect = ad44_get_history
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [1.0]
+
+    def test_chunks_concatenated_sorted_and_deduplicated(self, mock_app):
+        """HA repeats the window-start state, so adjacent chunks share a boundary reading."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        s2 = self._state("2024-01-02T08:00:00Z", 2.0)
+        s3 = self._state("2024-01-03T08:00:00Z", 3.0)
+        mock_app.get_history.side_effect = [[[s1, s2]], [[s2, s3]]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [1.0, 2.0, 3.0]
+        assert result["timestamp"].is_monotonic_increasing
+
+    def test_empty_chunk_is_valid_not_failure(self, mock_app):
+        """A sensor created mid-window has no states in early chunks — that is not an error."""
+        s1 = self._state("2024-01-03T08:00:00Z", 5.0)
+        mock_app.get_history.side_effect = [[[]], [[s1]]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert list(result["value"]) == [5.0]
+
+    def test_any_chunk_returning_none_fails_whole_fetch(self, mock_app, caplog):
+        """A partial frame would be forward-filled into 0-kWh rows that overwrite good cache rows."""
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.side_effect = [[[s1]], None]
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert result.empty
+        assert any(self.ENTITY in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_any_chunk_raising_fails_whole_fetch(self, mock_app):
+        s1 = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.side_effect = [[[s1]], RuntimeError("timeout")]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=4)
+
+        assert result.empty
+
+    def test_single_call_returning_none_warns(self, mock_app, caplog):
+        """Short-window path: a None response (AppDaemon swallowed an error) is now logged."""
+        mock_app.get_history.return_value = None
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            result = _fetch_history(mock_app, self.ENTITY, days=2)
+
+        assert result.empty
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_foreign_entity_lists_ignored(self, mock_app):
+        """Some AppDaemon 4.x versions document ignoring the entity filter when end_time is set."""
+        other = self._state("2024-01-01T08:00:00Z", 99.0, entity_id="sensor.other")
+        mine = self._state("2024-01-01T08:00:00Z", 1.0)
+        mock_app.get_history.return_value = [[other], [mine]]
+
+        result = _fetch_history(mock_app, self.ENTITY, days=2)
+
+        assert list(result["value"]) == [1.0]
+
+
+class TestEmptyResyncWarning:
+    """GitHub #24: a 30-day resync that returns nothing while a cache exists must WARN
+    (it previously left the poisoned cache in place with only INFO lines)."""
+
+    def test_fetch_energy_history_warns_when_resync_empty(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history.csv"
+        make_energy_df(["2024-01-01 10:00"], [1.5]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert any(
+            r.levelno == logging.WARNING and "sensor.energy" in r.getMessage() and "resync" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_fetch_energy_history_15m_warns_when_resync_empty(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        make_energy_df(["2024-01-01 10:00"], [0.4]).to_csv(cache_path, index=False)
+
+        with patch.object(ha_data, "_fetch_history", return_value=pd.DataFrame()):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert any(
+            r.levelno == logging.WARNING and "sensor.energy" in r.getMessage() and "resync" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_no_warning_when_resync_returns_data(self, mock_app, tmp_path, caplog):
+        cache_path = tmp_path / "energy_history.csv"
+        ha_raw = make_ha_raw(["2024-01-01T08:00:00Z", "2024-01-01T09:00:00Z"], [100.0, 101.0])
+
+        with patch.object(ha_data, "_fetch_history", return_value=ha_raw):
+            with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+                ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+
+        assert not any("resync" in r.getMessage() for r in caplog.records)
