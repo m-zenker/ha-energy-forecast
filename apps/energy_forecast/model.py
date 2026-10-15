@@ -2904,7 +2904,10 @@ def _project_indoor_temps(
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
-        T_in[t+1] = T_in[t] + (T_out[t] - T_in[t]) / tau
+        T_in[t+1] = max(T_in[t] + (T_out[t] - T_in[t]) / tau, setpoint[t] - d0)
+
+    while heating is on (thermostat floor), else the free term alone; ``d0`` is
+    the deficit at hour 0 (0 when heating only switches on later).
 
     Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
     otherwise falls back to the most-recent ``setpoint``.
@@ -2945,19 +2948,33 @@ def _project_indoor_temps(
         # Align outdoor temps to future_timestamps
         t_out_arr = outdoor_temp_series.reindex(future_timestamps, method="nearest").values.astype(float)
 
-        # Vectorised Euler forward over 48 steps
-        t_in_arr = np.empty(len(future_timestamps))
-        t_in_arr[0] = t_in_start
-        for i in range(1, len(future_timestamps)):
-            t_in_arr[i] = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+        n = len(future_timestamps)
+        room_setpoint = float(latest["setpoint"])
 
-        # Build a projected climate DataFrame matching what _engineer_features expects
-        setpoint_val = float(latest["setpoint"])
+        # Heating state per step. No series → thermostat-controlled for the whole window.
         if heating_active_series is not None and setpoint_on is not None and setpoint_off is not None:
-            ha_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values
-            setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
+            on_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values.astype(bool)
+            # Heating already on at hour 0 → this room's thermostat setpoint is the truth for every
+            # on-hour. Comparing all rooms to the shared mean (setpoint_on) invented ~1.4 °C of
+            # deficit for 18 °C rooms (2026-10-15). Turning on later → shared setpoint_on, as before.
+            on_setpoint = room_setpoint if on_arr[0] else setpoint_on
+            setpoint_arr = np.where(on_arr, on_setpoint, setpoint_off)
         else:
-            setpoint_arr = np.full(len(future_timestamps), setpoint_val)
+            on_arr = np.ones(n, dtype=bool)
+            setpoint_arr = np.full(n, room_setpoint)
+
+        # RC cool-down with a thermostat floor: while heating is on the room is held at its
+        # current deficit below the active setpoint instead of decaying toward outdoor. A pure
+        # cool-down projected ~4.6 °C of pressure at 24–35 h lead vs 0.02 °C real (2026-10-15).
+        # d0 is measured against the same setpoint the floor uses: the room's own setpoint when heating
+        # is already on at hour 0; when heating only switches on later the floor is the shared
+        # setpoint_on with d0 = 0 (season onset; room assumed brought to target).
+        initial_deficit = max(0.0, room_setpoint - t_in_start) if on_arr[0] else 0.0
+        t_in_arr = np.empty(n)
+        t_in_arr[0] = t_in_start
+        for i in range(1, n):
+            free = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+            t_in_arr[i] = max(free, setpoint_arr[i] - initial_deficit) if on_arr[i] else free
 
         # ── Deficit blend: live setpoint (near-term) → hysteresis-projected
         # setpoint (far-term) ────────────────────────────────────────────
@@ -2967,9 +2984,9 @@ def _project_indoor_temps(
         # thinks it *should* be set to. Beyond SENSOR_BLEND_HOURS we trust the
         # hysteresis projection fully, same rationale as the outdoor-temp blend
         # in _build_prediction_temp_df.
-        live_deficit_arr = np.maximum(0.0, setpoint_val - t_in_arr)
+        live_deficit_arr = np.maximum(0.0, room_setpoint - t_in_arr)
         hyst_deficit_arr = np.maximum(0.0, setpoint_arr - t_in_arr)
-        hours_ahead = np.arange(len(future_timestamps), dtype=float)
+        hours_ahead = np.arange(n, dtype=float)
         blend_span = max(SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS, 1)
         alpha = np.clip((hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_span, 0.0, 1.0)
         deficit_arr = live_deficit_arr * (1.0 - alpha) + hyst_deficit_arr * alpha
