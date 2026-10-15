@@ -2712,3 +2712,104 @@ class TestEmptyResyncWarning:
                 ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert not any("resync" in r.getMessage() for r in caplog.records)
+
+
+# ── Climate valve demand (heating_power_request) ─────────────────────────────
+
+
+def _climate_raw(rows):
+    """rows: (utc_iso, current_temperature, temperature, heating_power_request | None | "missing")."""
+    out = []
+    for ts, cur, sp, hpr in rows:
+        r = {
+            "timestamp": pd.Timestamp(ts).tz_convert("Europe/Zurich").floor("1h"),
+            "current_temperature": cur,
+            "temperature": sp,
+        }
+        if hpr != "missing":
+            r["heating_power_request"] = hpr
+        out.append(r)
+    return pd.DataFrame(out)
+
+
+def _hpr_series(out):
+    return out.assign(timestamp=pd.to_datetime(out["timestamp"])).set_index("timestamp")["heating_power_request"]
+
+
+class TestClimateValveDemand:
+    def test_hpr_hourly_max_includes_carried_state(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:50:00Z", 20.0, 20.0, 40),  # local 22:xx → valve open
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, 0),  # local 23:xx → closes
+                ("2026-10-14T23:30:00Z", 19.5, 20.0, 0),  # local 01:xx
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert h[pd.Timestamp("2026-10-14 22:00")] == 40
+        assert h[pd.Timestamp("2026-10-14 23:00")] == 40  # open at hour start (carried), closed during the hour
+        assert h[pd.Timestamp("2026-10-15 00:00")] == 0
+        assert h[pd.Timestamp("2026-10-15 01:00")] == 0
+
+    def test_carry_does_not_cross_missing_attribute(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 0),
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, None),  # attribute present but null (unavailable)
+                ("2026-10-14T23:10:00Z", 20.0, 20.0, 0),
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert pd.isna(h[pd.Timestamp("2026-10-15 00:00")])  # no state in hour, carry blocked by the null
+
+    def test_state_persists_across_quiet_hours(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 0),  # local 22:xx closed
+                ("2026-10-15T00:10:00Z", 19.0, 20.0, 0),  # local 02:xx — no rows at 23, 00, 01
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert list(h[pd.Timestamp("2026-10-14 23:00") : pd.Timestamp("2026-10-15 01:00")]) == [0, 0, 0]
+
+    def test_null_state_hour_itself_uses_start_state_only(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 30),
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, None),  # local 23:10 → unavailable
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert h[pd.Timestamp("2026-10-14 23:00")] == 30  # open at hour start, then unknown
+
+    def test_without_attribute_column_absent(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [("2026-10-14T20:50:00Z", 20.0, 20.0, "missing"), ("2026-10-14T22:50:00Z", 20.0, 20.0, "missing")]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        assert "heating_power_request" not in out.columns or out["heating_power_request"].isna().all()
+
+    def test_old_cache_without_column_merges(self, mock_app, tmp_path):
+        p = tmp_path / "climate_room.csv"
+        pd.DataFrame({"timestamp": ["2026-10-13 10:00:00"], "current_temp": [20.0], "setpoint": [20.0]}).to_csv(
+            p, index=False
+        )
+        raw = _climate_raw([("2026-10-14T20:50:00Z", 20.0, 20.0, 0)])
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", p)
+        assert len(out) >= 2 and pd.isna(out.iloc[0]["heating_power_request"])
+
+    def test_recent_climate_also_caches_hpr(self, mock_app, tmp_path):
+        raw = _climate_raw([("2026-10-14T20:50:00Z", 20.0, 20.0, 15)])
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_recent_climate(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        assert out["heating_power_request"].iloc[-1] == 15
