@@ -45,8 +45,11 @@ def _heating_active_series(ts: pd.DatetimeIndex, states: list[int]) -> pd.Series
 
 
 class TestSetpointProjection:
-    def test_heating_on_uses_setpoint_on(self):
-        """Heating already ON at hour 0 → room's own live setpoint (production passes setpoint_on = live mean in this state anyway)."""
+    def test_heating_on_at_hour_zero_uses_room_setpoint(self):
+        """Heating already ON at hour 0 → room's own live setpoint.
+
+        (Production passes setpoint_on = live mean in this state anyway.)
+        """
         ts = _future_ts()
         outdoor = _outdoor_series(ts)
         cr = _climate_recent(ts, setpoint=12.0)  # current entity setpoint is 12 (off state)
@@ -153,7 +156,7 @@ class TestDeficitBlending:
     SENSOR_FULL_TRUST_HOURS..SENSOR_BLEND_HOURS, mirroring the outdoor-temp
     live/forecast blend in _build_prediction_temp_df."""
 
-    def test_near_term_uses_live_setpoint_even_when_hysteresis_projects_on(self):
+    def test_near_term_uses_live_setpoint_not_hysteresis_setpoint(self):
         """Live setpoint is 12 (e.g. summer/eco mode); hysteresis setpoint (21)
         differs from live for every hour. The
         full-trust window (h <= SENSOR_FULL_TRUST_HOURS) must still be computed
@@ -172,6 +175,7 @@ class TestDeficitBlending:
             outdoor,
             tau_hours=1e6,  # effectively no cooling — indoor stays ~19 for all 8h
             heating_active_series=ha_series,
+            # Deliberate swap: heating is off, so setpoint_off=21 plays the hysteresis-projected setpoint (live 12 vs 21 diverge).
             setpoint_on=12.0,
             setpoint_off=21.0,
         )
@@ -204,6 +208,7 @@ class TestDeficitBlending:
             outdoor,
             tau_hours=1e6,
             heating_active_series=ha_series,
+            # Deliberate swap: heating is off, so setpoint_off=21 plays the hysteresis-projected setpoint (live 12 vs 21 diverge).
             setpoint_on=12.0,
             setpoint_off=21.0,
         )
@@ -232,6 +237,7 @@ class TestDeficitBlending:
             outdoor,
             tau_hours=1e6,
             heating_active_series=ha_series,
+            # Deliberate swap: heating is off, so setpoint_off=21 plays the hysteresis-projected setpoint (live 12 vs 21 diverge).
             setpoint_on=12.0,
             setpoint_off=21.0,
         )
@@ -255,6 +261,7 @@ class TestDeficitBlending:
             outdoor,
             tau_hours=24.0,
             heating_active_series=ha_series,
+            # Deliberate swap: heating is off, so setpoint_off=21 plays the hysteresis-projected setpoint (live 12 vs 21 diverge).
             setpoint_on=12.0,
             setpoint_off=21.0,
         )
@@ -433,7 +440,7 @@ class TestThermalPressureWithHysteresis:
         pressure = feat["thermal_pressure"].values
         assert pressure[0] == pytest.approx(0.0, abs=1e-6), (
             "Hour 0 must use the live setpoint (12 < indoor 19) — no phantom "
-            "deficit despite hysteresis projecting heating ON"
+            "deficit despite the hysteresis-projected setpoint (21) being higher"
         )
         assert pressure[5] > 0, (
             "By hour 5 (blend window) the hysteresis-projected setpoint (21) should dominate, producing a real deficit"
@@ -530,3 +537,11 @@ class TestHeatingAwareProjection:
             _climate_recent(ts, setpoint=20.0, current=20.0), ts, _outdoor_series(ts, 0.0), tau_hours=11.64
         )["climate.room"]
         assert p["current_temp"].min() == pytest.approx(20.0)
+
+    def test_stale_observation_starts_at_setpoint_with_zero_deficit(self):
+        ts = _future_ts()
+        cr = _climate_recent(ts, setpoint=21.0, current=15.0)
+        cr["climate.room"]["timestamp"] = [ts[0] - pd.Timedelta(hours=3)]  # > 2 h old -> ignored
+        p = self._proj(cr, ts, [1] * 48)
+        assert p["current_temp"].values[0] == pytest.approx(21.0)
+        assert np.all(p["deficit"].values == pytest.approx(0.0))  # d0 = 0

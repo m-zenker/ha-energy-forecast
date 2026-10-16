@@ -2914,9 +2914,11 @@ def _project_indoor_temps(
 
     Returns a dict ``{entity_id: pd.DataFrame}`` with ``timestamp``,
     ``current_temp``, ``setpoint`` and ``deficit`` columns indexed by
-    *future_timestamps*. ``setpoint`` is the pure hysteresis-projected
-    trajectory; ``deficit`` blends the live setpoint (near-term, full trust)
-    with that hysteresis-projected setpoint (far-term) — see the blend block
+    *future_timestamps*. ``setpoint`` is, for on-hours, the room's own live
+    setpoint when heating is already on at hour 0 (or when no heating series is
+    given) and the shared ``setpoint_on`` when heating only switches on later;
+    off-hours use ``setpoint_off``. ``deficit`` blends the live setpoint (near-term,
+    full trust) with that projected setpoint (far-term) — see the blend block
     below. These DataFrames can be passed as *climate_dfs* to
     ``_engineer_features()`` so that prediction-time thermal pressure reflects
     projected — rather than stale — indoor temperatures, using ``deficit``
