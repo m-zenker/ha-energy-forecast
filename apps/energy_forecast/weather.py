@@ -349,5 +349,13 @@ def fetch_open_meteo(lat: float, lon: float, timezone: str = "Europe/Zurich", pa
                 "humidity": h.get("relative_humidity_2m", [np.nan] * n),
             }
         )
-    except (requests.RequestException, KeyError, ValueError):
-        return pd.DataFrame(columns=_WEATHER_COLUMNS)
+    except (requests.RequestException, KeyError, ValueError) as exc:
+        _LOGGER.warning(
+            "Open-Meteo forecast fetch failed (%s) — weather features will be imputed from training medians.", exc
+        )
+        # Typed empty frame: a bare columns-only DataFrame has object dtype, which
+        # later makes np.exp()/np.maximum() fail in _engineer_features.
+        empty = pd.DataFrame(columns=_WEATHER_COLUMNS)
+        for col in _WEATHER_COLUMNS:
+            empty[col] = empty[col].astype("datetime64[ns]" if col == "timestamp" else "float64")
+        return empty
