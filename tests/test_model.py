@@ -5181,7 +5181,15 @@ class TestProjectIndoorTemps:
                 }
             )
         }
-        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=24.0)
+        result = _project_indoor_temps(
+            climate_recent,
+            ts,
+            outdoor,
+            tau_hours=24.0,
+            heating_active_series=pd.Series(0, index=ts),
+            setpoint_on=20.0,
+            setpoint_off=12.0,
+        )
         assert "climate.room" in result
         projected = result["climate.room"]
         t_in = projected["current_temp"].values
@@ -5259,7 +5267,15 @@ class TestProjectIndoorTemps:
                 }
             )
         }
-        result = _project_indoor_temps(climate_recent, ts, outdoor, tau_hours=None)
+        result = _project_indoor_temps(
+            climate_recent,
+            ts,
+            outdoor,
+            tau_hours=None,
+            heating_active_series=pd.Series(0, index=ts),
+            setpoint_on=20.0,
+            setpoint_off=12.0,
+        )
         t_in = result["climate.room"]["current_temp"].values
         assert t_in[0] == pytest.approx(10.0)
         # With DEFAULT_TAU=24 the first step: 10 + (5-10)/24 ≈ 9.79
