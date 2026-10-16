@@ -3072,6 +3072,10 @@ def _engineer_features(
     # ── Weather merge ────────────────────────────────────────────────────────
     w = weather_df.copy()
     w["timestamp"] = pd.to_datetime(w["timestamp"]).dt.floor("1h")
+    # Weather APIs can yield object-dtype columns (empty fallback frame, all-null
+    # fields); coerce so downstream ufuncs (np.exp, np.maximum) always see floats.
+    for _wcol in w.columns.drop("timestamp"):
+        w[_wcol] = pd.to_numeric(w[_wcol], errors="coerce")
 
     # 3-day rolling temperature (captures thermal mass / multi-day cold spells)
     w = w.sort_values("timestamp").reset_index(drop=True)

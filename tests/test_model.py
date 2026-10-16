@@ -513,6 +513,26 @@ class TestNewWeatherFeatures:
         assert (result["cloud_cover_pct"] == 42.0).all()
         assert (result["direct_radiation_wm2"] == 180.0).all()
 
+    def test_engineer_features_survives_empty_weather_fallback(self):
+        """Empty weather frame (Open-Meteo fetch failed) must not crash np.exp on object dtype."""
+        from energy_forecast import weather as _weather
+
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        with patch("requests.get", side_effect=__import__("requests").RequestException("down")):
+            w = _weather.fetch_open_meteo(47.0, 8.0)
+        result = _engineer_features(df, w, None)
+        assert result["defrost_risk"].dtype == "float64"
+
+    def test_engineer_features_coerces_object_dtype_weather(self):
+        """Object-dtype weather columns (e.g. all-null API fields) are coerced to float."""
+        ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
+        df = _make_bare_df(ts)
+        w = _make_weather_df(ts).astype({"temp_c": object, "wind_kmh": object})
+        result = _engineer_features(df, w, None)
+        assert result["temp_c"].dtype == "float64"
+        assert result["defrost_risk"].notna().all()
+
     def test_engineer_features_missing_weather_cols_filled_as_nan(self):
         """Safety net: if weather_df has no cloud/radiation, columns are NaN."""
         ts = pd.date_range("2026-03-12 08:00", periods=4, freq="1h")
