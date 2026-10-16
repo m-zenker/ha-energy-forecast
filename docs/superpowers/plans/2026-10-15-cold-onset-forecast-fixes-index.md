@@ -36,6 +36,12 @@ All pre-deploy gates use ≤ 7 cold days (no earlier cold data with climate exis
 
 ## Post-deploy verification & attribution (all plans)
 1. **Deploy log** (append here per deploy): plan/task, alpha tag, deploy timestamp (local), expected effect.
+### Deploy log
+| Plan/task | Tag | Deploy (local, 2026-10-16) | Expected effect |
+|---|---|---|---|
+| D Task 1 (`heating_power_request` cache) | v0.12.0-alpha-25 | ~05:42 | none on forecast; data clock starts (≥ 14 valve-closed nights) |
+| C Task 1 (+ tidy commit) (heating-aware projection) | v0.12.0-alpha-26 | ~05:51 | cold-day 24–47 h bias +6.9 → about −2 kWh/day; tomorrow forecast ~19–20 → ~10–13 kWh. Only target days whose predictions were issued after 05:51 on 2026-10-16 count for C. |
+
 2. **Metric** (not the rolling `mae_7d`): from `pred_history.json` (24–25 h lead, keep-first), per **target day**: bias (Σpred − Σact, kWh/day) and MAE (kWh/h), with a **fixed hour mask** that excludes the 06/07/20/21 h hours (A's repair window) and all EV-charging hours (B's population change). Split the days by deploy timestamps. Only days whose predictions were all issued after a deploy count for it (predictions are made ~24 h ahead).
 3. **Cold day** = daily mean outdoor temp < 13.5 °C (the learned heating-season `on_below`).
 4. **Success criteria:**

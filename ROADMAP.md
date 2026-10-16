@@ -6,9 +6,11 @@ Current: **v0.11.4** — 2026-06-16, main. 627 tests.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-24 (2026-09-28). **main:** v0.11.15 released 2026-10-06 (Rule-3 curated releases off main — dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season work).
+**dev:** v0.12.0-alpha-26 (2026-10-16). **main:** v0.11.15 released 2026-10-06 (Rule-3 curated releases off main — dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season work).
 
-**Heating-season projection live (#98, 2026-09-26) — bias recheck due ~2026-10-03:** rising autumn MAE (`mae_7d` 0.234 → 0.298, bias ≈ +0.3 kWh/h below 12 °C) was traced to `heating_active` being projected ON from hourly outdoor temps while the heating stayed off. Now a once-per-day daily-mean rule with thresholds learned from the heating sub-meter (live: on < 13.5 °C / off > 14.5 °C, 192 labelled days). The HA winter-mode automations were replaced by the daily `automation.heizsaison_tagesmittel` at the same time. Recheck: `scripts/analyze_forecast_bias.py` → 5–15 °C bins' bias ≈ 0, `mae_7d` back below ~0.24. Follow-ups tracked as #99. **2026-10-06 recheck:** `mae_7d` 0.196 (met), but still no daily mean < 13.5 °C since the deploy, so the cold-weather test is pending.
+**Cold-onset over-forecast (2026-10-15) — fixes in progress:** `mae_7d` jumped 0.196 → 0.477 (relative 115 %) after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term (rooms cooled toward outdoor, projected thermal pressure 4.6 °C vs 0.02 °C real) and compared every room to one shared setpoint. **C Task 1 deployed v0.12.0-alpha-26 (2026-10-16 ~05:50 local):** thermostat floor + per-room setpoint; live-model replay 2026-10-08..14: MAE 24–47 h 0.485 → 0.255, bias +6.9 → −2.2 kWh/day. **D Task 1 deployed v0.12.0-alpha-25 (2026-10-16 ~05:42 local):** `heating_power_request` valve demand now cached in `climate_*.csv` (data clock for τ/UA; needs ≥ 14 valve-closed nights). Success criterion for C: cold-day 24–47 h bias in [−3, +1] kWh/day over ≥ 3 cold days, point forecast inside p10–p90 for ≥ 90 % of 3 h blocks. Plans and order: `docs/superpowers/plans/2026-10-15-cold-onset-forecast-fixes-index.md`; findings `memory/project_cold_onset_overforecast_2026_10_15.md`.
+
+**Heating-season projection live (#98, 2026-09-26) — bias recheck due ~2026-10-03:** rising autumn MAE (`mae_7d` 0.234 → 0.298, bias ≈ +0.3 kWh/h below 12 °C) was traced to `heating_active` being projected ON from hourly outdoor temps while the heating stayed off. Now a once-per-day daily-mean rule with thresholds learned from the heating sub-meter (live: on < 13.5 °C / off > 14.5 °C, 192 labelled days). The HA winter-mode automations were replaced by the daily `automation.heizsaison_tagesmittel` at the same time. Recheck: `scripts/analyze_forecast_bias.py` → 5–15 °C bins' bias ≈ 0, `mae_7d` back below ~0.24. Follow-ups tracked as #99. **2026-10-06 recheck:** `mae_7d` 0.196 (met), but still no daily mean < 13.5 °C since the deploy, so the cold-weather test is pending. **2026-10-15:** the cold-weather test failed (`mae_7d` 0.477); fixed by the cold-onset plans below, see the status paragraph above.
 
 Recent releases:
 - v0.11.4 — 15-minute energy history cache (#85), strip partial day from clustering (#86), tomorrow block P10/P90 interval sensors, code review batch 1–5 (all open findings closed).
@@ -384,8 +386,14 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 96 | Cooling mode / AC support (tropical climates) | n/a for personal use; HACS-relevant | 1 day+ | long-term — community PR candidate, see Discussion #20 |
 | 97 | Open-Meteo archive retry/backoff on transient 5xx | robustness (community-reported) | 1 h | ✅ done (dev v0.12.0-alpha-24; released to main in v0.11.15, 2026-10-06; GitHub #21 follow-up posted) |
 | 98 | Daily-mean heating-season projection with learned thresholds | high (autumn/spring MAE) | ~1 day | ✅ done (v0.12.0-alpha-23) |
-| 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | recheck ~2026-10-03, then minors opportunistically |
+| 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | bias recheck superseded by the cold-onset fixes (C live 2026-10-16, verify ≥ 3 cold days); minors opportunistically |
 | 100 | Cumulative-kWh history from HA long-term statistics | robustness for high-frequency meters (community-reported) | ~1 day + 2 h spike | long-term — after the GitHub #24 short-term fix; spike websocket access first |
+| 101 | Cold-onset A: reset-aware hourly kWh for cumulative sub/correction sensors (`fix/counter-reset-increments`) | medium (clean target at 06/07/20/21 h, ≈ −0.05 `mae_7d`) | 2–3 h | planned — forces a retrain, re-baseline after |
+| 102 | Cold-onset B: EV wallbox-sensor hours no longer treated as contamination (`fix/ev-sensor-trust`) | small MAE gain, more training/MAE coverage | 2–3 h | planned — `mae_*` jumps at deploy by construction |
+| 103 | Cold-onset C Task 4: opt-in `heat_loss_deg` feature (steady-state heat-loss gradient) | targets the expected ≈ −2 kWh/day residual | 3–4 h | gated — own branch, backtest + paired sign test, flag on only after ≥ 14 cold days of C baseline |
+| 104 | Cold-onset D Task 3: pooled valve-closed τ estimator behind `tau_estimator` flag | low (τ only matters in heating-off hours) | 1 day | gated — needs ≥ 14 valve-closed nights in the D1 cache |
+| 105 | Cold-onset D Task 4: daily heat-balance `UA_eff` behind `physics.ua_eff_method` flag | activates physics heating for the first time | 1 day | gated — after D3; checks `physics_kwh` shift + `solar_gain_area` calibration |
+| 106 | Cold-onset D Task 5: `heating_intensity_7d` ML feature behind `heating_intensity_feature` flag | lever for the 2025 Oct–Nov regime shift (16–26 kWh/day at 5–9 °C) | 1 day | gated — cold-day MAE −5 % vs 14-day baseline |
 
 ---
 
