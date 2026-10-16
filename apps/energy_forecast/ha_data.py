@@ -1168,6 +1168,36 @@ def fetch_recent_generic_sensor(
     return combined
 
 
+def _hourly_climate(ha_df: pd.DataFrame) -> pd.DataFrame:
+    """Hourly climate frame from attribute rows (timestamps already floored to the hour).
+
+    current_temp / setpoint: last state in the hour, forward-filled (unchanged behaviour).
+    heating_power_request (Netatmo valve demand, optional): max over the states in the hour
+    AND the state in force at the start of the hour (a valve open at :00 that closes at :10
+    still delivered heat). HA history only records changes, so a state persists across hours
+    without rows — it is carried until the next row. A row whose attribute is null
+    (unavailable) ends the carry: hours after it stay NaN until a real value arrives, so
+    unknown is never turned into 0 (closed).
+    """
+    import numpy as np
+    import pandas as pd
+
+    g = ha_df.set_index("timestamp").sort_index()
+    hourly = g[["current_temp", "setpoint"]].resample("1h").last().ffill()
+    if "heating_power_request" in g.columns:
+        _NULL = -1.0  # sentinel: an explicit null state, distinct from "no row this hour"
+        hpr = pd.to_numeric(g["heating_power_request"], errors="coerce")
+        in_hour_max = hpr.resample("1h").max()
+        end_state = hpr.fillna(_NULL).resample("1h").last()  # NaN only for hours without rows
+        end_state = end_state.ffill()  # state persists across empty hours
+        start_state = end_state.shift(1).where(lambda x: x != _NULL)
+        hourly["heating_power_request"] = np.fmax(in_hour_max, start_state)
+    hourly = hourly.reset_index()
+    if hourly["timestamp"].dt.tz is not None:
+        hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+    return hourly
+
+
 def fetch_climate_history(
     app: hass.Hass,
     entity_id: str,
@@ -1196,17 +1226,11 @@ def fetch_climate_history(
 
     if not raw_ha.empty:
         raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
-        # For climate, we need to extract and resample both 'current_temperature' and 'temperature'
-        # attributes from the raw attribute rows.
-        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
-        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
-        ha_df = ha_df.sort_values("timestamp")
-
-        # Resample to hourly grid
-        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
-        if hourly["timestamp"].dt.tz is not None:
-            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
-        df_new = hourly.copy()
+        cols = ["timestamp", "current_temperature", "temperature"]
+        if "heating_power_request" in raw_ha.columns:
+            cols.append("heating_power_request")
+        ha_df = raw_ha[cols].rename(columns={"current_temperature": "current_temp", "temperature": "setpoint"})
+        df_new = _hourly_climate(ha_df)
     else:
         df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
@@ -1255,13 +1279,11 @@ def fetch_recent_climate(
 
     if not raw_ha.empty:
         raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
-        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
-        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
-        ha_df = ha_df.sort_values("timestamp")
-        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
-        if hourly["timestamp"].dt.tz is not None:
-            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
-        df_new = hourly.copy()
+        cols = ["timestamp", "current_temperature", "temperature"]
+        if "heating_power_request" in raw_ha.columns:
+            cols.append("heating_power_request")
+        ha_df = raw_ha[cols].rename(columns={"current_temperature": "current_temp", "temperature": "setpoint"})
+        df_new = _hourly_climate(ha_df)
     else:
         df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
