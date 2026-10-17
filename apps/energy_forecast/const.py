@@ -6,6 +6,9 @@ from typing import Any
 
 # Data Validation
 MAX_HOURLY_KWH = 50.0  # Filters out meter resets or spikes
+# A drop to below this fraction of the previous reading is a counter restart
+# (SolarEdge b1 battery meters reset twice daily); smaller dips are jitter.
+COUNTER_RESET_FRACTION = 0.9
 
 # EV Charging Detection
 # Hours above this threshold are classified as EV charging and excluded from

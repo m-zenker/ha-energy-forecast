@@ -936,6 +936,127 @@ class TestFetchSubSensorHistory:
         assert list(result.columns) == ["timestamp", "kwh"]
 
 
+class TestHourlyCounterIncrements:
+    """Cumulative counters that reset (SolarEdge b1 battery meters reset ~06:50/~20:55 daily)."""
+
+    def test_monotonic_matches_last_minus_last(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:50:00Z", "2026-01-10T09:30:00Z"],
+            [10.0, 10.4, 11.0, 11.5],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        # local 08:00 bucket is first → dropped; 09:00 = 11.0-10.0; 10:00 = 11.5-11.0
+        assert list(out.round(3)) == [1.0, 0.5]
+
+    def test_reset_mid_hour_keeps_pre_and_post_reset_energy(self):
+        # October: UTC+2. Local 06:00 bucket = 04:00–05:00 UTC.
+        raw = make_ha_raw(
+            [
+                "2026-10-14T03:30:00Z",
+                "2026-10-14T04:10:00Z",
+                "2026-10-14T04:40:00Z",
+                "2026-10-14T04:50:00Z",
+                "2026-10-14T04:55:00Z",
+                "2026-10-14T05:20:00Z",
+            ],
+            [2.0, 3.135, 3.302, 0.0, 0.045, 0.2],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        out.index = out.index.tz_localize(None)
+        assert out[pd.Timestamp("2026-10-14 06:00")] == pytest.approx(1.135 + 0.167 + 0.045)
+        assert out[pd.Timestamp("2026-10-14 07:00")] == pytest.approx(0.155)
+
+    def test_reset_to_small_nonzero_value_counts_that_value(self):
+        raw = make_ha_raw(
+            ["2026-10-14T17:30:00Z", "2026-10-14T18:40:00Z", "2026-10-14T18:59:00Z"],
+            [1.9, 2.012, 0.027],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.112 + 0.027)
+
+    def test_reset_at_hour_boundary(self):
+        raw = make_ha_raw(
+            [
+                "2026-10-14T02:30:00Z",
+                "2026-10-14T03:10:00Z",
+                "2026-10-14T03:59:00Z",
+                "2026-10-14T04:01:00Z",
+                "2026-10-14T04:30:00Z",
+            ],
+            [2.8, 3.0, 3.3, 0.01, 0.2],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        # 04:00 bucket dropped (first); 05:00 = 0.2 + 0.3 (pre-reset, unaffected); 06:00 = 0.01 + 0.19
+        assert list(out.round(3)) == [0.5, 0.2]
+
+    def test_transient_glitch_on_lifetime_counter_ignored(self):
+        raw = make_ha_raw(
+            [
+                "2026-10-14T03:30:00Z",
+                "2026-10-14T04:05:00Z",
+                "2026-10-14T04:10:00Z",
+                "2026-10-14T04:20:00Z",
+                "2026-10-14T04:40:00Z",
+            ],
+            [1200.0, 1203.0, 0.0, 1207.0, 1208.0],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(8.0)  # not 1210
+
+    def test_nan_sample_dropped_not_losing_energy(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:30:00Z", "2026-01-10T08:50:00Z"],
+            [10.0, 10.4, float("nan"), 11.5],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(1.5)
+
+    def test_appliance_cycle_counter_new_cycle_counted(self):
+        # Dishwasher per-cycle counter: 0.6 at end of last cycle → 0.0 → next cycle 0.1, 0.4 within the hour
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:05:00Z", "2026-10-14T04:20:00Z", "2026-10-14T04:50:00Z"],
+            [0.6, 0.0, 0.1, 0.4],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.4)  # old method: 0.4 − 0.6 < 0 → 0.0
+
+    def test_small_dip_is_jitter_not_reset(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:20:00Z", "2026-01-10T08:40:00Z"],
+            [10.0, 10.0, 9.99, 10.5],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.51)
+
+    def test_unsorted_input_is_sorted(self):
+        raw = make_ha_raw(
+            ["2026-01-10T08:50:00Z", "2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z"],
+            [11.0, 10.0, 10.4],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(1.0)
+
+    def test_fetch_recent_sub_sensor_keeps_reset_hour(self, mock_app, tmp_path):
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:40:00Z", "2026-10-14T04:50:00Z", "2026-10-14T04:55:00Z"],
+            [2.0, 3.302, 0.0, 0.045],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            result = ha_data.fetch_recent_sub_sensor(mock_app, "sensor.b1_export", tmp_path / "battery_discharge.csv")
+        row = result[result["timestamp"] == pd.Timestamp("2026-10-14 06:00")]
+        assert row.iloc[0]["kwh"] == pytest.approx(1.302 + 0.045)
+
+    def test_fetch_sub_sensor_history_keeps_reset_hour(self, mock_app, tmp_path):
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:40:00Z", "2026-10-14T04:50:00Z", "2026-10-14T04:55:00Z"],
+            [2.0, 3.302, 0.0, 0.045],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.b1_export", tmp_path / "battery_discharge.csv")
+        row = result[result["timestamp"] == pd.Timestamp("2026-10-14 06:00")]
+        assert row.iloc[0]["kwh"] == pytest.approx(1.302 + 0.045)
+
+
 # ── Stage 6 — CSV append-only writes (#19) ────────────────────────────────────
 
 
