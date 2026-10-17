@@ -102,6 +102,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/heating_season.py` — `heating_temp_on` / `heating_temp_off` are now optional overrides of daily-mean thresholds (previously hourly outdoor temps, defaults 14/18 °C). They must be set together; one alone is ignored with a warning. When unset, thresholds are learned per installation at each retrain from historical data (fallback 12/16 °C until ≥60 labelled days with ≥4 season transitions exist).
 - `apps/energy_forecast/model.py`, `apps/energy_forecast/energy_forecast.py` — when `physics.heating_sub_meter_sensor` is configured, the `heating_active` training feature now uses the sub-meter "heating day" label (>0.5 kWh space heating per day) rather than the raw switch state. The switch is still used for τ and physics calibration.
+- `apps/energy_forecast/ha_data.py`, `apps/energy_forecast/model.py`, `apps/energy_forecast/energy_forecast.py` — with `ev_charging_sensor` configured, EV-charging days are no longer excluded from regime clustering and EV hours are no longer dropped from MAE tracking — the wallbox subtraction is exact (sensor EV hours are stored net of wallbox kWh in the actuals history). Threshold-only setups unchanged. Expect `mae_*` to shift slightly at deploy (more scored hours).
 
 ---
 
