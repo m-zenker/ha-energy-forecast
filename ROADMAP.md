@@ -388,12 +388,22 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 98 | Daily-mean heating-season projection with learned thresholds | high (autumn/spring MAE) | ~1 day | ✅ done (v0.12.0-alpha-23) |
 | 99 | Heating-season follow-ups (bias recheck + deferred review minors) | low-medium | 2–3 h | bias recheck superseded by the cold-onset fixes (C live 2026-10-16, verify ≥ 3 cold days); minors opportunistically |
 | 100 | Cumulative-kWh history from HA long-term statistics | robustness for high-frequency meters (community-reported) | ~1 day + 2 h spike | long-term — after the GitHub #24 short-term fix; spike websocket access first |
-| 101 | Cold-onset A: reset-aware hourly kWh for cumulative sub/correction sensors (`fix/counter-reset-increments`) | medium (clean target at 06/07/20/21 h, ≈ −0.05 `mae_7d`) | 2–3 h | planned — forces a retrain, re-baseline after |
-| 102 | Cold-onset B: EV wallbox-sensor hours no longer treated as contamination (`fix/ev-sensor-trust`) | small MAE gain, more training/MAE coverage | 2–3 h | planned — `mae_*` jumps at deploy by construction |
+| 101 | Cold-onset A: reset-aware hourly kWh for cumulative sub/correction sensors (`fix/counter-reset-increments`) | medium (clean target at 06/07/20/21 h, ≈ −0.05 `mae_7d`) | 2–3 h | **implemented 2026-10-17** on `fix/counter-reset-increments` (3fc9265 + changelog bc308bf; 1177 tests; task review clean) — **deploy held** until the C verdict (see sequencing below); then local repair script (Plan A Task 2 Steps 3–6) forces a retrain, re-baseline after |
+| 102 | Cold-onset B: EV wallbox-sensor hours no longer treated as contamination (`fix/ev-sensor-trust`) | small MAE gain, more training/MAE coverage | 2–3 h | **implemented 2026-10-17** on `fix/ev-sensor-trust` (0b55c25, 1c5dead, changelog bca36cd; 1178 tests; both task reviews clean) — **deploy held** with A until the C verdict; `mae_*` jumps at deploy by construction |
 | 103 | Cold-onset C Task 4: opt-in `heat_loss_deg` feature (steady-state heat-loss gradient) | targets the expected ≈ −2 kWh/day residual | 3–4 h | gated — own branch, backtest + paired sign test, flag on only after ≥ 14 cold days of C baseline |
 | 104 | Cold-onset D Task 3: pooled valve-closed τ estimator behind `tau_estimator` flag | low (τ only matters in heating-off hours) | 1 day | gated — needs ≥ 14 valve-closed nights in the D1 cache |
 | 105 | Cold-onset D Task 4: daily heat-balance `UA_eff` behind `physics.ua_eff_method` flag (`feat/ua-eff-daily`) | activates physics heating for the first time (live `UA_eff` is null: hourly night fit fails the R² ≥ 0.5 gate) | 1 day | gated — not on D3 (Task 4 decouples `c_building` from the ML τ); hard gates: (1) alpha-26 (C) verified over ≥ 3 cold days, because non-null UA shifts `physics_kwh` (ML feature) at the first retrain; (2) full-feature backtest harness `scripts/backtest_heat_loss_feature.py` (Plan C Task 4 Step 5) exists; (3) COP scale resolved (formula ≈ 3.2 vs live sensor ≈ 5.6, UA uncertain up to ×1.75). Gate = cold-fold MAE not > 2 % worse + sign test, physics daily heating MAE < 50 % of meter daily mean, `solar_gain_area` in [0, 20]. Phase 2 cold-start counter changes unit to heating days (~57 live) |
 | 106 | Cold-onset D Task 5: `heating_intensity_7d` ML feature behind `heating_intensity_feature` flag | lever for the 2025 Oct–Nov regime shift (16–26 kWh/day at 5–9 °C) | 1 day | gated — cold-day MAE −5 % vs 14-day baseline |
+
+**Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
+0. v0.11.16 on main (weather dtype fix, Rule 3) after 24–48 h of clean dev logs — independent of everything below.
+1. Implement A (#101) and B (#102) on separate branches now; **hold the deploys**.
+2. C verdict: ≥ 3 cold days on alpha-26 (est. Oct 20–25); D1 valve data accumulates in parallel.
+3. Deploy A + B together, then re-baseline (A shifts actuals ≈ +0.5 kWh/day; B changes the `mae_*` pair population).
+4. Implement #105 (can overlap steps 2–3; needs the backtest harness and the COP-scale question settled first).
+5. Deploy #105 only after step 3's re-baseline holds — never in the same window as A/B (first non-null `UA_eff` shifts `physics_kwh`).
+6. #106, #104, #103 after ≥ 14 cold days of baseline (or ≥ 14 valve-closed nights for #104). Gate #103 and #105 separately — both target the same residual, so don't default both on.
+Open decision at the C verdict: physics release strategy (v0.12.0 opt-in vs further Rule 3 cherry-picks); alpha-26 likely does not port to main.
 
 ---
 
