@@ -42,6 +42,8 @@ from energy_forecast.model import (
     _strip_partial_last_day,
 )
 
+from tests._frames import train_frames
+
 # ── Shared training helper (reused by TestLogTransform and TestPredictIntervals) ─
 
 
@@ -7236,3 +7238,44 @@ class TestHeatingFeatureDf:
             heating_feature_df=feature,
         )
         assert captured["heating_active_df"] is feature
+
+
+class TestEvSourceInTraining:
+    def test_only_threshold_ev_rows_reach_clustering_and_ev_hours(self, tmp_path, monkeypatch):
+        from energy_forecast import clustering
+        from energy_forecast import model as model_mod
+
+        if not clustering.SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        seen: dict = {}
+        real_fit = clustering.DailyProfileClusterer.fit
+        real_how = model_mod._compute_likely_ev_hours
+
+        def spy_fit(self, df, ev_day_dates=None):
+            seen["ev_day_dates"] = set(ev_day_dates or ())
+            return real_fit(self, df, ev_day_dates=ev_day_dates)
+
+        def spy_how(base, ev):
+            seen["ev_rows"] = 0 if ev is None else len(ev)
+            return real_how(base, ev)
+
+        monkeypatch.setattr(clustering.DailyProfileClusterer, "fit", spy_fit)
+        monkeypatch.setattr(model_mod, "_compute_likely_ev_hours", spy_how)
+        energy_df, weather_df = train_frames()
+        ev_ts = energy_df["timestamp"].iloc[[300, 301, 700]]
+        ev_df = pd.DataFrame(
+            {"timestamp": ev_ts.values, "gross_kwh": [2.0, 2.0, 9.5], "ev_source": ["sensor", "sensor", "threshold"]}
+        )
+        m = model_mod.EnergyForecastModel(tmp_path, timezone="Europe/Zurich")
+        m.train(
+            energy_df,
+            weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            ev_df=ev_df,
+            enable_regimes=True,
+            regime_count=2,
+        )
+        assert seen["ev_day_dates"] == {pd.Timestamp(ev_ts.iloc[2]).date()}
+        assert seen["ev_rows"] == 1
