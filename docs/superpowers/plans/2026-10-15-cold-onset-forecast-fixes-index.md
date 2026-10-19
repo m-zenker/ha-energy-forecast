@@ -52,7 +52,7 @@ All pre-deploy gates use ≤ 7 cold days (no earlier cold data with climate exis
    - D4: UA_eff logged, `physics_kwh` daily heating vs meter.
    - D5: cold-day MAE −5 % vs the 14-day baseline.
 5. **Re-baseline after A's retrain** before judging anything later.
-   - Deficit fade (ROADMAP #107, `fix/deficit-fade`) changes C's indoor projection: deploy it together with A+B, and count only target days predicted entirely after that deploy toward the re-baseline.
+   - Deficit fade (ROADMAP #107, `fix/deficit-fade`) deployed 2026-10-19 (alpha-28) ahead of the C verdict. It is treated as bias-neutral for the C gate (replay: cold-day 24–47 h bias −0.15 kWh/day, far inside the 4 kWh/day band), so C days keep counting across that deploy. The clean re-baseline starts at the A+B deploy.
 6. Still open from the investigation: Oct–Nov 2025 at 5–9 °C used 16–26 kWh/day vs ≈ 10 now. Once C is live, check whether the remaining cold-day bias is explained by this regime shift (D Task 5's heating-intensity feature is the lever if it is).
 
 ## Workflow notes
