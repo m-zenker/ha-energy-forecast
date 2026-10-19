@@ -54,6 +54,9 @@ from .const import (
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
     DEFAULT_TAU,
+    DEFICIT_RECOVERY_TAU_H,
+    DEFICIT_STEADY_MIN_ROWS,
+    DEFICIT_STEADY_WINDOW_H,
     HOLDOUT_FRACTION,
     MIN_CV_ROWS,
     MIN_TRAINING_ROWS,
@@ -2904,10 +2907,14 @@ def _project_indoor_temps(
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
-        T_in[t+1] = max(T_in[t] + (T_out[t] - T_in[t]) / tau, setpoint[t] - d0)
+        T_in[t+1] = max(T_in[t] + (T_out[t] - T_in[t]) / tau, setpoint[t] - d(t))
 
-    while heating is on (thermostat floor), else the free term alone; ``d0`` is
-    the deficit at hour 0 (0 when heating only switches on later).
+    while heating is on (thermostat floor), else the free term alone. The floor deficit is
+    ``d(i) = d_ss + (d0 − d_ss)·exp(−i / DEFICIT_RECOVERY_TAU_H)``: ``d0`` is the deficit at hour 0,
+    ``d_ss`` the median deficit at the current setpoint over the last DEFICIT_STEADY_WINDOW_H (0 with
+    fewer than DEFICIT_STEADY_MIN_ROWS such rows); both are 0 when heating only switches on later or
+    the observation is stale. NaN (entity-unavailable) climate rows are skipped; a room with no valid row
+    yields an all-NaN frame.
 
     Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
     otherwise falls back to the most-recent ``setpoint``.
@@ -2939,11 +2946,30 @@ def _project_indoor_temps(
 
         cdf = cdf.copy()
         cdf["timestamp"] = pd.to_datetime(cdf["timestamp"])
-        latest = cdf.sort_values("timestamp").iloc[-1]
+        # Entity-unavailable rows carry NaN temp + setpoint (~430 h across 9 rooms live, 2026-10-19). A
+        # trailing one used to make the whole room projection NaN — use the last valid row instead.
+        cdf = cdf.dropna(subset=["current_temp", "setpoint"]).sort_values("timestamp")
+        if cdf.empty:
+            # No valid reading at all: keep an all-NaN frame (pre-existing behaviour) so the room's area stays
+            # in thermal_pressure's denominator exactly as in training, where unavailable rooms count too.
+            nan_col = np.full(len(future_timestamps), np.nan)
+            result[eid] = pd.DataFrame(
+                {"timestamp": future_timestamps, "current_temp": nan_col, "setpoint": nan_col, "deficit": nan_col}
+            )
+            continue
+        latest = cdf.iloc[-1]
 
         age = now - latest["timestamp"]
+        steady_deficit = 0.0
         if age <= stale_threshold:
             t_in_start = float(latest["current_temp"])
+            # Typical deficit at the CURRENT setpoint over the last DEFICIT_STEADY_WINDOW_H: a room that
+            # persistently sits below target keeps that demand; rows at other setpoints (night setback,
+            # just-raised morning setpoint) don't count — they'd invent or hide deficit vs the new target.
+            window = cdf[cdf["timestamp"] > latest["timestamp"] - pd.Timedelta(hours=DEFICIT_STEADY_WINDOW_H)]
+            same_sp = window[(window["setpoint"] - float(latest["setpoint"])).abs() < 0.05]
+            if len(same_sp) >= DEFICIT_STEADY_MIN_ROWS:
+                steady_deficit = float(np.median(np.maximum(0.0, same_sp["setpoint"] - same_sp["current_temp"])))
         else:
             t_in_start = float(latest["setpoint"])
 
@@ -2971,12 +2997,22 @@ def _project_indoor_temps(
         # d0 is measured against the same setpoint the floor uses: the room's own setpoint when heating
         # is already on at hour 0; when heating only switches on later the floor is the shared
         # setpoint_on with d0 = 0 (season onset; room assumed brought to target).
-        initial_deficit = max(0.0, room_setpoint - t_in_start) if on_arr[0] else 0.0
+        # The hour-0 deficit is often transient (setpoint just stepped up, e.g. ~04–05 h): holding it for
+        # 48 h swung the tomorrow forecast by +3–4 kWh for one hourly run (2026-10-19 replay). It now
+        # decays to the room's steady same-setpoint deficit with DEFICIT_RECOVERY_TAU_H; d(0) = d0 keeps
+        # hour 0 (what the published sensors read) unchanged. Read the module global at call time — the
+        # replay gate patches it to inf to reproduce the old constant-d0 floor.
+        if on_arr[0]:
+            initial_deficit = max(0.0, room_setpoint - t_in_start)
+            decay = np.exp(-np.arange(n, dtype=float) / DEFICIT_RECOVERY_TAU_H)
+            floor_deficit = steady_deficit + (initial_deficit - steady_deficit) * decay
+        else:
+            floor_deficit = np.zeros(n)
         t_in_arr = np.empty(n)
         t_in_arr[0] = t_in_start
         for i in range(1, n):
             free = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
-            t_in_arr[i] = max(free, setpoint_arr[i] - initial_deficit) if on_arr[i] else free
+            t_in_arr[i] = max(free, setpoint_arr[i] - floor_deficit[i]) if on_arr[i] else free
 
         # ── Deficit blend: live setpoint (near-term) → hysteresis-projected
         # setpoint (far-term) ────────────────────────────────────────────

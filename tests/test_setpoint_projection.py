@@ -41,6 +41,17 @@ def _heating_active_series(ts: pd.DatetimeIndex, states: list[int]) -> pd.Series
     return pd.Series(states, index=ts, dtype=int)
 
 
+def _history(ts0: pd.Timestamp, rows: list[tuple[float, float]]) -> dict:
+    """climate_recent for one room: hourly (current_temp, setpoint) rows ending at ts0 (last row = ts0)."""
+    n = len(rows)
+    stamps = pd.date_range(end=ts0, periods=n, freq="1h")
+    return {
+        "climate.room": pd.DataFrame(
+            {"timestamp": stamps, "current_temp": [r[0] for r in rows], "setpoint": [r[1] for r in rows]}
+        )
+    }
+
+
 # ── _project_indoor_temps: setpoint projection ─────────────────────────────────
 
 
@@ -495,8 +506,9 @@ class TestHeatingAwareProjection:
         assert p["deficit"].max() == pytest.approx(0.0)
 
     def test_heating_on_holds_initial_deficit(self):
+        """A deficit seen at the SAME setpoint over the last 24 h is real demand and is held (deficit fade keeps d_ss)."""
         ts = _future_ts()
-        p = self._proj(_climate_recent(ts, setpoint=21.0, current=20.5), ts, [1] * 48)
+        p = self._proj(_history(ts[0], [(20.5, 21.0)] * 24), ts, [1] * 48)
         assert p["deficit"].values == pytest.approx([0.5] * 48)
 
     def test_per_room_setpoint_used_when_on_at_hour_zero(self):
@@ -545,3 +557,114 @@ class TestHeatingAwareProjection:
         p = self._proj(cr, ts, [1] * 48)
         assert p["current_temp"].values[0] == pytest.approx(21.0)
         assert np.all(p["deficit"].values == pytest.approx(0.0))  # d0 = 0
+
+
+class TestDeficitFade:
+    """Transient hour-0 deficits fade with DEFICIT_RECOVERY_TAU_H; persistent same-setpoint deficits are kept (2026-10-19)."""
+
+    def _proj(self, cr, ts, states=None, setpoint_on=19.4, setpoint_off=12.0, t_out=5.0):
+        return _project_indoor_temps(
+            cr,
+            ts,
+            _outdoor_series(ts, t_out),
+            tau_hours=11.64,
+            heating_active_series=_heating_active_series(ts, states or [1] * len(ts)),
+            setpoint_on=setpoint_on,
+            setpoint_off=setpoint_off,
+        )["climate.room"]
+
+    def test_transient_step_up_deficit_fades(self):
+        from apps.energy_forecast.const import DEFICIT_RECOVERY_TAU_H
+
+        ts = _future_ts()
+        # 23 h at 21/21 (no deficit), then the latest hour 0.5 K below → transient
+        p = self._proj(_history(ts[0], [(21.0, 21.0)] * 23 + [(20.5, 21.0)]), ts)
+        d = p["deficit"].values
+        assert d[0] == pytest.approx(0.5)
+        assert d[1] == pytest.approx(0.5 * np.exp(-1 / DEFICIT_RECOVERY_TAU_H), abs=1e-6)
+        assert np.all(np.diff(d) <= 1e-12)
+        assert d[24] == pytest.approx(0.5 * np.exp(-24 / DEFICIT_RECOVERY_TAU_H), abs=1e-6)
+
+    def test_morning_step_up_with_yesterdays_daytime_history_fades(self):
+        """Real 10-17 05 h shape: yesterday 06–22 h at 21/21, setback 19 overnight, setpoint back to 21 with the
+        room 0.5 K below → 18 same-setpoint rows, median deficit 0 → transient fades (live: wohnzimmer n=17)."""
+        ts = _future_ts()
+        p = self._proj(_history(ts[0], [(21.0, 21.0)] * 17 + [(20.0, 19.0)] * 6 + [(20.5, 21.0)]), ts)
+        assert p["deficit"].values[0] == pytest.approx(0.5)
+        assert p["deficit"].values[24] < 0.01
+
+    def test_too_few_same_setpoint_rows_fades_to_zero(self):
+        from apps.energy_forecast.const import DEFICIT_RECOVERY_TAU_H
+
+        ts = _future_ts()
+        # night setback 19 (room at 20), setpoint just raised to 21 with the room at 20.5:
+        # only 1 row at setpoint 21 (< DEFICIT_STEADY_MIN_ROWS) → d_ss = 0
+        p = self._proj(_history(ts[0], [(20.0, 19.0)] * 6 + [(20.5, 21.0)]), ts)
+        assert p["deficit"].values[0] == pytest.approx(0.5)
+        assert p["deficit"].values[24] == pytest.approx(0.5 * np.exp(-24 / DEFICIT_RECOVERY_TAU_H), abs=1e-6)
+
+    def test_persistent_deficit_at_same_setpoint_is_kept(self):
+        ts = _future_ts()
+        p = self._proj(_history(ts[0], [(20.0, 21.0)] * 24), ts)
+        assert p["deficit"].values == pytest.approx([1.0] * 48)
+
+    def test_current_better_than_usual_relaxes_to_steady_deficit(self):
+        ts = _future_ts()
+        # usually 1 K below at setpoint 21, right now on target → floor relaxes to the usual 1 K
+        p = self._proj(_history(ts[0], [(20.0, 21.0)] * 23 + [(21.0, 21.0)]), ts)
+        d = p["deficit"].values
+        assert d[0] == pytest.approx(0.0)
+        assert d[24] == pytest.approx(1.0, abs=0.01)
+
+    def test_setpoint_change_ignores_other_setpoint_history(self):
+        ts = _future_ts()
+        # daytime 0.5 K deficit at setpoint 21; setback just started: setpoint 17, room at 20.5 (above it)
+        p = self._proj(_history(ts[0], [(20.5, 21.0)] * 20 + [(20.5, 17.0)]), ts)
+        assert p["deficit"].max() == pytest.approx(0.0)  # no phantom 0.5 K against the new setpoint
+
+    def test_stale_observation_has_no_steady_deficit(self):
+        ts = _future_ts()
+        cr = _history(ts[0] - pd.Timedelta(hours=3), [(20.0, 21.0)] * 24)  # latest row 3 h old → stale
+        p = self._proj(cr, ts)
+        assert p["current_temp"].values[0] == pytest.approx(21.0)
+        assert np.all(p["deficit"].values == pytest.approx(0.0))
+
+    def test_trailing_nan_row_uses_last_valid_observation(self):
+        ts = _future_ts()
+        cr = _history(ts[0], [(21.0, 21.0)] * 22 + [(20.5, 21.0), (np.nan, np.nan)])
+        p = self._proj(cr, ts)
+        assert not p.isna().any().any()
+        assert p["current_temp"].values[0] == pytest.approx(20.5)  # last valid row is 1 h old → fresh
+        assert p["deficit"].values[0] == pytest.approx(0.5)
+
+    def test_all_nan_rows_room_kept_as_nan_frame(self):
+        ts = _future_ts()
+        cr = _history(ts[0], [(np.nan, np.nan)] * 5)
+        out = _project_indoor_temps(cr, ts, _outdoor_series(ts), tau_hours=11.64)
+        p = out["climate.room"]  # kept: thermal_pressure's area denominator must match training
+        assert len(p) == len(ts)
+        assert p[["current_temp", "setpoint", "deficit"]].isna().all().all()
+
+    def test_hour_zero_unchanged_by_fade(self, monkeypatch):
+        import apps.energy_forecast.model as model_mod
+
+        ts = _future_ts()
+        cases = [
+            _history(ts[0], [(21.0, 21.0)] * 23 + [(20.5, 21.0)]),
+            _history(ts[0], [(20.0, 21.0)] * 24),
+            _history(ts[0], [(20.5, 21.0)] * 20 + [(20.5, 17.0)]),
+            _history(ts[0], [(22.0, 18.0)] * 24),
+        ]
+        for cr in cases:
+            faded = self._proj(cr, ts)
+            monkeypatch.setattr(model_mod, "DEFICIT_RECOVERY_TAU_H", float("inf"))
+            held = self._proj(cr, ts)
+            monkeypatch.undo()
+            assert faded["current_temp"].values[0] == pytest.approx(held["current_temp"].values[0])
+            assert faded["deficit"].values[0] == pytest.approx(held["deficit"].values[0])
+        # the replay hook really switches behaviour (fails if the constant were bound as a default argument)
+        cr = cases[0]
+        monkeypatch.setattr(model_mod, "DEFICIT_RECOVERY_TAU_H", float("inf"))
+        assert self._proj(cr, ts)["deficit"].values[24] == pytest.approx(0.5)
+        monkeypatch.undo()
+        assert self._proj(cr, ts)["deficit"].values[24] < 0.01

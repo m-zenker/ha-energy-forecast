@@ -40,6 +40,11 @@ SENSOR_BLEND_HOURS = 6
 
 # Thermal Projection (indoor temperature RC-ODE forward simulation)
 DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
+# Thermostat recovery of a transient hour-0 deficit in the indoor projection (2026-10-19): the floor
+# deficit decays from d0 to the room's steady same-setpoint deficit with this e-folding time.
+DEFICIT_RECOVERY_TAU_H = 2.0  # hours — value from plan 2026-10-19-deficit-fade Task 1
+DEFICIT_STEADY_WINDOW_H = 24  # hours of climate history used for the steady deficit
+DEFICIT_STEADY_MIN_ROWS = 3  # fewer same-setpoint rows → steady deficit 0 (setpoint just changed)
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
 # Physics UA_eff calibration eligibility (#92) — deliberately not shared with

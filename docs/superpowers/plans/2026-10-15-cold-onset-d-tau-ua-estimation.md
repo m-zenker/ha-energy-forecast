@@ -849,6 +849,55 @@ Add to `physics.py`'s `from .const import (...)` block: `C_BUILDING_DEFAULT_TAU_
 `_space_heating_kwh`: `c_building = self._config.get("c_building_wh_k") or (ua * C_BUILDING_DEFAULT_TAU_H)`; drop the `tau = self._tau_hours or 8.0` line if nothing else uses it there.
 `model.py` (~L452): pass `room_areas=room_areas, ua_window_end=energy_df["timestamp"].max() + pd.Timedelta(hours=1)` to `calibrate`, then add `elif physics_model.ua_calibration_stale: physics_model.recalibrate_ua(energy_df, climate_dfs, weather_df, heating_sub_meter_df, energy_df["timestamp"].max() + pd.Timedelta(hours=1), room_areas=room_areas, heating_active_df=heating_active_df)`.
 
+- [ ] **Step 3b: NaN-robust indoor averaging + DHW ODE guard** (folded in 2026-10-19; separate commit `fix: NaN-robust indoor temperature for physics series and DHW ODE`).
+
+  **Why:** found 2026-10-19. `physics_kwh` has 0 gain / 0 splits (rank 88/88) in the live model. `_area_weighted_t_indoor` uses `np.average`, so one room's NaN `current_temp` makes that hour's house average NaN. The live climate CSVs have 429 such hours across 9 of 10 rooms, first at 2026-04-12 07:00. `_dhw_kwh_series` carries `t_tank` forward, so the first NaN poisons every later hour: comparisons are False, `el_kwh` is 0, and the training `physics_kwh` stays a constant 0.144 (Q_base_el). Once this task makes `UA_eff` non-null, the same NaN hours would also make `_space_heating_kwh`, and so `physics_kwh`, NaN at those hours; the model.py merge fills them with 0, dropping base load too. Step 3's strict helper covers only the daily calibrator, so it doesn't fix this. Evidence: `memory/project_physics_kwh_low_importance.md`.
+
+  **Files:**
+  - `physics.py`: rewrite `_area_weighted_t_indoor` to share the per-hour num/den weighting with `_area_weighted_t_indoor_strict`, through one private helper with a `tolerance` argument:
+    - strict: `tolerance=59min`, gaps stay NaN;
+    - non-strict: unbounded `nearest`, then `.ffill().bfill()`, then `DEFAULT_AMBIENT_C`. It never returns NaN, and keeps the existing `None` when there are no rooms.
+  - `physics.py` `_dhw_kwh_series`: treat a non-finite `t_ambient.iloc[i]` as `DEFAULT_AMBIENT_C` (defence in depth for any caller).
+  - `physics.py` solar-gain calibration (~L873) and hourly `_calibrate_ua_eff` (~L781): pass `room_areas` through instead of `None`, now that `calibrate()` takes it (Step 3). This aligns calibration with the area weighting used at forecast time.
+
+  **Tests** (`tests/test_physics.py`, new class `TestIndoorNanRobustness`):
+  ```python
+  def test_one_room_nan_uses_remaining_rooms(self, tmp_path):
+      m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+      ts = pd.date_range("2026-04-01", periods=3, freq="1h")
+      clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": [20.0, np.nan, 20.0]}),
+              "climate.b": pd.DataFrame({"timestamp": ts, "current_temp": [22.0, 22.0, 22.0]})}
+      t = m._area_weighted_t_indoor(clim, ts, {"climate.a": 10.0, "climate.b": 10.0})
+      assert t.tolist() == pytest.approx([21.0, 22.0, 21.0])
+
+  def test_all_rooms_nan_hour_is_filled(self, tmp_path):
+      m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+      ts = pd.date_range("2026-04-01", periods=3, freq="1h")
+      clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": [20.0, np.nan, 21.0]})}
+      assert not m._area_weighted_t_indoor(clim, ts, None).isna().any()
+
+  def test_dhw_ode_survives_nan_ambient(self, tmp_path):
+      m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+      ts = pd.date_range("2026-04-01", periods=24 * 10, freq="1h")
+      amb = pd.Series(20.0, index=ts); amb.iloc[5] = np.nan
+      el, traj, final = m._dhw_kwh_series(ts, amb, 50.0, None)
+      assert not traj.isna().any() and np.isfinite(final)
+      assert (el.iloc[24:] > 0).sum() >= 3          # keeps cycling after the gap (was 0 before the fix)
+
+  def test_training_series_varies_despite_room_gap(self, tmp_path):
+      m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+      ts = pd.date_range("2026-04-01", periods=24 * 10, freq="1h")
+      energy = pd.DataFrame({"timestamp": ts, "gross_kwh": 0.5})
+      weather = pd.DataFrame({"timestamp": ts, "temp_c": 10.0, "direct_radiation_wm2": 0.0})
+      temps = np.full(len(ts), 20.0); temps[5] = np.nan
+      clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": temps})}
+      s = m.predict_training_series(energy, weather, climate_dfs=clim)
+      assert s.iloc[24:].nunique() > 1
+  ```
+  Check whether `DEFAULT_CONFIG`'s Q_dhw_daily/UA_dhw defaults make the tank cycle within 10 days; if not, set `m._calib["Q_dhw_daily"] = 2.8` in the two ODE tests, matching the live calibration. Run the tests and confirm they fail before implementing.
+
+  **Effect without UA (expected, not a win):** this brings back a DHW sawtooth in the training `physics_kwh`, but that open-loop ODE barely matches real reheat timing: 1 overlap out of 16 pre-NaN, while real reheats are solar-gated at 12–15 h. Don't expect importance to rise from 3b alone; the value comes from the heating term this task enables. Whether to keep DHW inside `physics_kwh` is a separate, open decision.
+
 - [ ] **Step 4: Full suite + ruff → PASS. Commit** `feat: daily rolling heat-balance UA_eff behind physics.ua_eff_method`.
 
 Expected live behaviour (verified on real data 2026-10-15): with the season switch, 35 eligible heating days in history (Phase 2 count stays ≥ 30), but only 6 in the last 28 days, so UA stays `null` until ~10 October heating days accumulate (~2026-10-18/19). That's correct. A spring window ending 05-21 gives 60.5 W/K (R² 0.60); one ending 05-01 is rejected at R² 0.38.
@@ -859,6 +908,7 @@ Expected live behaviour (verified on real data 2026-10-15): with the season swit
     - the 24 h-lead cold-fold MAE doesn't worsen by > 2 %, and the paired daily sign test is not worse (≤ 3 of 7 days worse);
     - physics' daily heating component tracks the heating meter with daily MAE < 50 % of the meter's daily mean on the held-out days;
     - the `solar_gain_area` printed after calibration is within [0, 20] m².
+  - Both arms include Step 3b. Also run a third arm with `hourly` on the pre-3b code: that's the live baseline, which isolates 3b's effect. For each arm, record `physics_kwh` gain % and rank (`booster_.feature_importance("gain")`). Report it for information; it's not a GO criterion. Live baseline 2026-10-19: rank 88/88, 0 gain.
   - GO → set `physics.ua_eff_method: daily` live (backup first) and force recalibration (delete `physics_calibration.json`'s `calibrated_at`, or wait ≤ 7 days). STOP → flag stays `hourly`; record the table.
 
 ---
