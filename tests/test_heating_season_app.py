@@ -79,3 +79,26 @@ def test_heating_season_attr():
         "n_days": 150,
         "mismatch_rate": 0.05,
     }
+
+
+def test_live_setpoint_skips_trailing_unavailable_row():
+    """A room whose latest climate row is NaN (entity unavailable) must not turn the live setpoint into NaN."""
+    import math
+
+    import numpy as np
+
+    app = _app("on")
+    now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+    climate = {
+        "climate.a": pd.DataFrame(
+            {
+                "timestamp": [now - pd.Timedelta(hours=1), now],
+                "current_temp": [20.0, np.nan],
+                "setpoint": [21.0, np.nan],
+            }
+        ),
+        "climate.b": pd.DataFrame({"timestamp": [now], "current_temp": [19.0], "setpoint": [19.0]}),
+    }
+    _, s_on, s_off = app._build_heating_active_projection(_forecast(lambda t: 4.0), climate)
+    assert math.isfinite(s_on) and math.isfinite(s_off)
+    assert s_on == 20.0  # mean of the last VALID setpoints (21, 19); heating on → live value feeds setpoint_on

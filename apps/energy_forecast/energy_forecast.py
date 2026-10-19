@@ -2434,7 +2434,12 @@ class EnergyForecast(hass.Hass):
         live_setpoints = []
         for eid, cdf in (climate_recent or {}).items():
             if cdf is not None and not cdf.empty and "setpoint" in cdf.columns:
-                latest_sp = cdf.sort_values("timestamp").iloc[-1]["setpoint"]
+                # Skip entity-unavailable (NaN) rows: float(nan) doesn't raise, and one NaN would make the
+                # mean — and so setpoint_on/off for the indoor projection — NaN (same rule as _project_indoor_temps).
+                valid = cdf.dropna(subset=["setpoint"])
+                if valid.empty:
+                    continue
+                latest_sp = valid.sort_values("timestamp").iloc[-1]["setpoint"]
                 try:
                     live_setpoints.append(float(latest_sp))
                 except (TypeError, ValueError):
