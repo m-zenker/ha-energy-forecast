@@ -6,7 +6,7 @@ Current: **v0.11.4** — 2026-06-16, main. 627 tests.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-27 (2026-10-16). **main:** v0.11.16 released 2026-10-19 (weather dtype fix, GitHub PR #25; previous v0.11.15 2026-10-06; Rule-3 curated releases off main — dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season work).
+**dev:** v0.12.0-alpha-28 (2026-10-19, deficit fade #107; A+B held for the C verdict ≥ 10-21). **main:** v0.11.16 released 2026-10-19 (weather dtype fix, GitHub PR #25; previous v0.11.15 2026-10-06; Rule-3 curated releases off main — dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season work).
 
 **Cold-onset over-forecast (2026-10-15) — fixes in progress:** `mae_7d` jumped 0.196 → 0.477 (relative 115 %) after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term (rooms cooled toward outdoor, projected thermal pressure 4.6 °C vs 0.02 °C real) and compared every room to one shared setpoint. **C Task 1 deployed v0.12.0-alpha-26 (2026-10-16 ~05:50 local):** thermostat floor + per-room setpoint; live-model replay 2026-10-08..14: MAE 24–47 h 0.485 → 0.255, bias +6.9 → −2.2 kWh/day. **D Task 1 deployed v0.12.0-alpha-25 (2026-10-16 ~05:42 local):** `heating_power_request` valve demand now cached in `climate_*.csv` (data clock for τ/UA; needs ≥ 14 valve-closed nights). Success criterion for C: cold-day 24–47 h bias in [−3, +1] kWh/day over ≥ 3 cold days, point forecast inside p10–p90 for ≥ 90 % of 3 h blocks. Plans and order: `docs/superpowers/plans/2026-10-15-cold-onset-forecast-fixes-index.md`; findings `memory/project_cold_onset_overforecast_2026_10_15.md`.
 
