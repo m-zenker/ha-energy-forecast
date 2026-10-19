@@ -352,6 +352,25 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 
 ---
 
+### #109 — Heating-Buffer Fade: Live Value Near-Term, Steady-State Further Out
+
+**Source:** 2026-10-19 follow-up to #107. After the deficit fade, the remaining hour-to-hour jumps in the tomorrow forecast all trace to `heating_buffer_temp` (see `memory/project_forecast_jumps_snapshot_broadcast.md`). `_prepare_prediction_X` (`model.py:1115`) holds the latest buffer reading flat across the whole 48 h horizon. The buffer cycles 28↔36 °C with the heat pump, so the forecast follows the cycle (replay: 30 → 36 °C ⇒ +3.4 kWh tomorrow; pinning it to 32 °C removed 4 of 5 jumps).
+
+**Proposal (initial idea):** use the live reading for the first ~2 h, then blend to a steady-state level (e.g. the 24 h median) by ~6 h, mirroring #107's deficit fade. The numbers are placeholders to tune.
+
+**Design points to settle before a spec:**
+1. **Shape and time constant:** an exponential decay (one parameter, like #107's τ_r) is preferred over hold-then-linear. Fit τ from the buffer data, e.g. the lag at which the reading stops predicting the next hours' consumption, rather than fixing 2 h/6 h. Within one HP cycle the reading may already be stale after < 1 h.
+2. **Near-term sign:** in training, the feature is measured in the same hour as the target, so a hot buffer means "the HP is running now". Physically, a just-charged buffer means the HP is about to switch off. The live value may therefore add little, or point the wrong way, even at 1–2 h.
+3. **Steady-state target:** a flat 24 h median ignores the heating curve: colder hours need a hotter buffer. Better candidates are a same-hour median over recent days, or the 24 h median shifted by the heating-curve difference (`heating_curve_sensor`).
+4. **Alternative (training-side):** train on a smoothed buffer level (e.g. rolling 24 h median), so training and prediction use the same signal and the feature stops standing in for "HP running now". Needs a retrain; the predict-side fade does not.
+5. **Validation:** the offline backtest can't judge this (`heating_buffer_temp` ranks #50 in fold models because the sensor starts 06-30; it's #7 in the live model). Gate it with a live-model hourly-origin replay like `scripts/replay_deficit_fade.py`: next-day total stability (mean |Δ|), MAE at 0–6 h and 24–47 h, and daily bias.
+
+**Related:** `dhw_buffer_temp` is a constant 50 °C for future hours, which skews forecasts (lower outside reheats) but doesn't cause jumps. The 2026-10-19 backtest showed this arrangement still wins on MAE, so it's out of scope here.
+
+**Effort:** ~½–1 day (τ fit + replay + implementation). **Impact:** removes the remaining buffer-driven swings of the tomorrow forecast, which EM's battery and DHW scheduling consume.
+
+---
+
 ### Deferred
 
 | # | Item | Reason |
@@ -396,6 +415,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 106 | Cold-onset D Task 5: `heating_intensity_7d` ML feature behind `heating_intensity_feature` flag | lever for the 2025 Oct–Nov regime shift (16–26 kWh/day at 5–9 °C) | 1 day | gated — cold-day MAE −5 % vs 14-day baseline |
 | 107 | Deficit fade in indoor projection (`fix/deficit-fade`): transient hour-0 room deficit decays (τ_r 2 h) to the room's same-setpoint steady deficit instead of being held 48 h; NaN climate rows skipped | removes the deficit-driven hourly swings of the tomorrow forecast (10-12 04 h replay jump 13.0 → 6.9 kWh); cold 24–47 h MAE −0.9 % (live-model replay, in-sample) | deployed alpha-28 (2026-10-19) | written gate STOP on total stability (18 % < 25 %) overridden: remaining swings are `heating_buffer_temp` (see memory); shipped ahead of the C verdict as bias-neutral (−0.15 kWh/day replay), C count continues |
 | 108 | Extend the last climate state to the current hour when the entity is still available (`fetch_recent_climate`) — live projection treats > 2 h without a recorded change as stale (start at setpoint, deficit 0) while training forward-fills between changes | train/serve consistency; today 58 % of room-hours are stale but 0 of 4372 stale room-hours (since 10-01) had a deficit, so no measurable effect yet | ~½ day | gated: re-run the stale-with-deficit check after the first real cold spell; do as its own plan if non-zero |
+| 109 | Heating-buffer fade: live `heating_buffer_temp` near-term, decaying to a heating-curve-aware steady-state level instead of the latest reading being held 48 h (see #109 detail) | removes the remaining tomorrow-forecast swings after #107 (replay: buffer pinned to 32 °C removed 4 of 5 jumps) | ~½–1 day | gated: first measure post-alpha-28 jump shrinkage (from 10-20, revisit in 2–3 weeks); fit τ from data; replay gate (stability + 0–6 h / 24–47 h MAE + bias); keep it out of the A/B and #105 deploy windows |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
