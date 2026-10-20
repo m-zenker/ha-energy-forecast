@@ -57,6 +57,7 @@ from .const import (
     DEFICIT_RECOVERY_TAU_H,
     DEFICIT_STEADY_MIN_ROWS,
     DEFICIT_STEADY_WINDOW_H,
+    HEATING_BUFFER_SMOOTH_H,
     HOLDOUT_FRACTION,
     MIN_CV_ROWS,
     MIN_TRAINING_ROWS,
@@ -305,6 +306,7 @@ class EnergyForecastModel:
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
+        self._heating_buffer_smooth_h: int = 0  # trailing-mean window the loaded model was trained with (0 = raw)
         self._regime_count: int = 5
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
@@ -474,10 +476,15 @@ class EnergyForecastModel:
             if climate_dfs:
                 open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
 
+        smooth_h = 0  # committed to self only after a successful fit (see below)
         if heating_buffer_temp_df is not None and not heating_buffer_temp_df.empty:
             heating_buffer_temp_series = heating_buffer_temp_df.set_index(
                 pd.to_datetime(heating_buffer_temp_df["timestamp"])
             )["heating_buffer_temp"]
+            if HEATING_BUFFER_SMOOTH_H > 0:
+                smoothed = smooth_heating_buffer(heating_buffer_temp_series, HEATING_BUFFER_SMOOTH_H)
+                if smoothed.notna().any():  # < 3 readings in total -> all NaN -> every row would be dropped
+                    heating_buffer_temp_series, smooth_h = smoothed, HEATING_BUFFER_SMOOTH_H
 
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
@@ -921,6 +928,7 @@ class EnergyForecastModel:
 
         self.model = model
         self.feature_cols = feature_cols
+        self._heating_buffer_smooth_h = smooth_h
         self.last_trained = datetime.now()
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
@@ -1110,9 +1118,20 @@ class EnergyForecastModel:
 
         heating_buffer_temp_series = None
         if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
-            # hold the most recent reading flat across the forecast horizon — same "recent" pattern
-            # used for dhw_recent/climate_recent elsewhere in this method
-            latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
+            if self._heating_buffer_smooth_h > 0:
+                # trained on the trailing mean: predict the same level, flat over the horizon, from the
+                # readings in [forecast_start - W, forecast_start); a dead sensor (empty window) -> NaN, which the
+                # existing training-median fill handles exactly as the raw path does today
+                level = heating_buffer_level(
+                    heating_buffer_temp_recent,
+                    self._heating_buffer_smooth_h,
+                    before=pd.Timestamp(forecast_df["timestamp"].min()).floor("1h"),
+                )
+                latest_val = float("nan") if level is None else level
+            else:
+                # hold the most recent reading flat across the forecast horizon — same "recent" pattern
+                # used for dhw_recent/climate_recent elsewhere in this method
+                latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
             heating_buffer_temp_series = pd.Series(latest_val, index=pd.DatetimeIndex(forecast_df["timestamp"]))
 
         feat_df = _engineer_features(
@@ -1721,6 +1740,7 @@ class EnergyForecastModel:
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
             "weather_tail": self._weather_tail,
+            "heating_buffer_smooth_h": self._heating_buffer_smooth_h,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -2168,6 +2188,7 @@ class EnergyForecastModel:
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
                     self._weather_tail = meta.get("weather_tail", None)
+                    self._heating_buffer_smooth_h = meta.get("heating_buffer_smooth_h", 0)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
