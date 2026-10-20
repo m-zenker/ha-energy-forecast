@@ -45,6 +45,10 @@ DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
 DEFICIT_RECOVERY_TAU_H = 2.0  # hours — value from plan 2026-10-19-deficit-fade Task 1
 DEFICIT_STEADY_WINDOW_H = 24  # hours of climate history used for the steady deficit
 DEFICIT_STEADY_MIN_ROWS = 3  # fewer same-setpoint rows → steady deficit 0 (setpoint just changed)
+# Heating-buffer smoothing (2026-10-20): train and predict `heating_buffer_temp` as a causal trailing mean over
+# this many hours instead of a heat-pump-cycle snapshot. ON (24 h, option S24); 0 = off (raw same-hour reading,
+# latest broadcast). Models trained before the retrain keep the raw path (window persisted in meta.pkl).
+HEATING_BUFFER_SMOOTH_H = 24
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
 # Physics UA_eff calibration eligibility (#92) — deliberately not shared with

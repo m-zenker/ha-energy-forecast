@@ -7236,3 +7236,224 @@ class TestHeatingFeatureDf:
             heating_feature_df=feature,
         )
         assert captured["heating_active_df"] is feature
+
+
+class TestHeatingBufferSmoothing:
+    """Heating-buffer smoothing (2026-10-20): train and predict on a causal trailing mean, not a snapshot."""
+
+    def test_smooth_is_causal_and_excludes_same_hour(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.date_range("2026-10-01", periods=30, freq="1h")
+        vals = np.full(30, 30.0)
+        vals[10] = 40.0  # one spike
+        out = smooth_heating_buffer(pd.Series(vals, index=idx), 6)
+        assert out.iloc[10] == pytest.approx(30.0)  # the reading at t does not leak into its own feature
+        assert out.iloc[11] == pytest.approx((5 * 30.0 + 40.0) / 6)  # but it is in the next hours' past window
+        assert out.iloc[17] == pytest.approx(30.0)  # and has left the 6 h window after 6 hours
+
+    def test_smooth_leading_rows_are_nan_until_three_past_readings(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.date_range("2026-10-01", periods=10, freq="1h")
+        out = smooth_heating_buffer(pd.Series(np.arange(10, dtype=float), index=idx), 24)
+        assert out.iloc[:3].isna().all()
+        assert out.iloc[3] == pytest.approx(1.0)  # mean of readings 0,1,2
+        assert out.index.equals(idx)
+
+    def test_smooth_tolerates_duplicate_and_unsorted_timestamps(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.DatetimeIndex(["2026-10-01 02:00", "2026-10-01 00:00", "2026-10-01 01:00", "2026-10-01 01:00"])
+        out = smooth_heating_buffer(pd.Series([3.0, 1.0, 2.0, 2.5], index=idx), 6)
+        assert out.index.is_unique and out.index.is_monotonic_increasing
+        assert len(out) == 3
+
+    def test_level_is_mean_of_window(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=30, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": 20.0 + np.arange(30)})
+        # the window holds the last 24 readings (i = 6..29), i.e. values 20+i
+        expected = np.mean(20.0 + np.arange(6, 30))
+        assert heating_buffer_level(df, 24) == pytest.approx(expected)
+
+    def test_level_with_before_excludes_the_partial_current_hour(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=30, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": [30.0] * 29 + [40.0]})
+        assert heating_buffer_level(df, 24, before=ts[-1]) == pytest.approx(30.0)  # label ts[-1] is not yet complete
+        assert heating_buffer_level(df, 24) == pytest.approx((23 * 30.0 + 40.0) / 24)
+
+    def test_level_with_short_history_uses_available_readings(self):
+        from energy_forecast.model import heating_buffer_level
+
+        df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-10-01", periods=2, freq="1h"), "heating_buffer_temp": [30.0, 34.0]}
+        )
+        assert heating_buffer_level(df, 24) == pytest.approx(32.0)
+        assert heating_buffer_level(df.iloc[:1], 24) == pytest.approx(30.0)
+
+    def test_level_ignores_nan_and_returns_none_when_all_nan(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=4, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": [30.0, np.nan, 34.0, np.nan]})
+        assert heating_buffer_level(df, 24) == pytest.approx(32.0)
+        df["heating_buffer_temp"] = np.nan
+        assert heating_buffer_level(df, 24) is None
+
+    # the model derives "now" in its own timezone (Europe/Zurich), so the fixtures must as well
+    @staticmethod
+    def _now_local():
+        return pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+
+    @staticmethod
+    def _train_small(tmp_path, smooth_h, monkeypatch, nan_rows=()):
+        monkeypatch.setattr("energy_forecast.model.HEATING_BUFFER_SMOOTH_H", smooth_h)
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        hb = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": 30.0 + rng.uniform(-3, 3, size=n)})
+        for i in nan_rows:
+            hb.loc[i, "heating_buffer_temp"] = np.nan
+        model = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        model.train(energy, weather, outdoor_df=None, weight_halflife_days=0, heating_buffer_temp_df=hb)
+        return model
+
+    @staticmethod
+    def _forecast_df():
+        fts = pd.date_range(TestHeatingBufferSmoothing._now_local().floor("1h"), periods=48, freq="1h")
+        return pd.DataFrame(
+            {
+                "timestamp": fts,
+                "temp_c": [10.0] * 48,
+                "precipitation_mm": [0.0] * 48,
+                "sunshine_min": [30.0] * 48,
+                "wind_kmh": [10.0] * 48,
+                "cloud_cover_pct": [50.0] * 48,
+                "direct_radiation_wm2": [100.0] * 48,
+            }
+        )
+
+    @staticmethod
+    def _recent(last_value):
+        # last COMPLETE hour is floor(now) - 1 h; `last_value` is that reading
+        ts = pd.date_range(
+            end=TestHeatingBufferSmoothing._now_local().floor("1h") - pd.Timedelta(hours=1), periods=30, freq="1h"
+        )
+        vals = np.full(30, 30.0)
+        vals[-1] = last_value
+        return pd.DataFrame({"timestamp": ts, "heating_buffer_temp": vals})
+
+    def test_predict_broadcasts_trailing_mean_when_trained_smoothed(self, tmp_path, monkeypatch):
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        assert model._heating_buffer_smooth_h == 24
+        _, X = model._prepare_prediction_X(
+            self._forecast_df(), live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=self._recent(40.0)
+        )
+        np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), (23 * 30.0 + 40.0) / 24)
+
+    def test_partial_current_hour_reading_is_not_in_the_predict_level(self, tmp_path, monkeypatch):
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        now_row = pd.DataFrame(
+            {"timestamp": [TestHeatingBufferSmoothing._now_local().floor("1h")], "heating_buffer_temp": [60.0]}
+        )
+        _, X = model._prepare_prediction_X(
+            self._forecast_df(),
+            live_temp=5.0,
+            recent_actuals=None,
+            heating_buffer_temp_recent=pd.concat([self._recent(30.0), now_row], ignore_index=True),
+        )
+        np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), 30.0)  # the label-H reading is incomplete
+
+    def test_level_anchors_to_current_hour_when_forecast_df_has_past_rows(self, tmp_path, monkeypatch):
+        # live forecast_df carries past_days history above the forecast; the level must still end at the current hour
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        fut = self._forecast_df()
+        past_ts = pd.date_range(end=fut["timestamp"].iloc[0] - pd.Timedelta(hours=1), periods=72, freq="1h")
+        past = fut.iloc[:1].drop(columns="timestamp").iloc[[0] * 72].reset_index(drop=True)
+        past.insert(0, "timestamp", past_ts)
+        fc = pd.concat([past, fut], ignore_index=True)
+        now_h = TestHeatingBufferSmoothing._now_local().floor("1h")
+        rts = pd.date_range(end=now_h - pd.Timedelta(hours=1), periods=96, freq="1h")
+        vals = np.where(rts >= now_h - pd.Timedelta(hours=24), 35.0, 28.0)
+        recent = pd.DataFrame({"timestamp": rts, "heating_buffer_temp": vals})
+        _, X = model._prepare_prediction_X(fc, live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=recent)
+        np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), 35.0)
+
+    def test_one_snapshot_barely_moves_the_smoothed_feature(self, tmp_path, monkeypatch):
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        lo = model._prepare_prediction_X(
+            self._forecast_df(), live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=self._recent(29.4)
+        )[1]["heating_buffer_temp"].iloc[0]
+        hi = model._prepare_prediction_X(
+            self._forecast_df(), live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=self._recent(35.6)
+        )[1]["heating_buffer_temp"].iloc[0]
+        assert hi - lo < 0.5  # 6.2 °C raw swing -> 6.2/24 ≈ 0.26 °C
+
+    def test_unsmoothed_model_keeps_raw_latest_even_if_constant_is_later_enabled(self, tmp_path, monkeypatch):
+        self._train_small(tmp_path, 0, monkeypatch)
+        monkeypatch.setattr("energy_forecast.model.HEATING_BUFFER_SMOOTH_H", 24)  # deploy happens, no retrain yet
+        reloaded = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        assert reloaded._heating_buffer_smooth_h == 0
+        _, X = reloaded._prepare_prediction_X(
+            self._forecast_df(), live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=self._recent(40.0)
+        )
+        np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), 40.0)
+
+    def test_failed_smoothed_train_leaves_raw_model_attribute_untouched(self, tmp_path, monkeypatch):
+        model = self._train_small(tmp_path, 0, monkeypatch)
+        monkeypatch.setattr("energy_forecast.model.HEATING_BUFFER_SMOOTH_H", 24)
+        ts = pd.date_range("2024-01-01", periods=10, freq="1h")  # far too few rows -> train() returns early
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": np.ones(10)})
+        weather = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": np.full(10, 5.0),
+                "precipitation_mm": 0.0,
+                "sunshine_min": 30.0,
+                "wind_kmh": 10.0,
+                "cloud_cover_pct": 50.0,
+                "direct_radiation_wm2": 100.0,
+            }
+        )
+        hb = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": np.full(10, 30.0)})
+        model.train(energy, weather, outdoor_df=None, weight_halflife_days=0, heating_buffer_temp_df=hb)
+        assert model._heating_buffer_smooth_h == 0  # the booster in memory is still the raw-trained one
+
+    def test_smoothed_window_survives_reload(self, tmp_path, monkeypatch):
+        self._train_small(tmp_path, 12, monkeypatch)
+        monkeypatch.setattr("energy_forecast.model.HEATING_BUFFER_SMOOTH_H", 0)
+        reloaded = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        assert reloaded._heating_buffer_smooth_h == 12
+
+    def test_all_nan_recent_falls_back_to_no_sensor_path(self, tmp_path, monkeypatch):
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        recent = self._recent(40.0)
+        recent["heating_buffer_temp"] = np.nan
+        _, X = model._prepare_prediction_X(
+            self._forecast_df(), live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=recent
+        )
+        # same as the raw path today: NaN -> training-median fill, NOT the out-of-range 0.0 portability fill
+        assert X["heating_buffer_temp"].notna().all()
+        assert (X["heating_buffer_temp"] != 0.0).all()
+
+    def test_training_buffer_frame_with_nan_readings_trains_smoothed(self, tmp_path, monkeypatch):
+        # smooth_heating_buffer drops NaN-reading timestamps from its index; the merge must tolerate that
+        model = self._train_small(tmp_path, 24, monkeypatch, nan_rows=[100, 101, 300])
+        assert model._heating_buffer_smooth_h == 24
+        assert model.model is not None

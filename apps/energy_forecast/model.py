@@ -57,6 +57,7 @@ from .const import (
     DEFICIT_RECOVERY_TAU_H,
     DEFICIT_STEADY_MIN_ROWS,
     DEFICIT_STEADY_WINDOW_H,
+    HEATING_BUFFER_SMOOTH_H,
     HOLDOUT_FRACTION,
     MIN_CV_ROWS,
     MIN_TRAINING_ROWS,
@@ -305,6 +306,7 @@ class EnergyForecastModel:
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
+        self._heating_buffer_smooth_h: int = 0  # trailing-mean window the loaded model was trained with (0 = raw)
         self._regime_count: int = 5
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
@@ -474,10 +476,15 @@ class EnergyForecastModel:
             if climate_dfs:
                 open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
 
+        smooth_h = 0  # committed to self only after a successful fit (see below)
         if heating_buffer_temp_df is not None and not heating_buffer_temp_df.empty:
             heating_buffer_temp_series = heating_buffer_temp_df.set_index(
                 pd.to_datetime(heating_buffer_temp_df["timestamp"])
             )["heating_buffer_temp"]
+            if HEATING_BUFFER_SMOOTH_H > 0:
+                smoothed = smooth_heating_buffer(heating_buffer_temp_series, HEATING_BUFFER_SMOOTH_H)
+                if smoothed.notna().any():  # < 3 readings in total -> all NaN -> every row would be dropped
+                    heating_buffer_temp_series, smooth_h = smoothed, HEATING_BUFFER_SMOOTH_H
 
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
@@ -921,6 +928,7 @@ class EnergyForecastModel:
 
         self.model = model
         self.feature_cols = feature_cols
+        self._heating_buffer_smooth_h = smooth_h
         self.last_trained = datetime.now()
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
@@ -1110,9 +1118,20 @@ class EnergyForecastModel:
 
         heating_buffer_temp_series = None
         if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
-            # hold the most recent reading flat across the forecast horizon — same "recent" pattern
-            # used for dhw_recent/climate_recent elsewhere in this method
-            latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
+            if self._heating_buffer_smooth_h > 0:
+                # trained on the trailing mean: predict the same level, flat over the horizon, from the
+                # readings in [current hour - W, current hour); a dead sensor (empty window) -> NaN, which the
+                # existing training-median fill handles exactly as the raw path does today
+                level = heating_buffer_level(
+                    heating_buffer_temp_recent,
+                    self._heating_buffer_smooth_h,
+                    before=future_hours[0],
+                )
+                latest_val = float("nan") if level is None else level
+            else:
+                # hold the most recent reading flat across the forecast horizon — same "recent" pattern
+                # used for dhw_recent/climate_recent elsewhere in this method
+                latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
             heating_buffer_temp_series = pd.Series(latest_val, index=pd.DatetimeIndex(forecast_df["timestamp"]))
 
         feat_df = _engineer_features(
@@ -1721,6 +1740,7 @@ class EnergyForecastModel:
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
             "weather_tail": self._weather_tail,
+            "heating_buffer_smooth_h": self._heating_buffer_smooth_h,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -2168,6 +2188,7 @@ class EnergyForecastModel:
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
                     self._weather_tail = meta.get("weather_tail", None)
+                    self._heating_buffer_smooth_h = meta.get("heating_buffer_smooth_h", 0)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -3043,6 +3064,45 @@ def _project_indoor_temps(
 
 
 # ── Core feature engineering ──────────────────────────────────────────────────
+
+
+def smooth_heating_buffer(series: pd.Series, window_h: int) -> pd.Series:
+    """Causal trailing mean of the heating-buffer reading, excluding the reading at ``t`` itself.
+
+    Value at ``t`` = mean of readings with ``t - window_h <= ts < t``; NaN until 3 past readings exist (the
+    caller's ``ffill().fillna(median)`` covers the sensor's first hours). Excluding the same-hour reading keeps
+    "the heat pump is running right now" out of the feature, which is what made it a target proxy.
+    """
+
+    s = series.dropna().sort_index(kind="stable")  # stable: "keep last" among duplicates is then the last written
+    s = s[~s.index.duplicated(keep="last")]
+    return s.rolling(f"{int(window_h)}h", min_periods=min(3, int(window_h)), closed="left").mean()
+
+
+def heating_buffer_level(recent: pd.DataFrame, window_h: int, before: pd.Timestamp | None = None) -> float | None:
+    """Predict-time counterpart of :func:`smooth_heating_buffer`: mean of the valid readings in the window.
+
+    The window is ``before - window_h <= ts < before``, exactly what training used for the first forecast hour
+    (live frames carry the partial current hour as their last label; ``before`` = forecast start excludes it).
+    ``before=None`` → the last ``window_h`` hours up to and including the latest valid reading. Uses whatever
+    readings exist (>= 1), so a short history after a sensor restart still yields a level; ``None`` when the
+    window holds no valid reading (dead sensor), so the caller can fall back to the training-median fill.
+    """
+    import pandas as pd
+
+    d = recent.dropna(subset=["heating_buffer_temp"])
+    if d.empty:
+        return None
+    ts = pd.to_datetime(d["timestamp"])
+    if before is None:
+        end = ts.max() + pd.Timedelta(nanoseconds=1)
+    else:
+        end = pd.Timestamp(before)
+        if end.tzinfo is not None:
+            end = end.tz_localize(None)
+    in_window = ((ts >= end - pd.Timedelta(hours=window_h)) & (ts < end)).to_numpy()
+    vals = d.loc[in_window, "heating_buffer_temp"]
+    return float(vals.mean()) if len(vals) else None
 
 
 def _engineer_features(
