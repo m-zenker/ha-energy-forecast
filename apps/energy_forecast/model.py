@@ -3045,6 +3045,45 @@ def _project_indoor_temps(
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 
+def smooth_heating_buffer(series: pd.Series, window_h: int) -> pd.Series:
+    """Causal trailing mean of the heating-buffer reading, excluding the reading at ``t`` itself.
+
+    Value at ``t`` = mean of readings with ``t - window_h <= ts < t``; NaN until 3 past readings exist (the
+    caller's ``ffill().fillna(median)`` covers the sensor's first hours). Excluding the same-hour reading keeps
+    "the heat pump is running right now" out of the feature, which is what made it a target proxy.
+    """
+
+    s = series.dropna().sort_index(kind="stable")  # stable: "keep last" among duplicates is then the last written
+    s = s[~s.index.duplicated(keep="last")]
+    return s.rolling(f"{int(window_h)}h", min_periods=min(3, int(window_h)), closed="left").mean()
+
+
+def heating_buffer_level(recent: pd.DataFrame, window_h: int, before: pd.Timestamp | None = None) -> float | None:
+    """Predict-time counterpart of :func:`smooth_heating_buffer`: mean of the valid readings in the window.
+
+    The window is ``before - window_h <= ts < before``, exactly what training used for the first forecast hour
+    (live frames carry the partial current hour as their last label; ``before`` = forecast start excludes it).
+    ``before=None`` → the last ``window_h`` hours up to and including the latest valid reading. Uses whatever
+    readings exist (>= 1), so a short history after a sensor restart still yields a level; ``None`` when the
+    window holds no valid reading (dead sensor), so the caller can fall back to the training-median fill.
+    """
+    import pandas as pd
+
+    d = recent.dropna(subset=["heating_buffer_temp"])
+    if d.empty:
+        return None
+    ts = pd.to_datetime(d["timestamp"])
+    if before is None:
+        end = ts.max() + pd.Timedelta(nanoseconds=1)
+    else:
+        end = pd.Timestamp(before)
+        if end.tzinfo is not None:
+            end = end.tz_localize(None)
+    in_window = ((ts >= end - pd.Timedelta(hours=window_h)) & (ts < end)).to_numpy()
+    vals = d.loc[in_window, "heating_buffer_temp"]
+    return float(vals.mean()) if len(vals) else None
+
+
 def _engineer_features(
     df: pd.DataFrame,  # naive timestamps
     weather_df: pd.DataFrame,  # naive timestamps

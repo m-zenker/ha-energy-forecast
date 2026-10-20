@@ -7236,3 +7236,70 @@ class TestHeatingFeatureDf:
             heating_feature_df=feature,
         )
         assert captured["heating_active_df"] is feature
+
+
+class TestHeatingBufferSmoothing:
+    """Heating-buffer smoothing (2026-10-20): train and predict on a causal trailing mean, not a snapshot."""
+
+    def test_smooth_is_causal_and_excludes_same_hour(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.date_range("2026-10-01", periods=30, freq="1h")
+        vals = np.full(30, 30.0)
+        vals[10] = 40.0  # one spike
+        out = smooth_heating_buffer(pd.Series(vals, index=idx), 6)
+        assert out.iloc[10] == pytest.approx(30.0)  # the reading at t does not leak into its own feature
+        assert out.iloc[11] == pytest.approx((5 * 30.0 + 40.0) / 6)  # but it is in the next hours' past window
+        assert out.iloc[17] == pytest.approx(30.0)  # and has left the 6 h window after 6 hours
+
+    def test_smooth_leading_rows_are_nan_until_three_past_readings(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.date_range("2026-10-01", periods=10, freq="1h")
+        out = smooth_heating_buffer(pd.Series(np.arange(10, dtype=float), index=idx), 24)
+        assert out.iloc[:3].isna().all()
+        assert out.iloc[3] == pytest.approx(1.0)  # mean of readings 0,1,2
+        assert out.index.equals(idx)
+
+    def test_smooth_tolerates_duplicate_and_unsorted_timestamps(self):
+        from energy_forecast.model import smooth_heating_buffer
+
+        idx = pd.DatetimeIndex(["2026-10-01 02:00", "2026-10-01 00:00", "2026-10-01 01:00", "2026-10-01 01:00"])
+        out = smooth_heating_buffer(pd.Series([3.0, 1.0, 2.0, 2.5], index=idx), 6)
+        assert out.index.is_unique and out.index.is_monotonic_increasing
+        assert len(out) == 3
+
+    def test_level_is_mean_of_window(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=30, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": 20.0 + np.arange(30)})
+        # the window holds the last 24 readings (i = 6..29), i.e. values 20+i
+        expected = np.mean(20.0 + np.arange(6, 30))
+        assert heating_buffer_level(df, 24) == pytest.approx(expected)
+
+    def test_level_with_before_excludes_the_partial_current_hour(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=30, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": [30.0] * 29 + [40.0]})
+        assert heating_buffer_level(df, 24, before=ts[-1]) == pytest.approx(30.0)  # label ts[-1] is not yet complete
+        assert heating_buffer_level(df, 24) == pytest.approx((23 * 30.0 + 40.0) / 24)
+
+    def test_level_with_short_history_uses_available_readings(self):
+        from energy_forecast.model import heating_buffer_level
+
+        df = pd.DataFrame(
+            {"timestamp": pd.date_range("2026-10-01", periods=2, freq="1h"), "heating_buffer_temp": [30.0, 34.0]}
+        )
+        assert heating_buffer_level(df, 24) == pytest.approx(32.0)
+        assert heating_buffer_level(df.iloc[:1], 24) == pytest.approx(30.0)
+
+    def test_level_ignores_nan_and_returns_none_when_all_nan(self):
+        from energy_forecast.model import heating_buffer_level
+
+        ts = pd.date_range("2026-10-01", periods=4, freq="1h")
+        df = pd.DataFrame({"timestamp": ts, "heating_buffer_temp": [30.0, np.nan, 34.0, np.nan]})
+        assert heating_buffer_level(df, 24) == pytest.approx(32.0)
+        df["heating_buffer_temp"] = np.nan
+        assert heating_buffer_level(df, 24) is None
