@@ -1120,12 +1120,12 @@ class EnergyForecastModel:
         if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
             if self._heating_buffer_smooth_h > 0:
                 # trained on the trailing mean: predict the same level, flat over the horizon, from the
-                # readings in [forecast_start - W, forecast_start); a dead sensor (empty window) -> NaN, which the
+                # readings in [current hour - W, current hour); a dead sensor (empty window) -> NaN, which the
                 # existing training-median fill handles exactly as the raw path does today
                 level = heating_buffer_level(
                     heating_buffer_temp_recent,
                     self._heating_buffer_smooth_h,
-                    before=pd.Timestamp(forecast_df["timestamp"].min()).floor("1h"),
+                    before=future_hours[0],
                 )
                 latest_val = float("nan") if level is None else level
             else:

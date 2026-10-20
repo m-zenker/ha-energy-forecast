@@ -7304,6 +7304,11 @@ class TestHeatingBufferSmoothing:
         df["heating_buffer_temp"] = np.nan
         assert heating_buffer_level(df, 24) is None
 
+    # the model derives "now" in its own timezone (Europe/Zurich), so the fixtures must as well
+    @staticmethod
+    def _now_local():
+        return pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+
     @staticmethod
     def _train_small(tmp_path, smooth_h, monkeypatch, nan_rows=()):
         monkeypatch.setattr("energy_forecast.model.HEATING_BUFFER_SMOOTH_H", smooth_h)
@@ -7331,7 +7336,7 @@ class TestHeatingBufferSmoothing:
 
     @staticmethod
     def _forecast_df():
-        fts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
+        fts = pd.date_range(TestHeatingBufferSmoothing._now_local().floor("1h"), periods=48, freq="1h")
         return pd.DataFrame(
             {
                 "timestamp": fts,
@@ -7347,7 +7352,9 @@ class TestHeatingBufferSmoothing:
     @staticmethod
     def _recent(last_value):
         # last COMPLETE hour is floor(now) - 1 h; `last_value` is that reading
-        ts = pd.date_range(end=pd.Timestamp.now().floor("1h") - pd.Timedelta(hours=1), periods=30, freq="1h")
+        ts = pd.date_range(
+            end=TestHeatingBufferSmoothing._now_local().floor("1h") - pd.Timedelta(hours=1), periods=30, freq="1h"
+        )
         vals = np.full(30, 30.0)
         vals[-1] = last_value
         return pd.DataFrame({"timestamp": ts, "heating_buffer_temp": vals})
@@ -7362,7 +7369,9 @@ class TestHeatingBufferSmoothing:
 
     def test_partial_current_hour_reading_is_not_in_the_predict_level(self, tmp_path, monkeypatch):
         model = self._train_small(tmp_path, 24, monkeypatch)
-        now_row = pd.DataFrame({"timestamp": [pd.Timestamp.now().floor("1h")], "heating_buffer_temp": [60.0]})
+        now_row = pd.DataFrame(
+            {"timestamp": [TestHeatingBufferSmoothing._now_local().floor("1h")], "heating_buffer_temp": [60.0]}
+        )
         _, X = model._prepare_prediction_X(
             self._forecast_df(),
             live_temp=5.0,
@@ -7370,6 +7379,21 @@ class TestHeatingBufferSmoothing:
             heating_buffer_temp_recent=pd.concat([self._recent(30.0), now_row], ignore_index=True),
         )
         np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), 30.0)  # the label-H reading is incomplete
+
+    def test_level_anchors_to_current_hour_when_forecast_df_has_past_rows(self, tmp_path, monkeypatch):
+        # live forecast_df carries past_days history above the forecast; the level must still end at the current hour
+        model = self._train_small(tmp_path, 24, monkeypatch)
+        fut = self._forecast_df()
+        past_ts = pd.date_range(end=fut["timestamp"].iloc[0] - pd.Timedelta(hours=1), periods=72, freq="1h")
+        past = fut.iloc[:1].drop(columns="timestamp").iloc[[0] * 72].reset_index(drop=True)
+        past.insert(0, "timestamp", past_ts)
+        fc = pd.concat([past, fut], ignore_index=True)
+        now_h = TestHeatingBufferSmoothing._now_local().floor("1h")
+        rts = pd.date_range(end=now_h - pd.Timedelta(hours=1), periods=96, freq="1h")
+        vals = np.where(rts >= now_h - pd.Timedelta(hours=24), 35.0, 28.0)
+        recent = pd.DataFrame({"timestamp": rts, "heating_buffer_temp": vals})
+        _, X = model._prepare_prediction_X(fc, live_temp=5.0, recent_actuals=None, heating_buffer_temp_recent=recent)
+        np.testing.assert_allclose(X["heating_buffer_temp"].to_numpy(), 35.0)
 
     def test_one_snapshot_barely_moves_the_smoothed_feature(self, tmp_path, monkeypatch):
         model = self._train_small(tmp_path, 24, monkeypatch)
