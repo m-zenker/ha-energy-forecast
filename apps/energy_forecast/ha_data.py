@@ -982,7 +982,7 @@ def fetch_sub_sensor_history(
         diff.columns = ["timestamp", "kwh"]
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
-        df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
+        df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
     else:
         # Use explicit dtypes so downstream merge_asof / pd.concat don't see
         # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
@@ -1048,7 +1048,7 @@ def fetch_recent_sub_sensor(
         diff.columns = ["timestamp", "kwh"]
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
-        df_new = diff[diff["kwh"] < MAX_HOURLY_KWH].copy()
+        df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
     else:
         # Use explicit dtypes so downstream merge_asof / pd.concat don't see
         # object-typed timestamp columns (pandas 3.x raises on mixed dtypes).
