@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     import hassapi as hass
     import pandas as pd
 
-from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH
+from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH, drop_dst_duplicates
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -1367,11 +1367,13 @@ def fetch_boolean_entity_history(
     # Convert to naive local time (strip tz, local time already correct)
     timestamps_naive = hourly.tz_localize(None)
 
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps_naive,
-            "is_away": (filled == "on").astype(int).values,
-        }
+    return drop_dst_duplicates(
+        pd.DataFrame(
+            {
+                "timestamp": timestamps_naive,
+                "is_away": (filled == "on").astype(int).values,
+            }
+        )
     )
 
 
@@ -1470,11 +1472,13 @@ def fetch_presence_history(
     people_count = stacked.sum(axis=1)
     timestamps_naive = all_ts.tz_localize(None)
 
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps_naive,
-            "people_home": people_count.astype(int).values,
-        }
+    return drop_dst_duplicates(
+        pd.DataFrame(
+            {
+                "timestamp": timestamps_naive,
+                "people_home": people_count.astype(int).values,
+            }
+        )
     )
 
 
