@@ -829,6 +829,26 @@ class TestCallbackSignature:
 
         EnergyForecast._update_cb(_FakeSelf(), "some_event", {}, {})
 
+    def test_update_cb_logs_traceback(self, caplog):
+        """A failing hourly update must log its traceback, not just str(exc) —
+        the 2026-10-22 DST outage logged only the message, hiding the raise site."""
+        import logging
+
+        import energy_forecast.energy_forecast as ef_mod
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeSelf()
+        fake._ml_model.model = object()
+
+        def _boom():
+            raise ValueError("boom")
+
+        fake._update_sensors = _boom
+        with caplog.at_level(logging.ERROR, logger=ef_mod._LOGGER.name):
+            EnergyForecast._update_cb(fake, {})
+        recs = [r for r in caplog.records if "Sensor update failed" in r.getMessage()]
+        assert recs and recs[0].exc_info is not None
+
 
 # ── Config validation — EV threshold vs charger_kw warning (#20) ─────────────
 
@@ -4615,6 +4635,36 @@ class TestUpdateSensorsExcludedRanges:
         )
         assert not in_range.any(), "excluded window must be absent from _cached_recent_actuals"
         assert len(result) == 24 - 4  # 05:00..08:00 inclusive = 4 hourly rows
+
+    def test_update_sensors_dedupes_dst_fallback_forecast(self, tmp_path, monkeypatch):
+        """2026-10-22 outage: SRG forecasts arrive in UTC; strip_tz maps Oct 25
+        00:00 and 01:00 UTC onto one naive 02:00 label, and a later reindex in
+        the physics path raised "cannot reindex on an axis with duplicate labels".
+        The cached forecast frame must carry unique timestamps."""
+        import energy_forecast.weather as weather_mod
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_update_sensors_deps(monkeypatch, _make_energy_df(24), tmp_path)
+        n = 48
+        srg_like = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-10-24 12:00", periods=n, freq="1h", tz="UTC"),
+                "temp_c": [10.0] * n,
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        monkeypatch.setattr(weather_mod, "fetch_forecast", lambda *a, **kw: srg_like.copy())
+
+        stub = _FakeUpdateSensors(tmp_path / "energy_history.csv")
+        EnergyForecast._update_sensors(stub)
+
+        cached = stub._cached_forecast_df
+        assert cached["timestamp"].is_unique
+        assert len(cached) == n - 1
 
     def test_update_sensors_repeat_call_downgrades_escalation_to_info(self, tmp_path, monkeypatch, caplog):
         """ROADMAP #95: a long-span exclusion (>14 days, escalates to WARNING

@@ -76,3 +76,39 @@ class TestResolveTimezone:
             result = resolve_timezone("Europe/Zurich", ZoneInfo("Europe/Zurich"), logging.getLogger("test_const"))
         assert result == "Europe/Zurich"
         assert not caplog.records
+
+
+class TestDropDstDuplicates:
+    """DST fall-back maps 02:00 CEST and 02:00 CET onto one naive 02:00 label."""
+
+    def test_fallback_utc_frame_collapses_to_unique(self):
+        import pandas as pd
+        from energy_forecast.const import drop_dst_duplicates, strip_tz
+
+        utc = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-10-24 22:00", periods=4, freq="h", tz="UTC"),
+                "temp_c": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+        out = drop_dst_duplicates(strip_tz(utc))
+        assert out["timestamp"].is_unique
+        assert list(out["timestamp"].dt.hour) == [0, 1, 2]
+        assert out.loc[out["timestamp"].dt.hour == 2, "temp_c"].item() == 3.0  # first (CEST) kept
+        assert list(out.index) == [0, 1, 2]
+
+    def test_spring_forward_is_noop(self):
+        import pandas as pd
+        from energy_forecast.const import drop_dst_duplicates, strip_tz
+
+        utc = pd.DataFrame({"timestamp": pd.date_range("2026-03-29 00:00", periods=4, freq="h", tz="UTC"), "v": 1.0})
+        df = strip_tz(utc)
+        pd.testing.assert_frame_equal(drop_dst_duplicates(df), df)
+
+    def test_empty_and_missing_column_passthrough(self):
+        import pandas as pd
+        from energy_forecast.const import drop_dst_duplicates
+
+        assert drop_dst_duplicates(pd.DataFrame()).empty
+        df = pd.DataFrame({"x": [1, 1]})
+        pd.testing.assert_frame_equal(drop_dst_duplicates(df), df)

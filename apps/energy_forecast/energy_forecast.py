@@ -40,6 +40,7 @@ from .const import (
     PRED_HISTORY_PATH,
     PRESENCE_STATE_HOME,
     UNIT_TO_KWH,
+    drop_dst_duplicates,
     resolve_timezone,
 )
 from .const import strip_tz as _strip_tz_util
@@ -1287,7 +1288,7 @@ class EnergyForecast(hass.Hass):
         try:
             self._update_sensors()
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.error("Sensor update failed: %s", exc)
+            _LOGGER.error("Sensor update failed: %s", exc, exc_info=True)
 
     # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
 
@@ -1873,7 +1874,7 @@ class EnergyForecast(hass.Hass):
             self.args.get("srg_client_secret"),
             timezone=self._timezone,
         )
-        forecast_df = _strip_tz(forecast_df, self._timezone)
+        forecast_df = drop_dst_duplicates(_strip_tz(forecast_df, self._timezone))
 
         # ── Fetch recent actuals ──────────────────────────────────────────────
         # Uses the lightweight fetch (last 2 days only) to stay well within
