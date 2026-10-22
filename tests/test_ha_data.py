@@ -2813,3 +2813,62 @@ class TestClimateValveDemand:
         with patch.object(ha_data, "_fetch_history", return_value=raw):
             out = ha_data.fetch_recent_climate(mock_app, "climate.room", tmp_path / "climate_room.csv")
         assert out["heating_power_request"].iloc[-1] == 15
+
+
+class TestHourlyStateHistoryDstFallback:
+    """Away/presence builders create a tz-aware hourly grid then tz_localize(None);
+    across the October fall-back that yields two naive 02:00 rows, which breaks the
+    timestamp-indexed reindex in model.predict (is_away / people_home features)."""
+
+    def test_boolean_entity_history_unique_across_fallback(self, mock_app):
+        mock_app.get_history.return_value = {
+            "input_boolean.abwesend": [
+                {"state": "on", "last_changed": "2026-10-24T20:00:00+00:00"},
+                {"state": "off", "last_changed": "2026-10-25T03:00:00+00:00"},
+            ]
+        }
+        result = ha_data.fetch_boolean_entity_history(mock_app, "input_boolean.abwesend", days=30)
+        assert result["timestamp"].is_unique
+        assert (result["timestamp"] == pd.Timestamp("2026-10-25 02:00")).sum() == 1
+
+    def test_presence_history_unique_across_fallback(self, mock_app):
+        mock_app.get_history.return_value = {
+            "person.alice": [
+                {"state": "home", "last_changed": "2026-10-24T20:00:00+00:00"},
+                {"state": "not_home", "last_changed": "2026-10-25T03:00:00+00:00"},
+            ]
+        }
+        result = ha_data.fetch_presence_history(mock_app, ["person.alice"], days=30)
+        assert result["timestamp"].is_unique
+        assert (result["timestamp"] == pd.Timestamp("2026-10-25 02:00")).sum() == 1
+
+    @staticmethod
+    def _sub_sensor_history(entity_id=None, **kw):
+        if "program" in entity_id:
+            states = [
+                {"state": "no_program", "last_changed": "2026-10-24T19:00:00+00:00"},
+                {"state": "eco", "last_changed": "2026-10-25T00:30:00+00:00"},
+            ]
+        else:
+            times = pd.date_range("2026-10-24 20:00", "2026-10-26 06:00", freq="30min", tz="UTC")
+            states = [
+                {"state": str(100 + i * 0.1), "last_updated": t.isoformat(), "last_changed": t.isoformat()}
+                for i, t in enumerate(times)
+            ]
+        return {entity_id: states}
+
+    @pytest.mark.parametrize("fetch_name", ["fetch_sub_sensor_history", "fetch_recent_sub_sensor"])
+    def test_sub_sensor_with_program_unique_across_fallback(self, mock_app, tmp_path, fetch_name):
+        """Program-label merge (_merge_sub_sensor_frames) set_index/map on the
+        fresh frame raised 'cannot reindex on an axis with duplicate labels'."""
+        mock_app.get_history.side_effect = self._sub_sensor_history
+        fetch = getattr(ha_data, fetch_name)
+        result = fetch(
+            mock_app,
+            "sensor.spuelmaschine_energy",
+            tmp_path / "sub.csv",
+            timezone="Europe/Zurich",
+            program_entity_id="sensor.spuelmaschine_program",
+        )
+        assert result["timestamp"].is_unique
+        assert (result["timestamp"] == pd.Timestamp("2026-10-25 02:00")).sum() == 1

@@ -81,6 +81,24 @@ def strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
     return df
 
 
+def drop_dst_duplicates(df: Any) -> Any:
+    """Drop rows whose naive 'timestamp' repeats an earlier row (DST fall-back).
+
+    strip_tz maps 02:00 CEST and 02:00 CET on the last Sunday of October onto
+    the same naive 02:00 label; any later Series.reindex on such an index raises
+    "cannot reindex on an axis with duplicate labels". The first (CEST) row is
+    kept, matching the drop_duplicates(keep="first") on the energy-history paths.
+    """
+    if df.empty or "timestamp" not in df.columns:
+        return df
+    dup = df["timestamp"].duplicated(keep="first")
+    n_dup = int(dup.sum())
+    if not n_dup:
+        return df
+    logging.getLogger("energy_forecast").info("DST fall-back: dropped %d duplicate naive timestamp row(s)", n_dup)
+    return df.loc[~dup].reset_index(drop=True)
+
+
 def resolve_timezone(configured: str | None, ha_timezone: Any, logger: logging.Logger) -> str:
     """Resolve the effective timezone for an app instance.
 
