@@ -1,7 +1,7 @@
 # Regime Label: Train/Serve Leak + Hard-Label Flip — Design
 
 **Date:** 2026-10-23 (rev. 2: after multi-stakeholder review)
-**Status:** Draft, awaiting approval
+**Status:** Reviewed (multi-stakeholder, 2 rounds + final sign-off: APPROVED), awaiting user approval
 **Branch base:** `dev` (all branches below)
 **Roadmap item:** #110 (unblocks #83)
 **Findings so far:** `memory/project_regime_flip_weather_source.md`
@@ -96,7 +96,8 @@
 - copy `data/` to a scratch directory and point every cache path there, because the fetches write back to their caches;
 - stub `get_history` to return `[]`, so `is_away` = 0, since `input_boolean.abwesend` history has no cache (accepted difference);
 - serve weather from the Open-Meteo archive, cached locally;
-- freeze the clock at `cutoff`;
+- freeze the clock at `cutoff`, **and** explicitly trim every copied cache (energy, sub_*, climate, DHW, heating, weather) to `≤ cutoff`. A frozen clock alone doesn't stop non-truncating caches from leaking future rows;
+- fetch the live model and `meta.pkl` as well as `clusterer.pkl` (`analyze_regimes.py` fetches only the latter);
 - stub `heating_season.save_thresholds` and the post-train 15 min fetch.
 
 The code runs on dev + A+B (#101/#102), using a local, never-pushed scratch merge if A+B aren't on dev yet.
@@ -115,7 +116,7 @@ If it fails, check auto-K and whether the live clusterer is stale, then **stop a
   - primary: 2026-10-15 → last complete day (≥ 21 days);
   - guard: a 3–4 week January 2026 window with ≥ 60 days of history before it.
 - **Protocol:** expanding window, weekly retrain, archive weather as a perfect forecast. Origin 17:00, scoring the next calendar day (what EM reads).
-- **Metrics:** daily-total MAE, primary and pooled across both folds. Source-switch sensitivity: re-predict each origin with `sunshine_min` ×0.66 and ×1.5, and report max |Δ daily total| and the count of days with |Δ| > 2 kWh. The `regime_kwh` gain share is report only.
+- **Metrics:** daily-total MAE, per fold and pooled (per-fold always shown, so pooling can't hide the January guard). Source-switch sensitivity: re-predict each origin with `sunshine_min` ×0.66 and ×1.5, and report max |Δ daily total| and the count of days with |Δ| > 2 kWh. The `regime_kwh` gain share is report only.
 
 ### 6.4 Decision
 1. A candidate (T or N) passes if, compared with H:
