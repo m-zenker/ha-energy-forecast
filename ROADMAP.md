@@ -28,8 +28,8 @@ Current: **dev v0.12.0-alpha-30** (2026-10-22, deployed, 1202 tests) · **main v
 | Topic | Decision |
 |---|---|
 | Primary goal | **Forecast accuracy** + visibility/dashboards |
-| Solar PV | Planned — target correction done (v0.8.0); solar forecast feature out of scope |
-| Home battery | SoC as feature deferred until panels installed (#40) |
+| Solar PV | Live since 2026-07-16 (SolarEdge) — target correction active (v0.8.0, live-path fix 2026-07-16); solar forecast feature out of scope |
+| Home battery | Live since 2026-07-16; charge/discharge in target correction (direction verified). SoC as feature unblocked but deferred until residuals show SoC correlation (#40) |
 | Tariff | Fixed flat rate — price optimisation **out of scope** |
 | Load shifting | **Out of scope** — handled by a separate system |
 | Audience | Personal-first; HACS nice-to-have, never at cost of accuracy |
@@ -389,7 +389,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | # | Item | Reason |
 |---|------|--------|
 | #22 | EV SoC / charging state feature | EV hours are subtracted from training target — SoC has no signal to learn. Revisit if EV load is re-included. |
-| #40 | Home battery SoC as feature | Deferred until solar panels installed; revisit if residuals show SoC correlation. |
+| #40 | Home battery SoC as feature | Unblocked (battery live since 2026-07-16); revisit if residuals show SoC correlation. |
 | #24 | Electricity spot price feature | Fixed flat tariff — out of scope. |
 | #94 | Remove vestigial `dhw_tank_volume_l` in `physics_schedule.json` | Dead duplicate of the `physics:` config value (`self._config`, correctly 400L, actually used by `_dhw_kwh_series`) — the schedule file's own copy (currently 200) is only ever echoed back into itself by the autonomous legionella-schedule-learning code, never read by the computation. No functional impact, but misleading if the file is inspected directly (caught 2026-08-18 during hem's DHW boost spec review). Clean up opportunistically next time `physics.py`'s schedule-writing code (`_check_legionella_stability`/schedule-learning path, ~line 684) is touched — not worth a dedicated pass on its own. |
 
