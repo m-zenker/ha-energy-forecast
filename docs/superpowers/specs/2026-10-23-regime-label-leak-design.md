@@ -14,7 +14,7 @@
 
 - **Leak.** Training fills `regime_kwh` from the clusterer's *true* daily labels (`model.py:604–639`). Live prediction uses the RandomForest's *predicted* label (`model.py:1176–1216`, inside `_prepare_prediction_X`). In harness models `regime_kwh` holds 31–33 % of gain; with out-of-bag (OOB) soft training labels it drops to #10–12 (2–2.5 %).
 - **Hard-label flip.** The label is an argmax, so a small change in daily sunshine near a regime boundary swaps the whole 24 h centroid. On 2026-10-21 an SRG-SSR 503 → Open-Meteo fallback flipped tomorrow's label 0 → 2 (7.9 → 20.9 kWh/day) and moved `tomorrow` 11.06 → 16.64 → 11.06 kWh. ha-energy-manager schedules off the tomorrow 3 h block sensors, which flip the same way.
-- **2026-10-23 evidence.** The 10-22 actual was 15.82 kWh. Regime 2 (16.6) was right and the live regime-0 forecast (10.7) was wrong, so on cold days the hard label can land on the wrong side, not only flicker.
+- **2026-10-23 evidence.** The 10-22 actual was 15.82 kWh. Regime 2 (16.6) was right and the live regime-0 forecast (10.7) was wrong, so on cold days the hard label can land on the wrong side, not only flicker (n = 1, a hypothesis for Step 3, not a finding).
 
 ## 2. Goals, non-goals, anti-goals
 
@@ -49,14 +49,13 @@
 - **`RegimePredictor.predict_proba(daily_features, n_clusters)`** returns a DataFrame with rows = dates and columns `0..n_clusters-1`, mapped from `classes_`; absent classes get 0. It returns `None` if unfitted or on error.
 - **`_prepare_prediction_X`** resets `self._last_regime_info = {}` at entry. After the hard labels are computed, it fills, per forecast date:
   - `label`;
-  - `proba` (rounded to 3);
-  - `soft_day_kwh` = Σ p_k · sum(centroid_k), taken before the temperature gate. This gives a free live shadow of the soft forecast.
+  - `proba` (rounded to 3).
 
   The fill sits in its **own nested `try/except`** that only logs. A failure there must never reach the outer `except`, which zeroes `regime_kwh`. The hard path feeding `feat_df["regime_kwh"]` stays unchanged.
-- **App:** after the app's own `_prepare_prediction_X` call (`energy_forecast.py:2068`, before any SHAP or scenario call that would overwrite the info), each sensor update appends one line to `regime_log.jsonl`, written next to `pred_history.json` in the app directory:
+- **App:** capture the info right after the app's own `_prepare_prediction_X` call (`energy_forecast.py:2068`), before any SHAP or scenario call overwrites it. Write the log line only after the DHW-override and other post-predict corrections (~`:2104`), so `tomorrow_kwh` is the published value. Each sensor update appends one line to `regime_log.jsonl`, written next to `pred_history.json` in the app directory:
 
   ```
-  {ts, last_trained, tomorrow_kwh, tomorrow: {label, proba, soft_day_kwh}}
+  {ts, last_trained, target_date, tomorrow_kwh, label, proba}
   ```
 
   The log is append-only with no trim (≈ 3 MB/year). A write failure logs a warning and carries on.
@@ -66,13 +65,13 @@
   - A fault-injection test: when `predict_proba` raises, `X["regime_kwh"]` is unchanged and the info dict is empty.
   - `predict_proba` mapping with a missing class.
   - Log append and write-failure tolerance.
-- **Deploy:** only within 6 h after a scheduled retrain, or after the C verdict closes. Acceptance: the AppDaemon log shows "Startup retrain skipped", and the log file grows by one line per update.
+- **Deploy:** only within 6 h after a scheduled retrain, or after the C verdict closes. Acceptance: the log file grows by one line per update; on the 6 h-window path, the AppDaemon log also shows "Startup retrain skipped".
 
 ## 5. Step 2: Soft path as shipping code, default off
 
 **Branch:** `fix/regime-soft-labels`. **Effort:** ~1 day. Not merged or deployed until Step 4.
 
-- **Private `regime_mode` keyword on `train()`** with values `"hard"` (default), `"soft_predict"` (P, diagnostic only) and `"soft_oob"` (T). It is not exposed in config. Step 3 runs this exact code.
+- **Private `regime_mode` keyword on `train()`** with values `"hard"` (default) and `"soft_oob"` (T). It is not exposed in config. Training stores it in `meta.pkl`, and `_prepare_prediction_X` reads it from there to pick hard or soft (missing key → `"hard"`). Step 3 runs this exact code.
 - **One helper used in both places** (training `model.py:623–639`, predict `model.py:1196–1216`):
   - Input: a per-date probability matrix (dates × k), where `k = centroids.shape[0]`, not `_regime_count`.
   - Hard mode uses one-hot rows; soft modes use probabilities.
@@ -80,8 +79,8 @@
   - It returns `Σ_k P[date(t), k] · centroid_k[hour(t)]`.
 - **Training probabilities for T:** `RegimePredictor.fit` keeps the OOB matrix (`oob_decision_function_`, rows = `common_idx`) in memory for this retrain only; nothing new is pickled.
   - NaN rows (never out-of-bag, ≈ 0 at 100 trees) fall back to the one-hot label.
-  - Days with a clusterer label but no daily features get `regime_kwh = 0`, not the hard label (which would re-introduce the leak), and their count is logged.
-- **Versioning:** `meta.pkl` gets `regime_mode`, written only when the soft series was actually built. Missing key → `"hard"`.
+  - Days with a clusterer label but no daily features get an explicit all-zero row in the matrix (so the forward-fill doesn't copy the previous day's probabilities into them), giving `regime_kwh = 0` instead of the hard label, which would re-introduce the leak. Their count is logged and the edge-case test covers it.
+- **Versioning:** `meta.pkl` gets `regime_mode = "soft_oob"` only when the soft series was actually built; otherwise `"hard"`.
 - **Tests:**
   - the helper on a toy 2-cluster fixture (hard vs soft vs edge cases);
   - the OOB mapping;
@@ -111,7 +110,7 @@ At the live `meta.pkl` cutoff, with the live `clusterer.pkl` and model fetched v
 If it fails, check auto-K and whether the live clusterer is stale, then **stop and report** to the user. The harness-vs-live mismatch (35/64/10.6 vs 7.9/37/20.9 kWh/day) must be explained here.
 
 ### 6.3 Backtest
-- **Arms:** H, T and N (`enable_regimes: false`) decide. P is a report-only column.
+- **Arms:** H, T and N (`enable_regimes: false`).
 - **Folds:**
   - primary: 2026-10-15 → last complete day (≥ 21 days);
   - guard: a 3–4 week January 2026 window with ≥ 60 days of history before it.
@@ -119,8 +118,11 @@ If it fails, check auto-K and whether the live clusterer is stale, then **stop a
 - **Metrics:** daily-total MAE, primary and pooled across both folds. Source-switch sensitivity: re-predict each origin with `sunshine_min` ×0.66 and ×1.5, and report max |Δ daily total| and the count of days with |Δ| > 2 kWh. The `regime_kwh` gain share is report only.
 
 ### 6.4 Decision
-1. A candidate (T or N) must beat H on sensitivity (lower max |Δ| and fewer days > 2 kWh). Its pooled daily MAE must be ≤ 1.02 × H, and its primary-fold MAE ≤ 1.05 × H.
-2. **T unless N clearly wins** (user decision 2026-10-23). N is chosen only if it passes (1) and beats T by ≥ 3 % on pooled daily MAE, or is clearly better in the January fold.
+1. A candidate (T or N) passes if, compared with H:
+   - its max |Δ| is strictly lower and its count of days > 2 kWh is ≤ H's;
+   - its pooled daily MAE is ≤ 1.03 × H (loosened from 1.02 so noise doesn't override the user's T default);
+   - its primary-fold MAE is ≤ 1.05 × H.
+2. **T unless N clearly wins** (user decision 2026-10-23). If both pass, ship N only if it beats T by ≥ 3 % on pooled daily MAE or by ≥ 5 % on the January fold; otherwise ship T. If only one passes, ship that one.
 3. If neither passes, keep H, record the numbers, and #110 stays open.
 
 Results go into the memory file and ROADMAP #110 before Step 4.
@@ -128,13 +130,13 @@ Results go into the memory file and ROADMAP #110 before Step 4.
 ## 7. Step 4: Ship
 
 - **T:** change the default `regime_mode` to `"soft_oob"` on `fix/regime-soft-labels`.
-- **N:** set `enable_regimes: false` in the live `apps.yaml` only. The shipped default is unchanged (user decision 2026-10-23), and the Step 2 branch is left unmerged.
+- **N:** set `enable_regimes: false` in the live `apps.yaml` only. The shipped default is unchanged (user decision 2026-10-23). The Step 2 model changes stay unmerged; cherry-pick `scripts/backtest_regime.py` and the harness loader to dev so the results stay reproducible.
 - **Rollout:**
   - It is forecast-changing, so it follows Cold-onset sequencing (`ROADMAP.md`): after A+B are deployed and their re-baseline holds, never in a window with A+B or #105.
   - Deploy via `@deploy-agent` Workflow A. The startup retrain applies it; fire `RELOAD_ENERGY_MODEL` only if the log shows "Startup retrain skipped".
   - Rollback: revert the merge, redeploy and retrain (§3). A code revert with a soft-trained model on disk also needs a retrain.
 - **Post-deploy check (14 days), comparing against the 14 days before deploy** (that window starts after the A+B re-baseline; if it's shorter, use what exists and say so):
-  - hard criterion: the share of hourly `tomorrow` updates with |Δ| > 2 kWh, from `regime_log.jsonl`, goes down;
+  - hard criterion: the share of hourly `tomorrow` updates with |Δ| > 2 kWh, from `regime_log.jsonl`, goes down. Δ is taken only between consecutive lines with the same `target_date` and the same `last_trained`, which excludes the midnight rollover and retrain jumps;
   - sanity floor: daily MAE ≤ 1.10 × pre-deploy, from `pred_history.json`.
 - **Docs:** CHANGELOG (`@changelog-writer`), ROADMAP (#110 closed, #83 unblocked with the new feature rank), MEMORY.
 
@@ -144,7 +146,6 @@ Results go into the memory file and ROADMAP #110 before Step 4.
 - The OOB bootstrap isn't temporal, so T keeps a small residual leak. The 31 % → 2 % gain drop shows it's small.
 - Perfect archive weather favours H, so T or N roughly equal to H on MAE reads as "not worse live".
 - Sunshine scaling is only a relative proxy for real source switches; it doesn't move zero-sun days.
-- The harness has `is_away` = 0 throughout.
 - 21 days can't resolve 1–2 % MAE differences. Sensitivity plus the user's T-default make the call.
 
-**Calls made without explicit sign-off** are marked inline: P as a diagnostic arm, the numeric gates (6.2, 6.4, 7), zero `regime_kwh` on no-feature days, and the log fields.
+**Calls made without explicit sign-off:** the numeric gates (6.2, 6.4, 7), zero `regime_kwh` on no-feature days, the log fields, and dropping arm P.
