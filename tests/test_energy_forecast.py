@@ -4579,6 +4579,22 @@ class TestUpdateSensorsExcludedRanges:
         monkeypatch.setattr(ef_mod, "PRED_HISTORY_PATH", tmp_path / "pred_history.json")
         return ha_data_mod
 
+    def test_update_sensors_writes_one_regime_log_line(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast import energy_forecast as ef_mod
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        self._patch_update_sensors_deps(monkeypatch, _make_energy_df(24), tmp_path)
+        log_path = tmp_path / "regime_log.jsonl"
+        assert ef_mod.REGIME_LOG_PATH == log_path  # redirected by conftest autouse fixture
+
+        EnergyForecast._update_sensors(_FakeUpdateSensors(tmp_path / "energy_history.csv"))
+
+        lines = log_path.read_text().splitlines()
+        assert len(lines) == 1
+        assert set(json.loads(lines[0])) == {"ts", "last_trained", "target_date", "tomorrow_kwh", "label", "proba"}
+
     def test_excluded_window_removed_from_recent_actuals(self, tmp_path):
         from energy_forecast import ha_data
 
@@ -4942,16 +4958,24 @@ class TestRegimeLog:
 
         info = {date(2026, 10, 25): {"label": 2, "proba": [0.1, 0.2, 0.7]}}
         rec = _build_regime_log_record(
-            "2026-10-24T17:00:00", datetime(2026, 10, 24, 12, 0), date(2026, 10, 25), 12.3456, info
+            "2026-10-24T17:00:00", datetime(2026, 10, 24, 12, 0), date(2026, 10, 25), 12.3456, info, "Europe/Zurich"
         )
         assert set(rec) == {"ts", "last_trained", "target_date", "tomorrow_kwh", "label", "proba"}
         assert rec["label"] == 2 and rec["proba"] == [0.1, 0.2, 0.7]
         assert rec["target_date"] == "2026-10-25"
         assert rec["last_trained"] == "2026-10-24T14:00:00"  # UTC 12:00 -> CEST 14:00
-        missing = _build_regime_log_record("t", datetime.min, date(2026, 10, 26), 1.0, info)
+        missing = _build_regime_log_record("t", datetime.min, date(2026, 10, 26), 1.0, info, "Europe/Zurich")
         assert missing["label"] is None and missing["proba"] is None
         assert missing["last_trained"] is None
-        assert _build_regime_log_record("t", None, date(2026, 10, 25), 1.0, {})["last_trained"] is None
+        assert _build_regime_log_record("t", None, date(2026, 10, 25), 1.0, {}, "UTC")["last_trained"] is None
+
+    def test_build_record_uses_given_timezone(self):
+        from datetime import date
+
+        rec = _build_regime_log_record(
+            "t", datetime(2026, 1, 15, 12, 0), date(2026, 1, 16), 1.0, {}, "America/New_York"
+        )
+        assert rec["last_trained"] == "2026-01-15T07:00:00"
 
     def test_record_from_real_model_is_json_serializable(self, tmp_path, monkeypatch):
         import json
@@ -4961,7 +4985,9 @@ class TestRegimeLog:
         m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
         assert m._last_regime_info
         target = sorted(m._last_regime_info)[-1]
-        rec = _build_regime_log_record("2026-10-23T17:00:00", m.last_trained, target, 11.0, m._last_regime_info)
+        rec = _build_regime_log_record(
+            "2026-10-23T17:00:00", m.last_trained, target, 11.0, m._last_regime_info, "Europe/Zurich"
+        )
         assert json.loads(json.dumps(rec))["label"] is not None
 
     def test_append_regime_log_appends_json_line(self, tmp_path):

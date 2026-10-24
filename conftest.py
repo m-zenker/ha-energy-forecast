@@ -47,3 +47,11 @@ def _heating_thresholds_to_tmp(tmp_path, monkeypatch):
 
     real_save = heating_season.save_thresholds
     monkeypatch.setattr(heating_season, "save_thresholds", lambda t, path: real_save(t, tmp_path / path.name))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_regime_log(tmp_path, monkeypatch):
+    """Redirect the append-only regime log so no test can write the real runtime file."""
+    from energy_forecast import energy_forecast as ef_mod
+
+    monkeypatch.setattr(ef_mod, "REGIME_LOG_PATH", tmp_path / "regime_log.jsonl")

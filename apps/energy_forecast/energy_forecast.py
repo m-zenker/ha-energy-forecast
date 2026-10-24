@@ -2271,6 +2271,7 @@ class EnergyForecast(hass.Hass):
                     _tomorrow_local_date(_now_local),
                     round(float(aggregated["tomorrow"]), 3),
                     _regime_info,
+                    self._timezone,
                 ),
             )
         except Exception as exc:  # noqa: BLE001
@@ -3308,16 +3309,17 @@ def _build_regime_log_record(
     tomorrow_date: date,
     tomorrow_kwh: float,
     regime_info: dict,
+    tz: str,
 ) -> dict:
     """Pure builder for one regime_log.jsonl line (JSON-native values only).
 
-    ``last_trained`` is a naive UTC datetime; it is logged as naive Europe/Zurich ISO.
+    ``last_trained`` is a naive UTC datetime; it is logged as naive ISO in ``tz`` (the app timezone).
     """
     import pandas as pd
 
     lt: str | None = None
     if last_trained is not None and last_trained != datetime.min:
-        lt = pd.Timestamp(last_trained).tz_localize("UTC").tz_convert("Europe/Zurich").tz_localize(None).isoformat()
+        lt = pd.Timestamp(last_trained).tz_localize("UTC").tz_convert(tz).tz_localize(None).isoformat()
     info = regime_info.get(tomorrow_date)
     return {
         "ts": ts,
