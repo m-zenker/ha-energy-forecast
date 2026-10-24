@@ -4958,24 +4958,22 @@ class TestRegimeLog:
 
         info = {date(2026, 10, 25): {"label": 2, "proba": [0.1, 0.2, 0.7]}}
         rec = _build_regime_log_record(
-            "2026-10-24T17:00:00", datetime(2026, 10, 24, 12, 0), date(2026, 10, 25), 12.3456, info, "Europe/Zurich"
+            "2026-10-24T17:00:00", datetime(2026, 10, 24, 12, 0), date(2026, 10, 25), 12.3456, info
         )
         assert set(rec) == {"ts", "last_trained", "target_date", "tomorrow_kwh", "label", "proba"}
         assert rec["label"] == 2 and rec["proba"] == [0.1, 0.2, 0.7]
         assert rec["target_date"] == "2026-10-25"
-        assert rec["last_trained"] == "2026-10-24T14:00:00"  # UTC 12:00 -> CEST 14:00
-        missing = _build_regime_log_record("t", datetime.min, date(2026, 10, 26), 1.0, info, "Europe/Zurich")
+        assert rec["last_trained"] == "2026-10-24T12:00:00"  # raw, unconverted
+        missing = _build_regime_log_record("t", datetime.min, date(2026, 10, 26), 1.0, info)
         assert missing["label"] is None and missing["proba"] is None
         assert missing["last_trained"] is None
-        assert _build_regime_log_record("t", None, date(2026, 10, 25), 1.0, {}, "UTC")["last_trained"] is None
+        assert _build_regime_log_record("t", None, date(2026, 10, 25), 1.0, {})["last_trained"] is None
 
-    def test_build_record_uses_given_timezone(self):
+    def test_build_record_logs_last_trained_raw(self):
         from datetime import date
 
-        rec = _build_regime_log_record(
-            "t", datetime(2026, 1, 15, 12, 0), date(2026, 1, 16), 1.0, {}, "America/New_York"
-        )
-        assert rec["last_trained"] == "2026-01-15T07:00:00"
+        rec = _build_regime_log_record("t", datetime(2026, 10, 23, 12, 31, 37), date(2026, 10, 24), 1.0, {})
+        assert rec["last_trained"] == "2026-10-23T12:31:37"
 
     def test_record_from_real_model_is_json_serializable(self, tmp_path, monkeypatch):
         import json
@@ -4985,9 +4983,7 @@ class TestRegimeLog:
         m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
         assert m._last_regime_info
         target = sorted(m._last_regime_info)[-1]
-        rec = _build_regime_log_record(
-            "2026-10-23T17:00:00", m.last_trained, target, 11.0, m._last_regime_info, "Europe/Zurich"
-        )
+        rec = _build_regime_log_record("2026-10-23T17:00:00", m.last_trained, target, 11.0, m._last_regime_info)
         assert json.loads(json.dumps(rec))["label"] is not None
 
     def test_append_regime_log_appends_json_line(self, tmp_path):

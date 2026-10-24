@@ -6475,6 +6475,21 @@ class TestRegimeGolden:
         np.testing.assert_array_equal(X["regime_kwh"].to_numpy(), golden["regime_kwh"])
         assert m._last_regime_info == {}
 
+    def test_regime_info_cleared_when_outer_block_fails(self, tmp_path, monkeypatch):
+        m, forecast_df, _ = self._train_and_prepare(tmp_path, monkeypatch)
+        assert m._last_regime_info
+
+        class _BadCentroids:
+            shape = m._clusterer.centroids.shape
+
+            def __getitem__(self, key):
+                raise RuntimeError("boom")  # step 3 of the outer block, after the info fill
+
+        monkeypatch.setattr(m._clusterer, "centroids", _BadCentroids())
+        _, X = m._prepare_prediction_X(forecast_df, 10.0, None)
+        assert (X["regime_kwh"] == 0).all()
+        assert m._last_regime_info == {}
+
     def test_regime_info_reset_each_call(self, tmp_path, monkeypatch):
         import datetime as _dt
 

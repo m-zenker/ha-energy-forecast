@@ -1236,6 +1236,7 @@ class EnergyForecastModel:
             except Exception as e:
                 _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
                 feat_df["regime_kwh"] = 0.0
+                self._last_regime_info = {}
         else:
             feat_df["regime_kwh"] = 0.0
 
