@@ -18,6 +18,8 @@ Covers:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -6376,6 +6378,72 @@ class TestAutoKRegimeSelection:
         assert "predicted_kwh" in result.columns
         assert result["predicted_kwh"].notna().all(), "predicted_kwh contains NaN"
         assert (result["predicted_kwh"] >= 0).all(), "predicted_kwh contains negative values"
+
+
+# ── Golden: regime_kwh feature column + predictions (#110) ───────────────────
+
+
+class TestRegimeGolden:
+    """Pins today's regime_kwh column and predictions so later refactors prove they changed nothing.
+
+    Regenerate (only on intentionally-changed behaviour): REGEN_REGIME_GOLDEN=1 pytest -k TestRegimeGolden
+    """
+
+    GOLDEN_PATH = Path(__file__).parent / "fixtures" / "regime_golden.npz"
+
+    @staticmethod
+    def _train_and_prepare(tmp_path, monkeypatch, forecast_hours: int = 48):
+        """Train a 3-regime model with a frozen clock; return (model, forecast_df, X)."""
+        pytest.importorskip("sklearn")
+        from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
+
+        if not SKLEARN_AVAILABLE:
+            pytest.skip("scikit-learn not available")
+
+        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
+        energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
+        m = EnergyForecastModel(tmp_path)
+        m.train(
+            energy_df,
+            weather_df,
+            outdoor_df=None,
+            weight_halflife_days=0,
+            enable_regimes=True,
+            regime_count=3,
+        )
+        future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=forecast_hours, freq="1h")
+        temps = [8.0 if (t.hour // 12) % 2 == 0 else 14.0 for t in future_ts]
+        forecast_df = pd.DataFrame(
+            {
+                "timestamp": future_ts,
+                "temp_c": temps,
+                "precipitation_mm": [0.0] * forecast_hours,
+                "sunshine_min": [30.0] * forecast_hours,
+                "wind_kmh": [10.0] * forecast_hours,
+                "cloud_cover_pct": [50.0] * forecast_hours,
+                "direct_radiation_wm2": [100.0] * forecast_hours,
+            }
+        )
+        _, X = m._prepare_prediction_X(forecast_df, 10.0, None)
+        return m, forecast_df, X
+
+    def test_golden_regime_kwh_and_predictions(self, tmp_path, monkeypatch):
+        m, forecast_df, X = self._train_and_prepare(tmp_path, monkeypatch)
+        pred = m.predict(forecast_df, live_temp=10.0)["predicted_kwh"].to_numpy()
+        pred_prepared = m.predict(
+            forecast_df, live_temp=10.0, _prepared=m._prepare_prediction_X(forecast_df, 10.0, None)
+        )["predicted_kwh"].to_numpy()
+
+        if os.environ.get("REGEN_REGIME_GOLDEN") == "1":
+            self.GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(self.GOLDEN_PATH, regime_kwh=X["regime_kwh"].to_numpy(), pred=pred)
+            pytest.skip("regenerated regime golden fixture")
+
+        golden = np.load(self.GOLDEN_PATH)
+        assert (X["regime_kwh"] > 0).any(), "fixture degenerate: regime_kwh is all zero"
+        np.testing.assert_array_equal(X["regime_kwh"].to_numpy(), golden["regime_kwh"])
+        np.testing.assert_allclose(pred, golden["pred"], rtol=0, atol=1e-9)
+        np.testing.assert_allclose(pred_prepared, golden["pred"], rtol=0, atol=1e-9)
 
 
 # ── Stage 1: Algorithmic correctness tests ────────────────────────────────────
