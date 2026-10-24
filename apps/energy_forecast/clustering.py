@@ -222,6 +222,27 @@ class RegimePredictor:
             _LOGGER.error(f"Regime Prediction failed: {e}")
             return np.full(len(daily_features), -1, dtype=int)
 
+    def predict_proba(self, daily_features: pd.DataFrame, n_clusters: int) -> pd.DataFrame | None:
+        """Class probabilities as a DataFrame with columns ``range(n_clusters)``.
+
+        Classes the forest never saw get probability 0. Classes >= n_clusters
+        are clipped to n_clusters - 1 (as ``np.clip`` does for hard labels), so
+        rows still sum to 1. Returns None if unfitted or on any failure.
+        """
+        if not self.is_fitted or self.model is None:
+            return None
+
+        try:
+            raw = self.model.predict_proba(daily_features)
+            out = np.zeros((len(daily_features), n_clusters), dtype=float)
+            for j, cls in enumerate(self.model.classes_):
+                col = min(max(int(cls), 0), n_clusters - 1)
+                out[:, col] += raw[:, j]
+            return pd.DataFrame(out, index=daily_features.index, columns=range(n_clusters))
+        except Exception as e:
+            _LOGGER.warning(f"Regime predict_proba failed: {e}")
+            return None
+
 
 def find_optimal_k(
     energy_df: pd.DataFrame,

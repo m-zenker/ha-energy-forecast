@@ -602,3 +602,54 @@ def test_regime_predictor_timeseries_cv_logged(caplog):
         predictor.fit(feats, labels)
 
     assert any("TimeSeriesCV" in r.message for r in caplog.records), "Expected 'TimeSeriesCV' in log output"
+
+
+# ── RegimePredictor.predict_proba ─────────────────────────────────────────────
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_predict_proba_maps_classes_to_columns():
+    """Classes {0, 2} seen, n_clusters=3 -> column 1 is all zero, rows sum to 1."""
+    feats, labels = _make_daily_features(n=20)
+    labels = labels.map({0: 0, 1: 2})
+    predictor = RegimePredictor()
+    predictor.fit(feats, labels)
+    assert predictor.is_fitted
+
+    df = predictor.predict_proba(feats, 3)
+
+    assert list(df.columns) == [0, 1, 2]
+    assert (df.index == feats.index).all()
+    assert (df[1] == 0).all()
+    assert np.allclose(df.sum(axis=1), 1)
+
+
+def test_predict_proba_unfitted_returns_none():
+    feats, _ = _make_daily_features(n=20)
+    assert RegimePredictor().predict_proba(feats, 3) is None
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_predict_proba_argmax_matches_predict():
+    feats, labels = _make_daily_features(n=20)
+    predictor = RegimePredictor()
+    predictor.fit(feats, labels)
+
+    df = predictor.predict_proba(feats, 2)
+
+    np.testing.assert_array_equal(df.idxmax(axis=1).to_numpy(), predictor.predict(feats))
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_predict_proba_clips_classes_beyond_n_clusters():
+    """A class id >= n_clusters is folded into column n_clusters-1; rows stay finite and sum to 1."""
+    feats, labels = _make_daily_features(n=20)
+    labels = labels.map({0: 0, 1: 3})
+    predictor = RegimePredictor()
+    predictor.fit(feats, labels)
+
+    df = predictor.predict_proba(feats, 2)
+
+    assert list(df.columns) == [0, 1]
+    assert np.isfinite(df.to_numpy()).all()
+    assert np.allclose(df.sum(axis=1), 1)
