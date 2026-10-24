@@ -23,7 +23,7 @@
 - `regime_mode` values are exactly `"hard"` and `"soft_oof"`. The meta key is `regime_mode`; a missing key means `"hard"`. It is not exposed in `apps.yaml`.
 - `k` is always `clusterer.centroids.shape[0]`, never `_regime_count`. Pass it explicitly wherever a function takes `n_clusters`.
 - Regime-info dict keys are `datetime.date` (that is what `_prepare_daily_regime_features(...).index` holds). Values are JSON-native: `int(label)` and `[float(round(p, 3)), ...]`.
-- **Times:** `meta.last_trained` is naive **UTC**; caches and `pred_history.json` are naive **Europe/Zurich local**. Every cutoff and window comparison converts UTC → local (`pd.Timestamp(x).tz_localize("UTC").tz_convert("Europe/Zurich").tz_localize(None)`).
+- **Times:** `meta.last_trained` is naive **local** (Europe/Zurich) on this install, verified 2026-10-24: the live value matches the local-time AppDaemon "Retrained" log line. Caches and `pred_history.json` are naive local too. Compare them directly, with **no** UTC conversion. (Corrected from rev. 2, which assumed UTC.)
 - The log file is `regime_log.jsonl`, next to `pred_history.json` (`const.PRED_HISTORY_PATH.parent`). It is append-only with no trim. Line schema, exact keys: `{"ts", "last_trained", "target_date", "tomorrow_kwh", "label", "proba"}`.
 - Part A must not change any predicted value. The golden test (Task A1) is the proof and must pass unchanged through Parts A and B.
 - **Deploy rules (§3, §4, §7):**
@@ -140,7 +140,7 @@
 
 - [ ] **Step 1:** CHANGELOG entry via `@changelog-writer`: "regime stability log, prediction-neutral". No README change.
 - [ ] **Step 2: Check the deploy window.**
-  - Run `pull_ha_data.py`, then read `data/models/meta.pkl` `last_trained`, converted UTC → local.
+  - Run `pull_ha_data.py`, then read `data/models/meta.pkl` `last_trained` (naive local, no conversion).
   - Deploy only if it is < 5 h before now, or the C verdict is closed.
   - Otherwise **stop and tell the user** the next eligible window, i.e. the next scheduled retrain = last retrain + 168 h. The user can also choose to trigger a retrain deliberately; that retrain is itself forecast-changing, so that's their call.
 - [ ] **Step 3:** Finalize via `@deploy-agent` Workflow A (merge → dev, next `v0.12.0-alpha-N` tag, deploy, push, cleanup).
@@ -277,7 +277,7 @@
   - `test_weather_stub_clips_to_cutoff`.
   - `test_loader_captures_train_kwargs`: tiny `data_dir` fixture (100 h energy CSV, minimal apps.yaml, weather stub in-memory). Captured kwargs include `enable_regimes=True`, and the energy frame's max timestamp ≤ cutoff.
 - [ ] **Step 2: Run, implement, run.** Expected: FAIL, then PASS, and the tests also pass on `dev` without Part B.
-- [ ] **Step 3: Smoke-run** against the real `data/`. Cutoff = live `meta.pkl` `last_trained`, converted UTC → local. Expected: no error. Print the energy rows, date span and kwargs keys, and one `build_prediction_inputs` call's keys.
+- [ ] **Step 3: Smoke-run** against the real `data/`. Cutoff = live `meta.pkl` `last_trained` (naive local, no conversion). Expected: no error. Print the energy rows, date span and kwargs keys, and one `build_prediction_inputs` call's keys.
 - [ ] **Step 4: Commit:** `feat: regime_harness live-equivalent loader + prediction inputs (#110)`.
 
 ### Task C2: Reproduction gate
