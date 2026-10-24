@@ -1,6 +1,6 @@
 # Regime Label: Train/Serve Leak + Hard-Label Flip — Design
 
-**Date:** 2026-10-23 (rev. 2: after multi-stakeholder review)
+**Date:** 2026-10-23 (rev. 2: after multi-stakeholder review; rev. 4 2026-10-24: out-of-fold instead of OOB, from the plan review)
 **Status:** Reviewed (multi-stakeholder, 2 rounds + final sign-off: APPROVED), awaiting user approval
 **Branch base:** `dev` (all branches below)
 **Roadmap item:** #110 (unblocks #83)
@@ -20,7 +20,7 @@
 
 **Goals:**
 1. Measure `tomorrow` stability in production, before and after the fix.
-2. Decide between H (current), T (OOB-soft train + soft predict) and N (regimes off) with a backtest that runs the shipping code on a frame proven to match the live model.
+2. Decide between H (current), T (out-of-fold soft train + soft predict) and N (regimes off) with a backtest that runs the shipping code on a frame proven to match the live model.
 3. Ship the winner without confounding the cold-onset sequencing.
 
 **Non-goals:** changing KMeans, auto-K or the regime feature set; SRG/OM sunshine alignment; label locking; the 8 °C / 168 h temperature gate; HA-visible regime attributes; #83.
@@ -71,19 +71,19 @@
 
 **Branch:** `fix/regime-soft-labels`. **Effort:** ~1 day. Not merged or deployed until Step 4.
 
-- **Private `regime_mode` keyword on `train()`** with values `"hard"` (default) and `"soft_oob"` (T). It is not exposed in config. Training stores it in `meta.pkl`, and `_prepare_prediction_X` reads it from there to pick hard or soft (missing key → `"hard"`). Step 3 runs this exact code.
+- **Private `regime_mode` keyword on `train()`** with values `"hard"` (default) and `"soft_oof"` (T). It is not exposed in config. Training stores it in `meta.pkl`, and `_prepare_prediction_X` reads it from there to pick hard or soft (missing key → `"hard"`). Step 3 runs this exact code.
 - **One helper used in both places** (training `model.py:623–639`, predict `model.py:1196–1216`):
   - Input: a per-date probability matrix (dates × k), where `k = centroids.shape[0]`, not `_regime_count`.
   - Hard mode uses one-hot rows; soft modes use probabilities.
   - It reindexes to the hourly dates and forward-fills (keeping today's partial-day semantics). Leading gaps get 0.
   - It returns `Σ_k P[date(t), k] · centroid_k[hour(t)]`.
-- **Training probabilities for T:** `RegimePredictor.fit` keeps the OOB matrix (`oob_decision_function_`, rows = `common_idx`) in memory for this retrain only; nothing new is pickled.
-  - NaN rows (never out-of-bag, ≈ 0 at 100 trees) fall back to the one-hot label.
+- **Training probabilities for T: 5-fold out-of-fold** (user decision 2026-10-24, rev. 4). `RegimePredictor.fit` returns `cross_val_predict(<same RF config>, X, y, cv=KFold(5, shuffle=True, random_state=42), method="predict_proba", params={"sample_weight": w})`, rows = `common_idx`, kept in memory for this retrain only; nothing new is pickled.
+  - Why not OOB: under sklearn 1.9 the RF bootstrap samples by `sample_weight`, so recent, heavily weighted days are rarely out-of-bag, and `oob_decision_function_` returns all-zero rows for them (checked 2026-10-24: 28 of 50 heavy days in a toy fit). That would put the leak back on the most recent weeks.
   - Days with a clusterer label but no daily features get an explicit all-zero row in the matrix (so the forward-fill doesn't copy the previous day's probabilities into them), giving `regime_kwh = 0` instead of the hard label, which would re-introduce the leak. Their count is logged and the edge-case test covers it.
-- **Versioning:** `meta.pkl` gets `regime_mode = "soft_oob"` only when the soft series was actually built; otherwise `"hard"`.
+- **Versioning:** `meta.pkl` gets `regime_mode = "soft_oof"` only when the soft series was actually built; otherwise `"hard"`.
 - **Tests:**
   - the helper on a toy 2-cluster fixture (hard vs soft vs edge cases);
-  - the OOB mapping;
+  - the out-of-fold mapping (heavy weights give no all-zero rows);
   - meta read and write, including the fallback when fit fails;
   - the Step 1 golden test still passes with the default.
 
@@ -130,7 +130,7 @@ Results go into the memory file and ROADMAP #110 before Step 4.
 
 ## 7. Step 4: Ship
 
-- **T:** change the default `regime_mode` to `"soft_oob"` on `fix/regime-soft-labels`.
+- **T:** change the default `regime_mode` to `"soft_oof"` on `fix/regime-soft-labels`.
 - **N:** set `enable_regimes: false` in the live `apps.yaml` only. The shipped default is unchanged (user decision 2026-10-23). The Step 2 model changes stay unmerged; cherry-pick `scripts/backtest_regime.py` and the harness loader to dev so the results stay reproducible.
 - **Rollout:**
   - It is forecast-changing, so it follows Cold-onset sequencing (`ROADMAP.md`): after A+B are deployed and their re-baseline holds, never in a window with A+B or #105.
@@ -144,7 +144,7 @@ Results go into the memory file and ROADMAP #110 before Step 4.
 ---
 
 ## 8. Accepted risks
-- The OOB bootstrap isn't temporal, so T keeps a small residual leak. The 31 % → 2 % gain drop shows it's small.
+- The 5-fold split is shuffled, not temporal, so T keeps a small residual leak through neighbouring days. The harness OOB-soft result (31 % → 2 % gain) suggests it is small; C3 re-measures it.
 - Perfect archive weather favours H, so T or N roughly equal to H on MAE reads as "not worse live".
 - Sunshine scaling is only a relative proxy for real source switches; it doesn't move zero-sun days.
 - 21 days can't resolve 1–2 % MAE differences. Sensitivity plus the user's T-default make the call.
