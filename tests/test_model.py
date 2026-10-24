@@ -6445,6 +6445,55 @@ class TestRegimeGolden:
         np.testing.assert_allclose(pred, golden["pred"], rtol=0, atol=1e-9)
         np.testing.assert_allclose(pred_prepared, golden["pred"], rtol=0, atol=1e-9)
 
+    def test_last_regime_info_filled(self, tmp_path, monkeypatch):
+        import datetime as _dt
+
+        from apps.energy_forecast.model import _prepare_daily_regime_features
+
+        m, forecast_df, _ = self._train_and_prepare(tmp_path, monkeypatch)
+        info = m._last_regime_info
+        assert set(info) == {_dt.date(2026, 10, 23), _dt.date(2026, 10, 24), _dt.date(2026, 10, 25)}
+        k = m._clusterer.centroids.shape[0]
+        daily = _prepare_daily_regime_features(forecast_df, country=m._country, canton=m._canton)
+        labels = dict(zip(daily.index, m._regime_model.predict(daily)))
+        for d, v in info.items():
+            assert isinstance(d, _dt.date)
+            assert len(v["proba"]) == k
+            assert v["label"] == int(labels[d])
+            assert type(v["label"]) is int
+            assert all(type(p) is float for p in v["proba"])
+
+    def test_regime_info_failure_is_isolated(self, tmp_path, monkeypatch):
+        from energy_forecast.clustering import RegimePredictor  # same module object model.py uses
+
+        def boom(self, *a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(RegimePredictor, "predict_proba", boom)
+        m, _, X = self._train_and_prepare(tmp_path / "b", monkeypatch)
+        golden = np.load(self.GOLDEN_PATH)
+        np.testing.assert_array_equal(X["regime_kwh"].to_numpy(), golden["regime_kwh"])
+        assert m._last_regime_info == {}
+
+    def test_regime_info_reset_each_call(self, tmp_path, monkeypatch):
+        import datetime as _dt
+
+        m, forecast_df, _ = self._train_and_prepare(tmp_path, monkeypatch)
+        assert len(m._last_regime_info) == 3
+        m._prepare_prediction_X(forecast_df.iloc[:7].reset_index(drop=True), 10.0, None)
+        assert set(m._last_regime_info) == {_dt.date(2026, 10, 23)}
+
+    def test_regime_info_empty_when_regimes_disabled(self, tmp_path, monkeypatch):
+        m, forecast_df, _ = self._train_and_prepare(tmp_path, monkeypatch)
+        assert m._last_regime_info
+        energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
+        m2 = EnergyForecastModel(tmp_path)  # same dir: stale clusterer/regime pickles on disk
+        m2.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, enable_regimes=False)
+        assert m2._enable_regimes is False
+        assert m2._clusterer is not None and m2._regime_model is not None, "stale pickles must be loaded"
+        m2._prepare_prediction_X(forecast_df, 10.0, None)
+        assert m2._last_regime_info == {}
+
 
 # ── Stage 1: Algorithmic correctness tests ────────────────────────────────────
 

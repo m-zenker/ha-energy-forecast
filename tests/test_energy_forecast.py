@@ -19,12 +19,15 @@ import pandas as pd
 import pytest
 from energy_forecast.energy_forecast import (
     EnergyForecast,
+    _append_regime_log,
     _apply_target_correction,
     _blend_today_totals,
+    _build_regime_log_record,
     _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
     _subtract_sub_sensors,
+    _tomorrow_local_date,
 )
 from energy_forecast.heating_season import default_thresholds
 from energy_forecast.model import EnergyForecastModel
@@ -4923,3 +4926,57 @@ class TestHeatingSeasonConfig:
         assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
         warnings = [str(c.args[0]) for c in app.logger.warning.call_args_list if c.args]
         assert any("must be set together" in w for w in warnings)
+
+
+class TestRegimeLog:
+    """#110 — regime_log.jsonl helpers."""
+
+    def test_tomorrow_local_date_dst_eve(self):
+        from datetime import date
+
+        assert _tomorrow_local_date(pd.Timestamp("2026-10-24 23:30")) == date(2026, 10, 25)
+        assert _tomorrow_local_date(pd.Timestamp("2026-10-25 00:10")) == date(2026, 10, 26)
+
+    def test_build_record_schema_and_nulls(self):
+        from datetime import date
+
+        info = {date(2026, 10, 25): {"label": 2, "proba": [0.1, 0.2, 0.7]}}
+        rec = _build_regime_log_record(
+            "2026-10-24T17:00:00", datetime(2026, 10, 24, 12, 0), date(2026, 10, 25), 12.3456, info
+        )
+        assert set(rec) == {"ts", "last_trained", "target_date", "tomorrow_kwh", "label", "proba"}
+        assert rec["label"] == 2 and rec["proba"] == [0.1, 0.2, 0.7]
+        assert rec["target_date"] == "2026-10-25"
+        assert rec["last_trained"] == "2026-10-24T14:00:00"  # UTC 12:00 -> CEST 14:00
+        missing = _build_regime_log_record("t", datetime.min, date(2026, 10, 26), 1.0, info)
+        assert missing["label"] is None and missing["proba"] is None
+        assert missing["last_trained"] is None
+        assert _build_regime_log_record("t", None, date(2026, 10, 25), 1.0, {})["last_trained"] is None
+
+    def test_record_from_real_model_is_json_serializable(self, tmp_path, monkeypatch):
+        import json
+
+        from tests.test_model import TestRegimeGolden
+
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
+        assert m._last_regime_info
+        target = sorted(m._last_regime_info)[-1]
+        rec = _build_regime_log_record("2026-10-23T17:00:00", m.last_trained, target, 11.0, m._last_regime_info)
+        assert json.loads(json.dumps(rec))["label"] is not None
+
+    def test_append_regime_log_appends_json_line(self, tmp_path):
+        import json
+
+        p = tmp_path / "regime_log.jsonl"
+        _append_regime_log(p, {"a": 1})
+        _append_regime_log(p, {"a": 2})
+        assert [json.loads(line) for line in p.read_text().splitlines()] == [{"a": 1}, {"a": 2}]
+
+    def test_append_regime_log_swallows_oserror(self, tmp_path, monkeypatch, caplog):
+        def boom(self, *a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "open", boom)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            _append_regime_log(tmp_path / "x.jsonl", {"a": 1})
+        assert any("regime" in r.message.lower() for r in caplog.records)

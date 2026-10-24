@@ -39,7 +39,7 @@ import logging
 import pickle
 import shutil
 import statistics
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -310,6 +310,8 @@ class EnergyForecastModel:
         self._regime_count: int = 5
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
+        # Per-date regime label/probabilities from the last _prepare_prediction_X call (log only, never a feature)
+        self._last_regime_info: dict[date, dict] = {}
 
         # Recent weather tail — last 400h stored at training time so that
         # temp_lag_168h / temp_lag_336h are computable at prediction time
@@ -1028,6 +1030,7 @@ class EnergyForecastModel:
         import numpy as np
         import pandas as pd
 
+        self._last_regime_info = {}
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
@@ -1196,6 +1199,22 @@ class EnergyForecastModel:
                 # 2. Predict regime IDs
                 predicted_labels = self._regime_model.predict(daily_features)
                 regime_map = dict(zip(daily_features.index, predicted_labels))
+
+                # 2b. Capture label/probabilities for the production regime log (prediction-neutral)
+                if self._enable_regimes:
+                    try:
+                        _proba_df = self._regime_model.predict_proba(daily_features, self._clusterer.centroids.shape[0])
+                        if _proba_df is not None:
+                            for _i, _d in enumerate(daily_features.index):
+                                if int(predicted_labels[_i]) < 0:
+                                    continue
+                                self._last_regime_info[_d] = {
+                                    "label": int(predicted_labels[_i]),
+                                    "proba": [float(round(p, 3)) for p in _proba_df.iloc[_i].to_numpy()],
+                                }
+                    except Exception as _exc:  # noqa: BLE001
+                        self._last_regime_info = {}
+                        _LOGGER.warning("Regime info capture failed (log only): %s", _exc)
 
                 # 3. Populate regime_kwh column (vectorized)
                 # Mirror training ffill so partial/gap days get a filled label
