@@ -480,7 +480,7 @@ def fetch_energy_history(
     # 5. Strip the current (still-open) hourly bucket BEFORE writing (GitHub #24).
     # A partial-hour row in the CSV is never corrected by fetch_recent_energy's
     # append-only path, so it must not enter the cache at all.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    completed_cutoff = pd.Timestamp.now(tz=timezone).tz_localize(None).floor("1h")
     combined = combined[combined["timestamp"] < completed_cutoff]
 
     # 6. Compact and save back to CSV (full sort + dedup rewrite; runs weekly).
@@ -563,7 +563,7 @@ def fetch_recent_energy(
     # 5. Strip the current (still-open) hourly bucket BEFORE appending (GitHub #24).
     # The append below skips timestamps already in the CSV, so a partial row written
     # here would never be corrected by later hourly runs.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("1h").tz_localize(None)
+    completed_cutoff = pd.Timestamp.now(tz=timezone).tz_localize(None).floor("1h")
     combined = combined[combined["timestamp"] < completed_cutoff]
 
     # 6. Append only genuinely new timestamps to CSV — avoids full rewrite each hour.
@@ -634,7 +634,7 @@ def fetch_energy_history_15m(
     combined = combined.drop_duplicates(subset=["timestamp"], keep="first")
 
     # Strip the still-open 15-min slot BEFORE writing (GitHub #24) — see fetch_energy_history.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    completed_cutoff = pd.Timestamp.now(tz=timezone).tz_localize(None).floor("15min")
     combined = combined[combined["timestamp"] < completed_cutoff]
 
     try:
@@ -699,7 +699,7 @@ def fetch_recent_energy_15m(
 
     # Strip the still-open 15-min slot BEFORE appending (GitHub #24) — the append
     # below never rewrites an existing timestamp, so a partial slot would stick.
-    completed_cutoff = pd.Timestamp.now(tz=timezone).floor("15min").tz_localize(None)
+    completed_cutoff = pd.Timestamp.now(tz=timezone).tz_localize(None).floor("15min")
     combined = combined[combined["timestamp"] < completed_cutoff]
 
     existing_ts = set(df_cache["timestamp"]) if not df_cache.empty else set()
@@ -1225,7 +1225,9 @@ def fetch_climate_history(
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
-        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
+        # No .dt.floor here: flooring tz-aware local times raises on the DST fall-back hour;
+        # _hourly_climate's resample("1h") buckets by hour and is DST-safe.
+        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"])
         cols = ["timestamp", "current_temperature", "temperature"]
         if "heating_power_request" in raw_ha.columns:
             cols.append("heating_power_request")
@@ -1278,7 +1280,9 @@ def fetch_recent_climate(
         return pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
     if not raw_ha.empty:
-        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"]).dt.floor("1h")
+        # No .dt.floor here: flooring tz-aware local times raises on the DST fall-back hour;
+        # _hourly_climate's resample("1h") buckets by hour and is DST-safe.
+        raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"])
         cols = ["timestamp", "current_temperature", "temperature"]
         if "heating_power_request" in raw_ha.columns:
             cols.append("heating_power_request")
