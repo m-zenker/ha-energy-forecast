@@ -397,7 +397,7 @@ class TestFetchEnergyHistory:
         cache_path = tmp_path / "energy_history.csv"
         # Use Europe/Zurich (same timezone as production) so current_hour matches
         # the completed_cutoff computed inside the function.
-        current_hour = pd.Timestamp.now(tz="Europe/Zurich").floor("1h").tz_localize(None)
+        current_hour = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
         prev_hour = current_hour - pd.Timedelta(hours=1)
 
         make_energy_df(
@@ -417,7 +417,7 @@ class TestFetchEnergyHistory:
         full-resync path used by _retrain()."""
         cache_path = tmp_path / "energy_history.csv"
         now_local = pd.Timestamp.now(tz="Europe/Zurich")
-        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).tz_convert("UTC").floor("1h").tz_convert("Europe/Zurich")
         ha_raw = make_ha_raw(
             [
                 (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
@@ -491,7 +491,7 @@ class TestFetchRecentEnergy:
     def test_excludes_current_partial_hour(self, mock_app, tmp_path):
         """fetch_recent_energy must not return the current (incomplete) hourly bucket."""
         cache_path = tmp_path / "energy_history.csv"
-        current_hour = pd.Timestamp.now(tz="Europe/Zurich").floor("1h").tz_localize(None)
+        current_hour = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
         prev_hour = current_hour - pd.Timedelta(hours=1)
 
         make_energy_df(
@@ -515,7 +515,7 @@ class TestFetchRecentEnergy:
         fetch_recent_energy must backfill them through the current hour."""
         cache_path = tmp_path / "energy_history.csv"
         now_local = pd.Timestamp.now(tz="Europe/Zurich")
-        last_real_hour = (now_local - pd.Timedelta(hours=3)).floor("1h")
+        last_real_hour = (now_local - pd.Timedelta(hours=3)).tz_convert("UTC").floor("1h").tz_convert("Europe/Zurich")
         ha_raw = make_ha_raw(
             [
                 (last_real_hour - pd.Timedelta(hours=1)).tz_convert("UTC").isoformat(),
@@ -2363,7 +2363,7 @@ class TestFetchEnergyHistory15m:
         cache = tmp_path / "energy_history_15m.csv"
 
         result = ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache)
-        cutoff = pd.Timestamp.now(tz="Europe/Zurich").floor("15min").tz_localize(None)
+        cutoff = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("15min")
         assert (result["timestamp"] < cutoff).all()
 
     @patch("energy_forecast.ha_data._fetch_history")
@@ -2373,7 +2373,9 @@ class TestFetchEnergyHistory15m:
 
         cache = tmp_path / "energy_history_15m.csv"
         now_local = pd.Timestamp.now(tz="Europe/Zurich")
-        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        last_real_slot = (
+            (now_local - pd.Timedelta(hours=1)).tz_convert("UTC").floor("15min").tz_convert("Europe/Zurich")
+        )
         ts = pd.to_datetime(
             [
                 (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
@@ -2428,7 +2430,9 @@ class TestFetchRecentEnergy15m:
 
         cache = tmp_path / "energy_history_15m.csv"
         now_local = pd.Timestamp.now(tz="Europe/Zurich")
-        last_real_slot = (now_local - pd.Timedelta(hours=1)).floor("15min")
+        last_real_slot = (
+            (now_local - pd.Timedelta(hours=1)).tz_convert("UTC").floor("15min").tz_convert("Europe/Zurich")
+        )
         ts = pd.to_datetime(
             [
                 (last_real_slot - pd.Timedelta(minutes=15)).tz_convert("UTC"),
@@ -2464,7 +2468,9 @@ class TestOpenBucketNeverCached:
     def _ha_raw_through_now() -> pd.DataFrame:
         """Cumulative readings every 5 min, +0.05 kWh each, from 3 h ago through now."""
         now = pd.Timestamp.now(tz="Europe/Zurich")
-        ts = pd.date_range((now - pd.Timedelta(hours=3)).floor("5min"), now, freq="5min")
+        ts = pd.date_range(
+            (now - pd.Timedelta(hours=3)).tz_convert("UTC").floor("5min").tz_convert("Europe/Zurich"), now, freq="5min"
+        )
         return pd.DataFrame({"timestamp": ts, "value": [100.0 + 0.05 * i for i in range(len(ts))]})
 
     @staticmethod
@@ -2475,7 +2481,7 @@ class TestOpenBucketNeverCached:
 
     @staticmethod
     def _cutoff(res: str) -> pd.Timestamp:
-        return pd.Timestamp.now(tz="Europe/Zurich").floor(res).tz_localize(None)
+        return pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor(res)
 
     def test_fetch_recent_energy_does_not_append_open_hour(self, mock_app, tmp_path):
         cache_path = tmp_path / "energy_history.csv"
@@ -2872,3 +2878,88 @@ class TestHourlyStateHistoryDstFallback:
         )
         assert result["timestamp"].is_unique
         assert (result["timestamp"] == pd.Timestamp("2026-10-25 02:00")).sum() == 1
+
+
+# ── DST fall-back: flooring tz-aware local times raises AmbiguousTimeError ────
+
+
+class TestDstAmbiguousFloor:
+    """2026-10-25: pandas floors tz-aware timestamps in wall-clock time and
+    re-localizes with ambiguous="raise", so any floor landing on 02:00 on
+    fall-back day raised "Cannot infer dst time from 2026-10-25 02:00:00".
+    Scalar now().floor() broke fetch_recent_energy(_15m) during the ambiguous
+    hour; Series .dt.floor() broke the climate fetches for as long as their
+    window contained it (2 days recent, 30 days full)."""
+
+    TZ = "Europe/Zurich"
+
+    @classmethod
+    def _freeze_now(cls, utc: str):
+        frozen = pd.Timestamp(utc)
+        return patch.object(
+            pd.Timestamp, "now", side_effect=lambda tz=None: frozen.tz_convert(tz) if tz else frozen.tz_localize(None)
+        )
+
+    @classmethod
+    def _energy_raw(cls, end_utc: str) -> pd.DataFrame:
+        ts = pd.date_range("2026-10-24 21:00Z", end_utc, freq="5min").tz_convert(cls.TZ)
+        return pd.DataFrame({"timestamp": ts, "value": [100.0 + 0.05 * i for i in range(len(ts))]})
+
+    @pytest.mark.parametrize("now_utc", ["2026-10-25 00:30Z", "2026-10-25 01:30Z"], ids=["0230_CEST", "0230_CET"])
+    def test_fetch_recent_energy_in_ambiguous_hour(self, mock_app, tmp_path, now_utc):
+        cache_path = tmp_path / "energy_history.csv"
+        with self._freeze_now(now_utc), patch.object(ha_data, "_fetch_history", return_value=self._energy_raw(now_utc)):
+            ha_data.fetch_recent_energy(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = pd.read_csv(cache_path, parse_dates=["timestamp"])
+        assert not saved.empty
+        assert (saved["timestamp"] < pd.Timestamp("2026-10-25 02:00")).all()
+
+    @pytest.mark.parametrize("now_utc", ["2026-10-25 00:40Z", "2026-10-25 01:40Z"], ids=["0240_CEST", "0240_CET"])
+    def test_fetch_recent_energy_15m_in_ambiguous_hour(self, mock_app, tmp_path, now_utc):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with self._freeze_now(now_utc), patch.object(ha_data, "_fetch_history", return_value=self._energy_raw(now_utc)):
+            ha_data.fetch_recent_energy_15m(mock_app, "sensor.energy", cache_path=cache_path)
+
+        saved = pd.read_csv(cache_path, parse_dates=["timestamp"])
+        assert not saved.empty
+        assert (saved["timestamp"] < pd.Timestamp("2026-10-25 02:30")).all()
+
+    @pytest.mark.parametrize("now_utc", ["2026-10-25 00:30Z", "2026-10-25 01:30Z"], ids=["0230_CEST", "0230_CET"])
+    def test_fetch_energy_history_in_ambiguous_hour(self, mock_app, tmp_path, now_utc):
+        cache_path = tmp_path / "energy_history.csv"
+        with self._freeze_now(now_utc), patch.object(ha_data, "_fetch_history", return_value=self._energy_raw(now_utc)):
+            ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
+        assert cache_path.exists()
+
+    @pytest.mark.parametrize("now_utc", ["2026-10-25 00:40Z", "2026-10-25 01:40Z"], ids=["0240_CEST", "0240_CET"])
+    def test_fetch_energy_history_15m_in_ambiguous_hour(self, mock_app, tmp_path, now_utc):
+        cache_path = tmp_path / "energy_history_15m.csv"
+        with self._freeze_now(now_utc), patch.object(ha_data, "_fetch_history", return_value=self._energy_raw(now_utc)):
+            ha_data.fetch_energy_history_15m(mock_app, "sensor.energy", cache_path=cache_path)
+        assert cache_path.exists()
+
+    @pytest.mark.parametrize("fetch_name", ["fetch_recent_climate", "fetch_climate_history"])
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_climate_window_spanning_fall_back(self, mock_fetch, mock_app, tmp_path, fetch_name):
+        # 23:30Z=01:30 CEST, 00:00Z/00:30Z=02:xx CEST, 01:00Z/01:30Z=02:xx CET, 02:00Z=03:00 CET
+        utc = ["2026-10-24 23:30", "2026-10-25 00:00", "2026-10-25 00:30", "2026-10-25 01:00", "2026-10-25 01:30"]
+        utc.append("2026-10-25 02:00")
+        mock_fetch.return_value = make_climate_ha_raw(utc, [20.0, 20.1, 20.2, 20.3, 20.4, 20.5], [21.0] * 6)
+        cache_file = tmp_path / "climate.csv"
+
+        df = getattr(ha_data, fetch_name)(mock_app, "climate.living_room", cache_file)
+
+        assert cache_file.exists()
+        assert not df["timestamp"].duplicated().any()
+        assert list(df["timestamp"]) == [pd.Timestamp(f"2026-10-25 0{h}:00") for h in (1, 2, 3)]
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_climate_spring_forward_has_no_phantom_hour(self, mock_fetch, mock_app, tmp_path):
+        # 2026-03-29: 00:30Z=01:30 CET, 01:00Z=03:00 CEST — local 02:00 does not exist
+        mock_fetch.return_value = make_climate_ha_raw(
+            ["2026-03-29 00:30", "2026-03-29 01:00", "2026-03-29 01:30"], [19.0, 19.5, 19.6], [21.0] * 3
+        )
+        df = ha_data.fetch_recent_climate(mock_app, "climate.living_room", tmp_path / "climate.csv")
+
+        assert list(df["timestamp"]) == [pd.Timestamp("2026-03-29 01:00"), pd.Timestamp("2026-03-29 03:00")]
