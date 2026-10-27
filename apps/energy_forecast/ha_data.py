@@ -15,7 +15,14 @@ if TYPE_CHECKING:
     import hassapi as hass
     import pandas as pd
 
-from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH, drop_dst_duplicates
+from .const import (
+    CACHE_PATH,
+    CACHE_PATH_15M,
+    COUNTER_RESET_FRACTION,
+    MAX_15MIN_KWH,
+    MAX_HOURLY_KWH,
+    drop_dst_duplicates,
+)
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -935,6 +942,33 @@ def _resolve_programs_for_series(
     return result
 
 
+def _hourly_counter_increments(raw_ha: pd.DataFrame) -> pd.DataFrame:
+    """Per-hour kWh from a cumulative counter's raw samples, reset-aware.
+
+    Diffs consecutive raw samples (not hourly last values) so a mid-hour counter
+    restart keeps both the pre-reset increments and the post-reset value. A drop
+    below COUNTER_RESET_FRACTION × previous reading is a restart (increment = new
+    value) unless it recovers at the next sample (glitch, ignored); smaller dips are
+    jitter (increment 0). For a monotonic counter the hourly sum telescopes to
+    last(H) − last(H−1), i.e. unchanged behaviour.
+    The first bucket has no prior reading and is dropped.
+    """
+    s = raw_ha.set_index("timestamp")["value"].sort_index().dropna()
+    # A dip that recovers at the very next sample is a transient glitch (e.g. a lifetime
+    # counter briefly reading 0 on integration restart), not a restart — drop the sample.
+    prev, nxt = s.shift(1), s.shift(-1)
+    glitch = (s < COUNTER_RESET_FRACTION * prev) & (nxt >= COUNTER_RESET_FRACTION * prev)
+    s = s[~glitch]
+    prev = s.shift(1)
+    inc = s - prev
+    restart = (inc < 0) & (s < COUNTER_RESET_FRACTION * prev)
+    inc = inc.where(~restart, s).clip(lower=0)
+    hourly = inc.resample("1h").sum().iloc[1:]
+    out = hourly.reset_index()
+    out.columns = ["timestamp", "kwh"]
+    return out
+
+
 def fetch_sub_sensor_history(
     app: hass.Hass,
     entity_id: str,
@@ -977,9 +1011,7 @@ def fetch_sub_sensor_history(
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "kwh"]
+        diff = _hourly_counter_increments(raw_ha)
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
@@ -1043,9 +1075,7 @@ def fetch_recent_sub_sensor(
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "kwh"]
+        diff = _hourly_counter_increments(raw_ha)
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
