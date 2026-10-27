@@ -24,6 +24,8 @@ from energy_forecast.energy_forecast import (
     _build_shap_narrative,
     _compute_anomaly,
     _compute_live_mae,
+    _ev_mae_excluded_hours,
+    _ev_sensor_kwh_by_hour,
     _subtract_sub_sensors,
 )
 from energy_forecast.heating_season import default_thresholds
@@ -4923,3 +4925,43 @@ class TestHeatingSeasonConfig:
         assert app._heating_temp_on_cfg is None and app._heating_temp_off_cfg is None
         warnings = [str(c.args[0]) for c in app.logger.warning.call_args_list if c.args]
         assert any("must be set together" in w for w in warnings)
+
+
+class TestEvMaeExcludedHours:
+    def test_sensor_rows_not_excluded(self):
+        ev = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2026-10-14 12:00"]), "gross_kwh": [3.0], "ev_source": ["sensor"]}
+        )
+        assert _ev_mae_excluded_hours(ev) == set()
+
+    def test_threshold_rows_excluded_with_neighbours(self):
+        ev = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2026-10-14 12:00"]), "gross_kwh": [9.5], "ev_source": ["threshold"]}
+        )
+        assert _ev_mae_excluded_hours(ev) == {
+            pd.Timestamp("2026-10-14 11:00"),
+            pd.Timestamp("2026-10-14 12:00"),
+            pd.Timestamp("2026-10-14 13:00"),
+        }
+
+    def test_none_and_empty(self):
+        assert _ev_mae_excluded_hours(None) == set()
+        assert _ev_mae_excluded_hours(pd.DataFrame(columns=["timestamp"])) == set()
+
+
+class TestEvSensorKwhByHour:
+    def test_only_sensor_rows_floored_to_hour(self):
+        ev = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-10-14 12:00", "2026-10-14 13:00"]),
+                "gross_kwh": [3.0, 9.5],
+                "ev_source": ["sensor", "threshold"],
+            }
+        )
+        assert _ev_sensor_kwh_by_hour(ev) == {pd.Timestamp("2026-10-14 12:00"): 3.0}
+
+    def test_none_empty_untagged(self):
+        assert _ev_sensor_kwh_by_hour(None) == {}
+        assert _ev_sensor_kwh_by_hour(pd.DataFrame(columns=["timestamp", "gross_kwh"])) == {}
+        untagged = pd.DataFrame({"timestamp": pd.to_datetime(["2026-10-14 12:00"]), "gross_kwh": [3.0]})
+        assert _ev_sensor_kwh_by_hour(untagged) == {}

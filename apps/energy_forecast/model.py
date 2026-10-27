@@ -64,6 +64,7 @@ from .const import (
     SENSOR_BLEND_HOURS,
     SENSOR_FULL_TRUST_HOURS,
 )
+from .ha_data import residual_ev_rows
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -498,7 +499,7 @@ class EnergyForecastModel:
             _LOGGER.info("Appliance signatures: no signatures learned (insufficient cycles in history)")
 
         # ── EV session probability: which hour_of_week slots charge regularly ─
-        likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
+        likely_ev_hours = _compute_likely_ev_hours(energy_df, residual_ev_rows(ev_df))
         self._likely_ev_hours = likely_ev_hours
 
         # ── Sample weighting for decay (Stage 1.5) ──────────────────────────
@@ -583,7 +584,10 @@ class EnergyForecastModel:
         if enable_regimes:
             _actual_k = regime_count
             _prebuilt_daily_features = None
-            ev_day_dates: set = set(ev_df["timestamp"].dt.date) if ev_df is not None and len(ev_df) > 0 else set()
+            _ev_resid = residual_ev_rows(ev_df)
+            ev_day_dates: set = (
+                set(_ev_resid["timestamp"].dt.date) if _ev_resid is not None and len(_ev_resid) > 0 else set()
+            )
             if regime_count == 0:
                 # Auto-K: build daily features once and reuse for both selection and predictor
                 _prebuilt_daily_features = _prepare_daily_regime_features(
