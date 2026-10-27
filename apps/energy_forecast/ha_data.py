@@ -745,6 +745,7 @@ def split_ev_charging(
     ev_mask = df["gross_kwh"] > threshold_kwh
 
     ev_df = df[ev_mask].copy()
+    ev_df["ev_source"] = "threshold"
 
     df.loc[ev_mask, "gross_kwh"] = np.maximum(0.0, df.loc[ev_mask, "gross_kwh"] - charger_kw)
 
@@ -779,6 +780,7 @@ def split_ev_charging_from_sensor(
 
     ev_df = energy_df[ev_mask].copy()
     ev_df["gross_kwh"] = ev_kwh[ev_mask]
+    ev_df["ev_source"] = "sensor"
 
     return energy_df, ev_df
 
@@ -839,6 +841,15 @@ def split_ev_charging_hybrid(
     baseline_df = pd.concat([sensor_baseline, threshold_baseline]).sort_values("timestamp").reset_index(drop=True)
     ev_df = pd.concat([sensor_ev, threshold_ev]).sort_values("timestamp").reset_index(drop=True)
     return baseline_df, ev_df
+
+
+def residual_ev_rows(ev_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """EV rows whose subtraction was inferred (threshold), i.e. whose baseline may still
+    carry EV residue. Wallbox-sensor rows are exact and returned as clean. Untagged
+    frames are treated as threshold-sourced (conservative)."""
+    if ev_df is None or ev_df.empty or "ev_source" not in ev_df.columns:
+        return ev_df
+    return ev_df[ev_df["ev_source"] == "threshold"]
 
 
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:

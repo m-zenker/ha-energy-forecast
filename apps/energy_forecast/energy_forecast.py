@@ -1948,13 +1948,8 @@ class EnergyForecast(hass.Hass):
             full_actuals = None
             ev_detected = None
 
-        ev_hour_set: set = set()
-        if ev_detected is not None and not ev_detected.empty:
-            ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))
-        # Hours immediately before/after EV charging are also contaminated (ramp-up/down).
-        # Excluded from _actuals_history so 7d/30d MAE sensors stay clean.
-        _ev_adjacent: set = {ts + pd.Timedelta(hours=d) for ts in ev_hour_set for d in (-1, 1)}
-        ev_mae_excluded: set = ev_hour_set | _ev_adjacent
+        ev_mae_excluded: set = _ev_mae_excluded_hours(ev_detected)
+        ev_sensor_kwh: dict = _ev_sensor_kwh_by_hour(ev_detected)
 
         sub_sensors_recent: dict = {}
         for entity_id in self._sub_energy_sensors:
@@ -2172,6 +2167,8 @@ class EnergyForecast(hass.Hass):
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
         # Use full_actuals (pre-split, pre-sub-sensor-subtraction, but target-corrected)
         # so stored kWh matches the training target on non-EV hours.
+        # Wallbox-sensor EV hours are stored net of the exact wallbox kWh; threshold-inferred
+        # EV hours (+-1 h) are excluded. Keep-last means a late wallbox reading self-corrects.
         if full_actuals is not None and not full_actuals.empty:
             completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
             # Retroactively evict EV hours + neighbors already in actuals_history.
@@ -2186,7 +2183,7 @@ class EnergyForecast(hass.Hass):
                 if _ts >= completed_cutoff:  # skip current (partial) hour
                     continue
                 if _ts not in ev_mae_excluded:
-                    self._actuals_history[_ts] = _kwh
+                    self._actuals_history[_ts] = max(0.0, _kwh - ev_sensor_kwh.get(_ts, 0.0))
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items() if pd.Timestamp(ts) >= actuals_cutoff
@@ -3366,6 +3363,31 @@ def _apply_target_correction(
 
     df["gross_kwh"] = (df["gross_kwh"] + delta.values).clip(lower=0.0)
     return df
+
+
+def _ev_mae_excluded_hours(ev_detected: pd.DataFrame | None) -> set:
+    """Hours dropped from the MAE/actuals history because their EV subtraction may leave residue.
+
+    Only threshold-inferred EV hours (plus +-1h ramp) qualify; wallbox-sensor hours are
+    subtracted exactly and are scored like any other hour.
+    """
+    import pandas as pd
+
+    resid = ha_data.residual_ev_rows(ev_detected)
+    if resid is None or resid.empty:
+        return set()
+    hours = set(pd.to_datetime(resid["timestamp"]).dt.floor("1h"))
+    return hours | {ts + pd.Timedelta(hours=d) for ts in hours for d in (-1, 1)}
+
+
+def _ev_sensor_kwh_by_hour(ev_detected: pd.DataFrame | None) -> dict:
+    """Wallbox kWh per hour for sensor-tagged EV rows — used to store MAE actuals net of EV."""
+    import pandas as pd
+
+    if ev_detected is None or ev_detected.empty or "ev_source" not in ev_detected.columns:
+        return {}
+    s = ev_detected[ev_detected["ev_source"] == "sensor"]
+    return dict(zip(pd.to_datetime(s["timestamp"]).dt.floor("1h"), s["gross_kwh"].astype(float)))
 
 
 def _fetch_correction_dfs(

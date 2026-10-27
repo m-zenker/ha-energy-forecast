@@ -818,6 +818,53 @@ class TestSplitEvChargingHybrid:
         assert len(ev) == len(expected_ev)
 
 
+# ── ev_source tagging / residual_ev_rows ─────────────────────────────────────
+
+
+class TestEvSource:
+    def _energy(self):
+        ts = pd.date_range("2026-07-26 10:00", periods=4, freq="h").append(
+            pd.date_range("2026-07-28 10:00", periods=2, freq="h")
+        )
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [9.5, 0.4, 0.3, 0.3, 3.0, 0.5]})
+
+    def test_threshold_rows_tagged(self):
+        _, ev = ha_data.split_ev_charging(self._energy(), 7.0, charger_kw=9.0)
+        assert set(ev["ev_source"]) == {"threshold"}
+
+    def test_sensor_rows_tagged(self):
+        evk = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-28 10:00"]), "kwh": [2.5]})
+        _, ev = ha_data.split_ev_charging_from_sensor(self._energy(), evk)
+        assert list(ev["ev_source"]) == ["sensor"]
+
+    def test_hybrid_mixes_sources_by_coverage(self):
+        evk = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-27 10:00", "2026-07-28 10:00"]), "kwh": [0.0, 2.5]})
+        _, ev = ha_data.split_ev_charging_hybrid(self._energy(), evk, 7.0, charger_kw=9.0)
+        src = ev.set_index("timestamp")["ev_source"]
+        assert src[pd.Timestamp("2026-07-26 10:00")] == "threshold"
+        assert src[pd.Timestamp("2026-07-28 10:00")] == "sensor"
+
+    def test_residual_ev_rows_keeps_threshold_only(self):
+        ev = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-07-26 10:00", "2026-07-28 10:00"]),
+                "gross_kwh": [9.5, 2.5],
+                "ev_source": ["threshold", "sensor"],
+            }
+        )
+        out = ha_data.residual_ev_rows(ev)
+        assert list(out["timestamp"]) == [pd.Timestamp("2026-07-26 10:00")]
+
+    def test_residual_ev_rows_untagged_is_conservative(self):
+        ev = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-28 10:00"]), "gross_kwh": [2.5]})
+        assert len(ha_data.residual_ev_rows(ev)) == 1
+
+    def test_residual_ev_rows_none_and_empty(self):
+        assert ha_data.residual_ev_rows(None) is None
+        empty = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        assert ha_data.residual_ev_rows(empty).empty
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 
