@@ -441,6 +441,22 @@ class TestAggregate:
         assert len(result["blocks_today_low"]) == 8
         assert len(result["blocks_today_high"]) == 8
 
+    def test_today_block_intervals_blend_elapsed_actuals(self):
+        """Today's P10/P90 blocks blend elapsed actuals like P50 (elapsed = actuals, rest = quantiles)."""
+        today = pd.Timestamp.now().normalize()
+        now = today + pd.Timedelta(hours=7)
+        preds = _pred_df(today, n=48, kwh=1.0)
+        ts = pd.date_range(today, periods=48, freq="1h")
+        ivs = pd.DataFrame({"timestamp": ts, "low_kwh": np.full(48, 0.5), "high_kwh": np.full(48, 2.0)})
+        act_ts = pd.date_range(today, periods=7, freq="1h")
+        actuals = pd.DataFrame({"timestamp": act_ts, "gross_kwh": np.full(7, 3.0)})
+        result = self._run(today, now, preds, actuals=actuals, intervals=ivs)
+
+        assert result["blocks_today_low"]["06_09"] == pytest.approx(4.0)
+        assert result["blocks_today_high"]["06_09"] == pytest.approx(7.0)
+        assert result["blocks_today_low"]["00_03"] == pytest.approx(9.0)
+        assert result["blocks_today_high"]["21_24"] == pytest.approx(6.0)
+
 
 # ── M4 — EV blending consistency ─────────────────────────────────────────────
 
