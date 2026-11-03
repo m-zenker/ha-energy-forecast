@@ -27,6 +27,7 @@ CACHE_PATH = Path(__file__).parent / "energy_history.csv"
 CACHE_PATH_15M = Path(__file__).parent / "energy_history_15m.csv"
 MAX_15MIN_KWH = MAX_HOURLY_KWH / 4  # 12.5 kWh — per-slot cap for 15-min resolution
 PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
+REGIME_LOG_PATH = PRED_HISTORY_PATH.parent / "regime_log.jsonl"  # append-only, one line per sensor update
 GITHUB_RELEASES_URL = "https://api.github.com/repos/m-zenker/ha-energy-forecast/releases/latest"
 
 # Occupancy Detection

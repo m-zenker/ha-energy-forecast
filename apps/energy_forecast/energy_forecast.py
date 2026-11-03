@@ -39,6 +39,7 @@ from .const import (
     GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
     PRESENCE_STATE_HOME,
+    REGIME_LOG_PATH,
     UNIT_TO_KWH,
     drop_dst_duplicates,
     resolve_timezone,
@@ -2076,6 +2077,7 @@ class EnergyForecast(hass.Hass):
             physics_model=self._physics_model,
             heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
+        _regime_info = dict(getattr(self._ml_model, "_last_regime_info", None) or {})
 
         predictions = self._ml_model.predict(
             forecast_df,
@@ -2256,6 +2258,20 @@ class EnergyForecast(hass.Hass):
             sub_sensors_recent=sub_sensors_recent or None,
             ev_actuals_df=_ev_actuals_df,
         )
+        try:
+            _now_local = pd.Timestamp.now(self._timezone).tz_localize(None)
+            _append_regime_log(
+                REGIME_LOG_PATH,
+                _build_regime_log_record(
+                    pd.Timestamp.now(self._timezone).isoformat(),  # tz-aware: DST fall-back safe
+                    self._ml_model.last_trained,
+                    _tomorrow_local_date(_now_local),
+                    round(float(aggregated["tomorrow"]), 3),
+                    _regime_info,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("regime_log record failed: %s", exc)
         aggregated["shap_top_features"] = shap_data
         aggregated["shap_narrative"] = _build_shap_narrative(shap_data)
         aggregated["mae_7d"] = mae_7d
@@ -3276,6 +3292,46 @@ class EnergyForecast(hass.Hass):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _tomorrow_local_date(now_local: Any) -> date:
+    """Tomorrow's calendar date in local time — same rule as ``_aggregate`` (normalize() + 1 day)."""
+    return (now_local.normalize() + timedelta(days=1)).date()
+
+
+def _build_regime_log_record(
+    ts: str,
+    last_trained: datetime | None,
+    tomorrow_date: date,
+    tomorrow_kwh: float,
+    regime_info: dict,
+) -> dict:
+    """Pure builder for one regime_log.jsonl line (JSON-native values only).
+
+    ``last_trained`` is logged raw (``isoformat()``, no conversion) as a retrain identifier.
+    """
+    lt: str | None = None
+    if last_trained is not None and last_trained != datetime.min:
+        lt = last_trained.isoformat()
+    info = regime_info.get(tomorrow_date)
+    return {
+        "ts": ts,
+        "last_trained": lt,
+        "target_date": tomorrow_date.isoformat(),
+        "tomorrow_kwh": tomorrow_kwh,
+        "label": info["label"] if info else None,
+        "proba": info["proba"] if info else None,
+    }
+
+
+def _append_regime_log(path: Path, record: dict) -> None:
+    """Append one JSON line to the regime log. Never raises."""
+    try:
+        line = json.dumps(record) + "\n"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Could not write regime log %s: %s", path, exc)
 
 
 def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
