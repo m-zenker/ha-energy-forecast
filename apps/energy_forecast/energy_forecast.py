@@ -2106,40 +2106,47 @@ class EnergyForecast(hass.Hass):
         # forecast by its true expected kWh amount, independent of whatever
         # weight the trained model happens to give the override features.
         # _override_delta stays None (not, say, an all-zero Series) when there's
-        # no physics model, so _publish_physics_sensors below can tell "nothing to
-        # fold in" apart from "a real, all-zero delta" without a redundant check.
+        # no physics model or no forecast row at or after the first predicted hour,
+        # so _publish_physics_sensors below can tell "nothing to fold in" apart from
+        # "a real, all-zero delta" without a redundant check.
         _override_delta = None
         if self._physics_model is not None:
-            _override_timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
-            # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
-            # derived through the exact same climate-projection path predict_series
-            # uses for the real physics_kwh feature — not raw outdoor temperature
-            # (final-review #2). Feeding outdoor temp here modelled a tank standing
-            # outside, inflating standing losses and therefore the correction itself.
-            _t_ambient = self._physics_model._t_indoor_for_window(
-                climate_recent or None,
-                _override_timestamps,
-                pd.Series(forecast_df["temp_c"].values, index=_override_timestamps),
-                room_areas=self._climate_room_areas or None,
-                heating_active_series=heating_active_series,
-                setpoint_on=heating_setpoint_on,
-                setpoint_off=heating_setpoint_off,
-            )
-            _initial_t_tank = self._physics_model._initial_t_tank_for_window(
-                dhw_recent if not dhw_recent.empty else None, _override_timestamps
-            )
-            _override_delta = self._physics_model.compute_serving_override_delta(
-                _override_timestamps, _t_ambient, _initial_t_tank
-            )
-            # Floored at zero, same as model.py's own `np.maximum(0, preds)`: this is a
-            # SIGNED delta applied to an already-final forecast with nothing downstream of
-            # it, so without the floor a large negative correction publishes a visibly
-            # negative hourly forecast (final-review #4).
-            predictions["predicted_kwh"] = np.maximum(
-                0.0,
-                predictions["predicted_kwh"].to_numpy()
-                + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy(),
-            )
+            # forecast_df carries a past tail (fetch_open_meteo past_days=3). Simulating over it
+            # seeds the tank from days ago and lets a finished override, which committed_override
+            # keeps, shift future reheats by ±1 kWh. The correction only applies to overrides still
+            # ahead: once an override's hour has passed, its modelled tail is deliberately dropped.
+            _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= predictions["timestamp"].iloc[0]]
+            if not _serving_df.empty:
+                _override_timestamps = pd.DatetimeIndex(_serving_df["timestamp"])
+                # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
+                # derived through the exact same climate-projection path predict_series
+                # uses for the real physics_kwh feature — not raw outdoor temperature
+                # (final-review #2). Feeding outdoor temp here modelled a tank standing
+                # outside, inflating standing losses and therefore the correction itself.
+                _t_ambient = self._physics_model._t_indoor_for_window(
+                    climate_recent or None,
+                    _override_timestamps,
+                    pd.Series(_serving_df["temp_c"].values, index=_override_timestamps),
+                    room_areas=self._climate_room_areas or None,
+                    heating_active_series=heating_active_series,
+                    setpoint_on=heating_setpoint_on,
+                    setpoint_off=heating_setpoint_off,
+                )
+                _initial_t_tank = self._physics_model._initial_t_tank_for_window(
+                    dhw_recent if not dhw_recent.empty else None, _override_timestamps
+                )
+                _override_delta = self._physics_model.compute_serving_override_delta(
+                    _override_timestamps, _t_ambient, _initial_t_tank
+                )
+                # Floored at zero, same as model.py's own `np.maximum(0, preds)`: this is a
+                # SIGNED delta applied to an already-final forecast with nothing downstream of
+                # it, so without the floor a large negative correction publishes a visibly
+                # negative hourly forecast (final-review #4).
+                predictions["predicted_kwh"] = np.maximum(
+                    0.0,
+                    predictions["predicted_kwh"].to_numpy()
+                    + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy(),
+                )
 
         self._publish_thermal_pressure()
         self._publish_physics_sensors(predictions, override_delta=_override_delta)
