@@ -1184,6 +1184,8 @@ class TestServingOverrideCorrection:
         outdoor_temp_c=5.0,
         climate_recent=None,
         base_kwh=1.0,
+        prediction_timestamps=None,
+        dhw_recent=None,
     ):
         """Drives EnergyForecast._update_sensors() end-to-end and returns
         (predictions, stub): `predictions` is the exact DataFrame it hands to
@@ -1226,14 +1228,21 @@ class TestServingOverrideCorrection:
             monkeypatch.setattr(
                 ha_data_mod, "fetch_recent_climate", lambda _self, eid, *a, **kw: climate_recent[eid].copy()
             )
+        if dhw_recent is not None:
+            stub._dhw_buffer_sensor = "sensor.tank"
+            # _FakeUpdateSensors has no cache-path helper; _update_sensors() calls it outside its try block.
+            stub._generic_sensor_cache_path = lambda eid, prefix="x", _t=tmp_path: _t / f"{prefix}.csv"
+            monkeypatch.setattr(ha_data_mod, "fetch_recent_generic_sensor", lambda *a, **kw: dhw_recent.copy())
         stub._physics_model = physics_model
         stub._physics_config = physics_model._config
         stub._room_thermostats = []
         stub._physics_climate_dfs = {}
         stub._physics_dhw_tank_df = None
         stub._physics_cop_df = None
+        # Real predict() always returns 48 h from now, even when forecast_df carries a past tail.
+        predicted_ts = forecast_timestamps if prediction_timestamps is None else prediction_timestamps
         stub._ml_model.predict = lambda *a, **kw: pd.DataFrame(
-            {"timestamp": forecast_timestamps, "predicted_kwh": [base_kwh] * len(forecast_timestamps)}
+            {"timestamp": predicted_ts, "predicted_kwh": [base_kwh] * len(predicted_ts)}
         )
 
         captured: dict = {}
@@ -1399,6 +1408,180 @@ class TestServingOverrideCorrection:
             f"negative forecast published: min={predictions['predicted_kwh'].min()}"
         )
         assert (predictions["predicted_kwh"] == 0.0).all()
+
+    # ── forecast_df carries a past tail (fetch_open_meteo past_days=3) ──────────────────────
+
+    def _tail_and_future(self, now):
+        tail = pd.date_range(now - pd.Timedelta(hours=72), now + pd.Timedelta(hours=47), freq="1h")
+        return tail, tail[tail >= now]
+
+    def _tail_physics_model(self, tmp_path, name):
+        """Live tank size and DHW calibration: the leak reproduces with them on any start hour."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        pm = ThermalPhysicsModel(tmp_path / name, {**self._physics_config(), "dhw_tank_volume_l": 400})
+        pm._calib.update(Q_dhw_daily=2.79, UA_dhw=3.18)
+        return pm
+
+    def _diverging_past_override(self, pm, tail, future, now):
+        """A past hour whose override leaks into `future` when simulated over the whole tail.
+
+        Searched, not fixed: whether a given offset leaks depends on the hour-of-day draw
+        profile, and the harness runs on the real clock.
+        """
+        t_ambient = pm._t_indoor_for_window(None, tail, pd.Series(5.0, index=tail))
+        initial_t_tank = pm._initial_t_tank_for_window(None, tail)
+        try:
+            for hours_back in range(1, 72):
+                candidate = now - pd.Timedelta(hours=hours_back)
+                pm._schedule["committed_override"] = {"legionella": [candidate.strftime("%Y-%m-%d"), candidate.hour]}
+                delta = pm.compute_serving_override_delta(tail, t_ambient, initial_t_tank)
+                if delta.reindex(future).abs().max() > 0.01:
+                    return candidate
+        finally:
+            pm._schedule["committed_override"] = None
+        pytest.fail("no past override leaks into the future window: the test no longer exercises the bug")
+
+    def _spy_on_serving_delta(self, pm, monkeypatch):
+        spy: dict = {}
+        real = pm.compute_serving_override_delta
+
+        def wrapped(timestamps, t_ambient, initial_t_tank):
+            spy.update(timestamps=timestamps, t_ambient=t_ambient, initial_t_tank=initial_t_tank)
+            return real(timestamps, t_ambient, initial_t_tank)
+
+        monkeypatch.setattr(pm, "compute_serving_override_delta", wrapped)
+        return spy
+
+    @staticmethod
+    def _climate_recent(now):
+        return {
+            "climate.living": pd.DataFrame(
+                {
+                    "timestamp": pd.date_range(end=now, periods=6, freq="1h"),
+                    "current_temp": [22.0] * 6,
+                    "setpoint": [22.0] * 6,
+                }
+            )
+        }
+
+    @staticmethod
+    def _commit(pm, ts):
+        pm.commit_dhw_schedule({"legionella": [ts.strftime("%Y-%m-%d"), ts.hour]})
+
+    def test_expired_override_in_past_tail_does_not_move_forecast(self, tmp_path, monkeypatch):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_expired")
+        self._commit(pm, self._diverging_past_override(pm, tail, future, now))
+
+        predictions, _ = self._run_update_sensors(
+            tmp_path, monkeypatch, pm, tail, prediction_timestamps=future, base_kwh=5.0
+        )
+
+        assert (predictions.set_index("timestamp")["predicted_kwh"] == 5.0).all()
+
+    def test_future_override_with_past_tail_moves_forecast_by_future_window_delta(self, tmp_path, monkeypatch):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_future")
+        self._commit(pm, future[5])
+        expected = pm.compute_serving_override_delta(
+            future,
+            pm._t_indoor_for_window(None, future, pd.Series(5.0, index=future)),
+            pm._initial_t_tank_for_window(None, future),
+        )
+        assert (expected != 0.0).any(), "test setup sanity: the override must diverge the DHW trajectory"
+
+        predictions, _ = self._run_update_sensors(
+            tmp_path, monkeypatch, pm, tail, prediction_timestamps=future, base_kwh=5.0
+        )
+
+        actual = predictions.set_index("timestamp")["predicted_kwh"] - 5.0
+        pd.testing.assert_series_equal(
+            actual, expected.rename("predicted_kwh"), check_names=False, check_freq=False, atol=1e-9
+        )
+
+    def test_override_delta_window_starts_at_current_hour(self, tmp_path, monkeypatch):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_window")
+        self._commit(pm, future[5])
+        spy = self._spy_on_serving_delta(pm, monkeypatch)
+
+        self._run_update_sensors(tmp_path, monkeypatch, pm, tail, prediction_timestamps=future, base_kwh=5.0)
+
+        assert spy["timestamps"][0] == now
+
+    def test_override_delta_seeds_from_latest_tank_reading(self, tmp_path, monkeypatch):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        past = tail[tail < now]
+        dhw_recent = pd.DataFrame({"timestamp": past, "buffer_temp": [60.0] * (len(past) - 1) + [47.0]})
+        pm = self._tail_physics_model(tmp_path, "physics_models_seed")
+        self._commit(pm, future[5])
+        spy = self._spy_on_serving_delta(pm, monkeypatch)
+
+        self._run_update_sensors(
+            tmp_path, monkeypatch, pm, tail, prediction_timestamps=future, base_kwh=5.0, dhw_recent=dhw_recent
+        )
+
+        assert spy["initial_t_tank"] == pytest.approx(47.0)
+
+    def test_override_delta_ambient_matches_future_window(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import _strip_tz
+
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        climate_recent = self._climate_recent(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_ambient")
+        self._commit(pm, future[5])
+        spy = self._spy_on_serving_delta(pm, monkeypatch)
+        stripped = {eid: _strip_tz(df.copy(), "Europe/Zurich") for eid, df in climate_recent.items()}
+        expected = pm._t_indoor_for_window(stripped, future, pd.Series(5.0, index=future), room_areas=None)
+
+        self._run_update_sensors(
+            tmp_path,
+            monkeypatch,
+            pm,
+            tail,
+            climate_recent=climate_recent,
+            prediction_timestamps=future,
+            base_kwh=5.0,
+        )
+
+        pd.testing.assert_series_equal(spy["t_ambient"], expected, check_names=False, check_freq=False)
+
+    def test_override_at_current_hour_still_applies(self, tmp_path, monkeypatch):
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_current")
+        self._commit(pm, now)
+
+        predictions, _ = self._run_update_sensors(
+            tmp_path, monkeypatch, pm, tail, prediction_timestamps=future, base_kwh=5.0
+        )
+
+        assert predictions.set_index("timestamp")["predicted_kwh"].loc[now] != pytest.approx(5.0)
+
+    def test_forecast_without_future_rows_leaves_forecast_unchanged(self, tmp_path, monkeypatch):
+        """climate_recent is required: without any rows, the indoor projection is what raises."""
+        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        tail, future = self._tail_and_future(now)
+        pm = self._tail_physics_model(tmp_path, "physics_models_no_future")
+        self._commit(pm, now - pd.Timedelta(hours=5))
+
+        predictions, _ = self._run_update_sensors(
+            tmp_path,
+            monkeypatch,
+            pm,
+            tail[tail < now],
+            climate_recent=self._climate_recent(now),
+            prediction_timestamps=future,
+            base_kwh=5.0,
+        )
+
+        assert (predictions.set_index("timestamp")["predicted_kwh"] == 5.0).all()
 
     def test_no_committed_override_leaves_published_forecast_unchanged(self, tmp_path, monkeypatch):
         """Zero-override-degradation: with nothing committed,
