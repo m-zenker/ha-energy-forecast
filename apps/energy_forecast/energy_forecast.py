@@ -3093,8 +3093,12 @@ class EnergyForecast(hass.Hass):
             def _isum(vals, s, e):
                 return round(float(np.sum(vals[(iv_times >= s) & (iv_times < e)])), 3)
 
-            today_low, _ = _blend_today_totals(iv_times, iv_low, blended_actuals, today_np, tomorrow_np, now_np)
-            today_high, _ = _blend_today_totals(iv_times, iv_high, blended_actuals, today_np, tomorrow_np, now_np)
+            today_low, blocks_low = _blend_today_totals(
+                iv_times, iv_low, blended_actuals, today_np, tomorrow_np, now_np
+            )
+            today_high, blocks_high = _blend_today_totals(
+                iv_times, iv_high, blended_actuals, today_np, tomorrow_np, now_np
+            )
 
             result.update(
                 {
@@ -3106,22 +3110,8 @@ class EnergyForecast(hass.Hass):
                     "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
                 }
             )
-            result["blocks_today_low"] = {
-                f"{h:02d}_{h + 3:02d}": _isum(
-                    iv_low,
-                    today_np + np.timedelta64(h, "h"),
-                    today_np + np.timedelta64(h + 3, "h"),
-                )
-                for h in range(0, 24, 3)
-            }
-            result["blocks_today_high"] = {
-                f"{h:02d}_{h + 3:02d}": _isum(
-                    iv_high,
-                    today_np + np.timedelta64(h, "h"),
-                    today_np + np.timedelta64(h + 3, "h"),
-                )
-                for h in range(0, 24, 3)
-            }
+            result["blocks_today_low"] = blocks_low
+            result["blocks_today_high"] = blocks_high
             result["blocks_tomorrow_low"] = {
                 f"{h:02d}_{h + 3:02d}": _isum(
                     iv_low,
