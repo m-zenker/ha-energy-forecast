@@ -373,8 +373,3 @@ def test_arm_specs_variants_only_use_supported_train_overrides(br):
     params = set(inspect.signature(EnergyForecastModel.train).parameters)
     for arm, (_, overrides) in br.ARM_SPECS.items():
         assert set(overrides) - {"enable_regimes"} <= params, arm
-    assert br.ARM_SPECS["TBF"][1] == {
-        "regime_mode": "soft_oof",
-        "regime_oof_cv": "blocked",
-        "regime_min_oof_acc": 0.5,
-    }

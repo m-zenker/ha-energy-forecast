@@ -271,7 +271,7 @@ CUTOFF_HOUR = 6  # weekly retrain at 06:00 local, like the live early-morning re
 ARMS = ("H", "T", "N", "J")  # J = H retrained one hour earlier: the retrain-jitter control
 
 # Arm -> (cutoff offset in hours, train() overrides). Variants of T (#110): TJ = T's own jitter control,
-# TB = blocked out-of-fold folds, TF = fall back to regime_kwh = 0 when out-of-fold accuracy < 0.5, TBF = both.
+# TB = blocked out-of-fold folds.
 ARM_SPECS: dict[str, tuple[int, dict]] = {
     "H": (0, {}),
     "T": (0, {"regime_mode": "soft_oof"}),
@@ -279,8 +279,6 @@ ARM_SPECS: dict[str, tuple[int, dict]] = {
     "J": (-1, {}),
     "TJ": (-1, {"regime_mode": "soft_oof"}),
     "TB": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "blocked"}),
-    "TF": (0, {"regime_mode": "soft_oof", "regime_min_oof_acc": 0.5}),
-    "TBF": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "blocked", "regime_min_oof_acc": 0.5}),
 }
 
 
@@ -409,7 +407,6 @@ def run_backtest(
                             "actual": actual,
                             "oof_acc": getattr(model, "_regime_oof_acc", None),
                             "oof_majority": getattr(model, "_regime_oof_majority", None),
-                            "regime_zero": bool(getattr(model, "_regime_zero", False)),
                             "k": int(model._clusterer.centroids.shape[0])
                             if getattr(model, "_clusterer", None)
                             else None,

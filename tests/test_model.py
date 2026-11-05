@@ -7760,7 +7760,7 @@ class TestRegimeSoftOOF:
 
 
 class TestRegimeSoftOOFVariants:
-    """#110 variants: regime_oof_cv='blocked' and the regime_min_oof_acc fallback to N (all default off)."""
+    """#110 variants: regime_oof_cv='blocked' and the logged out-of-fold accuracy diagnostic."""
 
     def test_invalid_variant_args_raise(self, tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="regime_oof_cv"):
@@ -7780,38 +7780,19 @@ class TestRegimeSoftOOFVariants:
         TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof", regime_oof_cv="blocked")
         assert seen["oof_cv"] == "blocked"
 
-    def test_fallback_zeroes_regime_kwh_and_persists(self, tmp_path, monkeypatch):
-        cap = TestRegimeSoftOOF._spy_training(monkeypatch)
-        m, forecast_df, X = TestRegimeGolden._train_and_prepare(
-            tmp_path,
-            monkeypatch,
-            regime_mode="soft_oof",
-            regime_min_oof_acc=1.01,  # impossible: always falls back
-        )
-        assert m._regime_zero is True and m._regime_mode == "soft_oof"
-        assert (cap["series"] == 0).all()
-        assert (X["regime_kwh"] == 0).all()
-        assert EnergyForecastModel(tmp_path)._regime_zero is True
+    def test_soft_oof_logs_accuracy_and_majority(self, tmp_path, monkeypatch, caplog):
+        import logging
 
-    def test_no_fallback_when_accuracy_is_enough(self, tmp_path, monkeypatch):
-        cap = TestRegimeSoftOOF._spy_training(monkeypatch)
-        m, _, X = TestRegimeGolden._train_and_prepare(
-            tmp_path, monkeypatch, regime_mode="soft_oof", regime_min_oof_acc=0.0
-        )
-        assert m._regime_zero is False
-        assert (cap["series"] != 0).any() and (X["regime_kwh"] != 0).any()
-        assert m._regime_oof_acc is not None and 0.0 <= m._regime_oof_acc <= 1.0
+        with caplog.at_level(logging.INFO):
+            m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof")
+        assert "out-of-fold accuracy" in caplog.text
+        assert 0.0 <= m._regime_oof_acc <= 1.0
+        assert 0.0 < m._regime_oof_majority <= 1.0
 
-    def test_missing_regime_zero_key_loads_false(self, tmp_path, monkeypatch):
+    def test_regime_zero_not_in_meta(self, tmp_path, monkeypatch):
         import pickle
 
-        from energy_forecast.model import _write_hash
-
-        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof")
         with open(m._meta_path, "rb") as fh:
             meta = pickle.load(fh)
-        meta.pop("regime_zero", None)
-        with open(m._meta_path, "wb") as fh:
-            pickle.dump(meta, fh)
-        _write_hash(m._meta_path)
-        assert EnergyForecastModel(tmp_path)._regime_zero is False
+        assert "regime_zero" not in meta

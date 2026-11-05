@@ -245,6 +245,22 @@ def test_oob_warning_emitted_near_chance(caplog):
         assert any("near chance" in r.message for r in caplog.records)
 
 
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_blocked_oof_rare_class_in_one_block():
+    """A class living entirely inside one blocked fold (days 17-19 of 40; fold 3 = days 16-23) is never seen
+    by the forest that scores that fold: probabilities stay finite, sum to 1, and class 2 is exactly 0 there."""
+    feats, labels = _make_daily_features(n=40)
+    labels = labels.copy()
+    labels.iloc[17:20] = 2
+    oof = RegimePredictor().fit(feats, labels, n_clusters=3, oof_cv="blocked")
+
+    assert oof is not None
+    assert list(oof.columns) == [0, 1, 2]
+    assert np.isfinite(oof.to_numpy()).all()
+    np.testing.assert_allclose(oof.sum(axis=1).to_numpy(), 1.0)
+    assert (oof.iloc[16:24][2] == 0).all()
+
+
 # ── _prepare_daily_regime_features: occupancy columns ────────────────────────
 
 
