@@ -173,9 +173,26 @@ class TrainRecorder(MagicMock):
         return MagicMock(**kw)
 
 
-def make_app(cfg: dict, scratch: Path):
-    """Run the real ``initialize()`` on a MagicMock-based app whose caches live in *scratch*."""
+_SEEDED_STATE = ("physics_calibration.json", "physics_schedule.json")
+
+
+def make_app(cfg: dict, scratch: Path, seed_physics_from: Path | None = None):
+    """Run the real ``initialize()`` on a MagicMock-based app whose caches live in *scratch*.
+
+    ``initialize()`` builds the physics model on the repo's ``apps/energy_forecast/models`` path, and training
+    persists calibration there, so it is redirected to ``scratch/models``. With *seed_physics_from* (a live
+    ``models/`` dir) the persisted physics state is copied in first; leave it None for historical cutoffs,
+    where today's state would be future information.
+    """
     from energy_forecast import energy_forecast as ef
+    from energy_forecast.physics import ThermalPhysicsModel
+
+    models = scratch / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    if seed_physics_from is not None:
+        for name in _SEEDED_STATE:
+            if (seed_physics_from / name).exists():
+                shutil.copy2(seed_physics_from / name, models / name)
 
     args = dict(cfg)
     args["cache_path"] = str(scratch / "energy_history.csv")
@@ -187,22 +204,56 @@ def make_app(cfg: dict, scratch: Path):
     app.get_history = MagicMock(return_value=[])
     for name in ("_validate_sensor_types", "_check_setup", "_publish_unavailable", "_load_pred_history"):
         setattr(app, name, MagicMock())
-    with patch.object(ef, "EnergyForecastModel", TrainRecorder), _preserved_loggers():
+    with (
+        patch.object(ef, "EnergyForecastModel", TrainRecorder),
+        patch.object(ef, "ThermalPhysicsModel", lambda _dir, physics_cfg: ThermalPhysicsModel(models, physics_cfg)),
+        _preserved_loggers(),
+    ):
         app.initialize()
     return app
+
+
+# ── dtype normalisation ───────────────────────────────────────────────────────
+
+
+def coerce_numeric_objects(obj):
+    """Restore float dtype on object columns that hold only numbers (recursing into dicts/lists/tuples).
+
+    With ``get_history`` -> ``[]`` the "fresh" HA frame is empty with object dtype, and concatenating it with
+    the float cache turns every value column into ``object``; live always has non-empty fresh rows, so its
+    columns stay float. Columns with any non-numeric value (e.g. ``program``) are left alone.
+    """
+    if isinstance(obj, pd.DataFrame):
+        out = obj.copy()
+        for col in out.columns:
+            if out[col].dtype == object:
+                num = pd.to_numeric(out[col], errors="coerce")
+                if num.notna().sum() == out[col].notna().sum():
+                    out[col] = num
+        return out
+    if isinstance(obj, dict):
+        return {k: coerce_numeric_objects(v) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(coerce_numeric_objects(v) for v in obj)
+    if isinstance(obj, list):
+        return [coerce_numeric_objects(v) for v in obj]
+    return obj
 
 
 # ── Live-equivalent training frame ────────────────────────────────────────────
 
 
 def load_live_equivalent_training_frame(
-    cutoff: pd.Timestamp, data_dir: Path, scratch: Path, archive: pd.DataFrame | None = None
+    cutoff: pd.Timestamp,
+    data_dir: Path,
+    scratch: Path,
+    archive: pd.DataFrame | None = None,
+    seed_physics_state: bool = False,
 ) -> dict:
     """Return the exact ``(args, kwargs)`` the live ``_retrain()`` passed to ``model.train()`` at *cutoff*.
 
     Keyword arguments are returned as-is; the positional ones come back under ``"_args"``.
     """
-    from energy_forecast import energy_forecast as ef
     from energy_forecast import ha_data, heating_season, weather
 
     cfg = load_config(data_dir)
@@ -222,14 +273,15 @@ def load_live_equivalent_training_frame(
         patch.object(ha_data, "fetch_energy_history_15m", lambda *a, **k: None),
         _preserved_loggers(),
     ):
-        app = make_app(cfg, scratch)
+        app = make_app(cfg, scratch, data_dir / "models" if seed_physics_state else None)
         app._retrain()
     captured = app._ml_model.captured
     if captured is None:
         raise RuntimeError("_retrain() returned without calling train() (insufficient history?)")
+    skip = {"physics_model"}  # not a frame; keep the live object
+    captured = {k: (v if k in skip else coerce_numeric_objects(v)) for k, v in captured.items()}
     captured["_app"] = app
     captured["_cfg"] = cfg
-    assert ef is not None
     return captured
 
 
@@ -251,6 +303,7 @@ def build_prediction_inputs(
     thresholds=None,
     horizon_h: int = 48,
     past_days: int = 3,
+    seed_physics_state: bool = False,
 ) -> dict:
     """Kwargs for ``EnergyForecastModel._prepare_prediction_X`` at *origin*, as ``_update_sensors`` builds them.
 
@@ -288,7 +341,7 @@ def build_prediction_inputs(
         patch.object(heating_season, "save_thresholds", lambda *a, **k: None),
         _preserved_loggers(),
     ):
-        app = make_app(cfg, scratch)
+        app = make_app(cfg, scratch, data_dir / "models" if seed_physics_state else None)
         if thresholds is None:
             thresholds = heating_season.load_thresholds(data_dir / "models" / "heating_thresholds.json")
         if thresholds is not None:
@@ -306,4 +359,4 @@ def build_prediction_inputs(
             pass
     if not captured:
         raise RuntimeError("_update_sensors() ended without reaching _prepare_prediction_X")
-    return captured
+    return {k: (v if k == "physics_model" else coerce_numeric_objects(v)) for k, v in captured.items()}

@@ -59,6 +59,7 @@ def data_dir(tmp_path):
             "timezone": "Europe/Zurich",
             "enable_regimes": True,
             "regime_count": 3,
+            "physics": {},
         }
     }
     (d / "apps.yaml").write_text(yaml.safe_dump(cfg))
@@ -128,3 +129,101 @@ def test_build_prediction_inputs_has_no_future_actuals(rh, data_dir, tmp_path):
     fc = inputs["forecast_df"]
     assert fc["timestamp"].max() == origin.floor("1h") + pd.Timedelta(hours=47)
     assert inputs["live_temp"] is not None
+
+
+# ── Gate maths (#110 Part C2) ─────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def br(rh):
+    path = _REPO_ROOT / "scripts" / "backtest_regime.py"
+    if not path.exists():
+        pytest.skip("scripts/backtest_regime.py not present in this checkout")
+    spec = importlib.util.spec_from_file_location("backtest_regime", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["backtest_regime"] = mod
+    spec.loader.exec_module(mod)
+    yield mod
+    del sys.modules["backtest_regime"]
+
+
+def _toy_energy(n_days: int = 30) -> pd.DataFrame:
+    rng = np.random.default_rng(3)
+    ts = pd.date_range("2026-01-01", periods=24 * n_days, freq="1h")
+    base = np.array([[0.3] * 24, [0.3] * 7 + [2.0] * 3 + [0.4] * 14, [0.4] * 17 + [2.5] * 4 + [0.4] * 3])
+    kwh = [base[(t.date().toordinal()) % 3][t.hour] + rng.uniform(-0.05, 0.05) for t in ts]
+    return pd.DataFrame({"timestamp": ts, "gross_kwh": kwh})
+
+
+def test_nearest_centroid_labels_matches_fit(br):
+    from energy_forecast.clustering import SKLEARN_AVAILABLE, DailyProfileClusterer
+
+    if not SKLEARN_AVAILABLE:
+        pytest.skip("scikit-learn not available")
+    df = _toy_energy()
+    c = DailyProfileClusterer(n_clusters=3)
+    fit_labels = c.fit(df)
+    out = br.nearest_centroid_labels(df, c.centroids)
+    pd.testing.assert_series_equal(out, fit_labels, check_names=False, check_dtype=False)
+
+
+def test_label_agreement_permutation_invariant(br):
+    live_c = np.array([[1.0] * 24, [5.0] * 24, [9.0] * 24])
+    perm = [2, 0, 1]  # harness IDs are a relabelling of the same regimes
+    harness_c = live_c[perm]
+    days = pd.Index(
+        [pd.Timestamp("2026-01-01").date(), pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-03").date()]
+    )
+    live_labels = pd.Series([0, 1, 2], index=days)
+    harness_labels = pd.Series([perm.index(0), perm.index(1), perm.index(2)], index=days)
+    assert br.label_agreement(live_c, harness_c, live_labels, harness_labels) == 1.0
+    # one day genuinely differs -> 2/3
+    harness_labels.iloc[0] = perm.index(1)
+    assert br.label_agreement(live_c, harness_c, live_labels, harness_labels) == pytest.approx(2 / 3)
+
+
+def test_gate_thresholds(br):
+    ok = {"k_live": 4, "k_harness": 4, "agreement": 0.90, "max_rel_pred_diff": 0.03}
+    assert br.gate(ok) == (True, [])
+    assert br.gate({**ok, "agreement": 0.899})[0] is False
+    assert br.gate({**ok, "max_rel_pred_diff": 0.0301})[0] is False
+    passed, reasons = br.gate({**ok, "k_harness": 3})
+    assert passed is False and any("k differs" in r for r in reasons)
+
+
+def test_coerce_numeric_objects_restores_float_only_when_numeric(rh):
+    df = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-01", periods=3, freq="1h"), "t": pd.Series([1.0, None, 3.0], dtype=object)}
+    )
+    df["program"] = pd.Series(["eco", None, "fast"], dtype=object)
+    out = rh.coerce_numeric_objects({"a": df})["a"]
+    assert out["t"].dtype == "float64" and np.isnan(out["t"].iloc[1])
+    assert out["program"].dtype == object and list(out["program"].dropna()) == ["eco", "fast"]
+
+
+def test_physics_state_stays_out_of_repo_models_dir(rh, data_dir, tmp_path):
+    """initialize() hard-codes apps/energy_forecast/models for the physics model; the harness must redirect it."""
+    repo_models = _REPO_ROOT / "apps" / "energy_forecast" / "models"
+    before = sorted(p.name for p in repo_models.iterdir()) if repo_models.exists() else []
+    scratch = tmp_path / "scratch_p"
+    captured = rh.load_live_equivalent_training_frame(
+        pd.Timestamp("2026-01-04 12:30"), data_dir, scratch, archive=_weather("2025-12-28 00:00", 24 * 14)
+    )
+    physics = captured["physics_model"]
+    assert physics is not None
+    assert physics._calibration_path.parent == scratch / "models"
+    after = sorted(p.name for p in repo_models.iterdir()) if repo_models.exists() else []
+    assert after == before
+
+
+def test_physics_state_seeded_only_on_request(rh, data_dir, tmp_path):
+    (data_dir / "models").mkdir()
+    (data_dir / "models" / "physics_calibration.json").write_text('{"Q_dhw_daily": 4.25}')
+    arch = _weather("2025-12-28 00:00", 24 * 14)
+    cut = pd.Timestamp("2026-01-04 12:30")
+    plain = rh.load_live_equivalent_training_frame(cut, data_dir, tmp_path / "s1", archive=arch)
+    seeded = rh.load_live_equivalent_training_frame(
+        cut, data_dir, tmp_path / "s2", archive=arch, seed_physics_state=True
+    )
+    assert plain["physics_model"]._calib.get("Q_dhw_daily") != 4.25
+    assert seeded["physics_model"]._calib.get("Q_dhw_daily") == 4.25
