@@ -431,6 +431,8 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 
 **Blockers before a plan:** explain why the harness retrain doesn't reproduce the live clusterer's centroids (harness 35/64/10.6 vs live 7.9/37/20.9 kWh/day); compare the 10-22 actual against 10.7 (regime 0) / 16.6 (regime 2). Expose the regime label as a sensor attribute so flips can be counted from HA history.
 
+**Backtest result (2026-11-05, branch `fix/regime-soft-labels`, not merged):** the harness reproduces the live clusterer exactly (k=4, same centroids) but not live daily totals (up to 14 %; pure retrain jitter is ~9 %). Hard labels are clearly worst on stability (max day-total change under a sunshine ×0.66/×1.5 perturbation: H 3.1 kWh, soft out-of-fold 0.5, regimes off 0.25) and on primary-fold daily MAE (H 1.92, soft 1.57, off 1.65 kWh/day; jitter 3.5 %). Soft and off are indistinguishable within jitter; the plan's original rule would pick "off", the jitter-adjusted rule picks soft. The January guard fold is uninformative (all arms ~10 kWh/day low). It does not reproduce the live +2.79 kWh/day bias, so it neither confirms nor refutes the regime-flip cause. Part D is waiting for a decision and for the cold-onset deploy sequencing.
+
 **Effort:** ~½ day backtest + 1 day implementation. **Impact:** MEDIUM — tomorrow-forecast stability (consumed by EM scheduling) and an honest feature ranking; decides #83. See `memory/project_regime_flip_weather_source.md`.
 
 ---
