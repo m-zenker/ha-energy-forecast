@@ -9,6 +9,8 @@ from apps.energy_forecast.clustering import (
     DailyProfileClusterer,
     RegimePredictor,
     find_optimal_k,
+    one_hot,
+    regime_kwh_from_proba,
 )
 from apps.energy_forecast.model import _prepare_daily_regime_features
 
@@ -653,3 +655,57 @@ def test_predict_proba_clips_classes_beyond_n_clusters():
     assert list(df.columns) == [0, 1]
     assert np.isfinite(df.to_numpy()).all()
     assert np.allclose(df.sum(axis=1), 1)
+
+
+# ── regime_kwh_from_proba / one_hot (#110 Part B1) ────────────────────────────
+
+_C = np.array([[float(h) for h in range(24)], [100.0 + h for h in range(24)]])  # k=2 centroids
+
+
+def _ts(dates, hours=(0, 5, 23)):
+    return pd.Series(pd.to_datetime([f"{d} {h:02d}:00" for d in dates for h in hours]))
+
+
+def test_one_hot_matches_centroid_lookup():
+    days = [pd.Timestamp("2026-01-01").date(), pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-03").date()]
+    labels = pd.Series([0, 1, 0], index=days)
+    ts = _ts(days)
+    out = regime_kwh_from_proba(one_hot(labels, 2), ts, _C)
+    expected = [_C[labels[t.date()], t.hour] for t in ts]
+    np.testing.assert_allclose(out, expected)
+
+
+def test_soft_is_weighted_sum():
+    d = pd.Timestamp("2026-01-01").date()
+    proba = pd.DataFrame([[0.25, 0.75]], index=[d], columns=[0, 1])
+    out = regime_kwh_from_proba(proba, _ts([d]), _C)
+    np.testing.assert_allclose(out, [0.25 * _C[0, h] + 0.75 * _C[1, h] for h in (0, 5, 23)])
+
+
+def test_ffill_absent_dates_and_leading_zero():
+    d0, d1, d2, d3 = (pd.Timestamp(f"2026-01-0{i}").date() for i in (1, 2, 3, 4))
+    proba = pd.DataFrame([[0.0, 1.0]], index=[d2], columns=[0, 1])  # only d2 present
+    out = regime_kwh_from_proba(proba, _ts([d0, d1, d2, d3], hours=(5,)), _C)
+    # d0, d1 absent before first present date -> 0; d2 used; d3 absent -> forward-filled from d2
+    np.testing.assert_allclose(out, [0.0, 0.0, _C[1, 5], _C[1, 5]])
+
+
+def test_negative_label_gives_zero_row():
+    d = pd.Timestamp("2026-01-01").date()
+    oh = one_hot(pd.Series([-1], index=[d]), 2)
+    assert (oh.to_numpy() == 0).all()
+    np.testing.assert_allclose(regime_kwh_from_proba(oh, _ts([d]), _C), 0.0)
+
+
+def test_label_ge_k_clipped():
+    d = pd.Timestamp("2026-01-01").date()
+    oh = one_hot(pd.Series([7], index=[d]), 2)
+    assert oh.iloc[0].tolist() == [0.0, 1.0]
+
+
+def test_missing_class_column_zero_finite():
+    d = pd.Timestamp("2026-01-01").date()
+    proba = pd.DataFrame([[1.0, 0.0]], index=[d], columns=[0, 1])
+    out = regime_kwh_from_proba(proba, _ts([d]), _C)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, [_C[0, h] for h in (0, 5, 23)])

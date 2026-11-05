@@ -244,6 +244,35 @@ class RegimePredictor:
             return None
 
 
+def one_hot(labels: pd.Series, k: int) -> pd.DataFrame:
+    """One-hot probability matrix (columns ``range(k)``) from daily integer labels.
+
+    Labels < 0 give an all-zero row (``regime_kwh`` 0, as the old lookup did).
+    Labels >= k are clipped to k - 1 (as ``np.clip`` did).
+    """
+    arr = labels.to_numpy().astype(int)
+    out = np.zeros((len(arr), k), dtype=float)
+    valid = arr >= 0
+    out[np.flatnonzero(valid), np.clip(arr[valid], 0, k - 1)] = 1.0
+    return pd.DataFrame(out, index=labels.index, columns=range(k))
+
+
+def regime_kwh_from_proba(proba: pd.DataFrame, timestamps: pd.Series, centroids: np.ndarray) -> np.ndarray:
+    """Hourly ``regime_kwh``: per-day class probabilities x centroid profile, summed over classes.
+
+    ``proba`` is indexed by ``datetime.date`` with columns ``0..k-1``. It is reindexed
+    to each timestamp's date; dates *absent* from the index are forward-filled in
+    timestamp order (leading ones give 0). Rows present, including all-zero rows,
+    are used as-is. One value is returned per timestamp.
+    """
+    k = centroids.shape[0]
+    ts = pd.to_datetime(timestamps)
+    dates = ts.dt.date.to_numpy()
+    p = proba.reindex(columns=range(k), fill_value=0.0).reindex(dates).ffill().fillna(0.0)
+    hours = ts.dt.hour.to_numpy()
+    return (p.to_numpy() * centroids[:, hours].T).sum(axis=1)
+
+
 def find_optimal_k(
     energy_df: pd.DataFrame,
     daily_features: pd.DataFrame,

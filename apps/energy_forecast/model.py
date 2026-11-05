@@ -627,20 +627,12 @@ class EnergyForecastModel:
                 self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
 
                 # 3. Create hourly regime_kwh_series (vectorized)
-                # Map daily labels to hourly timestamps
+                # Map daily labels to hourly timestamps (gaps forward-filled, leading gaps give 0)
                 ts_idx = pd.to_datetime(df["timestamp"])
-                hourly_labels = ts_idx.dt.date
-                # Reindex labels to all dates in df, ffill any gaps
-                mapped_labels = labels.reindex(hourly_labels).ffill().fillna(-1).astype(int).values
-
-                # Use centroids matrix to lookup values for each hour
-                regime_rows = np.zeros(len(ts_idx))
-                valid_mask = mapped_labels >= 0
-                if valid_mask.any():
-                    hours = ts_idx.dt.hour.values
-                    n_clusters = self._clusterer.centroids.shape[0]
-                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_rows[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
+                n_clusters = self._clusterer.centroids.shape[0]
+                regime_rows = clustering.regime_kwh_from_proba(
+                    clustering.one_hot(labels, n_clusters), ts_idx, self._clusterer.centroids
+                )
 
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
 
@@ -1202,7 +1194,6 @@ class EnergyForecastModel:
 
                 # 2. Predict regime IDs
                 predicted_labels = self._regime_model.predict(daily_features)
-                regime_map = dict(zip(daily_features.index, predicted_labels))
 
                 # 2b. Capture label/probabilities for the production regime log (prediction-neutral)
                 if self._enable_regimes:
@@ -1224,18 +1215,9 @@ class EnergyForecastModel:
                 # Mirror training ffill so partial/gap days get a filled label
                 # rather than -1 (which would zero out regime_kwh).
                 ts_idx = pd.to_datetime(feat_df["timestamp"])
-                hourly_labels = ts_idx.dt.date
-                date_series = pd.Series(hourly_labels)
-                label_series = date_series.map(regime_map).ffill().fillna(-1).astype(int)
-                mapped_labels = label_series.values
-
-                regime_vals = np.zeros(len(ts_idx))
-                valid_mask = mapped_labels >= 0
-                if valid_mask.any():
-                    hours = ts_idx.dt.hour.values
-                    n_clusters = self._clusterer.centroids.shape[0]
-                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_vals[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
+                n_clusters = self._clusterer.centroids.shape[0]
+                _label_df = clustering.one_hot(pd.Series(predicted_labels, index=daily_features.index), n_clusters)
+                regime_vals = clustering.regime_kwh_from_proba(_label_df, ts_idx, self._clusterer.centroids)
                 feat_df["regime_kwh"] = regime_vals
             except Exception as e:
                 _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
