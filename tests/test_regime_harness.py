@@ -384,3 +384,73 @@ def test_arm_specs_name_every_regime_mode(br):
     assert br.ARM_SPECS["TB"][1]["regime_oof_cv"] == "blocked"
     assert br.ARM_SPECS["T"][1]["regime_oof_cv"] == "shuffled"
     assert br.ARM_SPECS["TJ"][1]["regime_oof_cv"] == "shuffled"
+
+
+# ── check_regime_stability.py (#110 post-deploy check) ────────────────────────
+
+
+@pytest.fixture(scope="module")
+def sc():
+    path = _REPO_ROOT / "scripts" / "check_regime_stability.py"
+    if not path.exists():
+        pytest.skip("scripts/check_regime_stability.py not present in this checkout")
+    spec = importlib.util.spec_from_file_location("check_regime_stability", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["check_regime_stability"] = mod
+    spec.loader.exec_module(mod)
+    yield mod
+    del sys.modules["check_regime_stability"]
+
+
+def _line(ts, kwh, target="2026-11-04", trained="2026-11-03T06:00:00"):
+    return {"ts": ts, "last_trained": trained, "target_date": target, "tomorrow_kwh": kwh}
+
+
+def test_delta_share_basic(sc):
+    lines = [
+        _line("2026-11-03T22:00:00", 20.0),
+        _line("2026-11-03T23:00:00", 20.5),  # |d| 0.5
+        _line("2026-11-04T00:00:00", 23.5),  # |d| 3.0 -> over
+        _line("2026-11-04T01:00:00", 23.0),  # |d| 0.5
+    ]
+    assert sc.delta_share(lines) == pytest.approx(1 / 3)
+
+
+def test_delta_share_skips_rollover(sc):
+    lines = [
+        _line("2026-11-03T23:00:00", 20.0, target="2026-11-04"),
+        _line("2026-11-04T00:00:00", 30.0, target="2026-11-05"),  # different target_date: not a pair
+        _line("2026-11-04T01:00:00", 30.5, target="2026-11-05"),
+    ]
+    assert sc.delta_share(lines) == 0.0
+    assert len(sc.delta_pairs(lines)) == 1
+
+
+def test_delta_share_skips_retrain_boundary(sc):
+    lines = [
+        _line("2026-11-04T05:00:00", 20.0, trained="2026-11-03T06:00:00"),
+        _line("2026-11-04T07:00:00", 30.0, trained="2026-11-04T06:00:00"),  # new model: not a pair
+        _line("2026-11-04T08:00:00", 30.5, trained="2026-11-04T06:00:00"),
+    ]
+    assert sc.delta_share(lines) == 0.0
+    assert len(sc.delta_pairs(lines)) == 1
+
+
+def test_verdict_inconclusive_below_50_pairs(sc):
+    assert sc.verdict_share(pre=(0.5, 49), post=(0.0, 200)) == "INCONCLUSIVE"
+    assert sc.verdict_share(pre=(0.5, 200), post=(0.0, 49)) == "INCONCLUSIVE"
+    assert sc.verdict_share(pre=(0.2, 50), post=(0.2, 50)) == "PASS"
+    assert sc.verdict_share(pre=(0.2, 50), post=(0.3, 50)) == "FAIL"
+
+
+def test_daily_mae_uses_only_complete_days(sc):
+    pred, act = {}, {}
+    for h in range(24):  # 2026-11-01: complete, pred 1.0/h, actual 1.5/h -> |24-36| = 12
+        t = f"2026-11-01T{h:02d}:00:00"
+        pred[t], act[t] = 1.0, 1.5
+    for h in range(23):  # 2026-11-02: one hour missing from actuals -> skipped
+        t = f"2026-11-02T{h:02d}:00:00"
+        pred[t], act[t] = 1.0, 9.0
+    pred["2026-11-02T23:00:00"] = 1.0
+    mae, n = sc.daily_mae({"pred": pred, "actuals": act}, "2026-11-01", "2026-11-03")
+    assert n == 1 and mae == pytest.approx(12.0)
