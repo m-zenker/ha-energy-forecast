@@ -21,7 +21,7 @@ _LOGGER = logging.getLogger("energy_forecast")
 try:
     from sklearn.cluster import KMeans
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+    from sklearn.model_selection import KFold, TimeSeriesSplit, cross_val_predict, cross_val_score
 
     SKLEARN_AVAILABLE = True
 except ImportError as exc:
@@ -141,17 +141,25 @@ class RegimePredictor:
         labels: pd.Series,
         sample_weight: pd.Series | None = None,
         verbose: bool = True,
-    ):
+        n_clusters: int | None = None,
+    ) -> pd.DataFrame | None:
         """Train the regime classifier.
 
         Args:
             daily_features: DataFrame indexed by date with weather/calendar features.
             labels: Series of cluster IDs indexed by date.
             sample_weight: Optional Series of daily weights indexed by date.
+            n_clusters: Column count of the returned matrix (default ``max(labels) + 1``).
+
+        Returns:
+            The 5-fold out-of-fold class-probability matrix (index = dates used for
+            training, columns ``range(n_clusters)``, classes never seen give 0), or
+            None if training was skipped or the out-of-fold step failed.
         """
         if not SKLEARN_AVAILABLE:
-            return
+            return None
 
+        oof: pd.DataFrame | None = None
         try:
             # Ensure indices match
             common_idx = daily_features.index.intersection(labels.index)
@@ -166,7 +174,7 @@ class RegimePredictor:
                     fit_kwargs["sample_weight"] = w
 
             if len(X) < 14:
-                return
+                return None
 
             self.model = RandomForestClassifier(
                 n_estimators=100,
@@ -177,6 +185,8 @@ class RegimePredictor:
             )
             self.model.fit(X, y, **fit_kwargs)
             self.is_fitted = True
+
+            oof = self._out_of_fold_proba(X, y, fit_kwargs, n_clusters if n_clusters is not None else int(y.max()) + 1)
 
             train_acc = self.model.score(X, y)
             oob_acc = self.model.oob_score_
@@ -208,8 +218,32 @@ class RegimePredictor:
                     tscv_scores.mean(),
                 )
 
+            return oof
+
         except Exception as e:
             _LOGGER.error(f"Regime Predictor training failed: {e}")
+            return oof  # keep the out-of-fold matrix if only the later CV diagnostics failed
+
+    @staticmethod
+    def _out_of_fold_proba(X: pd.DataFrame, y: pd.Series, fit_kwargs: dict, n_clusters: int) -> pd.DataFrame | None:
+        """5-fold out-of-fold class probabilities (a day is never scored by a forest that saw its label)."""
+        try:
+            clf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3)
+            raw = cross_val_predict(
+                clf,
+                X,
+                y,
+                cv=KFold(5, shuffle=True, random_state=42),
+                method="predict_proba",
+                params=fit_kwargs or None,
+            )
+            out = np.zeros((len(X), n_clusters), dtype=float)
+            for j, cls in enumerate(np.unique(y)):
+                out[:, min(max(int(cls), 0), n_clusters - 1)] += raw[:, j]
+            return pd.DataFrame(out, index=X.index, columns=range(n_clusters))
+        except Exception as e:
+            _LOGGER.warning(f"Regime out-of-fold probabilities failed: {e}")
+            return None
 
     def predict(self, daily_features: pd.DataFrame) -> np.ndarray:
         """Predict cluster IDs for the given daily features."""

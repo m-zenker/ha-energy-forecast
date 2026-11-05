@@ -709,3 +709,63 @@ def test_missing_class_column_zero_finite():
     out = regime_kwh_from_proba(proba, _ts([d]), _C)
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out, [_C[0, h] for h in (0, 5, 23)])
+
+
+# ── RegimePredictor.fit out-of-fold matrix (#110 Part B2) ─────────────────────
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_returns_oof_matrix_aligned():
+    feats, labels = _make_daily_features(n=40)
+    feats = feats.iloc[2:]  # labels has 2 extra leading dates
+    oof = RegimePredictor().fit(feats, labels, n_clusters=2)
+    assert list(oof.index) == list(feats.index.intersection(labels.index))
+    assert list(oof.columns) == [0, 1]
+    np.testing.assert_allclose(oof.sum(axis=1), 1.0)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_oof_no_zero_rows_with_heavy_weights():
+    """Regression: weighted-bootstrap OOB left all-zero rows on sklearn 1.9."""
+    feats, labels = _make_daily_features(n=60)
+    w = pd.Series(np.linspace(1, 40, len(feats)), index=feats.index)
+    oof = RegimePredictor().fit(feats, labels, sample_weight=w, n_clusters=2)
+    assert (oof.sum(axis=1) > 0).all()
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_oof_rare_class_column():
+    feats, labels = _make_daily_features(n=40)
+    labels = labels.copy()
+    labels.iloc[[5, 15, 25]] = 2  # class 2 appears on only 3 days
+    oof = RegimePredictor().fit(feats, labels, n_clusters=3)
+    assert list(oof.columns) == [0, 1, 2]
+    assert np.isfinite(oof.to_numpy()).all()
+    np.testing.assert_allclose(oof.sum(axis=1), 1.0)
+
+
+def test_fit_short_returns_none():
+    feats, labels = _make_daily_features(n=10)
+    assert RegimePredictor().fit(feats, labels, n_clusters=2) is None
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_cv_failure_keeps_oof(monkeypatch):
+    import apps.energy_forecast.clustering as clustering
+
+    def boom(*a, **k):
+        raise RuntimeError("cv down")
+
+    monkeypatch.setattr(clustering, "cross_val_score", boom)
+    feats, labels = _make_daily_features(n=40)
+    rp = RegimePredictor()
+    oof = rp.fit(feats, labels, n_clusters=2)
+    assert oof is not None and rp.is_fitted
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_does_not_add_attributes():
+    feats, labels = _make_daily_features(n=40)
+    rp = RegimePredictor()
+    rp.fit(feats, labels, n_clusters=2)
+    assert set(vars(rp)) == {"model", "is_fitted"}
