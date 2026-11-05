@@ -9,6 +9,8 @@ from apps.energy_forecast.clustering import (
     DailyProfileClusterer,
     RegimePredictor,
     find_optimal_k,
+    one_hot,
+    regime_kwh_from_proba,
 )
 from apps.energy_forecast.model import _prepare_daily_regime_features
 
@@ -241,6 +243,22 @@ def test_oob_warning_emitted_near_chance(caplog):
     oob = predictor.model.oob_score_
     if oob < 0.5:
         assert any("near chance" in r.message for r in caplog.records)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_blocked_oof_rare_class_in_one_block():
+    """A class living entirely inside one blocked fold (days 17-19 of 40; fold 3 = days 16-23) is never seen
+    by the forest that scores that fold: probabilities stay finite, sum to 1, and class 2 is exactly 0 there."""
+    feats, labels = _make_daily_features(n=40)
+    labels = labels.copy()
+    labels.iloc[17:20] = 2
+    oof = RegimePredictor().fit(feats, labels, n_clusters=3, oof_cv="blocked")
+
+    assert oof is not None
+    assert list(oof.columns) == [0, 1, 2]
+    assert np.isfinite(oof.to_numpy()).all()
+    np.testing.assert_allclose(oof.sum(axis=1).to_numpy(), 1.0)
+    assert (oof.iloc[16:24][2] == 0).all()
 
 
 # ── _prepare_daily_regime_features: occupancy columns ────────────────────────
@@ -653,3 +671,152 @@ def test_predict_proba_clips_classes_beyond_n_clusters():
     assert list(df.columns) == [0, 1]
     assert np.isfinite(df.to_numpy()).all()
     assert np.allclose(df.sum(axis=1), 1)
+
+
+# ── regime_kwh_from_proba / one_hot (#110 Part B1) ────────────────────────────
+
+_C = np.array([[float(h) for h in range(24)], [100.0 + h for h in range(24)]])  # k=2 centroids
+
+
+def _ts(dates, hours=(0, 5, 23)):
+    return pd.Series(pd.to_datetime([f"{d} {h:02d}:00" for d in dates for h in hours]))
+
+
+def test_one_hot_matches_centroid_lookup():
+    days = [pd.Timestamp("2026-01-01").date(), pd.Timestamp("2026-01-02").date(), pd.Timestamp("2026-01-03").date()]
+    labels = pd.Series([0, 1, 0], index=days)
+    ts = _ts(days)
+    out = regime_kwh_from_proba(one_hot(labels, 2), ts, _C)
+    expected = [_C[labels[t.date()], t.hour] for t in ts]
+    np.testing.assert_allclose(out, expected)
+
+
+def test_soft_is_weighted_sum():
+    d = pd.Timestamp("2026-01-01").date()
+    proba = pd.DataFrame([[0.25, 0.75]], index=[d], columns=[0, 1])
+    out = regime_kwh_from_proba(proba, _ts([d]), _C)
+    np.testing.assert_allclose(out, [0.25 * _C[0, h] + 0.75 * _C[1, h] for h in (0, 5, 23)])
+
+
+def test_ffill_absent_dates_and_leading_zero():
+    d0, d1, d2, d3 = (pd.Timestamp(f"2026-01-0{i}").date() for i in (1, 2, 3, 4))
+    proba = pd.DataFrame([[0.0, 1.0]], index=[d2], columns=[0, 1])  # only d2 present
+    out = regime_kwh_from_proba(proba, _ts([d0, d1, d2, d3], hours=(5,)), _C)
+    # d0, d1 absent before first present date -> 0; d2 used; d3 absent -> forward-filled from d2
+    np.testing.assert_allclose(out, [0.0, 0.0, _C[1, 5], _C[1, 5]])
+
+
+def test_negative_label_gives_zero_row():
+    d = pd.Timestamp("2026-01-01").date()
+    oh = one_hot(pd.Series([-1], index=[d]), 2)
+    assert (oh.to_numpy() == 0).all()
+    np.testing.assert_allclose(regime_kwh_from_proba(oh, _ts([d]), _C), 0.0)
+
+
+def test_label_ge_k_clipped():
+    d = pd.Timestamp("2026-01-01").date()
+    oh = one_hot(pd.Series([7], index=[d]), 2)
+    assert oh.iloc[0].tolist() == [0.0, 1.0]
+
+
+def test_missing_class_column_zero_finite():
+    d = pd.Timestamp("2026-01-01").date()
+    proba = pd.DataFrame([[1.0, 0.0]], index=[d], columns=[0, 1])
+    out = regime_kwh_from_proba(proba, _ts([d]), _C)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, [_C[0, h] for h in (0, 5, 23)])
+
+
+# ── RegimePredictor.fit out-of-fold matrix (#110 Part B2) ─────────────────────
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_returns_oof_matrix_aligned():
+    feats, labels = _make_daily_features(n=40)
+    feats = feats.iloc[2:]  # labels has 2 extra leading dates
+    oof = RegimePredictor().fit(feats, labels, n_clusters=2)
+    assert list(oof.index) == list(feats.index.intersection(labels.index))
+    assert list(oof.columns) == [0, 1]
+    np.testing.assert_allclose(oof.sum(axis=1), 1.0)
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_oof_no_zero_rows_with_heavy_weights():
+    """Regression: weighted-bootstrap OOB left all-zero rows on sklearn 1.9."""
+    feats, labels = _make_daily_features(n=60)
+    w = pd.Series(np.linspace(1, 40, len(feats)), index=feats.index)
+    oof = RegimePredictor().fit(feats, labels, sample_weight=w, n_clusters=2)
+    assert (oof.sum(axis=1) > 0).all()
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_oof_rare_class_column():
+    feats, labels = _make_daily_features(n=40)
+    labels = labels.copy()
+    labels.iloc[[5, 15, 25]] = 2  # class 2 appears on only 3 days
+    oof = RegimePredictor().fit(feats, labels, n_clusters=3)
+    assert list(oof.columns) == [0, 1, 2]
+    assert np.isfinite(oof.to_numpy()).all()
+    np.testing.assert_allclose(oof.sum(axis=1), 1.0)
+
+
+def test_fit_short_returns_none():
+    feats, labels = _make_daily_features(n=10)
+    assert RegimePredictor().fit(feats, labels, n_clusters=2) is None
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_cv_failure_keeps_oof(monkeypatch):
+    import apps.energy_forecast.clustering as clustering
+
+    def boom(*a, **k):
+        raise RuntimeError("cv down")
+
+    monkeypatch.setattr(clustering, "cross_val_score", boom)
+    feats, labels = _make_daily_features(n=40)
+    rp = RegimePredictor()
+    oof = rp.fit(feats, labels, n_clusters=2)
+    assert oof is not None and rp.is_fitted
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_does_not_add_attributes():
+    feats, labels = _make_daily_features(n=40)
+    rp = RegimePredictor()
+    rp.fit(feats, labels, n_clusters=2)
+    assert set(vars(rp)) == {"model", "is_fitted"}
+
+
+# ── Blocked out-of-fold folds (#110 variant TB) ───────────────────────────────
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_blocked_oof_uses_unshuffled_folds(monkeypatch):
+    import apps.energy_forecast.clustering as clustering
+
+    seen = {}
+    orig = clustering.cross_val_predict
+
+    def spy(*a, **k):
+        seen["cv"] = k["cv"]
+        return orig(*a, **k)
+
+    monkeypatch.setattr(clustering, "cross_val_predict", spy)
+    feats, labels = _make_daily_features(n=40)
+    RegimePredictor().fit(feats, labels, n_clusters=2, oof_cv="blocked")
+    assert seen["cv"].shuffle is False
+    RegimePredictor().fit(feats, labels, n_clusters=2)
+    assert seen["cv"].shuffle is True  # default unchanged
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_blocked_oof_is_aligned_and_order_independent():
+    feats, labels = _make_daily_features(n=40)
+    w = pd.Series(np.linspace(1, 5, len(feats)), index=feats.index)
+    a = RegimePredictor().fit(feats, labels, sample_weight=w, n_clusters=2, oof_cv="blocked")
+    shuffled_rows = np.random.default_rng(0).permutation(len(feats))
+    b = RegimePredictor().fit(
+        feats.iloc[shuffled_rows], labels.iloc[shuffled_rows], sample_weight=w, n_clusters=2, oof_cv="blocked"
+    )
+    np.testing.assert_allclose(a.sum(axis=1), 1.0)
+    pd.testing.assert_frame_equal(a.sort_index(), b.sort_index())  # blocks follow the dates, not the row order
