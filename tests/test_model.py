@@ -6385,6 +6385,9 @@ class TestAutoKRegimeSelection:
 # ── Golden: regime_kwh feature column + predictions (#110) ───────────────────
 
 
+_TRAIN_DEFAULTS = object()  # sentinel: call train() with no regime arguments at all
+
+
 class TestRegimeGolden:
     """Pins today's regime_kwh column and predictions so later refactors prove they changed nothing.
 
@@ -6407,7 +6410,9 @@ class TestRegimeGolden:
         monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
         energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
         m = EnergyForecastModel(tmp_path)
-        extra = {**train_extra, **({} if regime_mode is None else {"regime_mode": regime_mode})}
+        # None -> explicit hard (the golden fixture predates the soft default); _TRAIN_DEFAULTS -> no regime args
+        mode_kw = {} if regime_mode is _TRAIN_DEFAULTS else {"regime_mode": regime_mode or "hard"}
+        extra = {**train_extra, **mode_kw}
         m.train(
             energy_df,
             weather_df,
@@ -7673,13 +7678,50 @@ class TestRegimeSoftOOF:
         monkeypatch.setattr(mdl, "_prepare_daily_regime_features", prep_spy)
         return cap
 
-    def test_default_mode_is_hard(self, tmp_path, monkeypatch):
+    def test_explicit_hard_mode_is_persisted(self, tmp_path, monkeypatch):
         import pickle
 
-        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="hard")
         assert m._regime_mode == "hard"
         with open(m._meta_path, "rb") as fh:
             assert pickle.load(fh)["regime_mode"] == "hard"
+
+    def test_default_train_is_soft_oof_blocked(self, tmp_path, monkeypatch):
+        import pickle
+
+        from energy_forecast.clustering import RegimePredictor
+
+        seen: dict = {}
+        orig = RegimePredictor.fit
+
+        def spy(self, *a, **k):
+            seen.update(k)
+            return orig(self, *a, **k)
+
+        monkeypatch.setattr(RegimePredictor, "fit", spy)
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode=_TRAIN_DEFAULTS)
+        assert m._regime_mode == "soft_oof"
+        assert seen["oof_cv"] == "blocked"
+        with open(m._meta_path, "rb") as fh:
+            assert pickle.load(fh)["regime_mode"] == "soft_oof"
+
+    def test_regimes_disabled_ignores_regime_mode_default(self, tmp_path, monkeypatch):
+        pytest.importorskip("sklearn")
+        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
+        energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, enable_regimes=False)
+        assert m._regime_mode == "hard"
+        assert m._regime_model is None
+
+    def test_auto_k_with_default_soft_oof(self, tmp_path, monkeypatch):
+        pytest.importorskip("sklearn")
+        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
+        energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
+        m = EnergyForecastModel(tmp_path)
+        m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, enable_regimes=True, regime_count=0)
+        assert 2 <= m._regime_count <= 8
+        assert m._regime_mode == "soft_oof"
 
     def test_invalid_mode_raises(self, tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="regime_mode"):
@@ -7707,13 +7749,18 @@ class TestRegimeSoftOOF:
             assert len(day) > 0
             assert (day == 0).all()
 
-    def test_soft_oof_fit_failure_writes_hard(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("mode", ["soft_oof", _TRAIN_DEFAULTS], ids=["explicit", "defaults"])
+    def test_soft_oof_fit_failure_writes_hard(self, tmp_path, monkeypatch, mode):
+        import pickle
+
         from energy_forecast.clustering import RegimePredictor
 
         orig_fit = RegimePredictor.fit
         monkeypatch.setattr(RegimePredictor, "fit", lambda self, *a, **k: (orig_fit(self, *a, **k), None)[1])
-        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof")
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode=mode)
         assert m._regime_mode == "hard"
+        with open(m._meta_path, "rb") as fh:
+            assert pickle.load(fh)["regime_mode"] == "hard"
 
     def test_meta_roundtrip_and_missing_key(self, tmp_path, monkeypatch):
         import pickle

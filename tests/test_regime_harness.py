@@ -373,3 +373,14 @@ def test_arm_specs_variants_only_use_supported_train_overrides(br):
     params = set(inspect.signature(EnergyForecastModel.train).parameters)
     for arm, (_, overrides) in br.ARM_SPECS.items():
         assert set(overrides) - {"enable_regimes"} <= params, arm
+
+
+def test_arm_specs_name_every_regime_mode(br):
+    for arm in ("H", "J", "T", "TB", "TJ"):
+        assert "regime_mode" in br.ARM_SPECS[arm][1], arm
+    assert br.ARM_SPECS["N"][1] == {"enable_regimes": False}
+    assert br.ARM_SPECS["H"][1] == {"regime_mode": "hard"}
+    assert br.ARM_SPECS["J"][1] == {"regime_mode": "hard"}
+    assert br.ARM_SPECS["TB"][1]["regime_oof_cv"] == "blocked"
+    assert br.ARM_SPECS["T"][1]["regime_oof_cv"] == "shuffled"
+    assert br.ARM_SPECS["TJ"][1]["regime_oof_cv"] == "shuffled"

@@ -354,8 +354,8 @@ class EnergyForecastModel:
         heating_sub_meter_df: pd.DataFrame | None = None,  # cols: timestamp, kwh — space-heating sub-meter (#92)
         use_physics_residual: bool = False,
         heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
-        regime_mode: str = "hard",  # "hard": true daily labels; "soft_oof": out-of-fold probabilities (#110, private)
-        regime_oof_cv: str = "shuffled",  # soft_oof folds: "shuffled" | "blocked" (#110 experiment, private)
+        regime_mode: str = "soft_oof",  # "soft_oof": out-of-fold probabilities (#110); "hard": true daily labels
+        regime_oof_cv: str = "blocked",  # soft_oof folds: "blocked" (contiguous, default) | "shuffled" (backtest only)
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np

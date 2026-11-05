@@ -273,11 +273,11 @@ ARMS = ("H", "T", "N", "J")  # J = H retrained one hour earlier: the retrain-jit
 # Arm -> (cutoff offset in hours, train() overrides). Variants of T (#110): TJ = T's own jitter control,
 # TB = blocked out-of-fold folds.
 ARM_SPECS: dict[str, tuple[int, dict]] = {
-    "H": (0, {}),
-    "T": (0, {"regime_mode": "soft_oof"}),
+    "H": (0, {"regime_mode": "hard"}),
+    "T": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "shuffled"}),
     "N": (0, {"enable_regimes": False}),
-    "J": (-1, {}),
-    "TJ": (-1, {"regime_mode": "soft_oof"}),
+    "J": (-1, {"regime_mode": "hard"}),
+    "TJ": (-1, {"regime_mode": "soft_oof", "regime_oof_cv": "shuffled"}),
     "TB": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "blocked"}),
 }
 
