@@ -7706,13 +7706,15 @@ class TestRegimeSoftOOF:
             assert pickle.load(fh)["regime_mode"] == "soft_oof"
 
     def test_regimes_disabled_ignores_regime_mode_default(self, tmp_path, monkeypatch):
-        pytest.importorskip("sklearn")
-        monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
+        import pickle
+
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode=_TRAIN_DEFAULTS)
+        assert m._regime_mode == "soft_oof"  # precondition: the same instance was soft before
         energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
-        m = EnergyForecastModel(tmp_path)
         m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, enable_regimes=False)
         assert m._regime_mode == "hard"
-        assert m._regime_model is None
+        with open(m._meta_path, "rb") as fh:
+            assert pickle.load(fh)["regime_mode"] == "hard"
 
     def test_auto_k_with_default_soft_oof(self, tmp_path, monkeypatch):
         pytest.importorskip("sklearn")

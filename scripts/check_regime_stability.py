@@ -39,7 +39,12 @@ def load_lines(path: Path) -> list[dict]:
 
 def delta_pairs(lines: list[dict]) -> list[float]:
     """|Δ tomorrow_kwh| between consecutive lines with the same target_date and the same last_trained."""
-    ordered = sorted(lines, key=lambda r: r["ts"])
+    ordered = sorted(
+        lines,
+        key=lambda r: pd.Timestamp(r["ts"]).tz_convert("UTC")
+        if pd.Timestamp(r["ts"]).tzinfo
+        else pd.Timestamp(r["ts"]).tz_localize("UTC"),
+    )
     deltas: list[float] = []
     prev = None
     for cur in ordered:
@@ -95,6 +100,24 @@ def _window(lines: list[dict], lo: pd.Timestamp, hi: pd.Timestamp) -> list[dict]
     return [r for r in lines if lo <= pd.Timestamp(r["ts"]).tz_localize(None) < hi]
 
 
+def _naive(ts: str) -> pd.Timestamp:
+    """Local wall time: a tz-aware timestamp keeps its wall clock, a naive one is taken as local."""
+    t = pd.Timestamp(ts)
+    return t.tz_localize(None) if t.tzinfo else t
+
+
+def post_start(lines: list[dict], deploy: pd.Timestamp) -> pd.Timestamp:
+    """Timestamp of the first log line written by a model trained after the deploy (the retrain that applies the
+    change), or ``deploy`` when none is found yet. Forecasts before it still come from the old model."""
+    before = [r for r in lines if _naive(r["ts"]) < deploy and r.get("last_trained")]
+    old = max(before, key=lambda r: _naive(r["ts"]))["last_trained"] if before else None
+    after = sorted((r for r in lines if _naive(r["ts"]) >= deploy), key=lambda r: _naive(r["ts"]))
+    for r in after:
+        if r.get("last_trained") and r["last_trained"] != old:
+            return _naive(r["ts"])
+    return deploy
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--deploy", required=True, help="ISO local time of the deploy")
@@ -103,14 +126,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--threshold", type=float, default=2.0)
     args = ap.parse_args(argv)
 
-    deploy, rebase = pd.Timestamp(args.deploy), pd.Timestamp(args.rebaseline)
+    deploy, rebase = _naive(args.deploy), _naive(args.rebaseline)
     pre_lo = max(rebase, deploy - pd.Timedelta(days=WINDOW_DAYS))
     post_hi = deploy + pd.Timedelta(days=WINDOW_DAYS)
     data = Path(args.data_dir)
 
     lines = [r for r in load_lines(data / "regime_log.jsonl") if "ts" in r]
+    post_lo = post_start(lines, deploy)
+    if post_lo == deploy:
+        print("note: no post-deploy retrain found in regime_log.jsonl yet; post window starts at the deploy time")
     res = {}
-    for name, lo, hi in (("pre", pre_lo, deploy), ("post", deploy, post_hi)):
+    for name, lo, hi in (("pre", pre_lo, deploy), ("post", post_lo, post_hi)):
         w = _window(lines, lo, hi)
         d = delta_pairs(w)
         share = (sum(x > args.threshold for x in d) / len(d)) if d else float("nan")
@@ -127,7 +153,9 @@ def main(argv: list[str] | None = None) -> int:
     if ph_path.exists():
         ph = json.loads(ph_path.read_text())
         pre_mae, n_pre = daily_mae(ph, str(pre_lo.date()), str(deploy.date()))
-        post_mae, n_post = daily_mae(ph, str(deploy.date()), str(post_hi.date()))
+        # pred_history keeps predictions made <= 25 h ahead: the first fully new-model day starts after that
+        mae_lo = post_lo if post_lo == deploy else (post_lo + pd.Timedelta(hours=25)).ceil("D")
+        post_mae, n_post = daily_mae(ph, str(mae_lo.date()), str(post_hi.date()))
         print(f" MAE: pre {pre_mae:.3f} kWh/day (n={n_pre} d)  post {post_mae:.3f} kWh/day (n={n_post} d)")
         if n_pre and n_post:
             v2 = "PASS" if post_mae <= MAE_TOL * pre_mae else "FAIL"

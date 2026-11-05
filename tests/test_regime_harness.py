@@ -1,6 +1,7 @@
 """Tests for scripts/regime_harness.py (#110 Part C): live-equivalent loader + prediction inputs."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -454,3 +455,34 @@ def test_daily_mae_uses_only_complete_days(sc):
     pred["2026-11-02T23:00:00"] = 1.0
     mae, n = sc.daily_mae({"pred": pred, "actuals": act}, "2026-11-01", "2026-11-03")
     assert n == 1 and mae == pytest.approx(12.0)
+
+
+def test_post_start_skips_old_model_lines(sc):
+    lines = [
+        _line("2026-11-05T20:00:00+01:00", 20.0, trained="2026-11-05T06:00:00"),
+        _line("2026-11-05T22:00:00+01:00", 20.1, trained="2026-11-05T06:00:00"),
+        _line("2026-11-05T23:00:00+01:00", 20.2, trained="2026-11-05T06:00:00"),  # after deploy, old model
+        _line("2026-11-05T23:30:00+01:00", 21.0, trained="2026-11-05T23:20:00"),  # startup retrain
+    ]
+    got = sc.post_start(lines, pd.Timestamp("2026-11-05T22:30"))
+    assert got == pd.Timestamp("2026-11-05T23:30")
+    assert sc.post_start(lines[:3], pd.Timestamp("2026-11-05T22:30")) == pd.Timestamp("2026-11-05T22:30")
+
+
+def test_main_accepts_offset_arguments_and_offset_log(sc, tmp_path):
+    (tmp_path / "regime_log.jsonl").write_text(
+        "\n".join(json.dumps(_line(f"2026-11-0{d}T10:00:00+01:00", 20.0)) for d in (3, 4, 5)) + "\n"
+    )
+    rc = sc.main(
+        ["--deploy", "2026-11-05T09:00+01:00", "--rebaseline", "2026-11-03T00:00+01:00", "--data-dir", str(tmp_path)]
+    )
+    assert rc == 1  # INCONCLUSIVE (too few pairs), but it must not crash
+
+
+def test_delta_pairs_orders_by_instant_across_dst(sc):
+    lines = [
+        _line("2026-10-25T02:45:00+02:00", 20.0),
+        _line("2026-10-25T02:15:00+01:00", 25.0),  # later instant, sorts earlier as a string
+        _line("2026-10-25T03:30:00+01:00", 25.5),
+    ]
+    assert sc.delta_pairs(lines) == pytest.approx([5.0, 0.5])
