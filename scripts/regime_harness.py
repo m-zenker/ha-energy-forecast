@@ -176,6 +176,34 @@ class TrainRecorder(MagicMock):
 _SEEDED_STATE = ("physics_calibration.json", "physics_schedule.json")
 
 
+def _has_rows(path: Path) -> bool:
+    try:
+        return len(pd.read_csv(path, usecols=[0])) > 0
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return False
+
+
+def prune_unavailable_sensors(cfg: dict, scratch: Path) -> dict:
+    """Drop sub-energy sensors and climate entities whose trimmed cache has no rows at the cutoff.
+
+    For a historical cutoff those sensors were not configured yet. Keeping them would hand training empty
+    frames while the feature list still expects their columns (found with the January fold, 2026-11-05).
+    """
+    out = dict(cfg)
+    kept_sub = []
+    for item in cfg.get("sub_energy_sensors") or []:
+        eid = str(item["entity_id"] if isinstance(item, dict) else item)
+        if _has_rows(scratch / f"sub_{eid.split('.', 1)[-1].replace('.', '_')}.csv"):
+            kept_sub.append(item)
+    out["sub_energy_sensors"] = kept_sub
+    out["climate_entities"] = [
+        e
+        for e in cfg.get("climate_entities") or []
+        if _has_rows(scratch / f"climate_{str(e).split('.', 1)[-1].replace('.', '_')}.csv")
+    ]
+    return out
+
+
 def make_app(cfg: dict, scratch: Path, seed_physics_from: Path | None = None):
     """Run the real ``initialize()`` on a MagicMock-based app whose caches live in *scratch*.
 
@@ -194,7 +222,7 @@ def make_app(cfg: dict, scratch: Path, seed_physics_from: Path | None = None):
             if (seed_physics_from / name).exists():
                 shutil.copy2(seed_physics_from / name, models / name)
 
-    args = dict(cfg)
+    args = prune_unavailable_sensors(cfg, scratch)
     args["cache_path"] = str(scratch / "energy_history.csv")
     args["mqtt_discovery"] = False
     app = ef.EnergyForecast()

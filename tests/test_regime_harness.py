@@ -227,3 +227,138 @@ def test_physics_state_seeded_only_on_request(rh, data_dir, tmp_path):
     )
     assert plain["physics_model"]._calib.get("Q_dhw_daily") != 4.25
     assert seeded["physics_model"]._calib.get("Q_dhw_daily") == 4.25
+
+
+# ── Decision rule (#110 Part C3) ──────────────────────────────────────────────
+
+
+def _arm(pooled=1.0, primary=1.0, jan=1.0, max_delta=5.0, n_over_2=4):
+    return {"pooled_mae": pooled, "primary_mae": primary, "jan_mae": jan, "max_delta": max_delta, "n_over_2": n_over_2}
+
+
+def _res(**arms):
+    r = {"H": _arm(), **arms}
+    return r
+
+
+def test_decide_t_when_both_pass_and_n_not_3pct_better(br):
+    r = _res(T=_arm(max_delta=2.0, n_over_2=1), N=_arm(pooled=0.98, jan=0.97, max_delta=2.0, n_over_2=1))
+    assert br.decide(r) == "T"
+
+
+def test_decide_n_when_3pct_pooled(br):
+    r = _res(T=_arm(max_delta=2.0, n_over_2=1), N=_arm(pooled=0.96, max_delta=1.0, n_over_2=0))
+    assert br.decide(r) == "N"
+
+
+def test_decide_n_when_5pct_january(br):
+    r = _res(T=_arm(max_delta=2.0, n_over_2=1), N=_arm(jan=0.94, max_delta=1.0, n_over_2=0))
+    assert br.decide(r) == "N"
+
+
+def test_decide_only_passing_candidate(br):
+    r = _res(T=_arm(pooled=1.10, max_delta=2.0, n_over_2=1), N=_arm(max_delta=2.0, n_over_2=1))
+    assert br.decide(r) == "N"
+    r = _res(T=_arm(max_delta=2.0, n_over_2=1), N=_arm(max_delta=9.0))
+    assert br.decide(r) == "T"
+
+
+def test_decide_h_when_none_pass(br):
+    r = _res(T=_arm(primary=1.20, max_delta=2.0), N=_arm(max_delta=6.0))
+    assert br.decide(r) == "H"
+
+
+def test_decide_without_t_arm(br):
+    assert br.decide(_res(N=_arm(max_delta=2.0, n_over_2=1))) == "N"
+    assert br.decide(_res()) == "H"
+
+
+def test_sensitivity_requires_strictly_lower_max(br):
+    assert br.decide(_res(T=_arm(max_delta=5.0, n_over_2=1))) == "H"  # equal max does not pass
+    assert br.decide(_res(T=_arm(max_delta=4.99, n_over_2=1))) == "T"
+
+
+def test_count_over_2_allows_equal(br):
+    h = {"H": _arm(n_over_2=0), "T": _arm(max_delta=1.0, n_over_2=0)}
+    assert br.decide(h) == "T"
+    h["T"]["n_over_2"] = 1
+    assert br.decide(h) == "H"
+
+
+def test_decide_ignores_stability_gain_within_jitter(br):
+    r = _res(T=_arm(max_delta=4.6, n_over_2=1))  # 8 % lower max delta
+    assert br.decide(r) == "T"
+    r["J"] = _arm(max_delta=5.5)  # H retrained 1 h earlier moves max delta by 10 %: the gain is noise
+    assert br.decide(r) == "H"
+
+
+def test_decide_n_must_beat_t_by_more_than_jitter(br):
+    r = _res(T=_arm(max_delta=2.0, n_over_2=1), N=_arm(pooled=0.96, max_delta=1.0, n_over_2=0))
+    assert br.decide(r) == "N"
+    r["J"] = _arm(pooled=1.05, max_delta=5.0)  # 5 % pooled jitter swamps N's 4 % edge
+    assert br.decide(r) == "T"
+
+
+# ── Backtest helpers (#110 Part C3) ───────────────────────────────────────────
+
+
+def test_weekly_cutoffs_and_origins_cover_every_origin_once(br):
+    first, last = pd.Timestamp("2026-10-14"), pd.Timestamp("2026-11-03")
+    cuts = br.weekly_cutoffs(first, last)
+    assert [c.strftime("%m-%d %H") for c in cuts] == ["10-14 06", "10-21 06", "10-28 06"]
+    origins = [o for c in cuts for o in br.origins_for(c, last)]
+    assert len(origins) == len(set(origins)) == 21  # 21 target days, each served by exactly one model
+    assert origins[0] == pd.Timestamp("2026-10-14 17:00") and origins[-1] == pd.Timestamp("2026-11-03 17:00")
+    assert all(o >= c for c in cuts for o in br.origins_for(c, last))  # a model never serves a day before its cutoff
+
+
+def test_arm_cutoff_jitter_control_is_one_hour_earlier(br):
+    c = pd.Timestamp("2026-10-14 06:00")
+    assert br.arm_cutoff("H", c) == c and br.arm_cutoff("T", c) == c
+    assert br.arm_cutoff("J", c) == c - pd.Timedelta(hours=1)
+
+
+def test_scale_sunshine_only_touches_future_hours(br):
+    origin = pd.Timestamp("2026-01-04 17:00")
+    fc = _weather("2026-01-01 17:00", 24 * 6)
+    out = br.scale_sunshine({"forecast_df": fc, "x": 1}, origin, 0.5)
+    ts = pd.to_datetime(out["forecast_df"]["timestamp"])
+    assert (out["forecast_df"].loc[ts < origin, "sunshine_min"] == 20.0).all()
+    assert (out["forecast_df"].loc[ts >= origin, "sunshine_min"] == 10.0).all()
+    assert (fc["sunshine_min"] == 20.0).all()  # input frame untouched
+    assert out["x"] == 1
+
+
+def test_fold_metrics(br):
+    df = pd.DataFrame(
+        {
+            "fold": ["primary", "primary", "jan", "primary"],
+            "base": [10.0, 12.0, 8.0, 9.0],
+            "lo": [9.0, 12.5, 5.0, 9.0],
+            "hi": [11.0, 12.0, 8.5, 9.0],
+            "actual": [11.0, 10.0, 9.0, np.nan],  # last row is not scoreable
+        }
+    )
+    m = br.fold_metrics(df)
+    assert m["n_scored"] == 3
+    assert m["primary_mae"] == pytest.approx(1.5) and m["jan_mae"] == pytest.approx(1.0)
+    assert m["pooled_mae"] == pytest.approx(4 / 3)
+    assert m["max_delta"] == pytest.approx(3.0)  # jan row: |5.0 - 8.0|
+    assert m["n_over_2"] == 1
+    assert m["mean_bias"] == pytest.approx((-1 + 2 - 1) / 3)
+
+
+def test_prune_unavailable_sensors_drops_sensors_without_rows_at_cutoff(rh, tmp_path):
+    ts = ["2026-01-01 00:00:00", "2026-01-01 01:00:00"]
+    pd.DataFrame({"timestamp": ts, "kwh": [1.0, 2.0]}).to_csv(tmp_path / "sub_washer.csv", index=False)
+    pd.DataFrame({"timestamp": [], "kwh": []}).to_csv(tmp_path / "sub_dryer.csv", index=False)  # trimmed to empty
+    pd.DataFrame({"timestamp": ts, "current_temp": [20.0, 20.0]}).to_csv(tmp_path / "climate_a.csv", index=False)
+    cfg = {
+        "energy_sensor": "sensor.x",
+        "sub_energy_sensors": ["sensor.washer", {"entity_id": "sensor.dryer", "program_sensor": "sensor.p"}],
+        "climate_entities": ["climate.a", "climate.b"],  # b has no cache file at all
+    }
+    out = rh.prune_unavailable_sensors(cfg, tmp_path)
+    assert out["sub_energy_sensors"] == ["sensor.washer"]
+    assert out["climate_entities"] == ["climate.a"]
+    assert cfg["sub_energy_sensors"][1]["entity_id"] == "sensor.dryer"  # input config untouched
