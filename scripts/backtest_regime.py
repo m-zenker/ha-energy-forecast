@@ -270,6 +270,19 @@ SUN_FACTORS = (0.66, 1.5)
 CUTOFF_HOUR = 6  # weekly retrain at 06:00 local, like the live early-morning retrain
 ARMS = ("H", "T", "N", "J")  # J = H retrained one hour earlier: the retrain-jitter control
 
+# Arm -> (cutoff offset in hours, train() overrides). Variants of T (#110): TJ = T's own jitter control,
+# TB = blocked out-of-fold folds, TF = fall back to regime_kwh = 0 when out-of-fold accuracy < 0.5, TBF = both.
+ARM_SPECS: dict[str, tuple[int, dict]] = {
+    "H": (0, {}),
+    "T": (0, {"regime_mode": "soft_oof"}),
+    "N": (0, {"enable_regimes": False}),
+    "J": (-1, {}),
+    "TJ": (-1, {"regime_mode": "soft_oof"}),
+    "TB": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "blocked"}),
+    "TF": (0, {"regime_mode": "soft_oof", "regime_min_oof_acc": 0.5}),
+    "TBF": (0, {"regime_mode": "soft_oof", "regime_oof_cv": "blocked", "regime_min_oof_acc": 0.5}),
+}
+
 
 def weekly_cutoffs(first_origin_day: pd.Timestamp, last_origin_day: pd.Timestamp) -> list[pd.Timestamp]:
     out, d = [], first_origin_day.normalize()
@@ -285,7 +298,7 @@ def origins_for(cutoff: pd.Timestamp, last_origin_day: pd.Timestamp) -> list[pd.
 
 
 def arm_cutoff(arm: str, cutoff: pd.Timestamp) -> pd.Timestamp:
-    return cutoff - pd.Timedelta(hours=1) if arm == "J" else cutoff
+    return cutoff + pd.Timedelta(hours=ARM_SPECS[arm][0])
 
 
 def scale_sunshine(inputs: dict, origin: pd.Timestamp, factor: float) -> dict:
@@ -313,7 +326,9 @@ def fold_metrics(df: pd.DataFrame) -> dict:
     }
 
 
-def run_backtest(data_dir: Path, root: Path) -> dict:
+def run_backtest(
+    data_dir: Path, root: Path, arms: tuple[str, ...] | None = None, folds: tuple[str, ...] | None = None
+) -> dict:
     import copy
     import inspect
 
@@ -328,10 +343,11 @@ def run_backtest(data_dir: Path, root: Path) -> dict:
     archive = rh.load_weather_archive(
         root / "archive", float(cfg["latitude"]), float(cfg["longitude"]), (live_cut - pd.Timedelta(days=800)).date()
     )
-    has_soft = "regime_mode" in inspect.signature(EnergyForecastModel.train).parameters
-    arms = [a for a in ARMS if a != "T" or has_soft]
-    if not has_soft:
-        print("regime_mode not in train(): arm T skipped")
+    train_params = set(inspect.signature(EnergyForecastModel.train).parameters)
+    # Arms whose overrides this train() does not support (e.g. running without Part B) are skipped.
+    arms = [a for a in (arms or ARMS) if set(ARM_SPECS[a][1]) - {"enable_regimes"} <= train_params]
+    folds = tuple(folds or FOLDS)
+    print("arms:", arms, "folds:", folds, flush=True)
 
     # Scoring target: corrected training-target frame at the live cutoff (hours with EV removed are absent).
     ref = rh.load_live_equivalent_training_frame(live_cut, data_dir, root / "ref", archive=archive)["_args"][0]
@@ -346,7 +362,7 @@ def run_backtest(data_dir: Path, root: Path) -> dict:
 
     rows: dict[str, list[dict]] = {a: [] for a in arms}
     inputs_cache: dict[pd.Timestamp, dict] = {}
-    for fold, (start, end) in FOLDS.items():
+    for fold, (start, end) in ((f, FOLDS[f]) for f in folds):
         t0 = pd.Timestamp(start)
         t1 = pd.Timestamp(end) if end else last_complete
         assert (t1 - t0).days + 1 >= (21 if fold == "primary" else 20), f"fold {fold} too short"
@@ -367,10 +383,7 @@ def run_backtest(data_dir: Path, root: Path) -> dict:
                     arm_cutoff(arm, cutoff), data_dir, root / f"tr_{fold}_{cutoff:%Y%m%d}_{arm}", archive=archive
                 )
                 kw = {k: v for k, v in copy.copy(cap).items() if not k.startswith("_")}
-                if arm == "N":
-                    kw["enable_regimes"] = False
-                if arm == "T":
-                    kw["regime_mode"] = "soft_oof"
+                kw.update(ARM_SPECS[arm][1])
                 mdir = root / f"model_{fold}_{cutoff:%Y%m%d}_{arm}"
                 shutil.rmtree(mdir, ignore_errors=True)
                 model = EnergyForecastModel(mdir, timezone=tz)
@@ -387,14 +400,29 @@ def run_backtest(data_dir: Path, root: Path) -> dict:
                         totals[name] = _next_day_total(pred, o)
                     target = o.normalize() + pd.Timedelta(days=1)
                     actual = day_actual(target) if target <= last_complete else float("nan")
-                    cell.append({"fold": fold, "cutoff": str(cutoff), "origin": str(o), **totals, "actual": actual})
+                    cell.append(
+                        {
+                            "fold": fold,
+                            "cutoff": str(cutoff),
+                            "origin": str(o),
+                            **totals,
+                            "actual": actual,
+                            "oof_acc": getattr(model, "_regime_oof_acc", None),
+                            "oof_majority": getattr(model, "_regime_oof_majority", None),
+                            "regime_zero": bool(getattr(model, "_regime_zero", False)),
+                            "k": int(model._clusterer.centroids.shape[0])
+                            if getattr(model, "_clusterer", None)
+                            else None,
+                        }
+                    )
                 cf.write_bytes(pickle.dumps(cell))
                 rows[arm] += cell
                 print(f"[{fold} {cutoff:%m-%d} {arm}] done", flush=True)
 
     frames = {a: pd.DataFrame(r) for a, r in rows.items()}
     metrics = {a: fold_metrics(f) for a, f in frames.items()}
-    verdict, reasons = decide_with_reasons(metrics)
+    full = {"H", "T", "N"} <= set(arms) and set(folds) == set(FOLDS)
+    verdict, reasons = decide_with_reasons(metrics) if full else (None, ["variant run: no decision"])
     return {
         "commit": _git_commit(),
         "versions_local": _versions(),
@@ -424,9 +452,11 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--data-dir", type=Path, default=REPO / "data")
     b.add_argument("--root", type=Path, required=True, help="scratch directory (resumable: per-cell cache)")
     b.add_argument("--out", type=Path, default=REPO / "data" / "backtest_regime_results.json")
+    b.add_argument("--arms", nargs="+", choices=sorted(ARM_SPECS), help="default: H T N J")
+    b.add_argument("--folds", nargs="+", choices=sorted(FOLDS), help="default: all")
     args = ap.parse_args(argv)
     if args.cmd == "backtest":
-        res = run_backtest(args.data_dir, args.root)
+        res = run_backtest(args.data_dir, args.root, tuple(args.arms or ()) or None, tuple(args.folds or ()) or None)
         args.out.write_text(json.dumps(res, indent=2, default=str))
         print(json.dumps({k: v for k, v in res.items() if k not in ("per_origin", "caveats")}, indent=2, default=str))
         return 0

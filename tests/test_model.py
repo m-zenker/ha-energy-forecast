@@ -6394,7 +6394,9 @@ class TestRegimeGolden:
     GOLDEN_PATH = Path(__file__).parent / "fixtures" / "regime_golden.npz"
 
     @staticmethod
-    def _train_and_prepare(tmp_path, monkeypatch, forecast_hours: int = 48, regime_mode: str | None = None):
+    def _train_and_prepare(
+        tmp_path, monkeypatch, forecast_hours: int = 48, regime_mode: str | None = None, **train_extra
+    ):
         """Train a 3-regime model with a frozen clock; return (model, forecast_df, X)."""
         pytest.importorskip("sklearn")
         from apps.energy_forecast.clustering import SKLEARN_AVAILABLE
@@ -6405,7 +6407,7 @@ class TestRegimeGolden:
         monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: pd.Timestamp("2026-10-23 17:00", tz=tz)))
         energy_df, weather_df = TestAutoKRegimeSelection()._make_regime_train_data(n=24 * 60, n_regimes=3)
         m = EnergyForecastModel(tmp_path)
-        extra = {} if regime_mode is None else {"regime_mode": regime_mode}
+        extra = {**train_extra, **({} if regime_mode is None else {"regime_mode": regime_mode})}
         m.train(
             energy_df,
             weather_df,
@@ -7755,3 +7757,61 @@ class TestRegimeSoftOOF:
         expected = m._regime_model.predict_proba(daily, m._clusterer.centroids.shape[0])
         pd.testing.assert_frame_equal(cap["proba"], expected)
         assert ((cap["proba"] > 0) & (cap["proba"] < 1)).any().any(), "soft path should give fractional probabilities"
+
+
+class TestRegimeSoftOOFVariants:
+    """#110 variants: regime_oof_cv='blocked' and the regime_min_oof_acc fallback to N (all default off)."""
+
+    def test_invalid_variant_args_raise(self, tmp_path, monkeypatch):
+        with pytest.raises(ValueError, match="regime_oof_cv"):
+            TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof", regime_oof_cv="x")
+
+    def test_blocked_is_passed_to_fit(self, tmp_path, monkeypatch):
+        from energy_forecast.clustering import RegimePredictor
+
+        seen = {}
+        orig = RegimePredictor.fit
+
+        def spy(self, *a, **k):
+            seen.update(k)
+            return orig(self, *a, **k)
+
+        monkeypatch.setattr(RegimePredictor, "fit", spy)
+        TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch, regime_mode="soft_oof", regime_oof_cv="blocked")
+        assert seen["oof_cv"] == "blocked"
+
+    def test_fallback_zeroes_regime_kwh_and_persists(self, tmp_path, monkeypatch):
+        cap = TestRegimeSoftOOF._spy_training(monkeypatch)
+        m, forecast_df, X = TestRegimeGolden._train_and_prepare(
+            tmp_path,
+            monkeypatch,
+            regime_mode="soft_oof",
+            regime_min_oof_acc=1.01,  # impossible: always falls back
+        )
+        assert m._regime_zero is True and m._regime_mode == "soft_oof"
+        assert (cap["series"] == 0).all()
+        assert (X["regime_kwh"] == 0).all()
+        assert EnergyForecastModel(tmp_path)._regime_zero is True
+
+    def test_no_fallback_when_accuracy_is_enough(self, tmp_path, monkeypatch):
+        cap = TestRegimeSoftOOF._spy_training(monkeypatch)
+        m, _, X = TestRegimeGolden._train_and_prepare(
+            tmp_path, monkeypatch, regime_mode="soft_oof", regime_min_oof_acc=0.0
+        )
+        assert m._regime_zero is False
+        assert (cap["series"] != 0).any() and (X["regime_kwh"] != 0).any()
+        assert m._regime_oof_acc is not None and 0.0 <= m._regime_oof_acc <= 1.0
+
+    def test_missing_regime_zero_key_loads_false(self, tmp_path, monkeypatch):
+        import pickle
+
+        from energy_forecast.model import _write_hash
+
+        m, _, _ = TestRegimeGolden._train_and_prepare(tmp_path, monkeypatch)
+        with open(m._meta_path, "rb") as fh:
+            meta = pickle.load(fh)
+        meta.pop("regime_zero", None)
+        with open(m._meta_path, "wb") as fh:
+            pickle.dump(meta, fh)
+        _write_hash(m._meta_path)
+        assert EnergyForecastModel(tmp_path)._regime_zero is False

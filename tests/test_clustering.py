@@ -769,3 +769,38 @@ def test_fit_does_not_add_attributes():
     rp = RegimePredictor()
     rp.fit(feats, labels, n_clusters=2)
     assert set(vars(rp)) == {"model", "is_fitted"}
+
+
+# ── Blocked out-of-fold folds (#110 variant TB) ───────────────────────────────
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_blocked_oof_uses_unshuffled_folds(monkeypatch):
+    import apps.energy_forecast.clustering as clustering
+
+    seen = {}
+    orig = clustering.cross_val_predict
+
+    def spy(*a, **k):
+        seen["cv"] = k["cv"]
+        return orig(*a, **k)
+
+    monkeypatch.setattr(clustering, "cross_val_predict", spy)
+    feats, labels = _make_daily_features(n=40)
+    RegimePredictor().fit(feats, labels, n_clusters=2, oof_cv="blocked")
+    assert seen["cv"].shuffle is False
+    RegimePredictor().fit(feats, labels, n_clusters=2)
+    assert seen["cv"].shuffle is True  # default unchanged
+
+
+@pytest.mark.skipif(not SKLEARN_AVAILABLE, reason="scikit-learn not available")
+def test_fit_blocked_oof_is_aligned_and_order_independent():
+    feats, labels = _make_daily_features(n=40)
+    w = pd.Series(np.linspace(1, 5, len(feats)), index=feats.index)
+    a = RegimePredictor().fit(feats, labels, sample_weight=w, n_clusters=2, oof_cv="blocked")
+    shuffled_rows = np.random.default_rng(0).permutation(len(feats))
+    b = RegimePredictor().fit(
+        feats.iloc[shuffled_rows], labels.iloc[shuffled_rows], sample_weight=w, n_clusters=2, oof_cv="blocked"
+    )
+    np.testing.assert_allclose(a.sum(axis=1), 1.0)
+    pd.testing.assert_frame_equal(a.sort_index(), b.sort_index())  # blocks follow the dates, not the row order

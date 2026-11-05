@@ -310,6 +310,9 @@ class EnergyForecastModel:
         self._heating_buffer_smooth_h: int = 0  # trailing-mean window the loaded model was trained with (0 = raw)
         self._regime_count: int = 5
         self._regime_mode: str = "hard"  # how regime_kwh was built in training: "hard" | "soft_oof" (#110)
+        self._regime_zero: bool = False  # soft_oof fell back to regime_kwh = 0 (classifier had no signal)
+        self._regime_oof_acc: float | None = None  # diagnostic only, not persisted
+        self._regime_oof_majority: float | None = None  # share of the most common regime (the accuracy to beat)
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
         # Per-date regime label/probabilities from the last _prepare_prediction_X call (log only, never a feature)
@@ -353,6 +356,8 @@ class EnergyForecastModel:
         use_physics_residual: bool = False,
         heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
         regime_mode: str = "hard",  # "hard": true daily labels; "soft_oof": out-of-fold probabilities (#110, private)
+        regime_oof_cv: str = "shuffled",  # soft_oof folds: "shuffled" | "blocked" (#110 experiment, private)
+        regime_min_oof_acc: float | None = None,  # soft_oof: below this out-of-fold accuracy use regime_kwh = 0 (#110)
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -360,6 +365,8 @@ class EnergyForecastModel:
 
         if regime_mode not in ("hard", "soft_oof"):
             raise ValueError(f"regime_mode must be 'hard' or 'soft_oof', got {regime_mode!r}")
+        if regime_oof_cv not in ("shuffled", "blocked"):
+            raise ValueError(f"regime_oof_cv must be 'shuffled' or 'blocked', got {regime_oof_cv!r}")
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
@@ -587,6 +594,9 @@ class EnergyForecastModel:
         self._enable_regimes = enable_regimes
         self._regime_count = regime_count
         self._regime_mode = "hard"
+        self._regime_zero = False
+        self._regime_oof_acc = None
+        self._regime_oof_majority = None
         regime_kwh_series = None
 
         if enable_regimes:
@@ -631,7 +641,9 @@ class EnergyForecastModel:
 
                 n_clusters = self._clusterer.centroids.shape[0]
                 self._regime_model = clustering.RegimePredictor()
-                oof = self._regime_model.fit(daily_features, labels, sample_weight=daily_weights, n_clusters=n_clusters)
+                oof = self._regime_model.fit(
+                    daily_features, labels, sample_weight=daily_weights, n_clusters=n_clusters, oof_cv=regime_oof_cv
+                )
 
                 # 3. Create hourly regime_kwh_series (vectorized)
                 # Map daily labels to hourly timestamps (gaps forward-filled, leading gaps give 0)
@@ -644,6 +656,17 @@ class EnergyForecastModel:
                         _LOGGER.info("soft_oof regime_kwh: %d labelled days without weather features get 0", n_missing)
                     regime_proba = regime_proba.fillna(0.0)
                     self._regime_mode = "soft_oof"
+                    _y = labels.reindex(oof.index)
+                    self._regime_oof_acc = float((oof.to_numpy().argmax(axis=1) == _y.to_numpy()).mean())
+                    self._regime_oof_majority = float(_y.value_counts(normalize=True).max())
+                    if regime_min_oof_acc is not None and self._regime_oof_acc < regime_min_oof_acc:
+                        _LOGGER.warning(
+                            "Regime classifier out-of-fold accuracy %.2f < %.2f — no usable signal, regime_kwh = 0",
+                            self._regime_oof_acc,
+                            regime_min_oof_acc,
+                        )
+                        self._regime_zero = True
+                        regime_proba = regime_proba * 0.0
                 else:
                     regime_proba = clustering.one_hot(labels, n_clusters)
                 regime_rows = clustering.regime_kwh_from_proba(regime_proba, ts_idx, self._clusterer.centroids)
@@ -1238,6 +1261,8 @@ class EnergyForecastModel:
                 else:
                     _regime_p = clustering.one_hot(pd.Series(predicted_labels, index=daily_features.index), n_clusters)
                 regime_vals = clustering.regime_kwh_from_proba(_regime_p, ts_idx, self._clusterer.centroids)
+                if self._regime_zero:
+                    regime_vals = np.zeros_like(regime_vals)
                 feat_df["regime_kwh"] = regime_vals
             except Exception as e:
                 _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
@@ -1766,6 +1791,7 @@ class EnergyForecastModel:
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
             "regime_mode": self._regime_mode,
+            "regime_zero": self._regime_zero,
             "weather_tail": self._weather_tail,
             "heating_buffer_smooth_h": self._heating_buffer_smooth_h,
         }
@@ -2215,6 +2241,7 @@ class EnergyForecastModel:
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
                     self._regime_mode = meta.get("regime_mode", "hard")
+                    self._regime_zero = bool(meta.get("regime_zero", False))
                     self._weather_tail = meta.get("weather_tail", None)
                     self._heating_buffer_smooth_h = meta.get("heating_buffer_smooth_h", 0)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:

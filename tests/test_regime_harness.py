@@ -316,6 +316,7 @@ def test_arm_cutoff_jitter_control_is_one_hour_earlier(br):
     c = pd.Timestamp("2026-10-14 06:00")
     assert br.arm_cutoff("H", c) == c and br.arm_cutoff("T", c) == c
     assert br.arm_cutoff("J", c) == c - pd.Timedelta(hours=1)
+    assert br.arm_cutoff("TJ", c) == c - pd.Timedelta(hours=1)  # T's own jitter control
 
 
 def test_scale_sunshine_only_touches_future_hours(br):
@@ -362,3 +363,18 @@ def test_prune_unavailable_sensors_drops_sensors_without_rows_at_cutoff(rh, tmp_
     assert out["sub_energy_sensors"] == ["sensor.washer"]
     assert out["climate_entities"] == ["climate.a"]
     assert cfg["sub_energy_sensors"][1]["entity_id"] == "sensor.dryer"  # input config untouched
+
+
+def test_arm_specs_variants_only_use_supported_train_overrides(br):
+    import inspect
+
+    from energy_forecast.model import EnergyForecastModel
+
+    params = set(inspect.signature(EnergyForecastModel.train).parameters)
+    for arm, (_, overrides) in br.ARM_SPECS.items():
+        assert set(overrides) - {"enable_regimes"} <= params, arm
+    assert br.ARM_SPECS["TBF"][1] == {
+        "regime_mode": "soft_oof",
+        "regime_oof_cv": "blocked",
+        "regime_min_oof_acc": 0.5,
+    }

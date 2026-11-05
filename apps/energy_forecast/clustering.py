@@ -142,6 +142,7 @@ class RegimePredictor:
         sample_weight: pd.Series | None = None,
         verbose: bool = True,
         n_clusters: int | None = None,
+        oof_cv: str = "shuffled",
     ) -> pd.DataFrame | None:
         """Train the regime classifier.
 
@@ -150,6 +151,8 @@ class RegimePredictor:
             labels: Series of cluster IDs indexed by date.
             sample_weight: Optional Series of daily weights indexed by date.
             n_clusters: Column count of the returned matrix (default ``max(labels) + 1``).
+            oof_cv: ``"shuffled"`` (default) or ``"blocked"``. Blocked uses contiguous, unshuffled date folds so a
+                day's neighbours stay in the same fold, which is closer to scoring a day the forest never saw.
 
         Returns:
             The 5-fold out-of-fold class-probability matrix (index = dates used for
@@ -186,7 +189,9 @@ class RegimePredictor:
             self.model.fit(X, y, **fit_kwargs)
             self.is_fitted = True
 
-            oof = self._out_of_fold_proba(X, y, fit_kwargs, n_clusters if n_clusters is not None else int(y.max()) + 1)
+            oof = self._out_of_fold_proba(
+                X, y, fit_kwargs, n_clusters if n_clusters is not None else int(y.max()) + 1, oof_cv
+            )
 
             train_acc = self.model.score(X, y)
             oob_acc = self.model.oob_score_
@@ -225,22 +230,21 @@ class RegimePredictor:
             return oof  # keep the out-of-fold matrix if only the later CV diagnostics failed
 
     @staticmethod
-    def _out_of_fold_proba(X: pd.DataFrame, y: pd.Series, fit_kwargs: dict, n_clusters: int) -> pd.DataFrame | None:
+    def _out_of_fold_proba(
+        X: pd.DataFrame, y: pd.Series, fit_kwargs: dict, n_clusters: int, oof_cv: str = "shuffled"
+    ) -> pd.DataFrame | None:
         """5-fold out-of-fold class probabilities (a day is never scored by a forest that saw its label)."""
         try:
+            order = np.argsort(X.index.to_numpy(), kind="stable") if oof_cv == "blocked" else np.arange(len(X))
+            Xo, yo = X.iloc[order], y.iloc[order]
+            params = {k: np.asarray(v)[order] for k, v in fit_kwargs.items()}
+            cv = KFold(5) if oof_cv == "blocked" else KFold(5, shuffle=True, random_state=42)
             clf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=6, min_samples_leaf=3)
-            raw = cross_val_predict(
-                clf,
-                X,
-                y,
-                cv=KFold(5, shuffle=True, random_state=42),
-                method="predict_proba",
-                params=fit_kwargs or None,
-            )
-            out = np.zeros((len(X), n_clusters), dtype=float)
-            for j, cls in enumerate(np.unique(y)):
+            raw = cross_val_predict(clf, Xo, yo, cv=cv, method="predict_proba", params=params or None)
+            out = np.zeros((len(Xo), n_clusters), dtype=float)
+            for j, cls in enumerate(np.unique(yo)):
                 out[:, min(max(int(cls), 0), n_clusters - 1)] += raw[:, j]
-            return pd.DataFrame(out, index=X.index, columns=range(n_clusters))
+            return pd.DataFrame(out, index=Xo.index, columns=range(n_clusters)).reindex(X.index)
         except Exception as e:
             _LOGGER.warning(f"Regime out-of-fold probabilities failed: {e}")
             return None
