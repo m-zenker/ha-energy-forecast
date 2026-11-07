@@ -167,7 +167,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
     dhw_schedule:
       legionella: ["2026-06-25", 10]  # [date string, hour]
   ```
-  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model and invalidates the cached forecast so the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
+  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model, and the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
 
 ---
 
@@ -192,7 +192,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 
 `dhw_schedule` is an optional, **transient** (non-persisted) override of the physics model's DHW/legionella schedule, shaped `{"legionella": ["YYYY-MM-DD", hour]}`. It only affects this one `get_scenario` call — it is never written to `physics_schedule.json` and does not survive past the call. When provided, `delta_kwh` reflects the **combined** appliance-schedule + dhw-schedule delta versus the natural (currently committed) baseline. To persist a DHW schedule change instead, use `energy_forecast/set_dhw_schedule` (see [Physics-ML Hybrid](#physics-ml-hybrid-phases-1--2-optional)).
 
-> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app only invalidates its internal forecast cache, not any cache kept by the caller.
+> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app does not touch any cache kept by the caller.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
@@ -1147,8 +1147,8 @@ data:
 
 Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, see [Scenario / What-If API](#scenario--what-if-api)),
 this override is **committed** — it is written to `physics_schedule.json` as `committed_override`
-and persists across restarts until overwritten. Calling it also invalidates this app's internal
-forecast cache (`_cached_forecast_df`), so the next hourly cycle recomputes with the new schedule.
+and persists across restarts until overwritten. `get_scenario` keeps answering after a commit and
+reads the override at prediction time; the next hourly cycle publishes the new schedule.
 It does **not** invalidate any scenario cache kept by a consuming app (see the caller cache
 contract above) — flush that separately after a successful call. Logs a WARNING and no-ops if
 `physics:` is not configured or `dhw_schedule` is not a dict.

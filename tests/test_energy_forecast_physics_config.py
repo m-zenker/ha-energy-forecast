@@ -1035,13 +1035,14 @@ class TestSetDhwScheduleService:
         calls = [c.args[0] for c in app.register_service.call_args_list]
         assert "energy_forecast/set_dhw_schedule" in calls
 
-    def test_commits_schedule_and_invalidates_cache(self, tmp_path):
+    def test_commit_keeps_scenario_cache(self, tmp_path):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
         app.initialize()
         app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
-        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        app._cached_forecast_df = df
 
         with patch.object(app._physics_model, "commit_dhw_schedule") as mock_commit:
             app._set_dhw_schedule_cb(
@@ -1051,7 +1052,73 @@ class TestSetDhwScheduleService:
                 {"dhw_schedule": {"legionella": ["2026-01-16", 10]}},
             )
             mock_commit.assert_called_once_with({"legionella": ["2026-01-16", 10]})
-        assert app._cached_forecast_df is None
+        assert app._cached_forecast_df is df
+
+    def test_clear_commit_keeps_scenario_cache(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        self._isolate_physics_model_dir(app, tmp_path)
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        app._cached_forecast_df = df
+
+        app._set_dhw_schedule_cb(
+            "default", "energy_forecast", "set_dhw_schedule", {"dhw_schedule": {"legionella": None}}
+        )
+        assert app._cached_forecast_df is df
+
+    def test_failed_commit_keeps_scenario_cache(self, tmp_path):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        app._cached_forecast_df = df
+
+        with patch.object(app._physics_model, "commit_dhw_schedule", side_effect=RuntimeError("disk full")):
+            app._set_dhw_schedule_cb(
+                "default",
+                "energy_forecast",
+                "set_dhw_schedule",
+                {"dhw_schedule": {"legionella": ["2026-01-16", 10]}},
+            )
+        assert app._cached_forecast_df is df
+
+    def test_get_scenario_answers_after_commit(self, tmp_path):
+        """Live 2026-11-07: a 05:04 commit left get_scenario silent until the 06:01 cycle."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        self._isolate_physics_model_dir(app, tmp_path)
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        app._get_scenario_cb = EnergyForecast._get_scenario_cb.__get__(app, type(app))
+        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        app._ml_model = MagicMock()
+        app._ml_model.predict_scenario.return_value = pd.DataFrame(
+            {"timestamp": [1], "predicted_kwh": [1.0], "delta_kwh": [0.5]}
+        )
+        app.fire_event = MagicMock()
+
+        app._set_dhw_schedule_cb(
+            "default",
+            "energy_forecast",
+            "set_dhw_schedule",
+            {"dhw_schedule": {"comfort_boost": ["2026-11-08", 12, 54.0]}},
+        )
+        app._get_scenario_cb(
+            "default",
+            "energy_forecast",
+            "get_scenario",
+            {"dhw_schedule": {"legionella": ["2026-11-07", 12]}, "request_id": "r1"},
+        )
+
+        app.fire_event.assert_called_once()
+        assert app.fire_event.call_args.args[0] == "energy_forecast_scenario_result"
+        assert app.fire_event.call_args.kwargs["request_id"] == "r1"
 
     def test_missing_dhw_schedule_kwarg_logs_warning_no_crash(self, caplog):
         import logging
@@ -1102,7 +1169,8 @@ class TestSetDhwScheduleService:
         app.initialize()
         self._isolate_physics_model_dir(app, tmp_path)
         app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
-        app._cached_forecast_df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        df = pd.DataFrame({"timestamp": [1], "temp_c": [5.0]})
+        app._cached_forecast_df = df
 
         app._set_dhw_schedule_cb(
             "default",
@@ -1112,7 +1180,7 @@ class TestSetDhwScheduleService:
         )
         assert app._physics_model._schedule["committed_override"] == {"comfort_boost": ["2026-08-05", 14, 57.5]}
         assert len(app._physics_model._schedule["override_history"]) == 1
-        assert app._cached_forecast_df is None  # cache invalidated, same as legionella today
+        assert app._cached_forecast_df is df
 
     def test_legionella_and_comfort_boost_same_day_neither_clobbers_other(self, tmp_path):
         """Cross-repo scenario from the spec's Testing section: same-day legionella-then-

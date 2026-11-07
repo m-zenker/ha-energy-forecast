@@ -63,7 +63,7 @@ Stable calibrated constants and frequently-written operational state are kept in
 | File | Change |
 |---|---|
 | `model.py` | `_engineer_features()` gets `physics_kwh_series` param; `train()` / `predict()` Phase 2 logic; `_find_passive_windows()` promoted to shared utility; log1p gate; gross-kWh MAE logging |
-| `energy_forecast.py` | Config ingest; new sensors; `recalibrate_physics` service; Scenario API `dhw_schedule` extension; `set_dhw_schedule` cache invalidation |
+| `energy_forecast.py` | Config ingest; new sensors; `recalibrate_physics` service; Scenario API `dhw_schedule` extension; `set_dhw_schedule` |
 
 ### 2.4 Files Unchanged
 
@@ -347,9 +347,11 @@ call_service("energy_forecast/get_scenario",
 
 When `dhw_schedule` is present: triggers fresh `predict_series(dhw_schedule_override=...)` rather than using `_cached_forecast_df`. Appliance overlay applied on top as today. Delta computed vs the **natural baseline** — defined as `predict_series()` using the current committed schedule from `physics_schedule.json` at the time of the call (including any prior `set_dhw_schedule` updates). The delta shows the incremental impact of the proposed `dhw_schedule` argument relative to whatever schedule is already in force; it is never computed relative to zero or the original factory schedule.
 
-New service `energy_forecast/set_dhw_schedule`: confirmed intent from energy manager; updates `physics_schedule.json` (atomic write-then-rename), **immediately invalidates `_cached_forecast_df`** so the next HA sensor publish reflects the updated schedule, and bypasses the legionella instability guard (see §3.3). Uses same `dhw_schedule_override` mechanism. Together with `get_scenario(dhw_schedule=...)`, this forms the oracle pattern for energy manager optimisation (see §8).
+New service `energy_forecast/set_dhw_schedule`: confirmed intent from energy manager; updates `physics_schedule.json` (atomic write-then-rename), keeps `_cached_forecast_df` (raw weather), and bypasses the legionella instability guard (see §3.3). The next HA sensor publish reflects the updated schedule because the committed override is read at prediction time. Uses same `dhw_schedule_override` mechanism. Together with `get_scenario(dhw_schedule=...)`, this forms the oracle pattern for energy manager optimisation (see §8).
 
-**Caller cache responsibility**: ha-energy-forecast invalidates its own `_cached_forecast_df` on `set_dhw_schedule`, but callers that maintain a secondary scenario cache (e.g. `ConsumptionForecastApp._scenario_cache` / `_scenario_store`) must flush their own cache immediately after a successful `set_dhw_schedule` call — all prior `delta_kwh` entries were computed against the old DHW baseline and are now stale.
+> **Amended 2026-11-07:** the original design invalidated `_cached_forecast_df` here. That was removed because it blocked `get_scenario` between a commit and the next hourly cycle, and the cycle overwrites the frame regardless.
+
+**Caller cache responsibility**: ha-energy-forecast holds no schedule-dependent scenario cache, but callers that maintain a secondary scenario cache (e.g. `ConsumptionForecastApp._scenario_cache` / `_scenario_store`) must flush their own cache immediately after a successful `set_dhw_schedule` call — all prior `delta_kwh` entries were computed against the old DHW baseline and are now stale.
 
 **`dhw_schedule` caching rule**: `get_scenario` calls that include `dhw_schedule` bypass ha-energy-forecast's internal cache. Callers must either (a) exclude results from their own scenario cache when `dhw_schedule` is present, or (b) include the `dhw_schedule` dict in their cache key hash. The safest default: do not cache any scenario result computed with a non-None `dhw_schedule`.
 
@@ -456,7 +458,7 @@ New test file: `tests/test_physics.py`.
 - `get_scenario` without `dhw_schedule` → cache used (no regression)
 - Delta computed vs natural physics baseline, not vs zero
 - `set_dhw_schedule(A)` then `get_scenario(dhw_schedule=B)` → delta computed vs baseline with schedule A (not B); natural baseline uses updated standing schedule A
-- `set_dhw_schedule` → `_cached_forecast_df` invalidated; next HA sensor publish reflects new schedule
+- `set_dhw_schedule` → `_cached_forecast_df` kept, `get_scenario` still answers; next HA sensor publish reflects new schedule
 
 ---
 
@@ -466,7 +468,7 @@ New test file: `tests/test_physics.py`.
 
 ### Issue 1 — `set_dhw_schedule` silently invalidates EM scenario cache — **RESOLVED (§5.4)**
 
-§5.4 now explicitly mandates: "Callers that maintain a secondary scenario cache must flush their own cache immediately after a successful `set_dhw_schedule` call." For `ConsumptionForecastApp` this means clearing `_scenario_cache` and saving `_scenario_store` after each successful service call. The spec also clarifies that ha-energy-forecast invalidates only its own `_cached_forecast_df`; secondary caches are the caller's responsibility.
+§5.4 now explicitly mandates: "Callers that maintain a secondary scenario cache must flush their own cache immediately after a successful `set_dhw_schedule` call." For `ConsumptionForecastApp` this means clearing `_scenario_cache` and saving `_scenario_store` after each successful service call. The spec also clarifies that secondary caches are the caller's responsibility; ha-energy-forecast does not touch them.
 
 ### Issue 2 — `dhw_schedule` not part of the scenario cache key — **RESOLVED (§5.4)**
 
