@@ -2,6 +2,10 @@
 
 Every arm uses ``regime_count=3`` to reproduce the original prototype; live uses 0 (auto).
 Lean frame: the -T / -regime results do NOT transfer to live, where physics inputs overlap temperature.
+
+-T is not temperature-free: dropping columns leaves temperature inside lag_*_tgated (discounted by temp deltas) and
+the regime_kwh temperature gate, so it understates temperature's value. A truly temperature-free arm needs a
+weather transform (e.g. constant temp_c), not a drop.
 """
 
 from backtest.arms import Arm, climatology
@@ -21,6 +25,7 @@ TEMP_GROUP = (
     "temp_delta_24h",
     "temp_lag_24h",
     "temp_lag_168h",
+    "defrost_risk",  # Gaussian of temp_c (model.py), not a sun/wind feature
 )
 SUN_GROUP = (  # control: non-temperature weather features
     "precipitation_mm",
@@ -31,7 +36,6 @@ SUN_GROUP = (  # control: non-temperature weather features
     "direct_radiation_wm2",
     "weighted_solar_gain",
     "infiltration_pressure",
-    "defrost_risk",
     "thermal_pressure_net",
 )
 _KW = {"regime_count": 3}

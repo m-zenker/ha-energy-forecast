@@ -50,6 +50,8 @@ def load_live_pred(data_dir: Path = DATA_DIR) -> tuple[pd.Series, pd.Series]:
 
 def gate_folds(live_pred: pd.Series, days: int = 28) -> list[Fold]:
     """Last *days* complete days of *live_pred* as consecutive ≤ 7-day folds (weekly retrain, like live)."""
+    if live_pred.empty:
+        return []
     end = (live_pred.index.max() + pd.Timedelta(hours=1)).normalize() - pd.Timedelta(days=1)
     start = max(end - pd.Timedelta(days=days - 1), live_pred.index.min().normalize())
     folds, s = [], start

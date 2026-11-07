@@ -18,6 +18,8 @@ CAVEATS = (
     " unfairly",
     "frame: lean — not valid for features/kwargs overlapping physics, climate, DHW or sub-meters"
     " (temperature group, heating degrees, buffer, regime_kwh)",
+    "CI: excludes training randomness — count an effect only if it is also outside the segment's seed noise floor"
+    " (--seeds)",
 )
 SEGMENTS = ("ALL", "COLD", "WARM")
 
@@ -91,17 +93,16 @@ def summarize(df: pd.DataFrame, ref: str = "base") -> dict[str, pd.DataFrame]:
 def format_summary(tables: dict[str, pd.DataFrame], header: Sequence[str] = (), ref: str = "base") -> str:
     """Fixed-width text: caveats, *header* lines, seed noise floor (if ``<ref>@s*`` arms exist), then each segment."""
     lines = list(CAVEATS) + list(header)
-    all_t = tables.get("ALL", pd.DataFrame())
-    seed_arms = [a for a in all_t.index if str(a).startswith(f"{ref}@s")]
-    floor = float(all_t.loc[seed_arms, "pct"].abs().max()) if seed_arms else None
-    if floor is not None:
-        lines.append(f"seed noise floor: ±{floor:.1f} % (arms marked ~ are inside it)")
     for seg in SEGMENTS:
         t = tables.get(seg, pd.DataFrame())
         if t.empty:
             lines.append(f"\n{seg}: no scored days")
             continue
         lines.append(f"\n{seg}")
+        seed_arms = [a for a in t.index if str(a).startswith(f"{ref}@s")]
+        floor = float(t.loc[seed_arms, "pct"].abs().max()) if seed_arms else None  # per segment: spread differs
+        if floor is not None:
+            lines.append(f"  seed noise floor: ±{floor:.1f} % (arms marked ~ are inside it)")
         lines.append(
             f"  {'arm':<14}{'days':>5}{'mae':>8}{'bias':>8}{'|bias|':>8}{'dMAE%':>8}"
             f"{'95% CI':>18}{'worse':>7}{'folds':>7}{'d|bias|%':>10}"

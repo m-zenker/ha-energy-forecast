@@ -44,7 +44,11 @@ rather than silently doing nothing.
 - `dMAE%` / `95% CI` is the paired difference against base. The CI resamples (fold, ISO-week) blocks, not days.
 - `worse` is the number of days the arm was worse. `folds` is how many folds agree with the sign of the mean.
 - `d|bias|%` is the same comparison on absolute daily bias. It caught arms that looked good on MAE before.
-- `~` marks an arm inside the seed noise floor; treat it as "no effect".
+- `~` marks an arm inside the seed noise floor; treat it as "no effect". The floor is computed **per segment**:
+  seed spread is larger in the thin WARM segment.
+- The CI treats each fold's trained model as fixed, so it **excludes training randomness**. Seed-only arms can get
+  CIs that exclude 0. Count an effect only when the CI excludes 0 **and** the arm is outside the floor.
+- `bias` / `|bias|` are kWh/day; `mae` is kWh/h.
 - The ALL / COLD / WARM segments split on a daily mean temperature of ≤ 10 °C.
 
 ## Accepted risks
@@ -54,6 +58,13 @@ rather than silently doing nothing.
 - **Lean frame.** There are no physics, climate, DHW or sub-meter inputs. Relative comparisons are invalid for
   features or kwargs that overlap them: the temperature group, heating degrees, heating/DHW buffer and `regime_kwh`.
   A live-equivalent frame is the next plan.
+- **Constant features in the lean frame.** Dropping one of these gives "no effect" because it carries no signal
+  here, not because the feature is useless live: `heating_active`, `dhw_buffer_temp`, `dhw_pressure`, `is_away`,
+  `people_home`, `thermal_pressure*`, `infiltration_pressure`, and `regime_kwh` when regimes are off. Nothing
+  warns about this.
+- **Drops leave derived information.** Dropping a column doesn't remove information computed from it. For example,
+  `lag_*_tgated` stays discounted by temperature deltas after `-T`. For a truly "without X" arm, use a `weather`
+  transform.
 - **One train per fold.** The replay model is older than live's weekly retrain. This is equal across arms, so it
   only affects the absolute numbers.
 - **Fold reuse.** Repeated experiments on the same 4 folds slowly overfit them. See the holdout rule below.

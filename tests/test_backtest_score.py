@@ -87,3 +87,20 @@ def test_format_has_caveats_noise_floor_and_empty_segment():
     assert "seed noise floor" in s and "WARM: no scored days" in s
     y_line = next(line for line in s.splitlines() if line[2:].startswith("y "))  # col 0 = mark, col 2 = arm
     assert "~" in y_line  # y's +1 % is inside the base@s1 floor (~4 %)
+
+
+def test_noise_floor_is_per_segment_and_ci_caveat():
+    df = _frame(cold=lambda day: day.day % 2 == 0, extra_arms=[("base@s1", 0.0), ("y", 0.02)])
+    warm_seed = (df.arm == "base@s1") & ~df.cold
+    df.loc[warm_seed, "mae"] += 0.03  # seed spread ~6 % in WARM, 0 % in COLD
+    s = format_summary(summarize(df))
+    assert "training randomness" in s
+    sections = dict(
+        zip(
+            ["ALL", "COLD", "WARM"],
+            s.split("\nALL")[1].replace("\nCOLD", "\x00").replace("\nWARM", "\x00").split("\x00"),
+        )
+    )
+    y_line = {seg: next(ln for ln in txt.splitlines() if ln[2:].startswith("y ")) for seg, txt in sections.items()}
+    assert "~" in y_line["WARM"] and "~" not in y_line["COLD"] and "~" not in y_line["ALL"]
+    assert all("seed noise floor" in txt for txt in sections.values())

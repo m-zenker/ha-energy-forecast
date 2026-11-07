@@ -36,6 +36,16 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def _repro_lines(inputs, weather, defaults: dict, data_dir: Path = DATA_DIR) -> list[str]:
+    """Summary header lines for --repro. Never raises: a failure becomes one 'unavailable' line."""
+    try:
+        live_pred, actuals = load_live_pred(data_dir)
+        rows = run_experiment([Arm("base")], gate_folds(live_pred), inputs, weather, defaults, origins="lead25")
+        return repro_report(replay_series(rows), live_pred, actuals).lines()
+    except Exception as exc:  # noqa: BLE001 — the comparison is informational; the experiment must still run
+        return [f"live comparison: unavailable ({type(exc).__name__}: {exc})"]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     try:
@@ -64,9 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     defaults = train_defaults(load_config())
     header: list[str] = []
     if args.repro:
-        live_pred, actuals = load_live_pred()
-        rows = run_experiment([Arm("base")], gate_folds(live_pred), inputs, weather, defaults, origins="lead25")
-        header += repro_report(replay_series(rows), live_pred, actuals).lines()
+        header += _repro_lines(inputs, weather, defaults)
 
     out = args.out or DATA_DIR / "backtest" / f"{args.experiment}_{pd.Timestamp.now():%Y%m%d-%H%M}.pkl"
     origins = getattr(exp, "ORIGINS", (6, 18))

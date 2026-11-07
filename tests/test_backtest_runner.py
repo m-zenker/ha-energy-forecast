@@ -120,3 +120,10 @@ def test_run_experiment_writes_pickle(synth, tmp_path):
     arms = [Arm("base"), Arm("-T", drop=("temp_c",))]
     df = run_experiment(arms, [synth.fold], synth.inputs, synth.weather, DEFAULTS, out=tmp_path / "r.pkl", days_limit=1)
     assert set(pd.read_pickle(tmp_path / "r.pkl").arm) == {"base", "-T"} and len(df) == 4
+
+
+def test_duplicate_arm_names_raise(synth, monkeypatch):
+    calls = spy(monkeypatch)
+    with pytest.raises(ValueError, match="duplicate"):
+        run_experiment([Arm("a"), Arm("a", drop=("temp_c",))], [synth.fold], synth.inputs, synth.weather, DEFAULTS)
+    assert not calls.train

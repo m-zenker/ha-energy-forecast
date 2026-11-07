@@ -134,6 +134,10 @@ def run_experiment(
     days_limit: int | None = None,
 ) -> pd.DataFrame:
     """Every arm × fold; the result pickle (if *out*) is rewritten after each arm so long runs can be inspected."""
+    names = [a.name for a in arms]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"duplicate arm names {dupes}: their rows would be pooled into one result")
     rows: list[dict] = []
     for arm in arms:
         for fold in folds:

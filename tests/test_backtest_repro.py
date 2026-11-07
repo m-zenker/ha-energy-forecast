@@ -56,3 +56,7 @@ def test_load_live_pred_roundtrip(tmp_path):
     )
     p, a = load_live_pred(tmp_path)
     assert p.iloc[0] == 0.5 and a.iloc[0] == 0.4 and isinstance(p.index, pd.DatetimeIndex)
+
+
+def test_gate_folds_empty_series():
+    assert gate_folds(pd.Series(dtype=float)) == []

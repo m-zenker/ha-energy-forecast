@@ -32,3 +32,14 @@ def test_temp_ablation_arms_are_valid_static_drops():
 
 def test_replay_series_empty_frame():  # gate window with no scorable days → run_experiment returns DataFrame()
     assert replay_series(pd.DataFrame()).empty
+
+
+def test_repro_failure_becomes_header_line(tmp_path):
+    from backtest.__main__ import _repro_lines
+
+    lines = _repro_lines(None, None, {}, data_dir=tmp_path)  # no pred_history.json
+    assert len(lines) == 1 and lines[0].startswith("live comparison: unavailable")
+
+
+def test_defrost_risk_counts_as_temperature():
+    assert "defrost_risk" in temp_ablation.TEMP_GROUP and "defrost_risk" not in temp_ablation.SUN_GROUP
