@@ -62,6 +62,8 @@ def gate_folds(live_pred: pd.Series, days: int = 28) -> list[Fold]:
 
 def replay_series(df: pd.DataFrame, arm: str = "base") -> pd.Series:
     """Flatten the ``lead25`` rows of *arm* into one hourly series."""
+    if df.empty:
+        return pd.Series(dtype=float)
     sub = df[(df["arm"] == arm) & (df["origin"] == "lead25")]
     parts = [pd.Series(r.pred, index=pd.date_range(r.ts0, periods=24, freq="h")) for r in sub.itertuples()]
     return pd.concat(parts).dropna().sort_index() if parts else pd.Series(dtype=float)
