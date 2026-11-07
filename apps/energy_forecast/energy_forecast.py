@@ -1088,7 +1088,7 @@ class EnergyForecast(hass.Hass):
         dhw_schedule must NOT be cached by the caller unless dhw_schedule is
         included in the cache key. The safest default is to never cache them.
         After a successful set_dhw_schedule call, callers must flush their own
-        scenario cache — this app only invalidates its own _cached_forecast_df.
+        scenario cache — this app holds no schedule-dependent scenario cache.
 
         Fires event "energy_forecast_scenario_result" with the forecast payload.
         """
@@ -1449,8 +1449,9 @@ class EnergyForecast(hass.Hass):
 
     def _set_dhw_schedule_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
         """AppDaemon service `energy_forecast/set_dhw_schedule`: commit a DHW schedule override
-        to the physics model and invalidate the cached forecast so the next hourly cycle
-        recomputes with the new schedule."""
+        to the physics model. Keeps _cached_forecast_df (raw weather, schedule-independent) so
+        get_scenario keeps answering between cycles; the override is read at prediction time and
+        the next hourly cycle publishes the new schedule."""
         if self._physics_model is None:
             _LOGGER.warning("set_dhw_schedule called but physics is not configured — ignoring")
             return
@@ -1460,7 +1461,6 @@ class EnergyForecast(hass.Hass):
             return
         try:
             self._physics_model.commit_dhw_schedule(dhw_schedule)
-            self._cached_forecast_df = None  # forces a fresh forecast on the next publish cycle
             _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(f"set_dhw_schedule failed: {exc}")
