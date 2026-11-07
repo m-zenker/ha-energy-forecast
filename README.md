@@ -5,8 +5,8 @@
 
 *Know your electricity bill before the day begins.*
 
-![Version](https://img.shields.io/badge/version-v0.12.0--alpha--15-blue)
- ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-1146%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
+![Version](https://img.shields.io/badge/version-v0.11.18-blue)
+ ![License](https://img.shields.io/badge/license-MIT-green) ![Tests](https://img.shields.io/badge/tests-864%20passing-brightgreen) ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.x-orange)
 
 Plan EV charging, avoid bill surprises, and know your daily energy use before the day starts — using a two-stage machine-learning model trained on *your own* historical grid-import data and local weather. The system identifies your household's "daily regimes" (e.g. Workday vs. Home Office) to provide a stable baseline, then fine-tunes hourly predictions based on real-time weather and lags.
 
@@ -89,10 +89,15 @@ In HA go to **Settings → Add-ons → Add-on Store**, install **AppDaemon**, th
     ├── __init__.py
     ├── energy_forecast.py
     ├── ha_data.py
+    ├── heating_season.py
     ├── model.py
+    ├── physics.py
+    ├── clustering.py
     ├── weather.py
-    └── const.py
+    ├── const.py
+    └── requirements.txt
 ```
+Copy the whole `apps/energy_forecast/` folder rather than picking files — `energy_forecast.py` imports its siblings unconditionally and fails to load if any is missing.
 
 **3. Create `apps.yaml`** from the example and set the three required keys:
 ```bash
@@ -108,7 +113,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 
 **Next steps:**
 1. **Import dashboard cards** — YAML files are in `dashboard/`. See [Dashboard Setup](#dashboard-setup) for required custom cards.
-2. **Run backfill if you have < 48 hours of history** — see [Backfilling history](#backfilling-history). New installs without backfill will not produce a forecast until 48 hours of data accumulate.
+2. **Run backfill if you have < 48 hours of history** — see [Backfilling history](#backfilling-history). New installs without backfill will not produce a forecast until enough data accumulates (≥ 48 hours of history, and ≥ 100 clean hourly rows before the first model trains).
 3. **Wait 48 hours for the first stable forecast.** Accuracy improves significantly over 2–4 weeks as lag features activate and the model learns your household's weekly rhythm.
 
 ---
@@ -126,6 +131,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Solar PV + battery support** — four optional sensors correct the training target to true household consumption
 - **Exponential sample weighting** — recent data influences the model more than old data
 - **Self-healing** — graceful fallbacks at every external dependency
+- **Update notification** — once a day (09:00 local) the app compares its version with the latest GitHub release and raises a one-time persistent notification if a newer one exists; disable with `update_check_enabled: false`
 
 ### Stage 2 — Thermal & Occupancy
 - **Thermal & DHW intent modeling** — climate setpoint/current-temperature delta (`thermal_pressure`) and DHW buffer temperature (`dhw_pressure`) let the model anticipate heat-pump and water-heater cycles before they start
@@ -161,7 +167,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
     dhw_schedule:
       legionella: ["2026-06-25", 10]  # [date string, hour]
   ```
-  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model and invalidates the cached forecast so the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
+  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model, and the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
 
 ---
 
@@ -186,7 +192,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 
 `dhw_schedule` is an optional, **transient** (non-persisted) override of the physics model's DHW/legionella schedule, shaped `{"legionella": ["YYYY-MM-DD", hour]}`. It only affects this one `get_scenario` call — it is never written to `physics_schedule.json` and does not survive past the call. When provided, `delta_kwh` reflects the **combined** appliance-schedule + dhw-schedule delta versus the natural (currently committed) baseline. To persist a DHW schedule change instead, use `energy_forecast/set_dhw_schedule` (see [Physics-ML Hybrid](#physics-ml-hybrid-phases-1--2-optional)).
 
-> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app only invalidates its internal forecast cache, not any cache kept by the caller.
+> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app does not touch any cache kept by the caller.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
@@ -291,9 +297,13 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
                ├── __init__.py
                ├── energy_forecast.py
                ├── ha_data.py
+               ├── heating_season.py
                ├── model.py
+               ├── physics.py
+               ├── clustering.py
                ├── weather.py
-               └── const.py
+               ├── const.py
+               └── requirements.txt
    ```
 
 3. **Create `apps.yaml`** from the provided example and keep it in place permanently — it is your live configuration:
@@ -312,7 +322,7 @@ This configuration is also available as [`ha_appdaemon_config.yaml`](ha_appdaemo
    HA Energy Forecast ready.
    ```
 
-5. **Initial training** runs ~10 seconds after startup. If you have fewer than 48 hours of history the app will log a warning and skip training until more data accumulates. See [Backfilling history](#backfilling-history) to import years of history from the HA SQLite database.
+5. **Initial training** runs ~10 seconds after startup. If you have fewer than 48 hours of history (or fewer than 100 clean hourly rows) the app will log a warning and skip training until more data accumulates. See [Backfilling history](#backfilling-history) to import years of history from the HA SQLite database.
 
    **Verify it's working:** after ~2 minutes, check `sensor.energy_forecast_setup_status` in **Developer Tools → States** — it should read `ok`. See also the [Troubleshooting quick sanity check](#troubleshooting).
 
@@ -458,6 +468,7 @@ energy_forecast:
   #   dhw_tank_temp_sensor: sensor.dhw_tank_temperature        # °C
   #   heating_buffer_temp_sensor: sensor.heating_buffer_temp  # °C
   #   heating_curve_sensor: sensor.heating_curve_setpoint      # heating curve setpoint
+  #   heating_sub_meter_sensor: sensor.hp_space_heating_kwh    # cumulative space-heating-only kWh meter (best UA_eff calibration)
   #   cop_formula: {a: 2.5, b: 0.07}                           # fallback Carnot-style COP formula (default shown)
   #   dhw_tank_volume_l: 200                                   # DHW tank volume (litres, default shown)
   #   dhw_power_w: 4000                                        # DHW heater power (W, default shown)
@@ -528,6 +539,8 @@ energy_forecast:
 | `physics.dhw_tank_temp_sensor` | No | — | Entity ID of a DHW tank temperature sensor (°C). Also sourced as the `buffer_temp` column used for DHW calibration and schedule inference. |
 | `physics.heating_buffer_temp_sensor` | No | — | Entity ID of a heating buffer temperature sensor (°C). Sourced as the `heating_buffer_temp` feature. |
 | `physics.heating_curve_sensor` | No | — | Entity ID of a heating-curve setpoint sensor. |
+| `physics.heating_sub_meter_sensor` | No | — | Entity ID of a cumulative kWh meter measuring **space heating only** (excluding DHW). Enables the most accurate UA_eff calibration tier: night windows are gated on measured sub-meter draw (> 0.3 kWh/h) and the regression target is the sub-meter series itself. Also supplies the heating label for the learned `heating_temp_on`/`heating_temp_off` thresholds. Without it, calibration falls back to `heating_system_active_entity`, then to an outdoor-temperature gate. |
+| `physics.c_building_wh_k` | No | `UA_eff × τ` | Advanced: building thermal capacity (Wh/K). Overrides the value derived from calibrated UA_eff and τ. Leave unset unless you have a measured figure. |
 | `physics.cop_formula` | No | `{a: 2.5, b: 0.07}` | Coefficients `{a, b}` for a fallback Carnot-style COP formula, used when `cop_sensor` is absent or unavailable. |
 | `physics.dhw_tank_volume_l` | No | `200` | DHW tank volume in litres. Used by the physics model to compute heat-loss and re-heat energy. |
 | `physics.dhw_power_w` | No | `4000` | DHW heater rated power in watts. |
@@ -1077,6 +1090,7 @@ empty `physics: {}` activates the feature.
       - climate_entity: climate.living_room
         temp_sensor: sensor.netatmo_living_room_temp
         area_m2: 35
+    heating_sub_meter_sensor: sensor.hp_space_heating_kwh   # optional: space-heating-only kWh meter (best calibration)
     dhw_tank_volume_l: 200         # optional (default shown)
     dhw_power_w: 4000              # optional (default shown)
     use_physics_residual: false    # Phase 2 flag — held at Phase 1 for now
@@ -1093,6 +1107,16 @@ All sub-keys are optional. See the [Parameter reference](#parameter-reference) f
 
 Features are added to the feature set only when physics is configured **and** the relevant sensor
 data is available for that training row — never constant-zero placeholders.
+
+### Calibration eligibility tiers
+
+UA_eff (building heat-loss) calibration picks the best available signal for deciding which night hours are usable:
+
+1. **`sub_meter`** — `physics.heating_sub_meter_sensor` configured: windows are gated on measured space-heating draw, and the regression target is the sub-meter series.
+2. **`heating_active`** — `heating_system_active_entity` configured: windows are gated on that boolean.
+3. **`temperature_fallback`** — neither configured: gated on outdoor temperature alone, plus a load-floor check once base load has been calibrated.
+
+EV-charging and away hours are excluded in every tier, at least 10 distinct calibration nights are required, and a fitted UA_eff outside the sanity bounds is discarded with a WARNING.
 
 ### Automatic calibration
 
@@ -1123,8 +1147,8 @@ data:
 
 Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, see [Scenario / What-If API](#scenario--what-if-api)),
 this override is **committed** — it is written to `physics_schedule.json` as `committed_override`
-and persists across restarts until overwritten. Calling it also invalidates this app's internal
-forecast cache (`_cached_forecast_df`), so the next hourly cycle recomputes with the new schedule.
+and persists across restarts until overwritten. `get_scenario` keeps answering after a commit and
+reads the override at prediction time; the next hourly cycle publishes the new schedule.
 It does **not** invalidate any scenario cache kept by a consuming app (see the caller cache
 contract above) — flush that separately after a successful call. Logs a WARNING and no-ops if
 `physics:` is not configured or `dhw_schedule` is not a dict.
@@ -1163,13 +1187,10 @@ columns are filled with `0.0` and a WARNING is logged. This applies to `predict(
 
 ### Known limitations
 
-- `energy_forecast/get_scenario` now always passes `physics_model` to `predict_scenario()` when
-  physics is configured, so `physics_kwh` is computed from the same real, cached sensor data
-  (`climate_recent` / `dhw_recent` / `room_areas`) used by the main forecast — it is no longer a
-  `0.0` stub, and the "physics disabled at predict time" WARNING no longer fires for `get_scenario`.
-  However, `heating_active_series` / `setpoint_on` / `setpoint_off` are still not passed from
-  `_get_scenario_cb`, so indoor-temperature-projection quality within a scenario can differ
-  slightly from the main hourly forecast, which does supply those inputs.
+- `energy_forecast/get_scenario` passes the same cached physics inputs as the main forecast
+  (`physics_model`, `climate_recent` / `dhw_recent` / `room_areas`, `heating_active_series`,
+  `setpoint_on` / `setpoint_off`), so `physics_kwh` within a scenario is computed identically to
+  the hourly forecast.
 - Phase 2 (`use_physics_residual: true`) is implemented but dormant — the cold-start gate blocks
   activation until ≥ 30 winter UA_eff calibration windows have been collected. No config change is
   needed; the next weekly retrain after the gate clears will promote automatically to Phase 2 and
@@ -1289,8 +1310,8 @@ Dashboard YAML files are in the `dashboard/` directory. To import them into Home
 - Use the [backfill tool](#backfilling-history) to import history from the HA SQLite DB.
 
 **`Insufficient history (N h). Skipping.`**
-- Fewer than 48 hours of data are available. The app will retry on the next training cycle. Normal on a new install — history accumulates automatically.
-- **New installs:** run the [backfill tool](#backfilling-history) to import existing HA history before the first training run. Without it, you will not receive a forecast until at least 48 consecutive hours of energy readings have been collected.
+- Fewer than 48 hours of data are available (training additionally needs ≥ 100 clean rows). The app will retry on the next training cycle. Normal on a new install — history accumulates automatically.
+- **New installs:** run the [backfill tool](#backfilling-history) to import existing HA history before the first training run. Without it, you will not receive a forecast until at least 48 hours of history and 100 clean hourly rows have been collected.
 
 **`ML engine: sklearn GBR` instead of LightGBM**
 - LightGBM failed to install — typically armv7, which has no prebuilt LightGBM wheel on PyPI.
