@@ -118,3 +118,40 @@ def test_load_warns_on_version_mismatch(tmp_path):
     sp.write_text(json.dumps(sc))
     with pytest.warns(UserWarning, match="pandas"):
         capture.load_capture(tmp_path, "predict", cid)
+
+
+def test_prune_removes_orphan_pickle_and_ref_dir(tmp_path):
+    now = _ts("2026-06-01")
+    d = tmp_path / "retrain"
+    d.mkdir(parents=True)
+    old = time.time() - 7200
+    pkl, ref, fresh = d / "a.pkl.gz", d / "a.ref", d / "b.pkl.gz"
+    pkl.write_bytes(b"x")
+    ref.mkdir()
+    (ref / "m.pkl").write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    for p in (pkl, ref):
+        os.utime(p, (old, old))
+    capture.prune(tmp_path, now)
+    assert not pkl.exists() and not ref.exists()
+    assert fresh.exists()
+
+
+def test_prune_survives_corrupt_sidecar(tmp_path):
+    now = _ts("2026-06-01")
+    capture.write_capture(tmp_path, "predict", {}, {}, now - pd.Timedelta(days=46))
+    d = tmp_path / "predict"
+    (d / "bad.json").write_text("{not json")
+    (d / "bad.pkl.gz").write_bytes(b"x")
+    (d / "naive.json").write_text(json.dumps({"ts_utc": "2026-05-30T00:00:00"}))
+    (d / "naive.pkl.gz").write_bytes(b"x")
+    assert capture.prune(tmp_path, now) == 3
+    assert not (d / "bad.pkl.gz").exists()
+
+
+def test_write_does_not_prune_new_capture(tmp_path, monkeypatch):
+    orig = capture.prune
+    monkeypatch.setattr(capture, "prune", lambda *a, **k: orig(*a, **{**k, "max_bytes": 0}))
+    cid = capture.write_capture(tmp_path, "predict", {}, {}, _ts("2020-01-01"))
+    assert cid is not None
+    assert (tmp_path / "predict" / f"{cid}.json").exists()

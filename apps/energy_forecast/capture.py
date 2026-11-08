@@ -76,11 +76,15 @@ def write_capture(
             "versions": library_versions(),
             "bytes": pkl.stat().st_size,
         }
-        _atomic_write_json(d / f"{capture_id}.json", sidecar)
+        try:
+            _atomic_write_json(d / f"{capture_id}.json", sidecar)
+        except Exception:
+            pkl.unlink(missing_ok=True)
+            raise
     except Exception as exc:
         _LOGGER.warning("capture: write failed (%s): %s", kind, exc)
         return None
-    prune(root, now_utc)
+    prune(root, now_utc, protect=capture_id)
     return capture_id
 
 
@@ -149,38 +153,73 @@ def _remove_capture(d: Path, capture_id: str) -> None:
     shutil.rmtree(d / f"{capture_id}.ref", ignore_errors=True)
 
 
+def _old_enough(path: Path) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime > _TMP_MAX_AGE_S
+    except OSError:
+        return False
+
+
+def _parse_ts(value) -> pd.Timestamp | None:
+    """Parse a tz-aware timestamp; None if missing, unparseable or naive."""
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts) or ts.tzinfo is None:
+        return None
+    return ts
+
+
 def prune(
     root: Path,
     now_utc: pd.Timestamp,
     retention_days: int = RETENTION_DAYS,
     max_bytes: int = MAX_TOTAL_BYTES,
+    protect: str | None = None,
 ) -> int:
-    """Drop captures past retention, then oldest-first until under max_bytes; clear stale .tmp files."""
+    """Drop captures past retention, then oldest-first until under max_bytes.
+
+    Also clears stale .tmp files and orphan .pkl.gz / .ref dirs lacking a sidecar (older than 1 h).
+    A capture with an unreadable sidecar is treated as the oldest. ``protect`` is never removed.
+    """
     removed = 0
     try:
         root = Path(root)
         cutoff = now_utc - pd.Timedelta(days=retention_days)
-        entries: list[tuple[str, Path, str, int]] = []
+        oldest = pd.Timestamp.min.tz_localize("UTC")
+        entries: list[tuple[pd.Timestamp, Path, str, int]] = []
         for kind in _KINDS:
             d = root / kind
             if not d.is_dir():
                 continue
             for tmp in d.glob("*.tmp"):
-                if time.time() - tmp.stat().st_mtime > _TMP_MAX_AGE_S:
+                if _old_enough(tmp):
                     tmp.unlink(missing_ok=True)
-            for sc in list_captures(root, kind):
-                cid = sc["capture_id"]
-                size = (
-                    (d / f"{cid}.pkl.gz").stat().st_size
-                    + (d / f"{cid}.json").stat().st_size
-                    + (_dir_size(d / f"{cid}.ref") if (d / f"{cid}.ref").is_dir() else 0)
-                )
-                entries.append((sc.get("ts_utc", ""), d, cid, size))
-        entries.sort(key=lambda e: pd.Timestamp(e[0]) if e[0] else pd.Timestamp.min.tz_localize("UTC"))
+            for orphan in list(d.glob("*.pkl.gz")) + list(d.glob("*.ref")):
+                cid = orphan.name.split(".")[0]
+                if not (d / f"{cid}.json").exists() and _old_enough(orphan):
+                    _remove_capture(d, cid)
+                    removed += 1
+            for sp in d.glob("*.json"):
+                cid = sp.stem
+                if cid == protect or not (d / f"{cid}.pkl.gz").exists():
+                    continue
+                try:
+                    ref = d / f"{cid}.ref"
+                    size = (d / f"{cid}.pkl.gz").stat().st_size + sp.stat().st_size
+                    size += _dir_size(ref) if ref.is_dir() else 0
+                    try:
+                        ts = _parse_ts(json.loads(sp.read_text()).get("ts_utc"))
+                    except Exception:
+                        ts = None
+                    entries.append((ts if ts is not None else oldest, d, cid, size))
+                except Exception as exc:
+                    _LOGGER.warning("capture: prune skipped %s: %s", sp.name, exc)
+        entries.sort(key=lambda e: e[0])
         keep = []
         for e in entries:
-            ts = pd.Timestamp(e[0]) if e[0] else None
-            if ts is not None and ts < cutoff:
+            if e[0] < cutoff:
                 _remove_capture(e[1], e[2])
                 removed += 1
             else:
