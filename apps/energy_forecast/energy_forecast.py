@@ -241,7 +241,7 @@ def _capture_retrain_inputs(app, train_kwargs: dict) -> str | None:
 
 def _snapshot_predict_inputs(app, predict_kwargs: dict, now_local) -> dict | None:
     """Deep-copy the raw predict inputs before the model touches them (flag-gated; never raises)."""
-    if not getattr(app, "_capture_inputs", False):
+    if not app._capture_inputs:
         return None
     try:
         physics = app._physics_model
@@ -280,7 +280,7 @@ def _write_predict_capture(
         meta = {
             "last_trained": str(app._ml_model.last_trained),
             "weather_source": weather_source,
-            "retrain_in_progress": bool(getattr(app, "_retrain_running", False)) and not after_retrain,
+            "retrain_in_progress": bool(app._retrain_running) and not after_retrain,
             "after_retrain": after_retrain,
             "physics": snapshot["physics_model"] is not None,
         }
@@ -313,6 +313,7 @@ class EnergyForecast(hass.Hass):
         _hd._LOGGER = self.logger
         _mdl._LOGGER = self.logger
         _wth._LOGGER = self.logger
+        capture._LOGGER = self.logger
 
         _LOGGER.info("HA Energy Forecast initialising…")
 

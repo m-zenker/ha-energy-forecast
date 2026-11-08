@@ -4399,6 +4399,8 @@ class _FakeUpdateSensors:
         self._lat = 47.0
         self._lon = 8.5
         self.args = {}
+        self._capture_inputs = False
+        self._retrain_running = False
         self._energy_sensor = "sensor.energy"
         self._cache_path = cache_path
         self._cache_path_15m = cache_path.parent / "energy_history_15m.csv"
