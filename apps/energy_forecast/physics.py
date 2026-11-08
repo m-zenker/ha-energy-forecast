@@ -1267,13 +1267,14 @@ class ThermalPhysicsModel:
         cop = self._cop_series(ts, t_out, cop_sensor_series=None)
         m = meter.reindex(ts)
         dtp = np.clip(t_in - t_out, 0, None)
+        ok = t_in.notna() & t_out.notna() & m.notna()  # one per-hour mask for observed AND modelled terms
         frame = pd.DataFrame(
             {
-                "dtp": dtp,
+                "dtp": dtp.where(ok),
                 "cop": cop,
                 "dt": t_in - t_out,
-                "ok": (t_in.notna() & t_out.notna() & m.notna()).astype(int),
-                "kwh": m.fillna(0.0),
+                "ok": ok.astype(int),
+                "kwh": m.where(ok, 0.0),
             }
         )
         if heating_active_df is not None and not heating_active_df.empty:

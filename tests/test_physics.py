@@ -2559,6 +2559,22 @@ class TestUaEffDaily:
         assert m._calib.get("calibrated_at") and (m._calib["UA_eff"], m._calib["gains_w"]) == (120.0, 800.0)
         assert "boom" in caplog.text
 
+    @pytest.mark.parametrize("gap", ["t_in", "meter"])
+    def test_hours_masked_consistently_in_observed_and_model(self, tmp_path, gap):
+        # 2 cold night hours/day without T_in (meter still reads) or without meter (T_in present): both the
+        # observed daily kWh and the modelled terms must drop the same hours, else UA is biased up / down
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture()
+        cop = m._cop_series(idx, pd.Series(t_out, index=idx), cop_sensor_series=None).values
+        meter = pd.DataFrame({"timestamp": idx, "kwh": 80.0 * np.clip(20.0 - t_out, 0, None) / cop / 1000.0})
+        night = idx.hour.isin([2, 3])
+        if gap == "t_in":
+            clim["climate.a"]["current_temp"] = np.where(night, np.nan, 20.0)
+        else:
+            meter = meter[~night]
+        ua, _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert n == 40 and ua == pytest.approx(80.0, rel=0.01)
+
     def test_ua_above_sanity_max_rejected(self, tmp_path, caplog):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _varying_daily_fixture()
