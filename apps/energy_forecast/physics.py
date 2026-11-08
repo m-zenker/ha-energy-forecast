@@ -173,6 +173,12 @@ class ThermalPhysicsModel:
 
     @property
     def ua_calibration_stale(self) -> bool:
+        """Due at the weekly retrain (half-day slack: retrains run every 168 h and stamp minutes in, so a strict
+        '> 7 d' would slip every refresh to 14 d), or when the configured UA method differs from the calibrated
+        one. Under config hourly the weekly refresh is a no-op, so a calib still on 'daily' stays stale until the
+        next full calibrate() re-fits hourly — harmless, recalibrate_ua returns before any work."""
+        if self._config.get("ua_eff_method", "hourly") != self._calib.get("ua_eff_method", "hourly"):
+            return True
         raw = self._calib.get("ua_calibrated_at")
         if not raw:
             return True
@@ -181,7 +187,7 @@ class ThermalPhysicsModel:
         except (ValueError, TypeError):
             return True
         age_days = (pd.Timestamp.now() - calibrated_at.tz_localize(None)).total_seconds() / 86400
-        return age_days > UA_EFF_RECAL_DAYS
+        return age_days >= UA_EFF_RECAL_DAYS - 0.5
 
     @property
     def is_cold_start_gated(self) -> bool:

@@ -2370,6 +2370,36 @@ class TestUaEffDaily:
         m._calib["ua_calibrated_at"] = (pd.Timestamp.now() - pd.Timedelta(days=2)).isoformat()
         assert not m.ua_calibration_stale
 
+    def test_ua_staleness_due_at_weekly_retrain(self, tmp_path):
+        # retrains run every 168 h and stamp minutes in; a strict "> 7 d" slips every refresh to 14 d
+        m = self._m(tmp_path)
+        m._calib["ua_calibrated_at"] = (pd.Timestamp.now() - pd.Timedelta(days=6.6)).isoformat()
+        assert m.ua_calibration_stale
+        m._calib["ua_calibrated_at"] = (pd.Timestamp.now() - pd.Timedelta(days=6.4)).isoformat()
+        assert not m.ua_calibration_stale
+
+    def test_ua_staleness_on_method_mismatch(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        m._calib.update(ua_calibrated_at=pd.Timestamp.now().isoformat(), ua_eff_method="hourly")
+        assert m.ua_calibration_stale  # switch to daily takes effect at the next retrain
+        m._calib["ua_eff_method"] = "daily"
+        assert not m.ua_calibration_stale
+
+    def test_hourly_config_with_daily_calib_recalibrate_is_cheap_noop(self, tmp_path):
+        # config switched back to hourly: stale stays True until the next full calibrate() re-fits hourly,
+        # but the weekly path must neither fit nor write anything on each retrain meanwhile
+        idx, weather, clim, t_out = _daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        m = self._m(tmp_path)
+        stamp = pd.Timestamp.now().isoformat()
+        m._calib.update(ua_calibrated_at=stamp, ua_eff_method="daily", UA_eff=120.0, gains_w=800.0)
+        assert m.ua_calibration_stale
+        with patch.object(m, "_calibrate_ua_eff_daily") as fit:
+            m.recalibrate_ua(energy, clim, weather, _meter_for(m, idx, t_out, 80.0), self._end(idx))
+        fit.assert_not_called()
+        assert (m._calib["UA_eff"], m._calib["gains_w"], m._calib["ua_calibrated_at"]) == (120.0, 800.0, stamp)
+        assert not (tmp_path / "models" / "physics_calibration.json").exists()
+
     def test_recalibrate_ua_updates_ua_only_and_noop_when_hourly(self, tmp_path):
         idx, weather, clim, t_out = _daily_fixture()
         energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
