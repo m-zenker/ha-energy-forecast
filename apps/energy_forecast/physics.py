@@ -19,6 +19,7 @@ import pandas as pd
 from .const import (
     C_BUILDING_DEFAULT_TAU_H,
     HEATING_SUB_METER_MIN_KWH,
+    UA_EFF_DAILY_MAX_GAINS_W,
     UA_EFF_DAILY_MIN_DAYS,
     UA_EFF_DAILY_MIN_MEAN_DT_K,
     UA_EFF_DAILY_MIN_R2,
@@ -80,6 +81,7 @@ def _default_calibration() -> dict[str, Any]:
         "calibrated_at": None,
         "n_calibration_windows_ua_eff": 0,
         "UA_eff": None,
+        "gains_w": None,  # internal gains (W) fitted jointly with UA_eff by the daily method (#105 Task 2b)
         "solar_gain_area": 0.0,
         "Q_base_el": 0.35,
         "q_base_el_calibrated": False,  # new (#92) -- see _resolve_heating_eligibility's tier 3
@@ -245,12 +247,15 @@ class ThermalPhysicsModel:
             return pd.Series(0.0, index=t_indoor.index)
 
         solar_area = self._calib.get("solar_gain_area") or 0.0
-        q_base_el = self._calib.get("Q_base_el") or 0.0
-        gains_fraction = self._config["internal_gains_fraction"]
+        fitted_gains_w = self._calib.get("gains_w")
+        if self._calib.get("ua_eff_method") == "daily" and fitted_gains_w is not None:
+            q_gain_int = float(fitted_gains_w)  # fitted jointly with this UA - keep prediction consistent with it
+        else:
+            q_base_el = self._calib.get("Q_base_el") or 0.0
+            q_gain_int = q_base_el * self._config["internal_gains_fraction"] * 1000.0
 
         q_loss = ua * (t_indoor - t_outdoor).clip(lower=0.0)
         q_solar = solar_area * ghi.fillna(0.0)
-        q_gain_int = q_base_el * gains_fraction * 1000.0
 
         c_building = self._config.get("c_building_wh_k") or (ua * C_BUILDING_DEFAULT_TAU_H)
         t_indoor_next = t_indoor.shift(-1).fillna(t_indoor)
@@ -1188,6 +1193,41 @@ class ThermalPhysicsModel:
 
         return (residual - median).abs() > 2 * sigma
 
+    @staticmethod
+    def _fit_ua_gains_daily(
+        dtp: np.ndarray, inv_cop: np.ndarray, day_codes: np.ndarray, y: np.ndarray
+    ) -> tuple[float, float, float]:
+        """Fit kwh_d = sum_h max(0, UA*dT+_h - G) * invCOP_h / 1000 (the clipped model prediction uses, minus
+        q_mass ~ 0/day and solar ~ 0) for UA in [0, UA_EFF_SANITY_MAX_W_PER_K], G in [0, UA_EFF_DAILY_MAX_GAINS_W].
+        Hours without data carry inv_cop = 0. Returns (UA W/K, G W, R2 on daily kWh)."""
+        n = len(y)
+        a = np.bincount(day_codes, weights=dtp * inv_cop, minlength=n) / 1000.0
+        b = np.bincount(day_codes, weights=inv_cop, minlength=n) / 1000.0
+        # linear (unclipped) start: kwh = UA*a - G*b, G clamped to >= 0
+        (ua0, g0), *_ = np.linalg.lstsq(np.column_stack([a, -b]), y, rcond=None)
+        if g0 < 0:
+            g0, ua0 = 0.0, float(np.sum(a * y) / np.sum(a * a))
+        ua0 = float(np.clip(ua0, 0.0, UA_EFF_SANITY_MAX_W_PER_K))
+        g0 = float(np.clip(g0, 0.0, UA_EFF_DAILY_MAX_GAINS_W))
+
+        def predict(ua: float, g: float) -> np.ndarray:
+            hourly = np.maximum(0.0, ua * dtp - g) * inv_cop
+            return np.bincount(day_codes, weights=hourly, minlength=n) / 1000.0
+
+        ua, g = ua0, g0
+        try:
+            from scipy.optimize import least_squares
+        except ImportError:  # pragma: no cover - live AppDaemon has scipy via scikit-learn
+            _LOGGER.info("UA_eff daily: scipy unavailable - using the linear UA+gains fit")
+        else:
+            hi = np.array([UA_EFF_SANITY_MAX_W_PER_K, UA_EFF_DAILY_MAX_GAINS_W])
+            x0 = np.clip([ua0, g0], hi * 1e-6, hi * (1 - 1e-6))  # strictly inside the bounds
+            res = least_squares(lambda p: predict(p[0], p[1]) - y, x0, bounds=(np.zeros(2), hi), x_scale=hi)
+            ua, g = float(res.x[0]), float(res.x[1])
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        r2 = 1.0 - float(np.sum((y - predict(ua, g)) ** 2)) / ss_tot if ss_tot > 1e-9 else 0.0
+        return ua, g, r2
+
     def _calibrate_ua_eff_daily(
         self,
         climate_dfs: dict[str, pd.DataFrame] | None,
@@ -1196,30 +1236,33 @@ class ThermalPhysicsModel:
         window_end: pd.Timestamp,
         room_areas: dict[str, float] | None = None,
         heating_active_df: pd.DataFrame | None = None,
-    ) -> tuple[float | None, int]:
-        """Effective UA (W/K, formula-COP units) from a DAILY heat balance on the heating sub-meter:
-            meter_kWh(day) = UA/1000 * sum_h max(0, T_in - T_out)/COP_h
-        Daily sums absorb buffer-tank and HP-cycling lag that defeat the hourly fit. Rolling window of
-        UA_EFF_DAILY_WINDOW_DAYS ending at window_end (data end, not the ML holdout): effective UA is
-        seasonal (formula-COP units; autumn 2026 ~ 84-88 W/K, R2 ~ 0.6). Days are selected on x (heating
-        season / dT), never on the meter value. Returns (UA | None, eligible heating days in history).
+    ) -> tuple[float | None, float | None, int]:
+        """Effective UA (W/K, formula-COP units) and internal gains G (W) from a DAILY heat balance on the
+        heating sub-meter, fitted jointly with the clipped model prediction uses:
+            meter_kWh(day) = sum_h max(0, UA * max(0, T_in - T_out) - G) / COP_h / 1000
+        Daily sums absorb buffer-tank and HP-cycling lag that defeat the hourly fit; G gives the balance point
+        that a through-origin slope would fold into a temperature-mix-dependent UA. Rolling window of
+        UA_EFF_DAILY_WINDOW_DAYS ending at window_end (data end, not the ML holdout). Days are selected on
+        dT / heating season, never on the meter value. Returns (UA | None, G | None, eligible heating days).
         """
         if not climate_dfs or heating_sub_meter_df is None or heating_sub_meter_df.empty:
-            return None, 0
+            return None, None, 0
         hs = heating_sub_meter_df.assign(timestamp=pd.to_datetime(heating_sub_meter_df["timestamp"]).dt.floor("1h"))
         meter = hs.groupby("timestamp")["kwh"].sum()
         meter = meter[meter.index < window_end]
         if meter.empty:
-            return None, 0
+            return None, None, 0
         ts = pd.date_range(meter.index.min().floor("1D"), window_end.floor("1h") - pd.Timedelta(hours=1), freq="1h")
         w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
         t_out = w["temp_c"].reindex(ts, method="nearest", tolerance=pd.Timedelta("1h"))
         t_in = self._area_weighted_t_indoor_strict(climate_dfs, ts, room_areas)
         cop = self._cop_series(ts, t_out, cop_sensor_series=None)
         m = meter.reindex(ts)
+        dtp = np.clip(t_in - t_out, 0, None)
         frame = pd.DataFrame(
             {
-                "x": np.clip(t_in - t_out, 0, None) / cop,
+                "dtp": dtp,
+                "cop": cop,
                 "dt": t_in - t_out,
                 "ok": (t_in.notna() & t_out.notna() & m.notna()).astype(int),
                 "kwh": m.fillna(0.0),
@@ -1229,7 +1272,7 @@ class ThermalPhysicsModel:
             ha = heating_active_df.assign(timestamp=pd.to_datetime(heating_active_df["timestamp"]).dt.floor("1h"))
             frame["on"] = ha.groupby("timestamp")["heating_active"].last().reindex(ts).ffill()
         day = frame.resample("1D").agg(
-            {"x": "sum", "dt": "mean", "ok": "sum", "kwh": "sum", **({"on": "mean"} if "on" in frame else {})}
+            {"dt": "mean", "ok": "sum", "kwh": "sum", **({"on": "mean"} if "on" in frame else {})}
         )
         heating = day["on"] >= 0.5 if "on" in day else day["dt"] >= UA_EFF_DAILY_MIN_MEAN_DT_K
         day = day[(day["ok"] >= 22) & heating]
@@ -1242,23 +1285,27 @@ class ThermalPhysicsModel:
                 UA_EFF_DAILY_WINDOW_DAYS,
                 UA_EFF_DAILY_MIN_DAYS,
             )
-            return None, n_days
-        x, y = win["x"].values, win["kwh"].values
-        slope = float(np.sum(x * y) / np.sum(x * x))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = 1.0 - float(np.sum((y - slope * x) ** 2)) / ss_tot if ss_tot > 1e-9 else 0.0
-        ua = slope * 1000.0
+            return None, None, n_days
+        hours = frame[frame.index.floor("1D").isin(win.index)]
+        valid = hours["dtp"].notna() & hours["cop"].notna()
+        day_codes = win.index.get_indexer(hours.index.floor("1D"))
+        inv_cop = np.where(valid, 1.0 / hours["cop"].where(valid, 1.0).values, 0.0)
+        ua, gains, r2 = self._fit_ua_gains_daily(hours["dtp"].fillna(0.0).values, inv_cop, day_codes, win["kwh"].values)
         _LOGGER.info(
-            "UA_eff calibration (daily, %d d window): %d days, UA_eff=%.1f W/K, R2=%.2f",
+            "UA_eff calibration (daily, %d d window): %d days, UA_eff=%.1f W/K, gains=%.0f W, R2=%.2f",
             UA_EFF_DAILY_WINDOW_DAYS,
             len(win),
             ua,
+            gains,
             r2,
         )
+        if gains >= UA_EFF_DAILY_MAX_GAINS_W * (1 - 1e-3):
+            _LOGGER.warning("UA_eff daily: rejected - gains at bound (G %.0f W, UA %.1f W/K, R2 %.2f)", gains, ua, r2)
+            return None, None, n_days
         if r2 < UA_EFF_DAILY_MIN_R2 or not (UA_EFF_SANITY_MIN_W_PER_K <= ua <= UA_EFF_SANITY_MAX_W_PER_K):
-            _LOGGER.warning("UA_eff daily: rejected (UA %.1f W/K, R2 %.2f)", ua, r2)
-            return None, n_days
-        return ua, n_days
+            _LOGGER.warning("UA_eff daily: rejected (UA %.1f W/K, gains %.0f W, R2 %.2f)", ua, gains, r2)
+            return None, None, n_days
+        return ua, gains, n_days
 
     def recalibrate_ua(
         self,
@@ -1277,7 +1324,7 @@ class ThermalPhysicsModel:
         if heating_sub_meter_df is None or heating_sub_meter_df.empty:
             return  # calibrate() fell back to hourly without a sub-meter; keep its UA/window count/method
         try:
-            ua_eff, n_windows = self._calibrate_ua_eff_daily(
+            ua_eff, gains_w, n_windows = self._calibrate_ua_eff_daily(
                 climate_dfs,
                 weather_df,
                 heating_sub_meter_df,
@@ -1290,6 +1337,7 @@ class ThermalPhysicsModel:
             self._calib["ua_calibrated_at"] = pd.Timestamp.now().isoformat()
             if ua_eff is not None:
                 self._calib["UA_eff"] = ua_eff
+                self._calib["gains_w"] = gains_w  # (UA, G) are a pair: stored and retained together
             else:
                 _LOGGER.warning("UA_eff weekly recalibration unavailable - retaining previous value")
             _atomic_write_json(self._calibration_path, self._calib)
@@ -1327,7 +1375,7 @@ class ThermalPhysicsModel:
                     if ua_window_end is not None
                     else pd.to_datetime(energy_df["timestamp"]).max() + pd.Timedelta(hours=1)
                 )
-                ua_eff, n_windows = self._calibrate_ua_eff_daily(
+                ua_eff, gains_w, n_windows = self._calibrate_ua_eff_daily(
                     climate_dfs,
                     weather_df,
                     heating_sub_meter_df,
@@ -1339,6 +1387,7 @@ class ThermalPhysicsModel:
                 if method == "daily":
                     _LOGGER.warning("physics.ua_eff_method=daily needs physics.heating_sub_meter_sensor - using hourly")
                     method = "hourly"
+                gains_w = None
                 ua_eff, n_windows = self._calibrate_ua_eff(
                     energy_df,
                     weather_df,
@@ -1354,8 +1403,11 @@ class ThermalPhysicsModel:
             self._calib["n_calibration_windows_ua_eff"] = n_windows
             self._calib["ua_eff_method"] = method
             self._calib["ua_calibrated_at"] = pd.Timestamp.now().isoformat()
+            if method == "hourly":
+                self._calib["gains_w"] = None  # hourly UA is fitted against config gains, never a fitted G
             if ua_eff is not None:
                 self._calib["UA_eff"] = ua_eff
+                self._calib["gains_w"] = gains_w  # (UA, G) are a pair: stored and retained together
             else:
                 _LOGGER.warning("UA_eff calibration unavailable — heating component will be skipped")
 

@@ -69,6 +69,7 @@ UA_EFF_DAILY_WINDOW_DAYS = 28  # rolling window ending at the data end
 UA_EFF_DAILY_MIN_DAYS = 10  # eligible heating days required inside the window
 UA_EFF_DAILY_MIN_MEAN_DT_K = 8.0  # heating-day test by mean indoor-outdoor dT when no heating_active signal
 UA_EFF_DAILY_MIN_R2 = 0.4  # reject fits explaining less daily-kWh variance than this
+UA_EFF_DAILY_MAX_GAINS_W = 3000.0  # upper bound on the jointly fitted internal gains G; a fit at it is rejected
 UA_EFF_RECAL_DAYS = 7  # UA-only recalibration cadence
 C_BUILDING_DEFAULT_TAU_H = 8.0  # building-mass time constant default (c_building = UA * this)
 

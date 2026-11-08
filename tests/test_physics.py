@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -2232,10 +2234,20 @@ def _daily_fixture(days=40, start="2026-04-01", t_in=20.0):
     return idx, weather, clim, t_out
 
 
-def _meter_for(m, idx, t_out, ua):
+def _varying_daily_fixture(days=42, start="2026-10-01", t_in=20.0):
+    # daily-mean T_out spans 2-14 C (weekly cycle) so a balance point (gains) is identifiable
+    idx = pd.date_range(start, periods=days * 24, freq="1h")
+    day = np.arange(len(idx)) // 24
+    t_out = 2.0 + 12.0 * (day % 7) / 6 + 4 * np.sin(np.arange(len(idx)) * 2 * np.pi / 24)
+    weather = pd.DataFrame({"timestamp": idx, "temp_c": t_out, "direct_radiation_wm2": 0.0})
+    clim = {"climate.a": pd.DataFrame({"timestamp": idx, "current_temp": t_in, "setpoint": t_in})}
+    return idx, weather, clim, t_out
+
+
+def _meter_for(m, idx, t_out, ua, gains_w=0.0):
     cop = m._cop_series(idx, pd.Series(t_out, index=idx), cop_sensor_series=None).values
     ua = np.broadcast_to(ua, len(idx))
-    kwh = ua * np.clip(20.0 - t_out, 0, None) / cop / 1000.0
+    kwh = np.clip(ua * np.clip(20.0 - t_out, 0, None) - gains_w, 0, None) / cop / 1000.0
     daily = pd.Series(kwh, index=idx).resample("1D").sum()
     bursts = pd.Series(0.0, index=idx)  # buffer tank: energy in 2-h bursts, daily sum unchanged
     for d, v in daily.items():
@@ -2254,21 +2266,21 @@ class TestUaEffDaily:
     def test_recovers_ua_in_formula_cop_units(self, tmp_path):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture()
-        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        ua, _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
         assert ua == pytest.approx(80.0, rel=0.05) and n == 40
 
     def test_partial_climate_day_dropped(self, tmp_path):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture(days=12)
         clim["climate.a"] = clim["climate.a"].iloc[5:]  # day 1 has only 19 h
-        _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        _, _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
         assert n == 11
 
     def test_partial_meter_day_dropped(self, tmp_path):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture(days=12)
         meter = _meter_for(m, idx, t_out, 80.0).iloc[5:]  # meter missing first 5 h
-        _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        _, _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
         assert n == 11
 
     def test_zero_kwh_heating_day_still_counts(self, tmp_path):
@@ -2276,26 +2288,28 @@ class TestUaEffDaily:
         idx, weather, clim, t_out = _daily_fixture(days=12)
         meter = _meter_for(m, idx, t_out, 80.0)
         meter.loc[meter["timestamp"].dt.date == idx[0].date(), "kwh"] = 0.0  # no selection on y
-        _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        _, _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
         assert n == 12
 
     def test_too_few_days_returns_none_but_counts(self, tmp_path):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture(days=6)
-        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        ua, _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
         assert ua is None and n == 6
 
     def test_rolling_window_uses_last_28_days_only(self, tmp_path):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture(days=60)
         ua_true = np.where(idx < idx[0] + pd.Timedelta(days=32), 150.0, 60.0)  # seasonal drop
-        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, ua_true), window_end=self._end(idx))
+        ua, _, n = m._calibrate_ua_eff_daily(
+            clim, weather, _meter_for(m, idx, t_out, ua_true), window_end=self._end(idx)
+        )
         assert ua == pytest.approx(60.0, rel=0.05) and n == 60
 
     def test_low_effective_ua_rejected(self, tmp_path, caplog):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _daily_fixture()
-        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 28.0), window_end=self._end(idx))
+        ua, _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 28.0), window_end=self._end(idx))
         assert ua is None and n == 40 and "rejected" in caplog.text
 
     def test_old_calibration_json_defaults_hourly(self, tmp_path):
@@ -2313,7 +2327,7 @@ class TestUaEffDaily:
         meter = _meter_for(m, idx, t_out, 80.0)
         dup = meter[meter["timestamp"] == pd.Timestamp("2026-10-25 02:00")].assign(kwh=0.5)  # second, real 02:00 hour
         meter = pd.concat([meter, dup]).sort_values("timestamp")
-        ua, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        ua, _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
         assert n == 14 and ua == pytest.approx(80.0, rel=0.06)  # 0.5 kWh extra on one of 14 days ≈ +0.5 % UA
 
     def test_calibrate_daily_flag_with_real_cutoff_shape(self, tmp_path):
@@ -2394,3 +2408,80 @@ class TestUaEffDaily:
             assert m._calib["ua_eff_method"] == "hourly"
             assert m._calib["UA_eff"] == 90.0
         assert not (tmp_path / "models" / "physics_calibration.json").exists()
+
+    # --- Task 2b: joint UA + internal-gains daily fit (#105) ---
+
+    def test_joint_fit_recovers_ua_and_gains(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        meter = _meter_for(m, idx, t_out, 150.0, gains_w=1000.0)
+        ua, gains, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert ua == pytest.approx(150.0, rel=0.05)
+        assert gains == pytest.approx(1000.0, rel=0.1)
+        assert n > 0
+
+    def test_zero_gains_data_gives_small_g(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        meter = _meter_for(m, idx, t_out, 150.0, gains_w=0.0)
+        ua, gains, _ = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert ua == pytest.approx(150.0, rel=0.05)
+        assert 0.0 <= gains <= 50.0
+
+    def test_gains_at_bound_rejected(self, tmp_path, caplog):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        meter = _meter_for(m, idx, t_out, 450.0, gains_w=6000.0)  # balance point the fit can only reach with G > 3000
+        ua, gains, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert ua is None and gains is None and n > 0
+        assert "gains at bound" in caplog.text
+
+    def test_prediction_uses_calibrated_gains_only_for_daily(self, tmp_path):
+        m = self._m(tmp_path)
+        idx = pd.date_range("2026-11-01", periods=48, freq="1h")
+        cop = pd.Series(3.0, index=idx)
+        args = dict(
+            t_indoor=pd.Series(20.0, index=idx),  # constant T_in -> q_mass = 0
+            t_outdoor=pd.Series(-5.0, index=idx),  # q_loss = 3750 W: clip inactive for both gains terms
+            ghi=pd.Series(0.0, index=idx),
+            cop=cop,
+        )
+        m._calib.update({"UA_eff": 150.0, "gains_w": 1000.0, "Q_base_el": 0.35})
+        m._calib["ua_eff_method"] = "daily"
+        daily = m._space_heating_kwh(**args)
+        m._calib["ua_eff_method"] = "hourly"
+        hourly = m._space_heating_kwh(**args)
+        cfg_gains_w = 0.35 * DEFAULT_CONFIG["internal_gains_fraction"] * 1000.0
+        expected = (1000.0 - cfg_gains_w) / 3.0 / 1000.0
+        np.testing.assert_allclose((hourly - daily).values, expected, rtol=1e-12)
+        np.testing.assert_allclose(daily.values, (3750.0 - 1000.0) / 3.0 / 1000.0, rtol=1e-12)
+        m._calib.update({"ua_eff_method": "daily", "gains_w": None})  # daily without a fitted G -> config gains
+        pd.testing.assert_series_equal(m._space_heating_kwh(**args), hourly)
+
+    def test_recalibrate_ua_stores_gains(self, tmp_path):
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        assert m._calib.get("gains_w") is None
+        meter = _meter_for(m, idx, t_out, 150.0, gains_w=1000.0)
+        m.recalibrate_ua(energy, clim, weather, meter, self._end(idx))
+        assert m._calib["UA_eff"] == pytest.approx(150.0, rel=0.05)
+        assert m._calib["gains_w"] == pytest.approx(1000.0, rel=0.1)
+        stored = json.loads((tmp_path / "models" / "physics_calibration.json").read_text())
+        assert stored["gains_w"] == pytest.approx(1000.0, rel=0.1)
+        # a failed refit keeps the previous (UA, gains) pair together
+        prev = (m._calib["UA_eff"], m._calib["gains_w"])
+        m.recalibrate_ua(energy, clim, weather, meter.iloc[: 24 * 3], idx[24 * 3])
+        assert (m._calib["UA_eff"], m._calib["gains_w"]) == prev
+
+    def test_calibrate_stores_gains_daily_and_none_hourly(self, tmp_path):
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        d = ThermalPhysicsModel(tmp_path / "d", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        meter = _meter_for(d, idx, t_out, 150.0, gains_w=1000.0)
+        d.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        assert d._calib["ua_eff_method"] == "daily" and d._calib["gains_w"] == pytest.approx(1000.0, rel=0.1)
+        h = ThermalPhysicsModel(tmp_path / "h", DEFAULT_CONFIG)
+        h._calib["gains_w"] = 1000.0  # stale value from an earlier daily calibration
+        h.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        assert h._calib["ua_eff_method"] == "hourly" and h._calib["gains_w"] is None
