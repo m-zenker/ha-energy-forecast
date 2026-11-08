@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,9 @@ NOW = pd.Timestamp("2026-03-01 06:00")
 TZ = "Europe/Zurich"
 
 
-def _make_captures(tmp_path: Path, with_physics: bool, retrain_in_progress: bool = False) -> Path:
+def _make_captures(
+    tmp_path: Path, with_physics: bool, retrain_in_progress: bool = False, after_retrain: bool = True
+) -> Path:
     """Simulate one live retrain + the update right after it, writing captures exactly as the app does."""
     root = tmp_path / "captures"
     live_dir = tmp_path / "live_models"
@@ -79,7 +82,7 @@ def _make_captures(tmp_path: Path, with_physics: bool, retrain_in_progress: bool
             "last_trained": str(model.last_trained),
             "weather_source": "open_meteo",
             "retrain_in_progress": retrain_in_progress,
-            "after_retrain": True,
+            "after_retrain": after_retrain,
             "physics": with_physics,
         },
         (NOW + pd.Timedelta(minutes=1)).tz_localize(TZ).tz_convert("UTC"),
@@ -137,3 +140,91 @@ def test_cli_prints_pass(tmp_path):
     )
     assert out.returncode == 0, out.stderr
     assert "PASS" in out.stdout
+
+
+def test_adaptive_retrain_pairs_with_first_predict_on_new_model(tmp_path):
+    """Adaptive retrains never produce an after_retrain capture; criterion 2 must still run."""
+    root = _make_captures(tmp_path, with_physics=False, after_retrain=False)
+    kinds = [r["kind"] for r in capture_replay.check(root)]
+    assert "train" in kinds
+
+
+def test_adaptive_pairing_skips_in_progress_captures(tmp_path):
+    root = _make_captures(tmp_path, with_physics=False, after_retrain=False, retrain_in_progress=True)
+    assert all(r["kind"] != "train" for r in capture_replay.check(root))
+
+
+def test_next_day_total_nan_when_tomorrow_missing():
+    import math
+
+    preds = pd.DataFrame({"timestamp": pd.date_range("2026-03-01 06:00", periods=5, freq="1h"), "predicted_kwh": 1.0})
+    assert math.isnan(capture_replay._next_day_total(preds, NOW))
+    row = {"kind": "train", "max_abs_diff": 0.0, "next_day_total_pct": capture_replay._pct(preds, preds, NOW)}
+    assert not capture_replay.passed(row)
+
+
+def test_check_loads_each_payload_once(tmp_path, monkeypatch):
+    root = _make_captures(tmp_path, with_physics=False)
+    real = capture.load_capture
+    calls: list[tuple[str, str]] = []
+
+    def counting(r, kind, cid):
+        calls.append((kind, cid))
+        return real(r, kind, cid)
+
+    monkeypatch.setattr(capture, "load_capture", counting)
+    capture_replay.check(root)
+    predict_loads = [c for c in calls if c[0] == "predict"]
+    assert len(predict_loads) == len(set(predict_loads)) == 1
+    retrain_loads = [c for c in calls if c[0] == "retrain"]
+    # replay_train loads the retrain payload once; model_init lookups are cached (one more load at most)
+    assert len(retrain_loads) <= 2
+
+
+def test_app_written_predict_capture_replays(tmp_path, monkeypatch):
+    """Capture through the real app hooks, then replay: catches key drift between app and replay."""
+    from energy_forecast import energy_forecast as ef_mod
+
+    root = _make_captures(tmp_path, with_physics=False)
+    for p in (root / "predict").iterdir():  # drop the hand-built predict capture; keep retrain + .ref
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    monkeypatch.setattr(ef_mod, "CAPTURE_DIR", root)
+    retrain_sc = capture.list_captures(root, "retrain")[0]
+    rpayload, _ = capture.load_capture(root, "retrain", retrain_sc["capture_id"])
+    weather = synthetic_weather(60, start="2026-01-01")
+    energy = synthetic_energy(weather)
+    hist = energy[energy["timestamp"] < NOW]
+    forecast = weather[(weather["timestamp"] >= NOW - pd.Timedelta(days=3))].head(72 + 48).copy()
+    predict_kwargs = {"forecast_df": forecast, "live_temp": None, "recent_actuals": hist.tail(24 * 8)}
+
+    class _Model:
+        last_trained = pd.Timestamp(retrain_sc["last_trained_after"])
+
+    class _App:
+        _capture_inputs = True
+        _retrain_running = False
+        _physics_model = None
+        _ml_model = _Model()
+
+    app = _App()
+    ref = capture_replay.reference_dir_for(root, {"last_trained": retrain_sc["last_trained_after"]})
+    # Produce the "live" model output with the real model from the retrain reference.
+    with frozen_now(NOW, TZ):
+        model = EnergyForecastModel(ref, **rpayload["model_init"])
+        prepared = model._prepare_prediction_X(**predict_kwargs, physics_model=None)
+        preds = model.predict(**predict_kwargs, physics_model=None, _prepared=prepared)
+    app._ml_model.last_trained = model.last_trained
+    snap = ef_mod._snapshot_predict_inputs(app, predict_kwargs, NOW)
+    assert snap is not None
+    with frozen_now(NOW + pd.Timedelta(minutes=1), TZ):  # keeps prune() from aging out the 2026-03 retrain
+        ef_mod._write_predict_capture(
+            app, snap, preds.copy(), preds.copy(), {"tomorrow": 0.0}, weather_source=None, after_retrain=False
+        )
+    (sc,) = capture.list_captures(root, "predict")
+    replayed = capture_replay.replay_predict(root, sc["capture_id"], ref)
+    assert capture_replay._max_abs_diff(replayed, preds.assign(timestamp=pd.to_datetime(preds["timestamp"]))) <= (
+        capture_replay.PREDICT_TOL_KWH
+    )

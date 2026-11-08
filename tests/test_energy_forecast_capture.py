@@ -352,3 +352,41 @@ def test_retrain_cb_passes_after_retrain(tmp_path):
     stub._ml_model.model = object()
     ef_mod.EnergyForecast._retrain_cb(stub)
     stub._update_sensors.assert_called_once_with(after_retrain=True)
+
+
+def test_predict_sidecar_names_serving_model_when_adaptive_retrain_fires_mid_update(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    stub = _predict_stub(tmp_path, monkeypatch, capture_on=True, run=False)
+    before = datetime(2026, 1, 1, 3, 0)
+    after = datetime(2026, 1, 2, 3, 0)
+    stub._ml_model.last_trained = before
+
+    def _retrain_mid_update(_actuals):
+        stub._ml_model.last_trained = after
+
+    stub._maybe_adaptive_retrain = _retrain_mid_update
+    ef_mod.EnergyForecast._update_sensors(stub)
+    payload, meta = _load_predict()
+    assert meta["last_trained"] == str(before)
+    assert meta["retrained_during_update"] is True
+    assert meta["retrain_in_progress"] is False
+    assert not {"served_last_trained", "retrain_running_at_snapshot"} & set(payload)
+
+
+def test_predict_sidecar_not_flagged_retrained_when_model_unchanged(tmp_path, monkeypatch):
+    _predict_stub(tmp_path, monkeypatch, capture_on=True)
+    _, meta = _load_predict()
+    assert meta["retrained_during_update"] is False
+
+
+def test_retrain_running_at_snapshot_marks_in_progress(tmp_path, monkeypatch):
+    stub = _predict_stub(tmp_path, monkeypatch, capture_on=True, run=False, retrain_running=True)
+
+    def _finish(_actuals):
+        stub._retrain_running = False
+
+    stub._maybe_adaptive_retrain = _finish
+    ef_mod.EnergyForecast._update_sensors(stub)
+    _, meta = _load_predict()
+    assert meta["retrain_in_progress"] is True

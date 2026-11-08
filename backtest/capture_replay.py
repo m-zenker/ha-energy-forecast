@@ -7,12 +7,16 @@ straight after that retrain, reproduces the live next-day total to <= 0.1 %.
 
 ``python -m backtest.capture_replay <captures_dir>`` prints one row per check and a PASS/FAIL line. It always
 exits 0: a FAIL is a finding to report, not something this tool gates on (same stance as ``backtest/repro.py``).
+
+Caveat: ``backtest.env.frozen_now`` patches only ``pd.Timestamp.now``, not ``datetime.now``. The latter is used
+solely for ``last_trained`` / archive stamps, which do not influence predictions, so the round trips are unaffected.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import math
 import shutil
 import tempfile
 from pathlib import Path
@@ -43,14 +47,23 @@ def _retarget_physics(physics, model_dir: Path):
     return physics
 
 
-def _model_init_for(root: Path, last_trained: str | None) -> dict:
-    """Constructor args of the retrain capture that produced *last_trained*; defaults when none is captured."""
+def _model_init_for(root: Path, last_trained: str | None, cache: dict | None = None) -> dict:
+    """Constructor args of the retrain capture that produced *last_trained*; defaults when none is captured.
+
+    Results are memoised in *cache* (keyed by ``last_trained``) so each retrain payload is unpickled at most once.
+    """
     capture = _capture_mod()
+    if cache is not None and last_trained in cache:
+        return dict(cache[last_trained])
+    init: dict = {"timezone": TZ}
     for sc in capture.list_captures(root, "retrain"):
         if last_trained is not None and sc.get("last_trained_after") == last_trained:
             payload, _ = capture.load_capture(root, "retrain", sc["capture_id"])
-            return dict(payload.get("model_init") or {})
-    return {"timezone": TZ}
+            init = dict(payload.get("model_init") or {})
+            break
+    if cache is not None:
+        cache[last_trained] = init
+    return dict(init)
 
 
 def reference_dir_for(root: Path, predict_sidecar: dict) -> Path | None:
@@ -65,13 +78,24 @@ def reference_dir_for(root: Path, predict_sidecar: dict) -> Path | None:
     return None
 
 
-def replay_predict(root: Path, predict_id: str, model_dir: Path) -> pd.DataFrame:
-    """Re-run feature building + predict() on a predict capture against the model files in *model_dir*."""
+def replay_predict(
+    root: Path,
+    predict_id: str,
+    model_dir: Path,
+    *,
+    loaded: tuple[dict, dict] | None = None,
+    init_cache: dict | None = None,
+) -> pd.DataFrame:
+    """Re-run feature building + predict() on a predict capture against the model files in *model_dir*.
+
+    *loaded* is an already-loaded ``(payload, sidecar)`` and *init_cache* a ``_model_init_for`` memo; both are
+    optional and only avoid repeated unpickling.
+    """
     from energy_forecast.model import EnergyForecastModel
 
     capture = _capture_mod()
-    payload, sidecar = capture.load_capture(root, "predict", predict_id)
-    init = _model_init_for(root, sidecar.get("last_trained"))
+    payload, sidecar = loaded if loaded is not None else capture.load_capture(root, "predict", predict_id)
+    init = _model_init_for(root, sidecar.get("last_trained"), init_cache)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         for p in Path(model_dir).iterdir():  # never let the replay touch the reference copy
@@ -126,7 +150,9 @@ def _next_day_total(preds: pd.DataFrame, now_local: pd.Timestamp) -> float:
     ts = pd.to_datetime(preds["timestamp"])
     tomorrow = (pd.Timestamp(now_local).normalize() + pd.Timedelta(days=1)).date()
     mask = ts.dt.date == tomorrow
-    return float(preds.loc[mask, "predicted_kwh"].sum() if mask.any() else preds["predicted_kwh"].sum())
+    if not mask.any():
+        return float("nan")  # no tomorrow rows: summing the whole vector would hide the gap
+    return float(preds.loc[mask, "predicted_kwh"].sum())
 
 
 def _max_abs_diff(a: pd.DataFrame, b: pd.DataFrame) -> float:
@@ -143,54 +169,67 @@ def check(root: Path) -> list[dict]:
     root = Path(root)
     rows: list[dict] = []
     predicts = capture.list_captures(root, "predict")
+    init_cache: dict = {}
+    loaded: dict[str, tuple[dict, dict]] = {}
+
+    def _load(cid: str) -> tuple[dict, dict]:
+        if cid not in loaded:
+            loaded[cid] = capture.load_capture(root, "predict", cid)
+        return loaded[cid]
+
+    def _row(kind: str, cid: str, replayed: pd.DataFrame) -> dict:
+        payload, _ = _load(cid)
+        live = payload["model_predictions"]
+        return {
+            "predict_id": cid,
+            "kind": kind,
+            "max_abs_diff": _max_abs_diff(replayed, live),
+            "next_day_total_pct": _pct(replayed, live, payload["now_local"]),
+        }
+
     for sc in predicts:
         if sc.get("retrain_in_progress"):
             continue
         ref = reference_dir_for(root, sc)
         if ref is None:
             continue
-        payload, _ = capture.load_capture(root, "predict", sc["capture_id"])
-        replayed = replay_predict(root, sc["capture_id"], ref)
-        live = payload["model_predictions"]
-        rows.append(
-            {
-                "predict_id": sc["capture_id"],
-                "kind": "predict",
-                "max_abs_diff": _max_abs_diff(replayed, live),
-                "next_day_total_pct": _pct(replayed, live, payload["now_local"]),
-            }
-        )
+        replayed = replay_predict(root, sc["capture_id"], ref, loaded=_load(sc["capture_id"]), init_cache=init_cache)
+        rows.append(_row("predict", sc["capture_id"], replayed))
     for rc in capture.list_captures(root, "retrain"):
         after = rc.get("last_trained_after")
+        if after is None:
+            continue
+        # Prefer the explicit after-retrain update; adaptive retrains never produce one, so fall back to the first
+        # clean predict capture served by the freshly trained model.
         pair = next((p for p in predicts if p.get("after_retrain") and p.get("last_trained") == after), None)
-        if after is None or pair is None:
+        if pair is None:
+            pair = next(
+                (p for p in predicts if not p.get("retrain_in_progress") and p.get("last_trained") == after), None
+            )
+        if pair is None:
             continue
         with tempfile.TemporaryDirectory() as tmp:
             scratch = replay_train(root, rc["capture_id"], Path(tmp) / "model")
-            replayed = replay_predict(root, pair["capture_id"], scratch)
-        payload, _ = capture.load_capture(root, "predict", pair["capture_id"])
-        live = payload["model_predictions"]
-        rows.append(
-            {
-                "predict_id": pair["capture_id"],
-                "kind": "train",
-                "max_abs_diff": _max_abs_diff(replayed, live),
-                "next_day_total_pct": _pct(replayed, live, payload["now_local"]),
-            }
-        )
+            replayed = replay_predict(
+                root, pair["capture_id"], scratch, loaded=_load(pair["capture_id"]), init_cache=init_cache
+            )
+        rows.append(_row("train", pair["capture_id"], replayed))
     return rows
 
 
 def _pct(replayed: pd.DataFrame, live: pd.DataFrame, now_local) -> float:
     lv = _next_day_total(live, now_local)
     rv = _next_day_total(replayed, now_local)
+    if math.isnan(lv) or math.isnan(rv):
+        return float("nan")
     return 0.0 if lv == rv else (float("inf") if lv == 0 else 100.0 * (rv - lv) / lv)
 
 
 def passed(row: dict) -> bool:
     if row["kind"] == "predict":
         return row["max_abs_diff"] <= PREDICT_TOL_KWH
-    return abs(row["next_day_total_pct"]) <= TRAIN_TOL_PCT
+    pct = row["next_day_total_pct"]
+    return not math.isnan(pct) and abs(pct) <= TRAIN_TOL_PCT
 
 
 def main(argv: list[str] | None = None) -> int:

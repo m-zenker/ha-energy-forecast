@@ -249,6 +249,9 @@ def _snapshot_predict_inputs(app, predict_kwargs: dict, now_local) -> dict | Non
             "predict_kwargs": copy.deepcopy(predict_kwargs),
             "physics_model": copy.deepcopy(physics) if physics is not None else None,
             "now_local": now_local,
+            # Bookkeeping only: stripped in _write_predict_capture, never part of the pickled payload.
+            "_served_last_trained": str(app._ml_model.last_trained),
+            "_retrain_running_at_snapshot": bool(app._retrain_running),
         }
     except Exception as exc:
         _LOGGER.warning("capture: predict snapshot failed: %s", exc)
@@ -271,6 +274,12 @@ def _write_predict_capture(
     try:
         import pandas as pd
 
+        snapshot = dict(snapshot)
+        served_last_trained = snapshot.pop("_served_last_trained", None)
+        running_at_snapshot = bool(snapshot.pop("_retrain_running_at_snapshot", False))
+        current_last_trained = str(app._ml_model.last_trained)
+        if served_last_trained is None:
+            served_last_trained = current_last_trained
         payload = {
             **snapshot,
             "model_predictions": model_predictions,
@@ -278,9 +287,11 @@ def _write_predict_capture(
             "tomorrow_kwh": aggregated["tomorrow"],
         }
         meta = {
-            "last_trained": str(app._ml_model.last_trained),
+            # The model that served model_predictions (a retrain may have completed since the snapshot).
+            "last_trained": served_last_trained,
+            "retrained_during_update": current_last_trained != served_last_trained,
             "weather_source": weather_source,
-            "retrain_in_progress": bool(app._retrain_running) and not after_retrain,
+            "retrain_in_progress": (running_at_snapshot or bool(app._retrain_running)) and not after_retrain,
             "after_retrain": after_retrain,
             "physics": snapshot["physics_model"] is not None,
         }
