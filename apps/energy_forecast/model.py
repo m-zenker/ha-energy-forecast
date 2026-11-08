@@ -481,6 +481,7 @@ class EnergyForecastModel:
                     heating_sub_meter_df=heating_sub_meter_df,
                     ev_df=ev_df,
                     away_df=away_df,
+                    room_areas=room_areas,
                 )
             physics_model._tau_hours = self._tau_hours
             physics_kwh_series = physics_model.predict_training_series(

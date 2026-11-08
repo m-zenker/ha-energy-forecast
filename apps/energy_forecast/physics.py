@@ -320,7 +320,10 @@ class ThermalPhysicsModel:
         t_tank_trajectory = np.zeros(len(timestamps))
         for i, ts in enumerate(timestamps):
             ua_dhw = self._calib.get("UA_dhw") or 15.0
-            dT = -ua_dhw * (t_tank - float(t_ambient.iloc[i])) / c_dhw
+            t_amb_i = float(t_ambient.iloc[i])
+            if not np.isfinite(t_amb_i):
+                t_amb_i = DEFAULT_AMBIENT_C
+            dT = -ua_dhw * (t_tank - t_amb_i) / c_dhw
             hour_of_day = ts.hour
             dT -= _DEFAULT_DRAW_PROFILE[hour_of_day] * draw_rate
 
@@ -471,23 +474,50 @@ class ThermalPhysicsModel:
             timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
         )
 
+    @staticmethod
+    def _area_weighted_num_den(
+        climate_data: dict[str, pd.DataFrame],
+        timestamps: pd.DatetimeIndex,
+        room_areas: dict[str, float] | None,
+        tolerance: pd.Timedelta | None,
+    ) -> tuple[pd.Series, pd.Series, int]:
+        """Per-hour area-weighted numerator/denominator over the rooms that have a finite reading at
+        that hour (a NaN room drops out instead of poisoning the average). tolerance bounds the
+        nearest-timestamp match (None = unbounded). Returns (num, den, n_rooms_with_data)."""
+        num = pd.Series(0.0, index=timestamps)
+        den = pd.Series(0.0, index=timestamps)
+        n_rooms = 0
+        for eid, cdf in (climate_data or {}).items():
+            if cdf.empty:
+                continue
+            c = cdf.assign(timestamp=pd.to_datetime(cdf["timestamp"])).groupby("timestamp")["current_temp"].last()
+            v = c.reindex(timestamps, method="nearest", tolerance=tolerance)
+            a = (room_areas or {}).get(eid, 20.0)
+            present = v.notna()
+            num += v.fillna(0.0) * a * present
+            den += a * present
+            n_rooms += 1
+        return num, den, n_rooms
+
     def _area_weighted_t_indoor(
         self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
     ) -> pd.Series | None:
+        """Area-weighted indoor temperature; never NaN. Hours where no room has a finite reading are
+        filled from the nearest valid hour (ffill/bfill), then DEFAULT_AMBIENT_C. None when no rooms."""
         if not climate_data:
             return None
-        parts, weights = [], []
-        for eid, cdf in climate_data.items():
-            if cdf.empty:
-                continue
-            c = cdf.set_index("timestamp")["current_temp"].reindex(timestamps, method="nearest")
-            parts.append(c)
-            weights.append((room_areas or {}).get(eid, 20.0))
-        if not parts:
+        num, den, n_rooms = self._area_weighted_num_den(climate_data, timestamps, room_areas, None)
+        if n_rooms == 0:
             return None
-        stacked = pd.concat(parts, axis=1)
-        w = np.array(weights)
-        return pd.Series(np.average(stacked.values, axis=1, weights=w), index=timestamps)
+        return (num / den).where(den > 0).ffill().bfill().fillna(DEFAULT_AMBIENT_C)
+
+    def _area_weighted_t_indoor_strict(
+        self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
+    ) -> pd.Series:
+        """Like _area_weighted_t_indoor, but hours without a reading within ±59 min stay NaN and the
+        weighting uses only rooms present at each hour (no unbounded 'nearest' fill)."""
+        num, den, _ = self._area_weighted_num_den(climate_data, timestamps, room_areas, pd.Timedelta("59min"))
+        return (num / den).where(den > 0)
 
     def _t_indoor_for_window(
         self,
@@ -722,6 +752,7 @@ class ThermalPhysicsModel:
         heating_sub_meter_df: pd.DataFrame | None = None,
         ev_df: pd.DataFrame | None = None,
         away_df: pd.DataFrame | None = None,
+        room_areas: dict[str, float] | None = None,
     ) -> tuple[float | None, int]:
         from .model import _find_passive_windows
 
@@ -778,7 +809,7 @@ class ThermalPhysicsModel:
         if y_override is not None:
             y_override = y_override[eligible]
 
-        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas=None)
+        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas)
         if t_indoor is None:
             return None, 0
         w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
@@ -850,6 +881,7 @@ class ThermalPhysicsModel:
         climate_dfs: dict[str, pd.DataFrame] | None,
         ua_eff: float | None,
         holdout_cutoff: pd.Timestamp,
+        room_areas: dict[str, float] | None = None,
     ) -> float | None:
         if ua_eff is None or not climate_dfs:
             return None
@@ -870,7 +902,7 @@ class ThermalPhysicsModel:
             _LOGGER.warning(f"solar_gain_area calibration: only {n_days} sunny winter days (need 14) — skipping")
             return None
 
-        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas=None)
+        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas)
         t_outdoor = w["temp_c"].reindex(e["timestamp"], method="nearest").values
         ghi_sub = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest").values
         cop = np.array([self._cop_formula_value(t, None) for t in t_outdoor])
@@ -1142,6 +1174,7 @@ class ThermalPhysicsModel:
         heating_sub_meter_df: pd.DataFrame | None = None,
         ev_df: pd.DataFrame | None = None,
         away_df: pd.DataFrame | None = None,
+        room_areas: dict[str, float] | None = None,
     ) -> None:
         try:
             q_base_el = self._calibrate_base_load(energy_df, away_df, ev_df, holdout_cutoff)
@@ -1163,6 +1196,7 @@ class ThermalPhysicsModel:
                 heating_sub_meter_df=heating_sub_meter_df,
                 ev_df=ev_df,
                 away_df=away_df,
+                room_areas=room_areas,
             )
             self._calib["n_calibration_windows_ua_eff"] = n_windows
             if ua_eff is not None:
@@ -1171,7 +1205,7 @@ class ThermalPhysicsModel:
                 _LOGGER.warning("UA_eff calibration unavailable — heating component will be skipped")
 
             solar_area = self._calibrate_solar_gain_area(
-                energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff
+                energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff, room_areas=room_areas
             )
             if solar_area is not None:
                 self._calib["solar_gain_area"] = solar_area

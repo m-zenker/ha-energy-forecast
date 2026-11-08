@@ -2114,3 +2114,48 @@ class TestZeroOverrideDegradation:
         el_kwh_b, _, final_b = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
         pd.testing.assert_series_equal(el_kwh_a, el_kwh_b)
         assert final_a == final_b
+
+
+class TestIndoorNanRobustness:
+    def test_one_room_nan_uses_remaining_rooms(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-04-01", periods=3, freq="1h")
+        clim = {
+            "climate.a": pd.DataFrame({"timestamp": ts, "current_temp": [20.0, np.nan, 20.0]}),
+            "climate.b": pd.DataFrame({"timestamp": ts, "current_temp": [22.0, 22.0, 22.0]}),
+        }
+        t = m._area_weighted_t_indoor(clim, ts, {"climate.a": 10.0, "climate.b": 10.0})
+        assert t.tolist() == pytest.approx([21.0, 22.0, 21.0])
+
+    def test_all_rooms_nan_hour_is_filled(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-04-01", periods=3, freq="1h")
+        clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": [20.0, np.nan, 21.0]})}
+        assert not m._area_weighted_t_indoor(clim, ts, None).isna().any()
+
+    def test_strict_indoor_leaves_gaps_nan(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-04-01", periods=6, freq="1h")
+        clim = {"climate.a": pd.DataFrame({"timestamp": ts[[0, 1, 5]], "current_temp": [20.0, 20.0, 21.0]})}
+        t_in = m._area_weighted_t_indoor_strict(clim, ts, None)
+        assert t_in.isna().tolist() == [False, False, True, True, True, False]
+
+    def test_dhw_ode_survives_nan_ambient(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-04-01", periods=24 * 10, freq="1h")
+        amb = pd.Series(20.0, index=ts)
+        amb.iloc[5] = np.nan
+        el, traj, final = m._dhw_kwh_series(ts, amb, 50.0, None)
+        assert not traj.isna().any() and np.isfinite(final)
+        assert (el.iloc[24:] > 0).sum() >= 3  # keeps cycling after the gap (was 0 before the fix)
+
+    def test_training_series_varies_despite_room_gap(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        ts = pd.date_range("2026-04-01", periods=24 * 10, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": 0.5})
+        weather = pd.DataFrame({"timestamp": ts, "temp_c": 10.0, "direct_radiation_wm2": 0.0})
+        temps = np.full(len(ts), 20.0)
+        temps[5] = np.nan
+        clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": temps})}
+        s = m.predict_training_series(energy, weather, climate_dfs=clim)
+        assert s.iloc[24:].nunique() > 1
