@@ -526,6 +526,7 @@ energy_forecast:
 | `shap_top_n` | No | `5` | Number of top SHAP features exposed as `shap_top_features` attribute on `sensor.energy_forecast_today`. Set to `0` to disable. |
 | `presence_sensors` | No | `[]` | List of Home Assistant `person` or `device_tracker` entities used for occupancy counting (`people_home` feature). |
 | `model_archive_count` | No | `3` | Number of previous model snapshots to keep in `models/archive/` for rollback. Set to `0` to disable model versioning. Rollback via HA event `energy_forecast_rollback_model` or dashboard. |
+| `capture_inputs` | No | `false` | Diagnostics: record exactly what each retrain and each hourly forecast passes to the model under `apps/energy_forecast/captures/`, for offline replay. See [Input capture](#input-capture-diagnostics). |
 | `update_check_enabled` | No | `true` | Daily check for a newer GitHub release. Fires a persistent_notification when main is behind the latest tagged release. Skipped on `-alpha`/`-beta` builds. Set to `false` to disable entirely. |
 | `mqtt_discovery` | No | `false` | Enable MQTT Discovery mode. Registers all sensors in the HA entity registry (area assignment, labels). Requires a running MQTT broker and the AppDaemon MQTT plugin. See [MQTT Discovery](#mqtt-discovery-optional) |
 | `mqtt_namespace` | No | `mqtt` | AppDaemon MQTT plugin namespace. Must match the `namespace:` key in the MQTT plugin block of `appdaemon.yaml` |
@@ -722,6 +723,15 @@ fetch_forecast()  [SRG-SSR → Open-Meteo fallback]
 When `sub_energy_sensors` is configured, each sub-sensor adds four features: `lag_24h` (same hour yesterday), `lag_168h` (same hour last week, requires ≥ 268 rows of sub-sensor history), `{prefix}_active_24h` (was the appliance active in the past 24 h?), and `{prefix}_runs_7d` (how many on/off cycles in the past 7 days).
 
 Lag features are dynamically enabled as history grows — short-horizon lags (`lag_1h` etc.) activate at ≥ 101 rows; the full autoregressive feature set is active at ≥ 436 rows (≈ 18 days).
+
+### Input capture (diagnostics)
+
+With `capture_inputs: true`, the app writes one gzip-pickle capture plus a JSON sidecar to `apps/energy_forecast/captures/`:
+
+- **retrain/**: every argument passed to `train()`, a copy of the physics state taken before training, the clock, and the app args with keys containing `secret`, `token` or `password` removed. The retrain also gets a `.ref/` copy of the model files it produced.
+- **predict/**: each hourly update's raw prediction inputs, including the weather frame actually served, its source (`srg` / `open_meteo`) and the physics state. It also holds the model output before the DHW override adjustment and the published vector after it.
+
+Captures are kept for 45 days and capped at 1 GB in total, oldest first. Measured on one install: about 3 MB per retrain and 0.5 MB per hourly update, so roughly 650 MB at steady state. Writing never blocks or fails an update; failures are logged as warnings. With the flag on, the inputs are deep-copied on every hourly update. Replay them with `python -m backtest.capture_replay <captures_dir>` (see `backtest/README.md`).
 
 ### Model persistence
 

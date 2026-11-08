@@ -18,6 +18,8 @@ EV charging handling:
 
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import logging
 import math
@@ -32,9 +34,10 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, ha_data, heating_season, weather
+from . import __version__, capture, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
+    CAPTURE_DIR,
     EV_CHARGING_THRESHOLD_KWH,
     GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
@@ -193,6 +196,119 @@ def _describe_temperature_mismatch(unit: str | None, state_class: str | None = N
     return None
 
 
+def _tracks_retrain(fn):
+    """Maintain self._retrain_running for the duration of a retrain (reset even on error)."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._retrain_running = True
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._retrain_running = False
+
+    return wrapper
+
+
+def _capture_retrain_inputs(app, train_kwargs: dict) -> str | None:
+    """Snapshot the exact train() inputs (flag-gated; never raises)."""
+    if not app._capture_inputs:
+        return None
+    try:
+        import pandas as pd
+
+        physics = train_kwargs.get("physics_model")
+        payload = {
+            "train_kwargs": {**train_kwargs, "physics_model": None},
+            "physics_model": copy.deepcopy(physics) if physics is not None else None,
+            "now_local": pd.Timestamp.now(tz=app._timezone).tz_localize(None),
+            "model_init": {"model_archive_count": app._model_archive_count, "timezone": app._timezone},
+            "args": {
+                k: v
+                for k, v in dict(app.args).items()
+                if not any(w in str(k).lower() for w in ("secret", "token", "password"))
+            },
+        }
+        meta = {
+            "last_trained_before": str(app._ml_model.last_trained) if app._ml_model.last_trained else None,
+            "physics": physics is not None,
+        }
+        return capture.write_capture(CAPTURE_DIR, "retrain", payload, meta, pd.Timestamp.now(tz="UTC"))
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain snapshot failed: %s", exc)
+        return None
+
+
+def _snapshot_predict_inputs(app, predict_kwargs: dict, now_local) -> dict | None:
+    """Deep-copy the raw predict inputs before the model touches them (flag-gated; never raises)."""
+    if not app._capture_inputs:
+        return None
+    try:
+        physics = app._physics_model
+        return {
+            "predict_kwargs": copy.deepcopy(predict_kwargs),
+            "physics_model": copy.deepcopy(physics) if physics is not None else None,
+            "now_local": now_local,
+            # Bookkeeping only: stripped in _write_predict_capture, never part of the pickled payload.
+            "_served_last_trained": str(app._ml_model.last_trained),
+            "_retrain_running_at_snapshot": bool(app._retrain_running),
+        }
+    except Exception as exc:
+        _LOGGER.warning("capture: predict snapshot failed: %s", exc)
+        return None
+
+
+def _write_predict_capture(
+    app,
+    snapshot: dict | None,
+    model_predictions,
+    published_predictions,
+    aggregated: dict,
+    *,
+    weather_source: str | None,
+    after_retrain: bool,
+) -> None:
+    """Persist the predict snapshot plus the model output and published vector (never raises)."""
+    if snapshot is None:
+        return
+    try:
+        import pandas as pd
+
+        snapshot = dict(snapshot)
+        served_last_trained = snapshot.pop("_served_last_trained", None)
+        running_at_snapshot = bool(snapshot.pop("_retrain_running_at_snapshot", False))
+        current_last_trained = str(app._ml_model.last_trained)
+        if served_last_trained is None:
+            served_last_trained = current_last_trained
+        payload = {
+            **snapshot,
+            "model_predictions": model_predictions,
+            "published_predictions": published_predictions.copy(),
+            "tomorrow_kwh": aggregated["tomorrow"],
+        }
+        meta = {
+            # The model that served model_predictions (a retrain may have completed since the snapshot).
+            "last_trained": served_last_trained,
+            "retrained_during_update": current_last_trained != served_last_trained,
+            "weather_source": weather_source,
+            "retrain_in_progress": (running_at_snapshot or bool(app._retrain_running)) and not after_retrain,
+            "after_retrain": after_retrain,
+            "physics": snapshot["physics_model"] is not None,
+        }
+        capture.write_capture(CAPTURE_DIR, "predict", payload, meta, pd.Timestamp.now(tz="UTC"))
+    except Exception as exc:
+        _LOGGER.warning("capture: predict snapshot failed: %s", exc)
+
+
+def _finish_retrain_capture(app, capture_id: str) -> None:
+    """Attach the freshly written model files and final train timestamp (never raises)."""
+    try:
+        capture.attach_reference(CAPTURE_DIR, capture_id, app._ml_model._model_dir)
+        capture.update_sidecar(CAPTURE_DIR, "retrain", capture_id, last_trained_after=str(app._ml_model.last_trained))
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain reference failed: %s", exc)
+
+
 class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
@@ -208,6 +324,7 @@ class EnergyForecast(hass.Hass):
         _hd._LOGGER = self.logger
         _mdl._LOGGER = self.logger
         _wth._LOGGER = self.logger
+        capture._LOGGER = self.logger
 
         _LOGGER.info("HA Energy Forecast initialising…")
 
@@ -290,6 +407,10 @@ class EnergyForecast(hass.Hass):
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
         # Daily GitHub-release update check (main-track users only; see _check_for_update_cb)
         self._update_check_enabled: bool = bool(self.args.get("update_check_enabled", True))
+
+        # Live input capture: record exact model inputs for offline replay (off by default)
+        self._capture_inputs: bool = bool(self.args.get("capture_inputs", False))
+        self._retrain_running: bool = False
 
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
@@ -999,7 +1120,7 @@ class EnergyForecast(hass.Hass):
         try:
             self._retrain()
             if self._ml_model.model is not None:
-                self._update_sensors()
+                self._update_sensors(after_retrain=True)
         except Exception as exc:  # noqa: BLE001
             import traceback
 
@@ -1500,6 +1621,7 @@ class EnergyForecast(hass.Hass):
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
+    @_tracks_retrain
     def _retrain(self) -> None:
         import pandas as pd
 
@@ -1824,9 +1946,9 @@ class EnergyForecast(hass.Hass):
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
 
-        self._ml_model.train(
-            baseline_df,
-            weather_df,
+        train_kwargs = dict(
+            energy_df=baseline_df,
+            weather_df=weather_df,
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
@@ -1848,6 +1970,10 @@ class EnergyForecast(hass.Hass):
             use_physics_residual=self._effective_use_physics_residual(),
             heating_feature_df=heating_feature_df,
         )
+        capture_id = _capture_retrain_inputs(self, train_kwargs)
+        self._ml_model.train(**train_kwargs)
+        if capture_id is not None:
+            _finish_retrain_capture(self, capture_id)
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
         self._last_adaptive_retrain = self._last_trained_local()
 
@@ -1862,7 +1988,7 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("15m cache update failed (non-fatal): %s", exc)
 
-    def _update_sensors(self) -> None:
+    def _update_sensors(self, *, after_retrain: bool = False) -> None:
         import numpy as np
         import pandas as pd
 
@@ -1875,6 +2001,8 @@ class EnergyForecast(hass.Hass):
             self.args.get("srg_client_secret"),
             timezone=self._timezone,
         )
+        # Read before _strip_tz/drop_dst_duplicates, which may drop DataFrame.attrs.
+        _weather_source = forecast_df.attrs.get("weather_source")
         forecast_df = drop_dst_duplicates(_strip_tz(forecast_df, self._timezone))
 
         # ── Fetch recent actuals ──────────────────────────────────────────────
@@ -2061,41 +2189,34 @@ class EnergyForecast(hass.Hass):
 
         # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
         # all receive the pre-computed result to avoid triple feature engineering.
+        predict_kwargs = {
+            "forecast_df": forecast_df,
+            "live_temp": live_temp,
+            "recent_actuals": recent_actuals,
+            "sub_sensors_recent": sub_sensors_recent or None,
+            "away_series": away_series,
+            "people_home_series": people_home_series,
+            "climate_recent": climate_recent or None,
+            "dhw_recent": dhw_recent if not dhw_recent.empty else None,
+            "room_areas": self._climate_room_areas or None,
+            "heating_active_series": heating_active_series,
+            "setpoint_on": heating_setpoint_on,
+            "setpoint_off": heating_setpoint_off,
+            "heating_buffer_temp_recent": self._physics_heating_buffer_df,
+        }
+        _capture_snapshot = _snapshot_predict_inputs(self, predict_kwargs, now_ts)
         _prepared = self._ml_model._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent=sub_sensors_recent or None,
-            away_series=away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent or None,
-            dhw_recent=dhw_recent if not dhw_recent.empty else None,
-            room_areas=self._climate_room_areas or None,
-            heating_active_series=heating_active_series,
-            setpoint_on=heating_setpoint_on,
-            setpoint_off=heating_setpoint_off,
+            **predict_kwargs,
             physics_model=self._physics_model,
-            heating_buffer_temp_recent=self._physics_heating_buffer_df,
         )
         _regime_info = dict(getattr(self._ml_model, "_last_regime_info", None) or {})
 
         predictions = self._ml_model.predict(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent=sub_sensors_recent or None,
-            away_series=away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent or None,
-            dhw_recent=dhw_recent if not dhw_recent.empty else None,
-            room_areas=self._climate_room_areas or None,
-            heating_active_series=heating_active_series,
-            setpoint_on=heating_setpoint_on,
-            setpoint_off=heating_setpoint_off,
+            **predict_kwargs,
             physics_model=self._physics_model,
-            heating_buffer_temp_recent=self._physics_heating_buffer_df,
             _prepared=_prepared,
         )
+        _model_predictions = predictions.copy() if _capture_snapshot is not None else None
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
 
         # ── Goal 1: deterministic post-model DHW override correction ──────────
@@ -2279,6 +2400,15 @@ class EnergyForecast(hass.Hass):
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("regime_log record failed: %s", exc)
+        _write_predict_capture(
+            self,
+            _capture_snapshot,
+            _model_predictions,
+            predictions,
+            aggregated,
+            weather_source=_weather_source,
+            after_retrain=after_retrain,
+        )
         aggregated["shap_top_features"] = shap_data
         aggregated["shap_narrative"] = _build_shap_narrative(shap_data)
         aggregated["mae_7d"] = mae_7d

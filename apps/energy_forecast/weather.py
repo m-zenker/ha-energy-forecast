@@ -139,6 +139,12 @@ def fetch_historical_weather(
     )
 
 
+def _tag_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Record which provider produced the frame (metadata only; data untouched)."""
+    df.attrs["weather_source"] = source
+    return df
+
+
 def fetch_forecast(
     plz: str,
     lat: float,
@@ -158,7 +164,7 @@ def fetch_forecast(
     import requests
 
     if not client_id or not client_secret:
-        return fetch_open_meteo(lat, lon, timezone=timezone)
+        return _tag_source(fetch_open_meteo(lat, lon, timezone=timezone), "open_meteo")
 
     try:
         # 1. Get OAuth Token (cached for 55 minutes to avoid rate-limiting).
@@ -176,7 +182,7 @@ def fetch_forecast(
                     auth_res.status_code,
                     auth_res.text,
                 )
-                return fetch_open_meteo(lat, lon, timezone=timezone)
+                return _tag_source(fetch_open_meteo(lat, lon, timezone=timezone), "open_meteo")
         token = _srg_token
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
@@ -197,7 +203,7 @@ def fetch_forecast(
 
             if not geo_id:
                 _LOGGER.warning("SRG-SSR geolocation lookup returned no results — falling back to Open-Meteo.")
-                return fetch_open_meteo(lat, lon, timezone=timezone)
+                return _tag_source(fetch_open_meteo(lat, lon, timezone=timezone), "open_meteo")
             _srg_geo_id[loc_key] = geo_id
         geo_id = _srg_geo_id[loc_key]
 
@@ -217,7 +223,7 @@ def fetch_forecast(
                 res.status_code,
                 title_str,
             )
-            return fetch_open_meteo(lat, lon, timezone=timezone)
+            return _tag_source(fetch_open_meteo(lat, lon, timezone=timezone), "open_meteo")
 
         records = []
         for hour in data.get("hours", []):
@@ -235,14 +241,14 @@ def fetch_forecast(
 
         # 3. Supplement with Open-Meteo: cloud/radiation + 3-day historical tail
         om_df = fetch_open_meteo(lat, lon, timezone=timezone)
-        return _supplement_from_open_meteo(srg_df, om_df, timezone=timezone)
+        return _tag_source(_supplement_from_open_meteo(srg_df, om_df, timezone=timezone), "srg")
 
     except (requests.RequestException, KeyError, ValueError) as exc:
         if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 401:
             _srg_token = None  # force re-auth on next call
             _srg_token_expires_at = 0.0
         _LOGGER.warning("SRG-SSR forecast failed (%s) — falling back to Open-Meteo.", exc)
-        return fetch_open_meteo(lat, lon, timezone=timezone)
+        return _tag_source(fetch_open_meteo(lat, lon, timezone=timezone), "open_meteo")
 
 
 def _supplement_from_open_meteo(
