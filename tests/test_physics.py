@@ -2557,6 +2557,20 @@ class TestUaEffDaily:
         assert m._calib["solar_gain_area"] == 0.0
         assert "solar_gain_area" in caplog.text
 
+    def test_daily_fit_none_keeps_solar_calibration(self, tmp_path):
+        # daily fit failed, retained hourly UA with no fitted G -> prediction uses config gains, so solar must
+        # still be calibrated as under hourly
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
+        m._calib.update(UA_eff=110.0, gains_w=None, solar_gain_area=5.0)
+        with (
+            patch.object(m, "_calibrate_ua_eff_daily", return_value=(None, None, 3)),
+            patch.object(m, "_calibrate_solar_gain_area", return_value=7.5) as solar,
+        ):
+            m.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        solar.assert_called_once()
+        assert m._calib["gains_w"] is None and m._calib["solar_gain_area"] == 7.5
+
     def test_daily_fit_exception_does_not_abort_calibrate(self, tmp_path, caplog):
         m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
         idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
