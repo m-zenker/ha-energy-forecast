@@ -345,8 +345,15 @@ class EnergyForecast(hass.Hass):
             "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
             "room_thermostats": [],
             "use_physics_residual": False,
+            "ua_eff_method": "hourly",  # "hourly" (night-window fit) or "daily" (rolling daily heat balance, #105)
         }
         self._physics_config: dict = {**default_physics_config, **physics_raw}
+        if self._physics_config["ua_eff_method"] not in ("hourly", "daily"):
+            _LOGGER.warning(
+                f"physics.ua_eff_method={self._physics_config['ua_eff_method']!r} must be 'hourly' or 'daily' "
+                "- using 'hourly'"
+            )
+            self._physics_config["ua_eff_method"] = "hourly"
 
         room_therm_raw = self._physics_config.get("room_thermostats") or []
         self._room_thermostats: list[dict] = []

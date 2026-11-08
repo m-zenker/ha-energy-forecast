@@ -482,6 +482,17 @@ class EnergyForecastModel:
                     ev_df=ev_df,
                     away_df=away_df,
                     room_areas=room_areas,
+                    ua_window_end=energy_df["timestamp"].max() + pd.Timedelta(hours=1),
+                )
+            elif physics_model.ua_calibration_stale:
+                physics_model.recalibrate_ua(
+                    energy_df,
+                    climate_dfs,
+                    weather_df,
+                    heating_sub_meter_df,
+                    energy_df["timestamp"].max() + pd.Timedelta(hours=1),
+                    room_areas=room_areas,
+                    heating_active_df=heating_active_df,
                 )
             physics_model._tau_hours = self._tau_hours
             physics_kwh_series = physics_model.predict_training_series(

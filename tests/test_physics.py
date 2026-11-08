@@ -2159,3 +2159,164 @@ class TestIndoorNanRobustness:
         clim = {"climate.a": pd.DataFrame({"timestamp": ts, "current_temp": temps})}
         s = m.predict_training_series(energy, weather, climate_dfs=clim)
         assert s.iloc[24:].nunique() > 1
+
+
+def _daily_fixture(days=40, start="2026-04-01", t_in=20.0):
+    idx = pd.date_range(start, periods=days * 24, freq="1h")
+    rng = np.random.default_rng(3)
+    t_out = 8.0 + 4 * np.sin(np.arange(len(idx)) * 2 * np.pi / 24) + rng.normal(0, 1, len(idx))
+    weather = pd.DataFrame({"timestamp": idx, "temp_c": t_out, "direct_radiation_wm2": 0.0})
+    clim = {"climate.a": pd.DataFrame({"timestamp": idx, "current_temp": t_in, "setpoint": t_in})}
+    return idx, weather, clim, t_out
+
+
+def _meter_for(m, idx, t_out, ua):
+    cop = m._cop_series(idx, pd.Series(t_out, index=idx), cop_sensor_series=None).values
+    ua = np.broadcast_to(ua, len(idx))
+    kwh = ua * np.clip(20.0 - t_out, 0, None) / cop / 1000.0
+    daily = pd.Series(kwh, index=idx).resample("1D").sum()
+    bursts = pd.Series(0.0, index=idx)  # buffer tank: energy in 2-h bursts, daily sum unchanged
+    for d, v in daily.items():
+        bursts[d + pd.Timedelta(hours=13)] = v / 2
+        bursts[d + pd.Timedelta(hours=14)] = v / 2
+    return pd.DataFrame({"timestamp": idx, "kwh": bursts.values})
+
+
+class TestUaEffDaily:
+    def _m(self, tmp_path):
+        return ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+
+    def _end(self, idx):
+        return idx[-1] + pd.Timedelta(hours=1)
+
+    def test_recovers_ua_in_formula_cop_units(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture()
+        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        assert ua == pytest.approx(80.0, rel=0.05) and n == 40
+
+    def test_partial_climate_day_dropped(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=12)
+        clim["climate.a"] = clim["climate.a"].iloc[5:]  # day 1 has only 19 h
+        _, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        assert n == 11
+
+    def test_partial_meter_day_dropped(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=12)
+        meter = _meter_for(m, idx, t_out, 80.0).iloc[5:]  # meter missing first 5 h
+        _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert n == 11
+
+    def test_zero_kwh_heating_day_still_counts(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=12)
+        meter = _meter_for(m, idx, t_out, 80.0)
+        meter.loc[meter["timestamp"].dt.date == idx[0].date(), "kwh"] = 0.0  # no selection on y
+        _, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert n == 12
+
+    def test_too_few_days_returns_none_but_counts(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=6)
+        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 80.0), window_end=self._end(idx))
+        assert ua is None and n == 6
+
+    def test_rolling_window_uses_last_28_days_only(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=60)
+        ua_true = np.where(idx < idx[0] + pd.Timedelta(days=32), 150.0, 60.0)  # seasonal drop
+        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, ua_true), window_end=self._end(idx))
+        assert ua == pytest.approx(60.0, rel=0.05) and n == 60
+
+    def test_low_effective_ua_rejected(self, tmp_path, caplog):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture()
+        ua, n = m._calibrate_ua_eff_daily(clim, weather, _meter_for(m, idx, t_out, 28.0), window_end=self._end(idx))
+        assert ua is None and n == 40 and "rejected" in caplog.text
+
+    def test_old_calibration_json_defaults_hourly(self, tmp_path):
+        (tmp_path / "models").mkdir()
+        (tmp_path / "models" / "physics_calibration.json").write_text(
+            '{"UA_eff": null, "calibrated_at": "2026-10-09T00:00:00"}'
+        )
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        assert m.ua_calibration_stale and m._calib.get("ua_eff_method", "hourly") == "hourly"
+
+    def test_dst_days_counted_once(self, tmp_path):
+        # 2026-10-25 has 25 local hours; fixture built on a naive local index with a duplicated 02:00
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture(days=14, start="2026-10-18")
+        meter = _meter_for(m, idx, t_out, 80.0)
+        dup = meter[meter["timestamp"] == pd.Timestamp("2026-10-25 02:00")].assign(kwh=0.5)  # second, real 02:00 hour
+        meter = pd.concat([meter, dup]).sort_values("timestamp")
+        ua, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert n == 14 and ua == pytest.approx(80.0, rel=0.06)  # 0.5 kWh extra on one of 14 days ≈ +0.5 % UA
+
+    def test_calibrate_daily_flag_with_real_cutoff_shape(self, tmp_path):
+        cfg = {**DEFAULT_CONFIG, "ua_eff_method": "daily"}
+        m = ThermalPhysicsModel(tmp_path / "models", cfg)
+        idx, weather, clim, t_out = _daily_fixture(days=60, start="2026-08-20")
+        meter = _meter_for(m, idx, t_out, 80.0)
+        meter.loc[meter["timestamp"] < pd.Timestamp("2026-10-08"), "kwh"] = 0.0  # summer: no heating
+        warm = weather["timestamp"] < pd.Timestamp("2026-10-08")
+        weather.loc[warm, "temp_c"] = 22.0  # not heating days by dT
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        m.calibrate(
+            energy,
+            weather,
+            clim,
+            None,
+            holdout_cutoff=idx[-1] - pd.Timedelta(days=37),  # the ML holdout - must NOT bound the UA window
+            heating_sub_meter_df=meter,
+            ua_window_end=self._end(idx),
+        )
+        assert m._calib["ua_eff_method"] == "daily" and m._calib["UA_eff"] == pytest.approx(80.0, rel=0.1)
+        assert "ua_calibrated_at" in m._calib
+
+    def test_default_flag_keeps_hourly(self, tmp_path):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        m.calibrate(
+            energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=_meter_for(m, idx, t_out, 80.0)
+        )
+        assert m._calib["ua_eff_method"] == "hourly"
+
+    def test_ua_staleness_weekly_and_missing_key_is_stale(self, tmp_path):
+        m = self._m(tmp_path)
+        assert m.ua_calibration_stale
+        m._calib["ua_calibrated_at"] = (pd.Timestamp.now() - pd.Timedelta(days=8)).isoformat()
+        assert m.ua_calibration_stale
+        m._calib["ua_calibrated_at"] = (pd.Timestamp.now() - pd.Timedelta(days=2)).isoformat()
+        assert not m.ua_calibration_stale
+
+    def test_recalibrate_ua_updates_ua_only_and_noop_when_hourly(self, tmp_path):
+        idx, weather, clim, t_out = _daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        hourly = self._m(tmp_path / "h")
+        meter = _meter_for(hourly, idx, t_out, 80.0)
+        hourly.recalibrate_ua(energy, clim, weather, meter, self._end(idx))
+        assert hourly._calib["UA_eff"] is None
+        m = ThermalPhysicsModel(tmp_path / "d" / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        m.recalibrate_ua(energy, clim, weather, meter, self._end(idx))
+        assert m._calib["UA_eff"] == pytest.approx(80.0, rel=0.05)
+        assert m._calib["ua_eff_method"] == "daily" and not m.ua_calibration_stale
+
+    def test_c_building_independent_of_ml_tau(self, tmp_path):
+        m = self._m(tmp_path)
+        m._calib["UA_eff"] = 28.0
+        idx, weather, clim, t_out = _daily_fixture(days=2)
+        t_in = pd.Series(20.0 + 0.2 * np.sin(np.arange(len(idx))), index=idx)
+        args = dict(
+            t_indoor=t_in,
+            t_outdoor=pd.Series(t_out, index=idx),
+            ghi=pd.Series(0.0, index=idx),
+            cop=pd.Series(3.2, index=idx),
+        )
+        m._tau_hours = 11.6
+        a = m._space_heating_kwh(**args)
+        m._tau_hours = 92.0
+        b = m._space_heating_kwh(**args)
+        pd.testing.assert_series_equal(a, b)

@@ -64,6 +64,14 @@ UA_EFF_FALLBACK_MIN_LOAD_KWH = 0.3  # tier 3: load floor, applied only once Q_ba
 UA_EFF_SANITY_MIN_W_PER_K = 50.0  # implausible-result guard on the recovered UA_eff
 UA_EFF_SANITY_MAX_W_PER_K = 500.0
 
+# Daily heat-balance UA_eff (physics.ua_eff_method = "daily", #105)
+UA_EFF_DAILY_WINDOW_DAYS = 28  # rolling window ending at the data end
+UA_EFF_DAILY_MIN_DAYS = 10  # eligible heating days required inside the window
+UA_EFF_DAILY_MIN_MEAN_DT_K = 8.0  # heating-day test by mean indoor-outdoor dT when no heating_active signal
+UA_EFF_DAILY_MIN_R2 = 0.4  # reject fits explaining less daily-kWh variance than this
+UA_EFF_RECAL_DAYS = 7  # UA-only recalibration cadence
+C_BUILDING_DEFAULT_TAU_H = 8.0  # building-mass time constant default (c_building = UA * this)
+
 # Supported energy sensor units and their kWh conversion factors.
 UNIT_TO_KWH: dict[str, float] = {"kWh": 1.0, "MWh": 1000.0, "Wh": 0.001}
 
