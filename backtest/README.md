@@ -39,6 +39,18 @@ rather than silently doing nothing.
 - `--smoke` runs the last fold for 2 days. `--arms`, `--folds` and `--no-fetch` narrow the run.
 - Rows are written to `data/backtest/<name>_<stamp>.pkl` after every arm.
 
+## Replaying live captures
+
+With `capture_inputs: true` on the live app (see the main README), pull `captures/` (the local `scripts/pull_ha_data.py` copies it to `data/captures/`), then:
+
+```bash
+/home/jovyan/my_envs/ha-energy-forecast/bin/python -m backtest.capture_replay data/captures
+```
+
+- `predict` rows re-run feature building plus `predict()` on a captured update, against the model files saved with the retrain that served it. PASS means a max absolute difference of at most 1e-6 kWh/h from what live computed.
+- `train` rows re-run `train()` on a retrain capture, seeded from the previous retrain's saved model files. They then predict on the update made right after that retrain. PASS means a next-day total within 0.1 %.
+- Updates taken while a retrain was running are skipped. The command reports only and always exits 0. A FAIL is a finding: some difference beyond the inputs, such as library versions (sidecars record them, and loading warns on a mismatch) or hidden state.
+
 ## Reading the summary
 
 - `dMAE%` / `95% CI` is the paired difference against base. The CI resamples (fold, ISO-week) blocks, not days.
