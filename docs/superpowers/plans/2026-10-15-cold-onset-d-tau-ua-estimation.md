@@ -606,6 +606,8 @@ GO → set `tau_estimator: valve_pooled` in live apps.yaml (backup first) and re
 
 ### Task 4: Daily heat-balance `UA_eff` behind `physics.ua_eff_method` flag (`feat/ua-eff-daily`)
 
+> **Superseded 2026-11-08** by docs/superpowers/plans/2026-11-08-ua-eff-daily-105.md (joint UA + gains fit; Step 3b shipped there as Task 1).
+
 **Files:**
 - Modify: `apps/energy_forecast/physics.py`:
   - new `_calibrate_ua_eff_daily` and `_area_weighted_t_indoor_strict`;

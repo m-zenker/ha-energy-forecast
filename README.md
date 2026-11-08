@@ -470,6 +470,8 @@ energy_forecast:
   #   heating_curve_sensor: sensor.heating_curve_setpoint      # heating curve setpoint
   #   heating_sub_meter_sensor: sensor.hp_space_heating_kwh    # cumulative space-heating-only kWh meter (best UA_eff calibration)
   #   cop_formula: {a: 2.5, b: 0.07}                           # fallback Carnot-style COP formula (default shown)
+  #   cop_formula_heating: {a: 2.5, b: 0.07}                   # optional: heating-only COP formula (default: unset = cop_formula)
+  #   ua_eff_method: hourly                                    # hourly (default) | daily (needs heating_sub_meter_sensor)
   #   dhw_tank_volume_l: 200                                   # DHW tank volume (litres, default shown)
   #   dhw_power_w: 4000                                        # DHW heater power (W, default shown)
   #   internal_gains_fraction: 0.8                             # fraction of rated power as internal gains (default shown)
@@ -542,6 +544,8 @@ energy_forecast:
 | `physics.heating_sub_meter_sensor` | No | — | Entity ID of a cumulative kWh meter measuring **space heating only** (excluding DHW). Enables the most accurate UA_eff calibration tier: night windows are gated on measured sub-meter draw (> 0.3 kWh/h) and the regression target is the sub-meter series itself. Also supplies the heating label for the learned `heating_temp_on`/`heating_temp_off` thresholds. Without it, calibration falls back to `heating_system_active_entity`, then to an outdoor-temperature gate. |
 | `physics.c_building_wh_k` | No | `UA_eff × τ` | Advanced: building thermal capacity (Wh/K). Overrides the value derived from calibrated UA_eff and τ. Leave unset unless you have a measured figure. |
 | `physics.cop_formula` | No | `{a: 2.5, b: 0.07}` | Coefficients `{a, b}` for a fallback Carnot-style COP formula, used when `cop_sensor` is absent or unavailable. |
+| `physics.cop_formula_heating` | No | unset (= `cop_formula`) | Optional `{a, b}` COP formula used for every space-heating COP evaluation (prediction and calibration); DHW keeps `physics.cop_formula`. Malformed values are ignored with a warning. |
+| `physics.ua_eff_method` | No | `hourly` | `hourly` (night-window fit) or `daily`: rolling 28-day daily heat balance on the heating sub-meter, jointly fitting UA (W/K) and internal gains (W), recalibrated weekly. `daily` requires `physics.heating_sub_meter_sensor` (otherwise falls back to `hourly` with a warning). |
 | `physics.dhw_tank_volume_l` | No | `200` | DHW tank volume in litres. Used by the physics model to compute heat-loss and re-heat energy. |
 | `physics.dhw_power_w` | No | `4000` | DHW heater rated power in watts. |
 | `physics.internal_gains_fraction` | No | `0.8` | Fraction of rated heater power treated as internal thermal gains. |
