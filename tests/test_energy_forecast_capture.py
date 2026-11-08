@@ -179,3 +179,176 @@ def test_fetch_forecast_tags_source(monkeypatch):
     monkeypatch.setattr(requests, "get", _fail)
     out = weather.fetch_forecast("8000", 47.0, 8.5, client_id="a", client_secret="b")
     assert out.attrs["weather_source"] == "open_meteo"
+
+
+# ── Task 3: predict hook ─────────────────────────────────────────────────────
+
+_PREDICT_KWARG_KEYS = {
+    "forecast_df",
+    "live_temp",
+    "recent_actuals",
+    "sub_sensors_recent",
+    "away_series",
+    "people_home_series",
+    "climate_recent",
+    "dhw_recent",
+    "room_areas",
+    "heating_active_series",
+    "setpoint_on",
+    "setpoint_off",
+    "heating_buffer_temp_recent",
+}
+
+
+def _predict_stub(tmp_path, monkeypatch, *, capture_on, after_retrain=False, run=True, retrain_running=False):
+    import json  # noqa: F401
+
+    from tests.test_energy_forecast import TestUpdateSensorsExcludedRanges, _FakeUpdateSensors
+
+    TestUpdateSensorsExcludedRanges()._patch_update_sensors_deps(monkeypatch, _make_energy_df(24), tmp_path)
+    stub = _FakeUpdateSensors(tmp_path / "energy_history.csv")
+    stub._capture_inputs = capture_on
+    stub._retrain_running = retrain_running
+    if run:
+        if after_retrain:
+            ef_mod.EnergyForecast._update_sensors(stub, after_retrain=True)
+        else:
+            ef_mod.EnergyForecast._update_sensors(stub)
+    return stub
+
+
+def _load_predict():
+    (cap,) = capture.list_captures(ef_mod.CAPTURE_DIR, "predict")
+    payload, meta = capture.load_capture(ef_mod.CAPTURE_DIR, "predict", cap["capture_id"])
+    return payload, meta
+
+
+def test_predict_capture_off_by_default(tmp_path, monkeypatch):
+    _predict_stub(tmp_path, monkeypatch, capture_on=False)
+    assert not ef_mod.CAPTURE_DIR.exists()
+
+
+def test_published_output_identical_with_flag_on(tmp_path, monkeypatch):
+    import json
+
+    def _once(on, sub):
+        d = tmp_path / sub
+        d.mkdir()
+        monkeypatch.setattr(ef_mod, "REGIME_LOG_PATH", d / "regime_log.jsonl")
+        stub = _predict_stub(d, monkeypatch, capture_on=on)
+        rec = json.loads((d / "regime_log.jsonl").read_text().splitlines()[0])
+        rec.pop("ts")
+        return stub.set_state_calls, rec, (d / "pred_history.json").read_text()
+
+    off = _once(False, "off")
+    assert not ef_mod.CAPTURE_DIR.exists()
+    on = _once(True, "on")
+    assert len(capture.list_captures(ef_mod.CAPTURE_DIR, "predict")) == 1
+    assert off[0], "expected published set_state calls"
+    assert on[0] == off[0]
+    assert on[1] == off[1]
+    assert on[2] == off[2]
+
+
+def test_predict_capture_contents(tmp_path, monkeypatch):
+    stub = _predict_stub(tmp_path, monkeypatch, capture_on=True)
+    payload, meta = _load_predict()
+    assert set(payload["predict_kwargs"]) == _PREDICT_KWARG_KEYS
+    expected = stub._ml_model.predict()
+    pd.testing.assert_frame_equal(payload["model_predictions"].reset_index(drop=True), expected)
+    pd.testing.assert_frame_equal(payload["published_predictions"].reset_index(drop=True), expected)
+    assert isinstance(payload["tomorrow_kwh"], float)
+    assert payload["now_local"].tzinfo is None
+    assert payload["physics_model"] is None
+    assert set(meta) >= {"last_trained", "weather_source", "retrain_in_progress", "physics", "after_retrain"}
+    assert meta["physics"] is False
+    assert meta["after_retrain"] is False
+    assert meta["retrain_in_progress"] is False
+    assert meta["weather_source"] is None  # patched fetch_forecast returns an untagged frame
+
+
+def test_predict_capture_records_weather_source(tmp_path, monkeypatch):
+    import energy_forecast.weather as weather_mod
+
+    def _fc(*a, **kw):
+        df = pd.DataFrame(columns=["timestamp"])
+        df.attrs["weather_source"] = "srg"
+        return df
+
+    stub = _predict_stub(tmp_path, monkeypatch, capture_on=True, run=False)
+    monkeypatch.setattr(weather_mod, "fetch_forecast", _fc)
+    ef_mod.EnergyForecast._update_sensors(stub)
+    _, meta = _load_predict()
+    assert meta["weather_source"] == "srg"
+
+
+class _PM:
+    def _t_indoor_for_window(self, *a, **kw):
+        return pd.Series(20.0, index=a[1])
+
+    def _initial_t_tank_for_window(self, *a, **kw):
+        return 45.0
+
+    def compute_serving_override_delta(self, idx, *a, **kw):
+        return pd.Series(0.5, index=idx)
+
+
+def test_predict_capture_model_predictions_precede_override(tmp_path, monkeypatch):
+    stub = _predict_stub(tmp_path, monkeypatch, capture_on=True, run=False)
+    base = stub._ml_model.predict()
+
+    stub._physics_model = _PM()
+    # physics hooks on the fake are real-delegating; neutralise the ones that need a real model
+    stub._fetch_physics_sensor_histories = lambda *a, **kw: None
+    stub._publish_physics_sensors = lambda *a, **kw: None
+    import energy_forecast.weather as weather_mod
+
+    fc = pd.DataFrame(
+        {"timestamp": pd.date_range(base["timestamp"].iloc[0] - pd.Timedelta(hours=2), periods=60, freq="1h")}
+    )
+    fc["temp_c"] = 5.0
+    monkeypatch.setattr(weather_mod, "fetch_forecast", lambda *a, **kw: fc.copy())
+    ef_mod.EnergyForecast._update_sensors(stub)
+    payload, meta = _load_predict()
+    assert meta["physics"] is True
+    assert (payload["model_predictions"]["predicted_kwh"] == 1.0).all()
+    assert (payload["published_predictions"]["predicted_kwh"] == 1.5).all()
+    assert payload["physics_model"] is not None
+
+
+def test_capture_failure_does_not_break_update(tmp_path, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(capture, "write_capture", MagicMock(side_effect=RuntimeError("x")))
+    with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+        _predict_stub(tmp_path, monkeypatch, capture_on=True)
+    assert ef_mod.REGIME_LOG_PATH.read_text().strip()
+    assert len([r for r in caplog.records if "capture: predict snapshot failed" in r.getMessage()]) == 1
+
+
+def test_after_retrain_marked(tmp_path, monkeypatch):
+    _predict_stub(tmp_path, monkeypatch, capture_on=True, after_retrain=True, retrain_running=True)
+    _, meta = _load_predict()
+    assert meta["after_retrain"] is True
+    assert meta["retrain_in_progress"] is False
+
+
+def test_retrain_in_progress_marked(tmp_path, monkeypatch):
+    _predict_stub(tmp_path, monkeypatch, capture_on=True, retrain_running=True)
+    _, meta = _load_predict()
+    assert meta["retrain_in_progress"] is True
+
+
+def test_predict_capture_without_physics(tmp_path, monkeypatch):
+    _predict_stub(tmp_path, monkeypatch, capture_on=True)
+    payload, _ = _load_predict()
+    assert payload["physics_model"] is None
+
+
+def test_retrain_cb_passes_after_retrain(tmp_path):
+    stub = MagicMock()
+    stub._lock = MagicMock()
+    stub._lock.acquire.return_value = True
+    stub._ml_model.model = object()
+    ef_mod.EnergyForecast._retrain_cb(stub)
+    stub._update_sensors.assert_called_once_with(after_retrain=True)
