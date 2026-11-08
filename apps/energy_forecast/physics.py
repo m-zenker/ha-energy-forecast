@@ -1383,14 +1383,18 @@ class ThermalPhysicsModel:
                     if ua_window_end is not None
                     else pd.to_datetime(energy_df["timestamp"]).max() + pd.Timedelta(hours=1)
                 )
-                ua_eff, gains_w, n_windows = self._calibrate_ua_eff_daily(
-                    climate_dfs,
-                    weather_df,
-                    heating_sub_meter_df,
-                    window_end,
-                    room_areas=room_areas,
-                    heating_active_df=heating_active_df,
-                )
+                try:
+                    ua_eff, gains_w, n_windows = self._calibrate_ua_eff_daily(
+                        climate_dfs,
+                        weather_df,
+                        heating_sub_meter_df,
+                        window_end,
+                        room_areas=room_areas,
+                        heating_active_df=heating_active_df,
+                    )
+                except Exception as e:  # keep the previous (UA, gains) pair; finish the rest of the calibration
+                    _LOGGER.warning(f"UA_eff daily calibration failed: {e} - retaining previous value")
+                    ua_eff, gains_w, n_windows = None, None, 0
             else:
                 if method == "daily":
                     _LOGGER.warning("physics.ua_eff_method=daily needs physics.heating_sub_meter_sensor - using hourly")

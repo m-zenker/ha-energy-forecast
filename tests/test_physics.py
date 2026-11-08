@@ -2546,6 +2546,19 @@ class TestUaEffDaily:
         spy.assert_called_once()
         assert m._calib["ua_eff_method"] == "hourly" and m._calib["solar_gain_area"] == 7.5
 
+    def test_daily_fit_exception_does_not_abort_calibrate(self, tmp_path, caplog):
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
+        m._calib.update(UA_eff=120.0, gains_w=800.0)
+        with (
+            patch.object(m, "_calibrate_ua_eff_daily", side_effect=RuntimeError("boom")),
+            patch.object(m, "_calibrate_ua_dhw", return_value=None) as dhw,
+        ):
+            m.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        dhw.assert_called_once()
+        assert m._calib.get("calibrated_at") and (m._calib["UA_eff"], m._calib["gains_w"]) == (120.0, 800.0)
+        assert "boom" in caplog.text
+
     def test_ua_above_sanity_max_rejected(self, tmp_path, caplog):
         m = self._m(tmp_path)
         idx, weather, clim, t_out = _varying_daily_fixture()
