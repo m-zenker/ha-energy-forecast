@@ -18,6 +18,8 @@ EV charging handling:
 
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import logging
 import math
@@ -32,9 +34,10 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, ha_data, heating_season, weather
+from . import __version__, capture, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
+    CAPTURE_DIR,
     EV_CHARGING_THRESHOLD_KWH,
     GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
@@ -193,6 +196,58 @@ def _describe_temperature_mismatch(unit: str | None, state_class: str | None = N
     return None
 
 
+def _tracks_retrain(fn):
+    """Maintain self._retrain_running for the duration of a retrain (reset even on error)."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._retrain_running = True
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._retrain_running = False
+
+    return wrapper
+
+
+def _capture_retrain_inputs(app, train_kwargs: dict) -> str | None:
+    """Snapshot the exact train() inputs (flag-gated; never raises)."""
+    if not app._capture_inputs:
+        return None
+    try:
+        import pandas as pd
+
+        physics = train_kwargs.get("physics_model")
+        payload = {
+            "train_kwargs": {**train_kwargs, "physics_model": None},
+            "physics_model": copy.deepcopy(physics) if physics is not None else None,
+            "now_local": pd.Timestamp.now(tz=app._timezone).tz_localize(None),
+            "model_init": {"model_archive_count": app._model_archive_count, "timezone": app._timezone},
+            "args": {
+                k: v
+                for k, v in dict(app.args).items()
+                if not any(w in str(k).lower() for w in ("secret", "token", "password"))
+            },
+        }
+        meta = {
+            "last_trained_before": str(app._ml_model.last_trained) if app._ml_model.last_trained else None,
+            "physics": physics is not None,
+        }
+        return capture.write_capture(CAPTURE_DIR, "retrain", payload, meta, pd.Timestamp.now(tz="UTC"))
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain snapshot failed: %s", exc)
+        return None
+
+
+def _finish_retrain_capture(app, capture_id: str) -> None:
+    """Attach the freshly written model files and final train timestamp (never raises)."""
+    try:
+        capture.attach_reference(CAPTURE_DIR, capture_id, app._ml_model._model_dir)
+        capture.update_sidecar(CAPTURE_DIR, "retrain", capture_id, last_trained_after=str(app._ml_model.last_trained))
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain reference failed: %s", exc)
+
+
 class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
@@ -290,6 +345,10 @@ class EnergyForecast(hass.Hass):
         self._model_archive_count: int = int(self.args.get("model_archive_count", 3))
         # Daily GitHub-release update check (main-track users only; see _check_for_update_cb)
         self._update_check_enabled: bool = bool(self.args.get("update_check_enabled", True))
+
+        # Live input capture: record exact model inputs for offline replay (off by default)
+        self._capture_inputs: bool = bool(self.args.get("capture_inputs", False))
+        self._retrain_running: bool = False
 
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
@@ -1500,6 +1559,7 @@ class EnergyForecast(hass.Hass):
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
+    @_tracks_retrain
     def _retrain(self) -> None:
         import pandas as pd
 
@@ -1824,9 +1884,9 @@ class EnergyForecast(hass.Hass):
         # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
         self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
 
-        self._ml_model.train(
-            baseline_df,
-            weather_df,
+        train_kwargs = dict(
+            energy_df=baseline_df,
+            weather_df=weather_df,
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
@@ -1848,6 +1908,10 @@ class EnergyForecast(hass.Hass):
             use_physics_residual=self._effective_use_physics_residual(),
             heating_feature_df=heating_feature_df,
         )
+        capture_id = _capture_retrain_inputs(self, train_kwargs)
+        self._ml_model.train(**train_kwargs)
+        if capture_id is not None:
+            _finish_retrain_capture(self, capture_id)
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
         self._last_adaptive_retrain = self._last_trained_local()
 
