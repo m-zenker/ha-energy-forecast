@@ -702,6 +702,7 @@ class TestRecalibratePhysicsService:
         app._cached_ev_df = ev_sentinel
         app._cached_away_df = away_sentinel
         app._cached_heating_sub_meter_df = sub_meter_sentinel
+        app._climate_room_areas = {"climate.living": 35.0}
 
         with patch.object(app._physics_model, "calibrate") as mock_calibrate:
             app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
@@ -711,6 +712,14 @@ class TestRecalibratePhysicsService:
             assert kwargs["ev_df"] is ev_sentinel
             assert kwargs["away_df"] is away_sentinel
             assert kwargs["heating_sub_meter_df"] is sub_meter_sentinel
+            # same room weighting and daily-UA window end as the scheduled path in model.py
+            assert kwargs["room_areas"] == {"climate.living": 35.0}
+            assert kwargs["ua_window_end"] == pd.Timestamp("2026-01-01 10:00")
+
+        app._climate_room_areas = {}  # unconfigured -> None, like the other call sites
+        with patch.object(app._physics_model, "calibrate") as mock_calibrate:
+            app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
+            assert mock_calibrate.call_args.kwargs["room_areas"] is None
 
     def test_recalibrate_service_before_first_retrain_logs_warning_and_does_not_crash(self, caplog):
         """No _cached_energy_df/_cached_weather_df yet (never retrained) — must not raise."""

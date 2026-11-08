@@ -1457,6 +1457,9 @@ class EnergyForecast(hass.Hass):
                 heating_sub_meter_df=self._cached_heating_sub_meter_df,
                 ev_df=self._cached_ev_df,
                 away_df=self._cached_away_df,
+                # same room weighting and daily-UA window end as the scheduled path (model.py)
+                room_areas=self._climate_room_areas or None,
+                ua_window_end=energy_df["timestamp"].max() + pd.Timedelta(hours=1),
             )
             _LOGGER.info("Physics recalibration complete")
         except Exception as exc:  # noqa: BLE001
