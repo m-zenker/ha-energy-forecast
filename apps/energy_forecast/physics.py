@@ -1266,6 +1266,8 @@ class ThermalPhysicsModel:
         or the other calibrated parameters. energy_df is accepted for signature symmetry with calibrate()."""
         if self._config.get("ua_eff_method", "hourly") != "daily":
             return
+        if heating_sub_meter_df is None or heating_sub_meter_df.empty:
+            return  # calibrate() fell back to hourly without a sub-meter; keep its UA/window count/method
         try:
             ua_eff, n_windows = self._calibrate_ua_eff_daily(
                 climate_dfs,

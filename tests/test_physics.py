@@ -2320,3 +2320,15 @@ class TestUaEffDaily:
         m._tau_hours = 92.0
         b = m._space_heating_kwh(**args)
         pd.testing.assert_series_equal(a, b)
+
+    def test_recalibrate_ua_keeps_state_without_sub_meter(self, tmp_path):
+        idx, weather, clim, _ = _daily_fixture()
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        m._calib.update({"n_calibration_windows_ua_eff": 200, "ua_eff_method": "hourly", "UA_eff": 90.0})
+        for meter in (None, pd.DataFrame({"timestamp": [], "kwh": []})):
+            m.recalibrate_ua(energy, clim, weather, meter, self._end(idx))
+            assert m._calib["n_calibration_windows_ua_eff"] == 200
+            assert m._calib["ua_eff_method"] == "hourly"
+            assert m._calib["UA_eff"] == 90.0
+        assert not (tmp_path / "models" / "physics_calibration.json").exists()
