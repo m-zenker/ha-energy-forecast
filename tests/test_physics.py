@@ -2546,6 +2546,17 @@ class TestUaEffDaily:
         spy.assert_called_once()
         assert m._calib["ua_eff_method"] == "hourly" and m._calib["solar_gain_area"] == 7.5
 
+    def test_recalibrate_ua_zeroes_solar_when_storing_daily_pair(self, tmp_path, caplog):
+        # hourly->daily switch via the weekly path: fitted G must not be stacked on the old hourly solar term
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
+        m._calib.update(UA_eff=110.0, gains_w=None, solar_gain_area=5.0, ua_eff_method="hourly")
+        with caplog.at_level(logging.INFO):
+            m.recalibrate_ua(energy, clim, weather, meter, self._end(idx))
+        assert m._calib["gains_w"] == pytest.approx(1000.0, rel=0.1)
+        assert m._calib["solar_gain_area"] == 0.0
+        assert "solar_gain_area" in caplog.text
+
     def test_daily_fit_exception_does_not_abort_calibrate(self, tmp_path, caplog):
         m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
         idx, weather, clim, meter, energy = self._sunny_winter_daily(m)

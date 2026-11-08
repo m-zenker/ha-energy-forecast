@@ -1316,6 +1316,11 @@ class ThermalPhysicsModel:
             return None, None, n_days
         return ua, gains, n_days
 
+    def _zero_solar_for_daily_gains(self) -> None:
+        # the fitted G already absorbs the average solar/internal gains; a solar term on top double counts
+        _LOGGER.info("UA_eff daily: fitted gains include solar - solar_gain_area set to 0, not calibrated")
+        self._calib["solar_gain_area"] = 0.0
+
     def recalibrate_ua(
         self,
         energy_df: pd.DataFrame,
@@ -1347,6 +1352,8 @@ class ThermalPhysicsModel:
             if ua_eff is not None:
                 self._calib["UA_eff"] = ua_eff
                 self._calib["gains_w"] = gains_w  # (UA, G) are a pair: stored and retained together
+                if gains_w is not None:
+                    self._zero_solar_for_daily_gains()
             else:
                 _LOGGER.warning("UA_eff weekly recalibration unavailable - retaining previous value")
             _atomic_write_json(self._calibration_path, self._calib)
