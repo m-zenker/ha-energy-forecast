@@ -1413,9 +1413,14 @@ class ThermalPhysicsModel:
             else:
                 _LOGGER.warning("UA_eff calibration unavailable — heating component will be skipped")
 
-            solar_area = self._calibrate_solar_gain_area(
-                energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff, room_areas=room_areas
-            )
+            if method == "daily":
+                # the fitted G already absorbs the average solar/internal gains; a solar term on top double counts
+                _LOGGER.info("UA_eff daily: fitted gains include solar - solar_gain_area set to 0, not calibrated")
+                solar_area = 0.0
+            else:
+                solar_area = self._calibrate_solar_gain_area(
+                    energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff, room_areas=room_areas
+                )
             if solar_area is not None:
                 self._calib["solar_gain_area"] = solar_area
 

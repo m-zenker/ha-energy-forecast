@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -2485,6 +2487,34 @@ class TestUaEffDaily:
         h._calib["gains_w"] = 1000.0  # stale value from an earlier daily calibration
         h.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
         assert h._calib["ua_eff_method"] == "hourly" and h._calib["gains_w"] is None
+
+    def _sunny_winter_daily(self, m):
+        idx, weather, clim, t_out = _varying_daily_fixture(start="2026-11-01")
+        weather["direct_radiation_wm2"] = np.where(idx.hour.isin(range(10, 15)), 200.0, 0.0)
+        meter = _meter_for(m, idx, t_out, 150.0, gains_w=1000.0)
+        energy = pd.DataFrame({"timestamp": idx, "gross_kwh": 0.5})
+        return idx, weather, clim, meter, energy
+
+    def test_daily_method_zeroes_solar_gain_area(self, tmp_path, caplog):
+        # the fitted G already absorbs average solar/internal gains - a solar term on top double counts
+        m = ThermalPhysicsModel(tmp_path / "models", {**DEFAULT_CONFIG, "ua_eff_method": "daily"})
+        idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
+        m._calib["solar_gain_area"] = 5.0  # value left over from an earlier hourly calibration
+        assert m._calibrate_solar_gain_area(energy, weather, clim, 150.0, idx[-1]) > 0  # would be positive
+        with caplog.at_level(logging.INFO):
+            m.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        assert m._calib["ua_eff_method"] == "daily" and m._calib["UA_eff"] == pytest.approx(150.0, rel=0.05)
+        assert m._calib["solar_gain_area"] == 0.0
+        assert "solar_gain_area" in caplog.text
+
+    def test_hourly_method_still_calibrates_solar_gain_area(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
+        idx, weather, clim, meter, energy = self._sunny_winter_daily(m)
+        m._calib["UA_eff"] = 150.0
+        with patch.object(m, "_calibrate_solar_gain_area", return_value=7.5) as spy:
+            m.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
+        spy.assert_called_once()
+        assert m._calib["ua_eff_method"] == "hourly" and m._calib["solar_gain_area"] == 7.5
 
     def test_ua_above_sanity_max_rejected(self, tmp_path, caplog):
         m = self._m(tmp_path)
