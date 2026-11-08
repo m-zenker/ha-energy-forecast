@@ -178,6 +178,40 @@ class TestCopFormulaHeating:
             base._dhw_kwh_series(ts, amb, 50.0, None)[0], new._dhw_kwh_series(ts, amb, 50.0, None)[0]
         )
 
+    def test_space_heating_calibrators_use_heating_formula(self, tmp_path):
+        """Calibration and prediction must share the COP function (space heating)."""
+        cfg = {**DEFAULT_CONFIG, "heating_curve_points": self.CURVE, "cop_formula_heating": {"a": 3.53, "b": 0.147}}
+        pm = ThermalPhysicsModel(tmp_path / "models", cfg)
+        keys: list[str] = []
+        orig = pm._cop_formula_value
+
+        def spy(t, shift, formula_key="cop_formula"):
+            keys.append(formula_key)
+            return orig(t, shift, formula_key)
+
+        pm._cop_formula_value = spy
+
+        energy_df, weather_df, climate_dfs, dhw_df = TestCalibrateUAEff()._synthetic_winter_data(n_nights=35)
+        pm._calibrate_ua_eff(energy_df, weather_df, climate_dfs, dhw_df, holdout_cutoff=pd.Timestamp("2026-06-01"))
+        assert keys and set(keys) == {"cop_formula_heating"}
+
+        keys.clear()
+        rows_e, rows_w, rows_c = [], [], []
+        for day in pd.date_range("2025-12-01", periods=20, freq="1D"):
+            for h in range(10, 15):
+                ts = day + pd.Timedelta(hours=h)
+                rows_e.append({"timestamp": ts, "gross_kwh": 0.5})
+                rows_w.append({"timestamp": ts, "temp_c": 2.0, "direct_radiation_wm2": 100.0 + 50 * (h - 10)})
+                rows_c.append({"timestamp": ts, "current_temp": 20.0})
+        pm._calibrate_solar_gain_area(
+            pd.DataFrame(rows_e),
+            pd.DataFrame(rows_w),
+            {"climate.living_room": pd.DataFrame(rows_c)},
+            ua_eff=150.0,
+            holdout_cutoff=pd.Timestamp("2026-06-01"),
+        )
+        assert keys and set(keys) == {"cop_formula_heating"}
+
 
 class TestSpaceHeating:
     def test_matches_spec_worked_example(self, tmp_path):

@@ -863,7 +863,7 @@ class ThermalPhysicsModel:
         sub_t_indoor = t_indoor.iloc[passive_idx].values
         sub_t_outdoor = t_outdoor[passive_idx]
         delta_t = sub_t_indoor - sub_t_outdoor
-        cop = np.array([self._cop_formula_value(t, None) for t in sub_t_outdoor])
+        cop = np.array([self._cop_formula_value(t, None, "cop_formula_heating") for t in sub_t_outdoor])
 
         if y_override is not None:
             q_heat_obs = y_override.iloc[passive_idx].values
@@ -930,7 +930,7 @@ class ThermalPhysicsModel:
         t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas)
         t_outdoor = w["temp_c"].reindex(e["timestamp"], method="nearest").values
         ghi_sub = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest").values
-        cop = np.array([self._cop_formula_value(t, None) for t in t_outdoor])
+        cop = np.array([self._cop_formula_value(t, None, "cop_formula_heating") for t in t_outdoor])
 
         q_loss_w = ua_eff * np.clip((t_indoor.values if t_indoor is not None else 20.0) - t_outdoor, 0, None)
         # gross_kwh includes standing base load (Q_base_el) — subtract it so q_heat_el_observed*cop*1000
