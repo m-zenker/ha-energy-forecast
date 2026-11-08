@@ -151,6 +151,34 @@ class TestCOPModel:
         assert cop_series.iloc[0] >= COP_MIN
 
 
+class TestCopFormulaHeating:
+    CURVE = [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]]
+
+    def test_unset_is_identical_to_today(self, tmp_path):
+        m = ThermalPhysicsModel(tmp_path, {**DEFAULT_CONFIG, "heating_curve_points": self.CURVE})
+        ts = pd.date_range("2026-11-01", periods=3, freq="1h")
+        cop = m._cop_series(ts, pd.Series([0.0, 6.0, 10.0], index=ts), None)
+        assert cop.tolist() == pytest.approx([2.5, 2.92, 3.2])
+
+    def test_heating_formula_applies_with_carnot_cap(self, tmp_path):
+        cfg = {**DEFAULT_CONFIG, "heating_curve_points": self.CURVE, "cop_formula_heating": {"a": 3.53, "b": 0.147}}
+        m = ThermalPhysicsModel(tmp_path, cfg)
+        ts = pd.date_range("2026-11-01", periods=2, freq="1h")
+        cop = m._cop_series(ts, pd.Series([0.0, 10.0], index=ts), None)
+        assert cop.iloc[0] == pytest.approx(3.33, abs=0.01)  # Carnot*0.45 binds at 0 C
+        assert cop.iloc[1] == pytest.approx(5.0, abs=0.01)  # linear binds at 10 C
+
+    def test_heating_formula_does_not_touch_dhw(self, tmp_path):
+        base = ThermalPhysicsModel(tmp_path / "a", {**DEFAULT_CONFIG, "heating_curve_points": self.CURVE})
+        cfg = {**DEFAULT_CONFIG, "heating_curve_points": self.CURVE, "cop_formula_heating": {"a": 3.53, "b": 0.147}}
+        new = ThermalPhysicsModel(tmp_path / "b", cfg)
+        ts = pd.date_range("2026-11-01", periods=24 * 5, freq="1h")
+        amb = pd.Series(20.0, index=ts)
+        pd.testing.assert_series_equal(
+            base._dhw_kwh_series(ts, amb, 50.0, None)[0], new._dhw_kwh_series(ts, amb, 50.0, None)[0]
+        )
+
+
 class TestSpaceHeating:
     def test_matches_spec_worked_example(self, tmp_path):
         # spec §7: UA_eff=150, ΔT=10°C, COP=3.0 -> 0.5 kWh/h (no solar/gains/mass)

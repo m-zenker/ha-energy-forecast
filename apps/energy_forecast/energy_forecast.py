@@ -339,6 +339,7 @@ class EnergyForecast(hass.Hass):
             "heating_curve_sensor": None,
             "heating_sub_meter_sensor": None,  # entity_id of the space-heating-only kWh sub-meter (#92)
             "cop_formula": {"a": 2.5, "b": 0.07},
+            "cop_formula_heating": None,  # optional {a, b} for space heating only; DHW keeps cop_formula (#105)
             "dhw_tank_volume_l": 200,
             "dhw_power_w": 4000,
             "internal_gains_fraction": 0.8,
@@ -354,6 +355,13 @@ class EnergyForecast(hass.Hass):
                 "- using 'hourly'"
             )
             self._physics_config["ua_eff_method"] = "hourly"
+        _cfh = self._physics_config["cop_formula_heating"]
+        if _cfh is not None:
+            try:
+                self._physics_config["cop_formula_heating"] = {"a": float(_cfh["a"]), "b": float(_cfh["b"])}
+            except (TypeError, KeyError, ValueError):
+                _LOGGER.warning(f"physics.cop_formula_heating={_cfh!r} must be {{a: float, b: float}} - ignoring")
+                self._physics_config["cop_formula_heating"] = None
 
         room_therm_raw = self._physics_config.get("room_thermostats") or []
         self._room_thermostats: list[dict] = []

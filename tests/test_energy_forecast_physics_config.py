@@ -117,6 +117,26 @@ class TestPhysicsConfigIngest:
         assert app._physics_config["internal_gains_fraction"] == 0.8
         assert app._physics_config["use_physics_residual"] is False
 
+    def test_malformed_heating_formula_falls_back(self, caplog):
+        import logging
+
+        app = _make_app({"physics": {"cop_formula_heating": {"a": "x"}}})
+        app.logger = logging.getLogger("energy_forecast")
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            app.initialize()
+        assert app._physics_config["cop_formula_heating"] is None
+        assert any("cop_formula_heating" in r.message for r in caplog.records)
+
+    def test_valid_heating_formula_coerced_to_float(self):
+        app = _make_app({"physics": {"cop_formula_heating": {"a": 3, "b": "0.147"}}})
+        app.initialize()
+        assert app._physics_config["cop_formula_heating"] == {"a": 3.0, "b": 0.147}
+
+    def test_heating_formula_default_none(self):
+        app = _make_app({"physics": {}})
+        app.initialize()
+        assert app._physics_config["cop_formula_heating"] is None
+
 
 class TestPhysicsSensorFetch:
     def test_no_physics_model_skips_all_physics_fetches(self, monkeypatch):
