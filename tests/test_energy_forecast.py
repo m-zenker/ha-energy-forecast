@@ -713,7 +713,7 @@ class TestRetrainCoversPreWallboxEvHistory:
 
         EnergyForecast._retrain(stub)
 
-        trained_df = stub._ml_model.train.call_args.args[0]
+        trained_df = stub._ml_model.train.call_args.kwargs["energy_df"]
         spike_row = trained_df[trained_df["timestamp"] == pd.Timestamp("2024-01-01 10:00")]
         assert len(spike_row) == 1, "the EV hour itself must remain in the training frame"
         assert abs(spike_row.iloc[0]["gross_kwh"] - 1.0) < 1e-6, (
@@ -756,7 +756,7 @@ class TestRetrainSkipsPaddingForSensorDetectedEv:
 
         EnergyForecast._retrain(stub)
 
-        trained_ts = set(stub._ml_model.train.call_args.args[0]["timestamp"])
+        trained_ts = set(stub._ml_model.train.call_args.kwargs["energy_df"]["timestamp"])
         assert pd.Timestamp("2024-01-02 10:00") in trained_ts, "sensor-detected EV hour's left neighbor must be kept"
         assert pd.Timestamp("2024-01-02 12:00") in trained_ts, "sensor-detected EV hour's right neighbor must be kept"
 
@@ -781,7 +781,7 @@ class TestRetrainSkipsPaddingForSensorDetectedEv:
 
         EnergyForecast._retrain(stub)
 
-        trained_ts = set(stub._ml_model.train.call_args.args[0]["timestamp"])
+        trained_ts = set(stub._ml_model.train.call_args.kwargs["energy_df"]["timestamp"])
         assert pd.Timestamp("2024-01-01 09:00") not in trained_ts, (
             "threshold-detected EV hour's left neighbor must still be dropped"
         )
@@ -4085,6 +4085,8 @@ class _FakeRetrain:
         self._heating_temp_on_cfg = None
         self._heating_temp_off_cfg = None
         self._heating_thresholds_path = Path(cache_path).parent / "heating_thresholds.json"
+        self._capture_inputs = False
+        self._retrain_running = False
 
     def log(self, msg, level="INFO"):
         pass
@@ -4200,7 +4202,7 @@ class TestRetrainExcludedRanges:
         stub = _FakeRetrain(cache_path)
         EnergyForecast._retrain(stub)
 
-        trained_df = stub._ml_model.train.call_args.args[0]
+        trained_df = stub._ml_model.train.call_args.kwargs["energy_df"]
         excluded = (trained_df["timestamp"] >= pd.Timestamp("2024-01-05 00:00")) & (
             trained_df["timestamp"] <= pd.Timestamp("2024-01-05 12:00")
         )
@@ -4236,7 +4238,7 @@ class TestRetrainExcludedRanges:
         stub = _FakeRetrain(cache_path)
         EnergyForecast._retrain(stub)
 
-        trained_df = stub._ml_model.train.call_args.args[0]
+        trained_df = stub._ml_model.train.call_args.kwargs["energy_df"]
         assert len(trained_df) == 200
 
     def test_exclusion_pushing_below_min_history_hours_skips_retrain(self, tmp_path, monkeypatch, caplog):
@@ -4397,6 +4399,8 @@ class _FakeUpdateSensors:
         self._lat = 47.0
         self._lon = 8.5
         self.args = {}
+        self._capture_inputs = False
+        self._retrain_running = False
         self._energy_sensor = "sensor.energy"
         self._cache_path = cache_path
         self._cache_path_15m = cache_path.parent / "energy_history_15m.csv"

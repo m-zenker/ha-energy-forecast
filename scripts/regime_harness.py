@@ -165,6 +165,11 @@ class TrainRecorder(MagicMock):
         self.last_mae = None
 
         def _train(*args, **kwargs):
+            # _retrain() passes the two frames by keyword (shared train_kwargs dict); callers of the
+            # harness still consume them positionally via "_args".
+            if not args:
+                kwargs = dict(kwargs)
+                args = (kwargs.pop("energy_df"), kwargs.pop("weather_df"))
             self.captured = {"_args": args, **kwargs}
 
         self.train.side_effect = _train

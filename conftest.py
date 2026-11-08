@@ -55,3 +55,11 @@ def _isolate_regime_log(tmp_path, monkeypatch):
     from energy_forecast import energy_forecast as ef_mod
 
     monkeypatch.setattr(ef_mod, "REGIME_LOG_PATH", tmp_path / "regime_log.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_capture_dir(tmp_path, monkeypatch):
+    """Redirect live-input captures so no test can write the real runtime directory."""
+    from energy_forecast import energy_forecast as ef_mod
+
+    monkeypatch.setattr(ef_mod, "CAPTURE_DIR", tmp_path / "captures")
