@@ -2485,3 +2485,11 @@ class TestUaEffDaily:
         h._calib["gains_w"] = 1000.0  # stale value from an earlier daily calibration
         h.calibrate(energy, weather, clim, None, holdout_cutoff=idx[-1], heating_sub_meter_df=meter)
         assert h._calib["ua_eff_method"] == "hourly" and h._calib["gains_w"] is None
+
+    def test_ua_above_sanity_max_rejected(self, tmp_path, caplog):
+        m = self._m(tmp_path)
+        idx, weather, clim, t_out = _varying_daily_fixture()
+        meter = _meter_for(m, idx, t_out, 700.0, gains_w=1000.0)  # optimizer must not clamp UA to the sanity max
+        ua, gains, n = m._calibrate_ua_eff_daily(clim, weather, meter, window_end=self._end(idx))
+        assert ua is None and gains is None and n > 0
+        assert "rejected" in caplog.text

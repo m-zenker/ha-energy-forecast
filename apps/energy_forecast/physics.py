@@ -1198,7 +1198,9 @@ class ThermalPhysicsModel:
         dtp: np.ndarray, inv_cop: np.ndarray, day_codes: np.ndarray, y: np.ndarray
     ) -> tuple[float, float, float]:
         """Fit kwh_d = sum_h max(0, UA*dT+_h - G) * invCOP_h / 1000 (the clipped model prediction uses, minus
-        q_mass ~ 0/day and solar ~ 0) for UA in [0, UA_EFF_SANITY_MAX_W_PER_K], G in [0, UA_EFF_DAILY_MAX_GAINS_W].
+        q_mass ~ 0/day and solar ~ 0) for UA in [0, 2*UA_EFF_SANITY_MAX_W_PER_K], G in [0, UA_EFF_DAILY_MAX_GAINS_W].
+        UA's bound is twice the sanity max so an over-range fit lands above it and is rejected by the caller's
+        range check instead of being clamped to an accepted value at the bound.
         Hours without data carry inv_cop = 0. Returns (UA W/K, G W, R2 on daily kWh)."""
         n = len(y)
         a = np.bincount(day_codes, weights=dtp * inv_cop, minlength=n) / 1000.0
@@ -1207,7 +1209,7 @@ class ThermalPhysicsModel:
         (ua0, g0), *_ = np.linalg.lstsq(np.column_stack([a, -b]), y, rcond=None)
         if g0 < 0:
             g0, ua0 = 0.0, float(np.sum(a * y) / np.sum(a * a))
-        ua0 = float(np.clip(ua0, 0.0, UA_EFF_SANITY_MAX_W_PER_K))
+        ua0 = float(np.clip(ua0, 0.0, 2 * UA_EFF_SANITY_MAX_W_PER_K))
         g0 = float(np.clip(g0, 0.0, UA_EFF_DAILY_MAX_GAINS_W))
 
         def predict(ua: float, g: float) -> np.ndarray:
@@ -1220,7 +1222,7 @@ class ThermalPhysicsModel:
         except ImportError:  # pragma: no cover - live AppDaemon has scipy via scikit-learn
             _LOGGER.info("UA_eff daily: scipy unavailable - using the linear UA+gains fit")
         else:
-            hi = np.array([UA_EFF_SANITY_MAX_W_PER_K, UA_EFF_DAILY_MAX_GAINS_W])
+            hi = np.array([2 * UA_EFF_SANITY_MAX_W_PER_K, UA_EFF_DAILY_MAX_GAINS_W])
             x0 = np.clip([ua0, g0], hi * 1e-6, hi * (1 - 1e-6))  # strictly inside the bounds
             res = least_squares(lambda p: predict(p[0], p[1]) - y, x0, bounds=(np.zeros(2), hi), x_scale=hi)
             ua, g = float(res.x[0]), float(res.x[1])
