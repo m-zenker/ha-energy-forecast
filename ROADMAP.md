@@ -101,6 +101,16 @@ Hourly MAE is mostly timing noise, and optimising it rewards median-style foreca
 
 Scaling the replayed current model by the trailing 7-day actual/forecast ratio (clipped 0.7–1.3, causal) mostly removes daily bias (winter −2.23 → −0.18, Oct −0.96 → +0.05; holdout −0.80 → −0.05) but costs hourly MAE (winter −1.7 %, Sep −0.6 %, Oct −5.9 %) and doesn't reliably reduce daily error (Sep 1.74 → 1.90, Oct 2.37 → 2.56). Consider only if bias, not hourly error, becomes the priority.
 
+### #116 — Retrain Age Off by the UTC Offset (`last_trained` Is Local, Read as UTC)
+
+**Priority:** Low. **Status:** confirmed by code reading and the live log (2026-11-09); not fixed.
+
+`model.py:961` stamps `last_trained` with naive `datetime.now()`, which is local time in the add-on container. `_last_trained_local()` (`energy_forecast.py:1145-1160`) treats that stamp as UTC and converts it to local time (`.tz_localize("UTC").tz_convert(tz)`), which applies the offset a second time. The computed age therefore reads 1 h short in CET and 2 h short in CEST. Live log 2026-11-08 21:26: "Startup retrain skipped — last retrain was -0.9h ago" (true age ≈ 0.15 h). Introduced in 1010a9f (2026-07-09).
+
+**Effect:** the startup-retrain skip gate (`energy_forecast.py:1187`, < 6 h) and the adaptive-retrain cooldown seed (`:1171`, `:1978`) run 1–2 h late. Never early, so there is no spurious retrain and no crash. `model.py:1685` compares naive with naive and is consistent.
+
+**Fix options:** store `last_trained` as tz-aware UTC (needs a load-time shim for existing `meta.pkl` stamps), or have `_last_trained_local()` treat a naive stamp as system-local. Add a regression test that pins both CET and CEST. Size S; tag BEHAVIOUR (retrain timing).
+
 ### #83 — Add `predicted_day_total` Feature (Temperature Regression)
 
 **Priority:** Medium — consider after #82.
