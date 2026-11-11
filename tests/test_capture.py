@@ -155,3 +155,59 @@ def test_write_does_not_prune_new_capture(tmp_path, monkeypatch):
     cid = capture.write_capture(tmp_path, "predict", {}, {}, _ts("2020-01-01"))
     assert cid is not None
     assert (tmp_path / "predict" / f"{cid}.json").exists()
+
+
+def test_attach_pre_state_copies_model_dir_without_archive(tmp_path):
+    md = tmp_path / "model"
+    (md / "archive").mkdir(parents=True)
+    (md / "energy_model.pkl").write_bytes(b"m")
+    (md / "physics_schedule.json").write_text("{}")
+    (md / "archive" / "old.pkl").write_bytes(b"o")
+    root = tmp_path / "caps"
+    cid = capture.write_capture(root, "retrain", {}, {}, _ts("2026-06-01"))
+    before = capture.list_captures(root, "retrain")[0]["bytes"]
+    capture.attach_pre_state(root, cid, md)
+    pre = root / "retrain" / f"{cid}.pre"
+    assert sorted(p.name for p in pre.iterdir()) == ["energy_model.pkl", "physics_schedule.json"]
+    sc = capture.list_captures(root, "retrain")[0]
+    assert sc["pre_state"] is True and sc["bytes"] > before
+
+
+def test_attach_pre_state_missing_model_dir_leaves_empty_pre(tmp_path):
+    root = tmp_path / "caps"
+    cid = capture.write_capture(root, "retrain", {}, {}, _ts("2026-06-01"))
+    capture.attach_pre_state(root, cid, tmp_path / "does-not-exist")
+    pre = root / "retrain" / f"{cid}.pre"
+    assert pre.is_dir() and list(pre.iterdir()) == []
+    assert capture.list_captures(root, "retrain")[0]["pre_state"] is True
+
+
+def test_prune_removes_pre_dir_with_its_capture_and_counts_it_in_the_cap(tmp_path):
+    now = _ts("2026-06-01")
+    ids = []
+    for i in range(2):
+        md = tmp_path / f"model{i}"
+        md.mkdir()
+        (md / "m.pkl").write_bytes(os.urandom(600))
+        cid = capture.write_capture(tmp_path, "retrain", {}, {}, now - pd.Timedelta(days=2 - i))
+        capture.attach_pre_state(tmp_path, cid, md)
+        ids.append(cid)
+    # Each capture is ~600 B of .pre plus a small pickle and sidecar: one fits under 1000 B, two do not.
+    removed = capture.prune(tmp_path, now, max_bytes=1000)
+    assert removed == 1
+    d = tmp_path / "retrain"
+    assert not (d / f"{ids[0]}.pre").exists() and not (d / f"{ids[0]}.json").exists()
+    assert (d / f"{ids[1]}.pre").is_dir()
+
+
+def test_prune_removes_orphan_pre_dir(tmp_path):
+    now = _ts("2026-06-01")
+    d = tmp_path / "retrain"
+    d.mkdir(parents=True)
+    pre = d / "a.pre"
+    pre.mkdir()
+    (pre / "m.pkl").write_bytes(b"x")
+    old = time.time() - 7200
+    os.utime(pre, (old, old))
+    capture.prune(tmp_path, now)
+    assert not pre.exists()

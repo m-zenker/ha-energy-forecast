@@ -27,6 +27,7 @@ RETENTION_DAYS = 45
 MAX_TOTAL_BYTES = 1_000_000_000
 _TMP_MAX_AGE_S = 3600
 _KINDS = ("retrain", "predict")
+_SIDE_DIRS = (".ref", ".pre")  # model-file dirs stored next to a retrain capture
 
 
 def library_versions() -> dict[str, str]:
@@ -99,19 +100,42 @@ def update_sidecar(root: Path, kind: str, capture_id: str, **fields) -> None:
         _LOGGER.warning("capture: sidecar update failed (%s/%s): %s", kind, capture_id, exc)
 
 
-def attach_reference(root: Path, capture_id: str, model_dir: Path) -> None:
-    """Copy the model dir's regular files (not archive/) next to a retrain capture."""
-    try:
-        ref = Path(root) / "retrain" / f"{capture_id}.ref"
-        ref.mkdir(parents=True, exist_ok=True)
+def _capture_bytes(d: Path, capture_id: str) -> int:
+    """Pickle size plus every model-file side dir of one capture."""
+    total = (d / f"{capture_id}.pkl.gz").stat().st_size
+    for suffix in _SIDE_DIRS:
+        side = d / f"{capture_id}{suffix}"
+        if side.is_dir():
+            total += _dir_size(side)
+    return total
+
+
+def _attach_model_dir(root: Path, capture_id: str, model_dir: Path, suffix: str, flag: str) -> None:
+    """Copy the model dir's regular files (not archive/) to ``<capture_id><suffix>`` and flag the sidecar."""
+    d = Path(root) / "retrain"
+    side = d / f"{capture_id}{suffix}"
+    side.mkdir(parents=True, exist_ok=True)
+    if Path(model_dir).is_dir():
         for p in Path(model_dir).iterdir():
             if p.is_file():
-                shutil.copy2(p, ref / p.name)
-        pkl = Path(root) / "retrain" / f"{capture_id}.pkl.gz"
-        total = pkl.stat().st_size + _dir_size(ref)
-        update_sidecar(root, "retrain", capture_id, bytes=total, reference=True)
+                shutil.copy2(p, side / p.name)
+    update_sidecar(root, "retrain", capture_id, bytes=_capture_bytes(d, capture_id), **{flag: True})
+
+
+def attach_reference(root: Path, capture_id: str, model_dir: Path) -> None:
+    """Copy the model dir's regular files (not archive/) next to a retrain capture (the model train() produced)."""
+    try:
+        _attach_model_dir(root, capture_id, model_dir, ".ref", "reference")
     except Exception as exc:
         _LOGGER.warning("capture: attach_reference failed (%s): %s", capture_id, exc)
+
+
+def attach_pre_state(root: Path, capture_id: str, model_dir: Path) -> None:
+    """Copy the model dir as it is *before* train() runs. A missing dir yields an empty ``.pre`` (fresh install)."""
+    try:
+        _attach_model_dir(root, capture_id, model_dir, ".pre", "pre_state")
+    except Exception as exc:
+        _LOGGER.warning("capture: attach_pre_state failed (%s): %s", capture_id, exc)
 
 
 def list_captures(root: Path, kind: str) -> list[dict]:
@@ -150,7 +174,8 @@ def load_capture(root: Path, kind: str, capture_id: str) -> tuple[dict, dict]:
 def _remove_capture(d: Path, capture_id: str) -> None:
     (d / f"{capture_id}.json").unlink(missing_ok=True)
     (d / f"{capture_id}.pkl.gz").unlink(missing_ok=True)
-    shutil.rmtree(d / f"{capture_id}.ref", ignore_errors=True)
+    for suffix in _SIDE_DIRS:
+        shutil.rmtree(d / f"{capture_id}{suffix}", ignore_errors=True)
 
 
 def _old_enough(path: Path) -> bool:
@@ -196,7 +221,7 @@ def prune(
             for tmp in d.glob("*.tmp"):
                 if _old_enough(tmp):
                     tmp.unlink(missing_ok=True)
-            for orphan in list(d.glob("*.pkl.gz")) + list(d.glob("*.ref")):
+            for orphan in list(d.glob("*.pkl.gz")) + [p for sfx in _SIDE_DIRS for p in d.glob(f"*{sfx}")]:
                 cid = orphan.name.split(".")[0]
                 if not (d / f"{cid}.json").exists() and _old_enough(orphan):
                     _remove_capture(d, cid)
@@ -206,9 +231,7 @@ def prune(
                 if cid == protect or not (d / f"{cid}.pkl.gz").exists():
                     continue
                 try:
-                    ref = d / f"{cid}.ref"
-                    size = (d / f"{cid}.pkl.gz").stat().st_size + sp.stat().st_size
-                    size += _dir_size(ref) if ref.is_dir() else 0
+                    size = _capture_bytes(d, cid) + sp.stat().st_size
                     try:
                         ts = _parse_ts(json.loads(sp.read_text()).get("ts_utc"))
                     except Exception:
