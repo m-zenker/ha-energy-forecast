@@ -233,7 +233,11 @@ def _capture_retrain_inputs(app, train_kwargs: dict) -> str | None:
             "last_trained_before": str(app._ml_model.last_trained) if app._ml_model.last_trained else None,
             "physics": physics is not None,
         }
-        return capture.write_capture(CAPTURE_DIR, "retrain", payload, meta, pd.Timestamp.now(tz="UTC"))
+        capture_id = capture.write_capture(CAPTURE_DIR, "retrain", payload, meta, pd.Timestamp.now(tz="UTC"))
+        if capture_id is not None:
+            # train() has not run yet, so this is the exact state the retrain starts from (replay seed).
+            capture.attach_pre_state(CAPTURE_DIR, capture_id, app._ml_model._model_dir)
+        return capture_id
     except Exception as exc:
         _LOGGER.warning("capture: retrain snapshot failed: %s", exc)
         return None

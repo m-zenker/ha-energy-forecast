@@ -1,6 +1,7 @@
 """Live input capture: flag wiring and the retrain hook (Task 2)."""
 
 import copy
+import shutil
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -130,6 +131,40 @@ def test_retrain_capture_failure_does_not_break_retrain(tmp_path, monkeypatch):
     stub = _stub(tmp_path, capture_on=True)
     _run(stub)
     stub._ml_model.train.assert_called_once()
+
+
+def test_retrain_capture_has_pre_state_before_train_runs(tmp_path, monkeypatch):
+    _patch_deps(monkeypatch)
+
+    def _train(**kw):
+        (tmp_path / "models" / "model.txt").write_text("trained")
+
+    stub = _stub(tmp_path, capture_on=True, train=_train)
+    _run(stub)
+    (cap,) = capture.list_captures(ef_mod.CAPTURE_DIR, "retrain")
+    d = ef_mod.CAPTURE_DIR / "retrain"
+    assert (d / f"{cap['capture_id']}.pre" / "model.txt").read_text() == "m"
+    assert (d / f"{cap['capture_id']}.ref" / "model.txt").read_text() == "trained"
+    assert not (d / f"{cap['capture_id']}.pre" / "archive").exists()
+    assert cap["pre_state"] is True and cap["reference"] is True
+
+
+def test_pre_state_failure_does_not_block_training(tmp_path, monkeypatch):
+    _patch_deps(monkeypatch)
+    monkeypatch.setattr(shutil, "copy2", MagicMock(side_effect=OSError("disk full")))
+    log = MagicMock()
+    monkeypatch.setattr(capture, "_LOGGER", log)  # initialize() rebinds it to the app logger in other tests
+    stub = _stub(tmp_path, capture_on=True)
+    _run(stub)
+    stub._ml_model.train.assert_called_once()
+    assert any("attach_pre_state failed" in c.args[0] for c in log.warning.call_args_list)
+
+
+def test_pre_state_not_written_when_flag_off(tmp_path, monkeypatch):
+    _patch_deps(monkeypatch)
+    stub = _stub(tmp_path, capture_on=False)
+    _run(stub)
+    assert not ef_mod.CAPTURE_DIR.exists()
 
 
 def test_retrain_running_flag_reset_on_exception(tmp_path, monkeypatch):

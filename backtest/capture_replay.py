@@ -2,8 +2,10 @@
 
 Criterion 1 (predict round trip): the model that served a predict capture, re-run on the captured raw inputs
 under the captured clock, reproduces the captured pre-override vector to <= 1e-6 kWh/h.
-Criterion 2 (train round trip): train() re-run on a retrain capture, then predicting on the update made
-straight after that retrain, reproduces the live next-day total to <= 0.1 %.
+Criterion 2 (train round trip): train() re-run on a retrain capture, starting from the model dir as it was before
+that retrain (``<id>.pre/``, else the previous retrain's ``.ref/``), then predicting on the update made straight
+after that retrain, reproduces the live next-day total to <= 0.1 %. A retrain capture with no such seed cannot be
+judged (train() depends on prior model state) and is reported as SKIP, not FAIL.
 
 ``python -m backtest.capture_replay <captures_dir>`` prints one row per check and a PASS/FAIL line. It always
 exits 0: a FAIL is a finding to report, not something this tool gates on (same stance as ``backtest/repro.py``).
@@ -45,6 +47,10 @@ def _retarget_physics(physics, model_dir: Path):
     physics._calibration_path = Path(model_dir) / "physics_calibration.json"
     physics._schedule_path = Path(model_dir) / "physics_schedule.json"
     return physics
+
+
+class NoSeedError(LookupError):
+    """A retrain capture has neither a pre-train state nor a previous reference to start the replay from."""
 
 
 def _model_init_for(root: Path, last_trained: str | None, cache: dict | None = None) -> dict:
@@ -124,16 +130,31 @@ def _previous_reference(root: Path, retrain_id: str) -> Path | None:
     return prev
 
 
-def replay_train(root: Path, retrain_id: str, scratch: Path) -> Path:
-    """Re-run train() on a retrain capture into *scratch* (seeded from the previous retrain's output)."""
+def seed_dir_for(root: Path, retrain_id: str) -> Path | None:
+    """Model dir the retrain started from: its own ``.pre/`` (even if empty), else the previous retrain's ``.ref/``."""
+    capture = _capture_mod()
+    pre = Path(root) / "retrain" / f"{retrain_id}.pre"
+    for sc in capture.list_captures(root, "retrain"):
+        if sc["capture_id"] == retrain_id and sc.get("pre_state") and pre.is_dir():
+            return pre
+    return _previous_reference(root, retrain_id)
+
+
+def replay_train(root: Path, retrain_id: str, scratch: Path, *, allow_unseeded: bool = False) -> Path:
+    """Re-run train() on a retrain capture into *scratch*, seeded from ``seed_dir_for``.
+
+    Raises ``NoSeedError`` when there is no seed, unless *allow_unseeded* (then it trains from an empty dir).
+    """
     from energy_forecast.model import EnergyForecastModel
 
     capture = _capture_mod()
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    prev = _previous_reference(root, retrain_id)
-    if prev is not None:
-        for p in prev.iterdir():
+    seed = seed_dir_for(root, retrain_id)
+    if seed is None and not allow_unseeded:
+        raise NoSeedError(f"retrain capture {retrain_id} has no .pre/ and no previous .ref/ to seed from")
+    if seed is not None:
+        for p in seed.iterdir():
             if p.is_file():
                 shutil.copy2(p, scratch / p.name)
     payload, _ = capture.load_capture(root, "retrain", retrain_id)
@@ -208,6 +229,17 @@ def check(root: Path) -> list[dict]:
             )
         if pair is None:
             continue
+        if seed_dir_for(root, rc["capture_id"]) is None:
+            rows.append(
+                {
+                    "kind": "train",
+                    "predict_id": pair["capture_id"],
+                    "max_abs_diff": float("nan"),
+                    "next_day_total_pct": float("nan"),
+                    "skipped": "no seed",
+                }
+            )
+            continue
         with tempfile.TemporaryDirectory() as tmp:
             scratch = replay_train(root, rc["capture_id"], Path(tmp) / "model")
             replayed = replay_predict(
@@ -225,6 +257,10 @@ def _pct(replayed: pd.DataFrame, live: pd.DataFrame, now_local) -> float:
     return 0.0 if lv == rv else (float("inf") if lv == 0 else 100.0 * (rv - lv) / lv)
 
 
+def skipped(row: dict) -> bool:
+    return "skipped" in row
+
+
 def passed(row: dict) -> bool:
     if row["kind"] == "predict":
         return row["max_abs_diff"] <= PREDICT_TOL_KWH
@@ -237,17 +273,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("captures_dir", type=Path)
     args = ap.parse_args(argv)
     rows = check(args.captures_dir)
-    if not rows:
+    checked = [r for r in rows if not skipped(r)]
+    n_skip = len(rows) - len(checked)
+    if not checked:
         print("no checkable captures (need a predict capture with a model .ref, or a retrain + after-retrain pair)")
+        if n_skip:
+            print(f"{n_skip} retrain capture(s) skipped: no seed (no .pre/ and no previous .ref/)")
         return 0
     print(f"{'kind':<8} {'predict_id':<24} {'max_abs_diff':>14} {'next_day_%':>11}  result")
     for r in rows:
+        result = "SKIP" if skipped(r) else ("PASS" if passed(r) else "FAIL")
         print(
-            f"{r['kind']:<8} {r['predict_id']:<24} {r['max_abs_diff']:>14.3g} {r['next_day_total_pct']:>11.4f}  "
-            f"{'PASS' if passed(r) else 'FAIL'}"
+            f"{r['kind']:<8} {r['predict_id']:<24} {r['max_abs_diff']:>14.3g} "
+            f"{r['next_day_total_pct']:>11.4f}  {result}"
         )
-    n_fail = sum(not passed(r) for r in rows)
-    print(f"{'PASS' if n_fail == 0 else 'FAIL'}: {len(rows) - n_fail}/{len(rows)} checks within tolerance")
+    n_fail = sum(not passed(r) for r in checked)
+    tail = f", {n_skip} skipped (no seed)" if n_skip else ""
+    print(f"{'PASS' if n_fail == 0 else 'FAIL'}: {len(checked) - n_fail}/{len(checked)} checks within tolerance{tail}")
     return 0
 
 

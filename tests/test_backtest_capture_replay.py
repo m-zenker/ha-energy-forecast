@@ -23,9 +23,17 @@ TZ = "Europe/Zurich"
 
 
 def _make_captures(
-    tmp_path: Path, with_physics: bool, retrain_in_progress: bool = False, after_retrain: bool = True
+    tmp_path: Path,
+    with_physics: bool,
+    retrain_in_progress: bool = False,
+    after_retrain: bool = True,
+    pre_state: str = "empty",
 ) -> Path:
-    """Simulate one live retrain + the update right after it, writing captures exactly as the app does."""
+    """Simulate one live retrain + the update right after it, writing captures exactly as the app does.
+
+    ``pre_state``: ``"empty"`` attaches the (empty) model dir like a fresh install, ``"before"`` first trains an
+    earlier model so the attached pre-train state is non-empty, ``"none"`` writes a capture that predates ``.pre/``.
+    """
     root = tmp_path / "captures"
     live_dir = tmp_path / "live_models"
     weather = synthetic_weather(60, start="2026-01-01")
@@ -54,6 +62,20 @@ def _make_captures(
         {"last_trained_before": None, "physics": with_physics},
         NOW.tz_localize(TZ).tz_convert("UTC"),
     )
+    if pre_state == "before":
+        prior_now = NOW - pd.Timedelta(days=1)
+        with frozen_now(prior_now, TZ):
+            prior = EnergyForecastModel(live_dir, **init)
+            prior.train(
+                **{
+                    **train_kwargs,
+                    "energy_df": hist[hist["timestamp"] < prior_now],
+                    "weather_df": weather[weather["timestamp"] < prior_now],
+                    "physics_model": None,
+                }
+            )
+    if pre_state != "none":
+        capture.attach_pre_state(root, rid, live_dir)
     with frozen_now(NOW, TZ):
         model = EnergyForecastModel(live_dir, **init)
         model.train(**train_kwargs)
@@ -228,3 +250,89 @@ def test_app_written_predict_capture_replays(tmp_path, monkeypatch):
     assert capture_replay._max_abs_diff(replayed, preds.assign(timestamp=pd.to_datetime(preds["timestamp"]))) <= (
         capture_replay.PREDICT_TOL_KWH
     )
+
+
+def _fake_retrain(root: Path, ts: str, tmp_path: Path, *, pre: str | None = None, ref: str | None = None) -> str:
+    """A retrain capture with marker files in .pre/ and/or .ref/ (payload is never loaded by seed_dir_for)."""
+    cid = capture.write_capture(root, "retrain", {}, {"last_trained_after": ts}, pd.Timestamp(ts, tz="UTC"))
+    for suffix, marker in ((".pre", pre), (".ref", ref)):
+        if marker is None:
+            continue
+        md = tmp_path / f"{cid}{suffix}.src"
+        md.mkdir()
+        (md / "marker.txt").write_text(marker)
+        (capture.attach_pre_state if suffix == ".pre" else capture.attach_reference)(root, cid, md)
+    return cid
+
+
+def test_first_retrain_without_seed_is_skipped_not_failed(tmp_path, capsys):
+    root = _make_captures(tmp_path, with_physics=False, pre_state="none")
+    rows = capture_replay.check(root)
+    train = next(r for r in rows if r["kind"] == "train")
+    assert train["skipped"] == "no seed" and capture_replay.skipped(train)
+    assert capture_replay.passed(next(r for r in rows if r["kind"] == "predict"))
+    assert capture_replay.main([str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "SKIP" in out and "1 skipped" in out and "FAIL" not in out
+
+
+def test_round_trip_passes_with_pre_state(tmp_path):
+    root = _make_captures(tmp_path, with_physics=False, pre_state="before")
+    (rc,) = capture.list_captures(root, "retrain")
+    assert any((root / "retrain" / f"{rc['capture_id']}.pre").iterdir())
+    train = next(r for r in capture_replay.check(root) if r["kind"] == "train")
+    assert not capture_replay.skipped(train)
+    assert capture_replay.passed(train) and abs(train["next_day_total_pct"]) <= capture_replay.TRAIN_TOL_PCT
+
+
+def test_pre_state_seed_is_preferred_over_previous_ref(tmp_path):
+    root = tmp_path / "caps"
+    _fake_retrain(root, "2026-03-01", tmp_path, ref="previous-ref")
+    second = _fake_retrain(root, "2026-03-02", tmp_path, pre="own-pre", ref="own-ref")
+    seed = capture_replay.seed_dir_for(root, second)
+    assert seed == root / "retrain" / f"{second}.pre"
+    assert (seed / "marker.txt").read_text() == "own-pre"
+
+
+def test_falls_back_to_previous_ref_without_pre_state(tmp_path):
+    root = tmp_path / "caps"
+    first = _fake_retrain(root, "2026-03-01", tmp_path, ref="previous-ref")
+    second = _fake_retrain(root, "2026-03-02", tmp_path, ref="own-ref")
+    assert capture_replay.seed_dir_for(root, second) == root / "retrain" / f"{first}.ref"
+    assert capture_replay.seed_dir_for(root, first) is None
+
+
+def test_empty_pre_dir_is_a_valid_seed(tmp_path):
+    root = _make_captures(tmp_path, with_physics=False, pre_state="empty")
+    (rc,) = capture.list_captures(root, "retrain")
+    seed = capture_replay.seed_dir_for(root, rc["capture_id"])
+    assert seed is not None and list(seed.iterdir()) == []
+    capture_replay.replay_train(root, rc["capture_id"], tmp_path / "scratch")  # no NoSeedError
+
+
+def test_replay_train_raises_no_seed_error_unless_allowed(tmp_path):
+    root = _make_captures(tmp_path, with_physics=False, pre_state="none")
+    (rc,) = capture.list_captures(root, "retrain")
+    with pytest.raises(capture_replay.NoSeedError):
+        capture_replay.replay_train(root, rc["capture_id"], tmp_path / "scratch")
+    out = capture_replay.replay_train(root, rc["capture_id"], tmp_path / "scratch2", allow_unseeded=True)
+    assert (out / "energy_model.pkl").exists()
+
+
+def test_seeded_replay_still_fails_when_an_input_changes(tmp_path):
+    root = _make_captures(tmp_path, with_physics=False, pre_state="before")
+    (rc,) = capture.list_captures(root, "retrain")
+    payload, _ = capture.load_capture(root, "retrain", rc["capture_id"])
+    df = payload["train_kwargs"]["energy_df"].copy()
+    num = [c for c in df.columns if c != "timestamp" and pd.api.types.is_numeric_dtype(df[c])]
+    df[num] = df[num] * 1.5
+    payload["train_kwargs"]["energy_df"] = df
+    capture.write_capture(
+        root,
+        "retrain",
+        payload,
+        {k: v for k, v in rc.items() if k not in {"capture_id", "kind", "ts_utc", "versions", "bytes"}},
+        pd.Timestamp(rc["ts_utc"]),
+    )
+    train = next(r for r in capture_replay.check(root) if r["kind"] == "train")
+    assert not capture_replay.skipped(train) and not capture_replay.passed(train)
