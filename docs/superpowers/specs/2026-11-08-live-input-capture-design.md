@@ -98,6 +98,12 @@ check ~11-19), accepting that the deploy restarts AppDaemon and triggers a start
   that served it (criterion 1) without first passing criterion 2, and lets criterion 2 compare the retrained
   model to the live one directly. Each predict capture records the `last_trained` it was served by, which
   keys it to its retrain capture.
+- **Pre-train state per retrain (added 2026-11-11):** each retrain capture also stores `<id>.pre/`, the model dir
+  as it was before `train()` (regular files, not `archive/`; empty when the dir is missing, e.g. a fresh install).
+  `train()` depends on prior model state (the first live replay from an empty dir gave 152 trees vs live 174 and
+  a 0.79 % next-day-total gap; seeded with live state it matched exactly), so criterion 2 seeds its replay from
+  `.pre/`, falling back to the previous retrain's `.ref/` for captures that predate this, and reports a capture
+  with neither as SKIP (no seed), not FAIL.
 - **Retention matches across kinds:** retrain and predict captures are both kept for the same number of
   days, so no predict capture is left without its model (adaptive retrains can run ~daily). Window length:
   see open question below.
