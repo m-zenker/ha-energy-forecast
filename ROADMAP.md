@@ -503,7 +503,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
 1. ✅ Implement A (#101) and B (#102) on separate branches; deploys held until step 2 (done 2026-10-17).
 2. ✅ (PASS, pooled, 2026-10-27) C verdict: ≥ 3 cold target days on C + #109 smoothing, counted from the 2026-10-20 22:33 retrain (10-21 check on alpha-26 alone: not met); earliest ~10-25. D1 valve data gate already met (2026-10-21).
-3. ✅ Deployed A + B together (alpha-32, 2026-10-27); re-baseline **not yet holding** (bias +2.79 kWh/day on 2026-11-03, +2.43 on the 2026-11-06 recheck; #110 shipped alpha-35 2026-11-05; rescore ~11-12). (A shifts actuals ≈ +0.5 kWh/day; B changes the `mae_*` pair population).
+3. ✅ Deployed A + B together (alpha-32, 2026-10-27); re-baseline **not yet holding** (bias +2.79 kWh/day on 2026-11-03, +2.43 on 11-06, +2.54 on 11-08, +1.89 on 2026-11-12 (alpha-35 cold days −1.79, beats naive −9 %; `memory/project_deploy_accuracy_review_2026_11_08.md`); #110 shipped alpha-35 2026-11-05; rescore at ≥ 5 alpha-35 cold days). (A shifts actuals ≈ +0.5 kWh/day; B changes the `mae_*` pair population).
 4. Implement #105 (can overlap steps 2–3; needs the backtest harness and the COP-scale question settled first).
 5. Deploy #105 only after step 3's re-baseline holds — never in the same window as A/B (first non-null `UA_eff` shifts `physics_kwh`).
 6. #106, #104, #103 after ≥ 14 cold days of baseline (or ≥ 14 valve-closed nights for #104). Gate #103 and #105 separately — both target the same residual, so don't default both on.
