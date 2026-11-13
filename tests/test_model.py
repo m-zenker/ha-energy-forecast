@@ -4297,6 +4297,120 @@ class TestCompositeForecast:
         assert (result["delta_kwh"] == 0.0).all()
 
 
+class TestCompositeDeltaKwhHi:
+    """delta_kwh_hi: upper-quartile appliance profile, same offset/clipping as delta_kwh."""
+
+    _SIGS = {
+        "sub_dw": {
+            "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+            "hourly_profile_hi": [1.5, 3.0, 2.0, 0.9],
+            "total_kwh": 5.0,
+            "peak_hour": 1,
+            "n_cycles": 5,
+            "programs": {
+                "eco": {
+                    "hourly_profile": [0.5, 1.0, 0.5],
+                    "hourly_profile_hi": [0.8, 1.6, 0.7],
+                    "total_kwh": 2.0,
+                    "n_cycles": 3,
+                },
+                "nohi": {"hourly_profile": [0.4, 0.4], "total_kwh": 1.0, "n_cycles": 3},
+            },
+        }
+    }
+
+    def test_composite_adds_delta_kwh_hi(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, self._SIGS)
+        assert "delta_kwh_hi" in result.columns
+        for i, v in enumerate([0.8, 1.6, 0.7]):
+            assert result["delta_kwh_hi"].iloc[4 + i] == pytest.approx(v)
+        assert result["delta_kwh_hi"].iloc[0] == pytest.approx(0.0)
+        assert result["delta_kwh_hi"].iloc[7] == pytest.approx(0.0)
+        # mean delta untouched
+        assert result["delta_kwh"].iloc[5] == pytest.approx(1.0)
+
+    def test_composite_hi_falls_back_without_hi_key(self):
+        """Program without hourly_profile_hi -> its mean profile; combined sig without hi -> mean."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "nohi"}}, self._SIGS)
+        assert result["delta_kwh_hi"].iloc[4] == pytest.approx(0.4)
+        assert result["delta_kwh_hi"].iloc[5] == pytest.approx(0.4)
+        assert result["delta_kwh_hi"].iloc[6] == pytest.approx(0.0)
+
+        legacy = {"sub_dw": {"hourly_profile": [1.0, 2.0], "total_kwh": 3.0, "peak_hour": 1, "n_cycles": 4}}
+        result = _composite_forecast(df, {"sub_dw": "12:00"}, legacy)
+        assert result["delta_kwh_hi"].iloc[2] == pytest.approx(1.0)
+        assert result["delta_kwh_hi"].iloc[3] == pytest.approx(2.0)
+
+    def test_composite_unknown_program_uses_combined_hi(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, self._SIGS)
+        for i, v in enumerate([1.5, 3.0, 2.0, 0.9]):
+            assert result["delta_kwh_hi"].iloc[4 + i] == pytest.approx(v)
+        # plain string schedule also uses combined hi
+        result = _composite_forecast(df, {"sub_dw": "14:00"}, self._SIGS)
+        assert result["delta_kwh_hi"].iloc[5] == pytest.approx(3.0)
+
+    def test_composite_hi_clipped_at_window_end(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        sigs = {"sub_dw": {"hourly_profile": [1.0, 1.0, 1.0], "hourly_profile_hi": [2.0, 2.0, 2.0]}}
+        result = _composite_forecast(df, {"sub_dw": "07:00"}, sigs)  # offset 21; fits
+        assert result["delta_kwh_hi"].iloc[23] == pytest.approx(2.0)
+        df2 = _make_baseline_df(start="2024-06-01 10:00", n=48)
+        long_sigs = {"sub_dw": {"hourly_profile": [1.0] * 30, "hourly_profile_hi": [2.0] * 30}}
+        result2 = _composite_forecast(df2, {"sub_dw": "09:00"}, long_sigs)  # offset 23, clipped to 25 h
+        assert result2["delta_kwh_hi"].iloc[47] == pytest.approx(2.0)
+        assert len(result2) == 48
+
+    def test_composite_empty_schedule_has_zero_delta_kwh_hi(self):
+        df = _make_baseline_df()
+        for sched, sigs in (({}, self._SIGS), ({"sub_dw": "14:00"}, {})):
+            result = _composite_forecast(df, sched, sigs)
+            assert "delta_kwh_hi" in result.columns
+            assert (result["delta_kwh_hi"] == 0.0).all()
+
+    def test_composite_delta_kwh_unchanged(self):
+        """delta_kwh / predicted_kwh are byte-identical to the pre-change output (golden)."""
+        import json
+        from pathlib import Path
+
+        golden = json.loads((Path(__file__).parent / "fixtures" / "composite_golden.json").read_text())
+        ts = pd.date_range("2024-06-01 10:00", periods=48, freq="1h")
+        base = pd.DataFrame({"timestamp": ts, "predicted_kwh": [0.3 + 0.05 * (i % 7) for i in range(48)]})
+        sigs = {
+            "dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "hourly_profile_hi": [1.5, 3.0, 2.0, 0.9],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": [0.5, 1.0, 0.5],
+                        "hourly_profile_hi": [0.8, 1.6, 0.7],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    },
+                    "nohi": {"hourly_profile": [0.4, 0.4], "total_kwh": 1.0, "n_cycles": 3},
+                },
+            },
+            "wm": {"hourly_profile": [0.2, 0.9, 0.9, 0.3, 0.1], "total_kwh": 2.4, "peak_hour": 1, "n_cycles": 5},
+        }
+        cases = {
+            "a": {"dw": {"start": "14:00", "program": "eco"}, "wm": "55:00", "x": "10:00"},
+            "b": {"dw": "20:00", "wm": "07:00"},
+            "c": {"dw": {"start": "08:00", "program": "intensive"}, "wm": "09:00"},
+            "d": {"dw": "07:00"},
+            "e": {},
+            "f": {"dw": {"start": "09:00", "program": "nohi"}},
+        }
+        for key, sched in cases.items():
+            records = _composite_forecast(base, sched, sigs).to_dict("records")
+            got = [{"predicted_kwh": r["predicted_kwh"], "delta_kwh": r["delta_kwh"]} for r in records]
+            assert got == golden[key], key
+
+
 class TestScenarioDhwDelta:
     def test_delta_kwh_reflects_dhw_shift_vs_natural_baseline(self, tmp_path):
         """NOTE: deviates from the brief by adding `use_physics_residual=True` to
