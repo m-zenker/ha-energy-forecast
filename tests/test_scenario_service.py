@@ -475,6 +475,32 @@ class TestGetScenarioValidation:
 
         assert not any("invalid time" in r.message for r in caplog.records)
 
+    def _run(self, value, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(app, "ha", "ef", "get_scenario", {"schedule": {"wm": value}})
+        return app._ml_model.predict_scenario.call_args[0][2]
+
+    def test_dict_schedule_value_is_kept(self, caplog):
+        value = {"start": "10:00", "program": "eco"}
+        assert self._run(value, caplog) == {"wm": value}
+
+    def test_dict_schedule_with_bad_start_is_dropped(self, caplog):
+        assert self._run({"start": "25:00"}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+
+    def test_dict_schedule_missing_start_or_nonstr_program_is_dropped(self, caplog):
+        assert self._run({"program": "eco"}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+        caplog.clear()
+        assert self._run({"start": "10:00", "program": 5}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+
 
 class TestGetScenarioCbSubSensors:
     def test_list_typed_sub_energy_sensors_does_not_crash(self):
