@@ -1203,7 +1203,7 @@ class EnergyForecast(hass.Hass):
         """AppDaemon service callback: energy_forecast/get_scenario.
 
         Accepts kwargs:
-          schedule (dict[str, str]): {prefix: "HH:MM" | "off" | None}
+          schedule (dict): {prefix: "HH:MM" | "off" | None | {"start": "HH:MM", "program": str}}
           dhw_schedule (dict | None): transient physics DHW override, e.g.
               {"legionella": ("2026-06-25", 10)} — NOT persisted. Delta is
               computed vs. the natural (currently committed) baseline.
@@ -1238,7 +1238,13 @@ class EnergyForecast(hass.Hass):
                     continue
                 if val is not None and val != "off":
                     try:
-                        datetime.strptime(str(val), "%H:%M")
+                        if isinstance(val, dict):
+                            # {"start": "HH:MM", "program": str} — program optional
+                            datetime.strptime(str(val.get("start")), "%H:%M")
+                            if "program" in val and not isinstance(val["program"], str):
+                                raise ValueError("program must be a str")
+                        else:
+                            datetime.strptime(str(val), "%H:%M")
                     except ValueError:
                         _LOGGER.warning("get_scenario: invalid time '%s' for prefix '%s' — ignored", val, key)
                         continue

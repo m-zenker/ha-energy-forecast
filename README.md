@@ -182,6 +182,7 @@ data:
   schedule:
     sub_dishwasher: "22:30"        # key = entity ID suffix from sub_energy_sensors
     sub_washing_machine: "off"     # "off" or null to exclude from scenario
+    sub_dryer: {start: "23:00", program: "eco"}  # dict form: program = lowercased program_sensor state; unknown program falls back to the combined profile
   dhw_schedule:                    # optional: transient physics DHW override (requires `physics:` block)
     legionella: ["2026-06-25", 10] # [date string, hour] — NOT persisted
   publish: true                    # optional: write result to HA sensors
@@ -198,7 +199,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 ```json
 {
   "forecast": [
-    {"timestamp": "2024-06-01T00:00:00+02:00", "predicted_kwh": 0.42, "delta_kwh": 0.0},
+    {"timestamp": "2024-06-01T00:00:00+02:00", "predicted_kwh": 0.42, "delta_kwh": 0.0, "delta_kwh_hi": 0.0},
     {"timestamp": "2024-06-01T01:00:00+02:00", "predicted_kwh": 0.38, "delta_kwh": 0.0},
     "..."
   ],
@@ -206,7 +207,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 }
 ```
 
-`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline.
+`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline. `delta_kwh_hi` is the appliance-only delta built from the upper-quartile-cycle profiles (same sign and units as `delta_kwh`, no DHW delta); absent on older versions.
 
 > **Correlating requests with responses:** pass `request_id` (any string, e.g. a UUID) in the service call and it is echoed back verbatim in the result event's `request_id` field — `null` if you didn't send one. This exists so a caller with more than one `get_scenario` request potentially in flight at once (e.g. two independent AppDaemon apps both calling this service around the same time) can tell which event answers which request, rather than assuming the next fired event is theirs.
 
