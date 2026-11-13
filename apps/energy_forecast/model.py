@@ -1469,7 +1469,7 @@ class EnergyForecastModel:
         self,
         forecast_df: pd.DataFrame,
         live_temp: float | None,
-        schedule: dict[str, str | None],
+        schedule: dict[str, str | dict | None],
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
         away_series: pd.Series | None = None,

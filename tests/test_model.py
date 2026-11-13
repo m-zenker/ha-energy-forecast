@@ -4860,6 +4860,7 @@ class TestApplianceHiProfile:
         cycles = [[0.1]] * 4 + [[1.0, 1.0, 1.0]] * 4
         df, _ = _make_mixed_cycle_df(cycles)
         s = _learn_appliance_signatures({"x": df})["x"]
+        assert s.get("clusters")
         for c in s.get("clusters", {}).values():
             assert "hourly_profile_hi" not in c
 
