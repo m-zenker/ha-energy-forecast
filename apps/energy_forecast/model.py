@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 from . import clustering
 from .const import (
+    APPLIANCE_HI_PERCENTILE,
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
     DEFAULT_TAU,
@@ -2559,6 +2560,19 @@ def _learn_appliance_signatures(
         arr = np.array(padded)
         return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
 
+    def _hi_profile(wins: list[list[float]]) -> list[float]:
+        """Column-wise mean of the cycles whose total is at/above the upper-quartile total.
+
+        Totals come from the windows passed in (post outlier rejection). With fewer than
+        4 windows the percentile is meaningless, so the mean of all windows is returned.
+        """
+        if len(wins) < 4:
+            return _avg_profile(wins)[0]
+        wtotals = np.array([sum(w) for w in wins])
+        thresh = float(np.percentile(wtotals, APPLIANCE_HI_PERCENTILE)) - 1e-9
+        top = [w for w, t in zip(wins, wtotals) if t >= thresh]
+        return _avg_profile(top)[0]
+
     def _resolve_program(cycle_ts: pd.Timestamp, prog_df: pd.DataFrame) -> str | None:
         """Last-value-carry-forward lookup of program at cycle start."""
         earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
@@ -2658,6 +2672,7 @@ def _learn_appliance_signatures(
                 prof, std = _avg_profile(pwins)
                 programs[label] = {
                     "hourly_profile": prof,
+                    "hourly_profile_hi": _hi_profile(pwins),
                     "std_profile": std,
                     "total_kwh": float(sum(prof)),
                     "n_cycles": len(pwins),
@@ -2713,6 +2728,7 @@ def _learn_appliance_signatures(
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
+            "hourly_profile_hi": _hi_profile(windows),
             "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),

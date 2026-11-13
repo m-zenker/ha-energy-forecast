@@ -4671,6 +4671,85 @@ class TestApplianceSignaturesPrograms:
         assert loaded["dw"]["programs"]["eco"]["n_cycles"] == 4
 
 
+# ── Upper-quartile appliance profile (hourly_profile_hi) ─────────────────────
+
+
+def _make_mixed_cycle_df(cycles: list[list[float]], period_hours: int = 6) -> tuple[pd.DataFrame, list[str]]:
+    """Sub-sensor with the given cycle shapes, one per ``period_hours``; also returns the start timestamps."""
+    ts = pd.date_range("2024-01-01", periods=len(cycles) * period_hours, freq="1h")
+    kwh = [0.0] * len(ts)
+    for i, cyc in enumerate(cycles):
+        for j, v in enumerate(cyc):
+            kwh[i * period_hours + j] = v
+    starts = [str(ts[i * period_hours]) for i in range(len(cycles))]
+    return pd.DataFrame({"timestamp": ts, "kwh": kwh}), starts
+
+
+class TestApplianceHiProfile:
+    """hourly_profile_hi: column-mean of cycles at/above the upper-quartile total."""
+
+    LIGHT = [0.1]
+    # heavy totals 0.5, 0.55, 0.6, 0.65 (interleaved with the light cycles)
+    HEAVY = [[0.35, 0.1, 0.05], [0.4, 0.1, 0.05], [0.45, 0.1, 0.05], [0.5, 0.1, 0.05]]
+
+    def _eight_cycles(self):
+        cycles = []
+        for h in self.HEAVY:
+            cycles += [self.LIGHT, h]
+        return cycles
+
+    def test_hi_profile_is_mean_of_cycles_at_or_above_p75(self):
+        """Totals 0.1x4, 0.5..0.65: P75 = 0.5625 -> only the 0.6 and 0.65 cycles; mean profile unchanged."""
+        df, _ = _make_mixed_cycle_df(self._eight_cycles())
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["n_rejected"] == 0
+        assert s["n_cycles"] == 8
+        # recorded from the pre-change code (all-cycle column mean)
+        assert s["hourly_profile"] == pytest.approx([0.2625, 0.05, 0.025])
+        assert s["hourly_profile_hi"] == pytest.approx([0.475, 0.1, 0.05])
+
+    def test_hi_profile_fewer_than_four_cycles_is_mean(self):
+        df = _make_cycle_df([1.0, 2.0, 0.5], n_cycles=3)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["hourly_profile_hi"] == pytest.approx(s["hourly_profile"])
+
+    def test_hi_profile_identical_cycles_keeps_all_despite_float_ties(self):
+        """Tied totals must not be dropped by float comparison against the percentile."""
+        df = _make_cycle_df([0.1, 0.2, 0.3], n_cycles=6)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["hourly_profile_hi"] == pytest.approx([0.1, 0.2, 0.3])
+
+    def test_hi_profile_per_program(self):
+        cycles = self._eight_cycles()
+        df, starts = _make_mixed_cycle_df(cycles)
+        labels = ["eco" if i % 2 == 0 else "intensive" for i in range(8)]
+        prog_df = _make_prog_df(starts, labels)
+        s = _learn_appliance_signatures({"x": df}, program_histories={"x": prog_df})["x"]
+        eco, intensive = s["programs"]["eco"], s["programs"]["intensive"]
+        assert eco["hourly_profile"] == pytest.approx([0.1])
+        assert eco["hourly_profile_hi"] == pytest.approx([0.1])
+        # intensive totals 0.5, 0.55, 0.6, 0.65 (4 windows) -> P75 0.6125 -> only the 0.65 cycle
+        assert intensive["hourly_profile"] == pytest.approx([0.425, 0.1, 0.05])
+        assert intensive["hourly_profile_hi"] == pytest.approx([0.5, 0.1, 0.05])
+
+    def test_hi_profile_uses_post_rejection_windows(self):
+        """An extreme cycle is rejected (> median + 2 sigma) and must not shift the percentile."""
+        cycles = [[0.1], [0.1], [0.1], [0.1], [0.12], [0.14], [0.16], [10.0]]
+        df, _ = _make_mixed_cycle_df(cycles)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["n_rejected"] == 1
+        assert s["n_cycles"] == 7
+        # post-rejection totals [.1,.1,.1,.1,.12,.14,.16]: P75 = 0.13 -> 0.14 and 0.16 cycles
+        assert s["hourly_profile_hi"] == pytest.approx([0.15])
+
+    def test_hi_profile_not_on_clusters(self):
+        cycles = [[0.1]] * 4 + [[1.0, 1.0, 1.0]] * 4
+        df, _ = _make_mixed_cycle_df(cycles)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        for c in s.get("clusters", {}).values():
+            assert "hourly_profile_hi" not in c
+
+
 # ── Concurrency (SE-2) ───────────────────────────────────────────────────────
 
 
