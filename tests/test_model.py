@@ -4297,6 +4297,120 @@ class TestCompositeForecast:
         assert (result["delta_kwh"] == 0.0).all()
 
 
+class TestCompositeDeltaKwhHi:
+    """delta_kwh_hi: upper-quartile appliance profile, same offset/clipping as delta_kwh."""
+
+    _SIGS = {
+        "sub_dw": {
+            "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+            "hourly_profile_hi": [1.5, 3.0, 2.0, 0.9],
+            "total_kwh": 5.0,
+            "peak_hour": 1,
+            "n_cycles": 5,
+            "programs": {
+                "eco": {
+                    "hourly_profile": [0.5, 1.0, 0.5],
+                    "hourly_profile_hi": [0.8, 1.6, 0.7],
+                    "total_kwh": 2.0,
+                    "n_cycles": 3,
+                },
+                "nohi": {"hourly_profile": [0.4, 0.4], "total_kwh": 1.0, "n_cycles": 3},
+            },
+        }
+    }
+
+    def test_composite_adds_delta_kwh_hi(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "eco"}}, self._SIGS)
+        assert "delta_kwh_hi" in result.columns
+        for i, v in enumerate([0.8, 1.6, 0.7]):
+            assert result["delta_kwh_hi"].iloc[4 + i] == pytest.approx(v)
+        assert result["delta_kwh_hi"].iloc[0] == pytest.approx(0.0)
+        assert result["delta_kwh_hi"].iloc[7] == pytest.approx(0.0)
+        # mean delta untouched
+        assert result["delta_kwh"].iloc[5] == pytest.approx(1.0)
+
+    def test_composite_hi_falls_back_without_hi_key(self):
+        """Program without hourly_profile_hi -> its mean profile; combined sig without hi -> mean."""
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "nohi"}}, self._SIGS)
+        assert result["delta_kwh_hi"].iloc[4] == pytest.approx(0.4)
+        assert result["delta_kwh_hi"].iloc[5] == pytest.approx(0.4)
+        assert result["delta_kwh_hi"].iloc[6] == pytest.approx(0.0)
+
+        legacy = {"sub_dw": {"hourly_profile": [1.0, 2.0], "total_kwh": 3.0, "peak_hour": 1, "n_cycles": 4}}
+        result = _composite_forecast(df, {"sub_dw": "12:00"}, legacy)
+        assert result["delta_kwh_hi"].iloc[2] == pytest.approx(1.0)
+        assert result["delta_kwh_hi"].iloc[3] == pytest.approx(2.0)
+
+    def test_composite_unknown_program_uses_combined_hi(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        result = _composite_forecast(df, {"sub_dw": {"start": "14:00", "program": "intensive"}}, self._SIGS)
+        for i, v in enumerate([1.5, 3.0, 2.0, 0.9]):
+            assert result["delta_kwh_hi"].iloc[4 + i] == pytest.approx(v)
+        # plain string schedule also uses combined hi
+        result = _composite_forecast(df, {"sub_dw": "14:00"}, self._SIGS)
+        assert result["delta_kwh_hi"].iloc[5] == pytest.approx(3.0)
+
+    def test_composite_hi_clipped_at_window_end(self):
+        df = _make_baseline_df(start="2024-06-01 10:00")
+        sigs = {"sub_dw": {"hourly_profile": [1.0, 1.0, 1.0], "hourly_profile_hi": [2.0, 2.0, 2.0]}}
+        result = _composite_forecast(df, {"sub_dw": "07:00"}, sigs)  # offset 21; fits
+        assert result["delta_kwh_hi"].iloc[23] == pytest.approx(2.0)
+        df2 = _make_baseline_df(start="2024-06-01 10:00", n=48)
+        long_sigs = {"sub_dw": {"hourly_profile": [1.0] * 30, "hourly_profile_hi": [2.0] * 30}}
+        result2 = _composite_forecast(df2, {"sub_dw": "09:00"}, long_sigs)  # offset 23, clipped to 25 h
+        assert result2["delta_kwh_hi"].iloc[47] == pytest.approx(2.0)
+        assert len(result2) == 48
+
+    def test_composite_empty_schedule_has_zero_delta_kwh_hi(self):
+        df = _make_baseline_df()
+        for sched, sigs in (({}, self._SIGS), ({"sub_dw": "14:00"}, {})):
+            result = _composite_forecast(df, sched, sigs)
+            assert "delta_kwh_hi" in result.columns
+            assert (result["delta_kwh_hi"] == 0.0).all()
+
+    def test_composite_delta_kwh_unchanged(self):
+        """delta_kwh / predicted_kwh are byte-identical to the pre-change output (golden)."""
+        import json
+        from pathlib import Path
+
+        golden = json.loads((Path(__file__).parent / "fixtures" / "composite_golden.json").read_text())
+        ts = pd.date_range("2024-06-01 10:00", periods=48, freq="1h")
+        base = pd.DataFrame({"timestamp": ts, "predicted_kwh": [0.3 + 0.05 * (i % 7) for i in range(48)]})
+        sigs = {
+            "dw": {
+                "hourly_profile": [1.0, 2.0, 1.5, 0.5],
+                "hourly_profile_hi": [1.5, 3.0, 2.0, 0.9],
+                "total_kwh": 5.0,
+                "peak_hour": 1,
+                "n_cycles": 5,
+                "programs": {
+                    "eco": {
+                        "hourly_profile": [0.5, 1.0, 0.5],
+                        "hourly_profile_hi": [0.8, 1.6, 0.7],
+                        "total_kwh": 2.0,
+                        "n_cycles": 3,
+                    },
+                    "nohi": {"hourly_profile": [0.4, 0.4], "total_kwh": 1.0, "n_cycles": 3},
+                },
+            },
+            "wm": {"hourly_profile": [0.2, 0.9, 0.9, 0.3, 0.1], "total_kwh": 2.4, "peak_hour": 1, "n_cycles": 5},
+        }
+        cases = {
+            "a": {"dw": {"start": "14:00", "program": "eco"}, "wm": "55:00", "x": "10:00"},
+            "b": {"dw": "20:00", "wm": "07:00"},
+            "c": {"dw": {"start": "08:00", "program": "intensive"}, "wm": "09:00"},
+            "d": {"dw": "07:00"},
+            "e": {},
+            "f": {"dw": {"start": "09:00", "program": "nohi"}},
+        }
+        for key, sched in cases.items():
+            records = _composite_forecast(base, sched, sigs).to_dict("records")
+            got = [{"predicted_kwh": r["predicted_kwh"], "delta_kwh": r["delta_kwh"]} for r in records]
+            assert got == golden[key], key
+
+
 class TestScenarioDhwDelta:
     def test_delta_kwh_reflects_dhw_shift_vs_natural_baseline(self, tmp_path):
         """NOTE: deviates from the brief by adding `use_physics_residual=True` to
@@ -4669,6 +4783,86 @@ class TestApplianceSignaturesPrograms:
         assert "programs" in loaded["dw"]
         assert "eco" in loaded["dw"]["programs"]
         assert loaded["dw"]["programs"]["eco"]["n_cycles"] == 4
+
+
+# ── Upper-quartile appliance profile (hourly_profile_hi) ─────────────────────
+
+
+def _make_mixed_cycle_df(cycles: list[list[float]], period_hours: int = 6) -> tuple[pd.DataFrame, list[str]]:
+    """Sub-sensor with the given cycle shapes, one per ``period_hours``; also returns the start timestamps."""
+    ts = pd.date_range("2024-01-01", periods=len(cycles) * period_hours, freq="1h")
+    kwh = [0.0] * len(ts)
+    for i, cyc in enumerate(cycles):
+        for j, v in enumerate(cyc):
+            kwh[i * period_hours + j] = v
+    starts = [str(ts[i * period_hours]) for i in range(len(cycles))]
+    return pd.DataFrame({"timestamp": ts, "kwh": kwh}), starts
+
+
+class TestApplianceHiProfile:
+    """hourly_profile_hi: column-mean of cycles at/above the upper-quartile total."""
+
+    LIGHT = [0.1]
+    # heavy totals 0.5, 0.55, 0.6, 0.65 (interleaved with the light cycles)
+    HEAVY = [[0.35, 0.1, 0.05], [0.4, 0.1, 0.05], [0.45, 0.1, 0.05], [0.5, 0.1, 0.05]]
+
+    def _eight_cycles(self):
+        cycles = []
+        for h in self.HEAVY:
+            cycles += [self.LIGHT, h]
+        return cycles
+
+    def test_hi_profile_is_mean_of_cycles_at_or_above_p75(self):
+        """Totals 0.1x4, 0.5..0.65: P75 = 0.5625 -> only the 0.6 and 0.65 cycles; mean profile unchanged."""
+        df, _ = _make_mixed_cycle_df(self._eight_cycles())
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["n_rejected"] == 0
+        assert s["n_cycles"] == 8
+        # recorded from the pre-change code (all-cycle column mean)
+        assert s["hourly_profile"] == pytest.approx([0.2625, 0.05, 0.025])
+        assert s["hourly_profile_hi"] == pytest.approx([0.475, 0.1, 0.05])
+
+    def test_hi_profile_fewer_than_four_cycles_is_mean(self):
+        df = _make_cycle_df([1.0, 2.0, 0.5], n_cycles=3)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["hourly_profile_hi"] == pytest.approx(s["hourly_profile"])
+
+    def test_hi_profile_identical_cycles_keeps_all_despite_float_ties(self):
+        """Tied totals must not be dropped by float comparison against the percentile."""
+        df = _make_cycle_df([0.1, 0.2, 0.3], n_cycles=6)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["hourly_profile_hi"] == pytest.approx([0.1, 0.2, 0.3])
+
+    def test_hi_profile_per_program(self):
+        cycles = self._eight_cycles()
+        df, starts = _make_mixed_cycle_df(cycles)
+        labels = ["eco" if i % 2 == 0 else "intensive" for i in range(8)]
+        prog_df = _make_prog_df(starts, labels)
+        s = _learn_appliance_signatures({"x": df}, program_histories={"x": prog_df})["x"]
+        eco, intensive = s["programs"]["eco"], s["programs"]["intensive"]
+        assert eco["hourly_profile"] == pytest.approx([0.1])
+        assert eco["hourly_profile_hi"] == pytest.approx([0.1])
+        # intensive totals 0.5, 0.55, 0.6, 0.65 (4 windows) -> P75 0.6125 -> only the 0.65 cycle
+        assert intensive["hourly_profile"] == pytest.approx([0.425, 0.1, 0.05])
+        assert intensive["hourly_profile_hi"] == pytest.approx([0.5, 0.1, 0.05])
+
+    def test_hi_profile_uses_post_rejection_windows(self):
+        """An extreme cycle is rejected (> median + 2 sigma) and must not shift the percentile."""
+        cycles = [[0.1], [0.1], [0.1], [0.1], [0.12], [0.14], [0.16], [10.0]]
+        df, _ = _make_mixed_cycle_df(cycles)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s["n_rejected"] == 1
+        assert s["n_cycles"] == 7
+        # post-rejection totals [.1,.1,.1,.1,.12,.14,.16]: P75 = 0.13 -> 0.14 and 0.16 cycles
+        assert s["hourly_profile_hi"] == pytest.approx([0.15])
+
+    def test_hi_profile_not_on_clusters(self):
+        cycles = [[0.1]] * 4 + [[1.0, 1.0, 1.0]] * 4
+        df, _ = _make_mixed_cycle_df(cycles)
+        s = _learn_appliance_signatures({"x": df})["x"]
+        assert s.get("clusters")
+        for c in s.get("clusters", {}).values():
+            assert "hourly_profile_hi" not in c
 
 
 # ── Concurrency (SE-2) ───────────────────────────────────────────────────────

@@ -36,6 +36,7 @@ PRESENCE_STATE_HOME = "home"
 
 # Appliance Signature Learning
 APPLIANCE_MAX_WINDOW_HOURS = 12  # Hard cap for adaptive cycle detection
+APPLIANCE_HI_PERCENTILE = 75  # Cycles at/above this total-kWh percentile form the upper-quartile profile
 
 # Sensor Blending Logic
 # How many hours to trust the local outdoor sensor before

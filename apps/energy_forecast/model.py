@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 from . import clustering
 from .const import (
+    APPLIANCE_HI_PERCENTILE,
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
     DEFAULT_TAU,
@@ -1468,7 +1469,7 @@ class EnergyForecastModel:
         self,
         forecast_df: pd.DataFrame,
         live_temp: float | None,
-        schedule: dict[str, str | None],
+        schedule: dict[str, str | dict | None],
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
         away_series: pd.Series | None = None,
@@ -1483,7 +1484,7 @@ class EnergyForecastModel:
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         dhw_schedule_override: dict | None = None,
     ) -> pd.DataFrame:
-        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
+        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh, delta_kwh_hi].
 
         Runs the baseline predict() then overlays the appliance profiles from
         *schedule* using the learned appliance signatures. If *dhw_schedule_override*
@@ -1547,6 +1548,7 @@ class EnergyForecastModel:
         if dhw_schedule_override is not None and physics_model is not None:
             dhw_delta = (scenario_baseline_df["predicted_kwh"] - natural_baseline_df["predicted_kwh"]).to_numpy()
             result["delta_kwh"] = result["delta_kwh"] + dhw_delta
+            # delta_kwh_hi stays appliance-only: it sizes a booking's power, not the DHW shift.
 
         return result
 
@@ -2559,6 +2561,19 @@ def _learn_appliance_signatures(
         arr = np.array(padded)
         return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
 
+    def _hi_profile(wins: list[list[float]]) -> list[float]:
+        """Column-wise mean of the cycles whose total is at/above the upper-quartile total.
+
+        Totals come from the windows passed in (post outlier rejection). With fewer than
+        4 windows the percentile is meaningless, so the mean of all windows is returned.
+        """
+        if len(wins) < 4:
+            return _avg_profile(wins)[0]
+        wtotals = np.array([sum(w) for w in wins])
+        thresh = float(np.percentile(wtotals, APPLIANCE_HI_PERCENTILE)) - 1e-9
+        top = [w for w, t in zip(wins, wtotals) if t >= thresh]
+        return _avg_profile(top)[0]
+
     def _resolve_program(cycle_ts: pd.Timestamp, prog_df: pd.DataFrame) -> str | None:
         """Last-value-carry-forward lookup of program at cycle start."""
         earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
@@ -2658,6 +2673,7 @@ def _learn_appliance_signatures(
                 prof, std = _avg_profile(pwins)
                 programs[label] = {
                     "hourly_profile": prof,
+                    "hourly_profile_hi": _hi_profile(pwins),
                     "std_profile": std,
                     "total_kwh": float(sum(prof)),
                     "n_cycles": len(pwins),
@@ -2713,6 +2729,7 @@ def _learn_appliance_signatures(
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
+            "hourly_profile_hi": _hi_profile(windows),
             "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),
@@ -2755,16 +2772,20 @@ def _composite_forecast(
         signatures:  appliance signatures dict from _learn_appliance_signatures().
 
     Returns:
-        DataFrame with columns [timestamp, predicted_kwh, delta_kwh].
+        DataFrame with columns [timestamp, predicted_kwh, delta_kwh, delta_kwh_hi].
         ``delta_kwh`` is the signed kWh difference vs. the baseline introduced by
         the scheduled appliances; it is 0 when schedule is empty or a prefix has no
-        matching signature.
+        matching signature. ``delta_kwh_hi`` is the same overlay built from the
+        upper-quartile profiles (``hourly_profile_hi``) for booking power sizing;
+        profile choice: program hi -> program mean -> combined hi -> combined mean.
+        It is appliance-only and does not feed ``predicted_kwh``.
     """
     import numpy as np
     import pandas as pd
 
     result = baseline_df.copy()
     result["delta_kwh"] = 0.0
+    result["delta_kwh_hi"] = 0.0
 
     if not schedule or not signatures:
         return result
@@ -2813,10 +2834,12 @@ def _composite_forecast(
         # Profile selection: prefer per-program profile; fall back to combined
         sig = signatures[prefix]
         profile: list | None = None
+        profile_hi: list | None = None
         if program is not None:
             prog_profiles = sig.get("programs", {})
             if program in prog_profiles:
                 profile = prog_profiles[program]["hourly_profile"]
+                profile_hi = prog_profiles[program].get("hourly_profile_hi") or profile
             else:
                 _LOGGER.debug(
                     "_composite_forecast: no profile for program '%s' on '%s' — using combined",
@@ -2825,13 +2848,17 @@ def _composite_forecast(
                 )
         if profile is None:
             profile = sig["hourly_profile"]
+            profile_hi = sig.get("hourly_profile_hi") or profile
         # Clip profile to available window
         profile = profile[: 48 - offset_h]
         if not profile:
             continue
+        profile_hi = profile_hi[: 48 - offset_h]
 
         n = len(profile)
         result.loc[result.index[offset_h : offset_h + n], "delta_kwh"] += profile
+        n_hi = len(profile_hi)
+        result.loc[result.index[offset_h : offset_h + n_hi], "delta_kwh_hi"] += profile_hi
 
     result["predicted_kwh"] = np.maximum(0.0, result["predicted_kwh"].values + result["delta_kwh"].values)
     return result
