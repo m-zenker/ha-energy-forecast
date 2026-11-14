@@ -17,12 +17,30 @@ def _frame(x_mae=lambda base, day, fold: base + 0.01, cold=lambda day: True, x_b
             for origin in (6, 18):
                 base = 0.5 + rng.uniform(-0.1, 0.1)
                 common = dict(fold=fold, day=day.date(), origin=origin, cold=cold(day), ts0=day)
-                rows.append(dict(arm="base", mae=base, bias=1.0, **common))
+                rows.append(dict(arm="base", mae=base, bias=1.0, mae3=1.0, naive_mae=0.5, naive_mae3=1.2, **common))
                 rows.append(
-                    dict(arm="x", mae=x_mae(base, day, fold), bias=x_bias if x_bias is not None else 1.0, **common)
+                    dict(
+                        arm="x",
+                        mae=x_mae(base, day, fold),
+                        bias=x_bias if x_bias is not None else 1.0,
+                        mae3=0.9,
+                        naive_mae=0.5,
+                        naive_mae3=1.2,
+                        **common,
+                    )
                 )
                 for name, shift in extra_arms:
-                    rows.append(dict(arm=name, mae=base + shift, bias=1.0, **common))
+                    rows.append(
+                        dict(
+                            arm=name,
+                            mae=base + shift,
+                            bias=1.0,
+                            mae3=1.0 + shift,
+                            naive_mae=0.5,
+                            naive_mae3=1.2,
+                            **common,
+                        )
+                    )
     return pd.DataFrame(rows)
 
 
@@ -104,3 +122,28 @@ def test_noise_floor_is_per_segment_and_ci_caveat():
     y_line = {seg: next(ln for ln in txt.splitlines() if ln[2:].startswith("y ")) for seg, txt in sections.items()}
     assert "~" in y_line["WARM"] and "~" not in y_line["COLD"] and "~" not in y_line["ALL"]
     assert all("seed noise floor" in txt for txt in sections.values())
+
+
+_NEW_COLS = ["mae3", "naive_mae", "naive_mae3"]
+
+
+def test_mae3_and_naive_columns_in_summary():
+    t = summarize(DF)["ALL"]
+    assert t.loc["base", "mae3"] == pytest.approx(1.0)
+    assert t.loc["x", "mae3"] == pytest.approx(0.9)
+    assert t.loc["x", "mae3_pct"] == pytest.approx(-10.0)
+    assert t.loc["base", "naive_mae"] == pytest.approx(0.5)
+    assert t.loc["base", "naive_mae3"] == pytest.approx(1.2)
+    text = format_summary(summarize(DF))
+    assert "mae3" in text and "dMAE3%" in text
+    assert "naive same-hour mean (ref hours): mae 0.500  mae3 1.200" in text
+
+
+def test_old_pickle_without_mae3_still_summarizes():
+    old = DF.drop(columns=_NEW_COLS)
+    t = summarize(old)["ALL"]
+    assert np.isnan(t.loc["base", "mae3"]) and np.isnan(t.loc["x", "mae3_pct"])
+    assert np.isnan(t.loc["base", "naive_mae"]) and np.isnan(t.loc["base", "naive_mae3"])
+    text = format_summary(summarize(old))
+    assert "nan" not in text.lower() and "naive" not in text
+    assert "dMAE%" in text

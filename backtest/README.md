@@ -48,8 +48,54 @@ With `capture_inputs: true` on the live app (see the main README), pull `capture
 ```
 
 - `predict` rows re-run feature building plus `predict()` on a captured update, against the model files saved with the retrain that served it. PASS means a max absolute difference of at most 1e-6 kWh/h from what live computed.
-- `train` rows re-run `train()` on a retrain capture, seeded from the previous retrain's saved model files. They then predict on the update made right after that retrain. PASS means a next-day total within 0.1 %.
+- `train` rows re-run `train()` on a retrain capture, seeded from the model dir as it was before that retrain (`<id>.pre/`, else the previous retrain's `.ref/`, else SKIP). They then predict on the update made right after that retrain. PASS means a next-day total within 0.1 %.
 - Updates taken while a retrain was running are skipped. The command reports only and always exits 0. A FAIL is a finding: some difference beyond the inputs, such as library versions (sidecars record them, and loading warns on a mismatch) or hidden state.
+
+## Walk-forward on a capture (live-equivalent frame)
+
+The lean frame above has no climate, tank or sub-meter inputs and no intervals. For anything that touches those,
+use the capture frame: one retrain capture holds the full live history, so truncating it at a cutoff gives the
+inputs live had then.
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.walkforward \
+    data/captures --start 2026-10-01 --end 2026-11-12 --arms base jit droptp --out data/backtest/wf
+```
+
+- It runs the real `train()` / `predict()` / `predict_intervals()`: daily retrain at 18:00 seeded from the previous
+  model dir, four origins a day, 48 h each. Arms are listed in `backtest/walkforward.py` (`ARMS`); add a `WfArm`
+  there for a feature drop, a `train()` kwarg, another cadence or live's 3-day weather tail.
+- **Always run `jit` with `base`.** It is the same model retrained one hour earlier. Its distance from `base` is
+  the noise floor: about ±1 % on hourly MAE, ±2 % on 3 h blocks, and up to ±13 % on daily |bias|.
+- **Burn-in.** The first model of a run is unseeded and differs from a seeded one by about as much as the jitter
+  arm. Start a week before the days you want to score, and compare arms only on runs with the same start.
+- Needs the env that matches the HA host (`ha-energy-forecast-live`), like every capture replay. About 17 s per
+  simulated day on one core. Run arms in parallel as separate processes; `--n-jobs 1` (default) keeps LightGBM
+  from oversubscribing.
+- Checked against live on 2026-11-13: serve inputs within 0.007 kWh/h of captured live forecasts; a retrain at the
+  capture time is identical to the live model.
+
+Score the rows with `backtest.wf_score`:
+
+```python
+from backtest import wf_score as ws
+rows = ws.attach_actuals(rows, frame.actuals(), daily_temp)      # daily_temp: mean temp_c per day
+table = ws.day_table(ws.add_naive(ws.day_ahead(rows)))            # newest forecast with >= 24 h lead
+ws.summarize(table); ws.paired(table, "droptp", metric="mae3"); ws.next_day_swing(rows)
+```
+
+- **Judge on `mae3` (3 h-block totals), `daily_abs` and `bias`; `mae` (hourly) is secondary.** Hourly MAE rewards
+  under-forecasting, and `ha-energy-manager` consumes 3 h blocks.
+- `cold_gate()` applies the ROADMAP #118 rule: pooled cold-day bias within −12 % to +6 % of consumption over at
+  least 14 cold days, else INCONCLUSIVE.
+- `naive` is the same-hour mean of days −2..−8, the baseline a change has to beat.
+- `backtest.audit_intervals.report(rows)` gives interval coverage as shipped, recalibrated on served errors, and
+  for the summed block and daily bands.
+- `python -m backtest.audit_features data/captures` pairs every feature as served with the value later trained on,
+  by lead. Run it after any change to feature building.
+
+Limits: perfect weather (measured cost of real forecast weather: 1–2 %); history is today's view of the past; the
+physics state is the capture's at every cutoff; days before a sensor existed have no such inputs, as live had none.
 
 ## Reading the summary
 
@@ -61,6 +107,8 @@ With `capture_inputs: true` on the live app (see the main README), pull `capture
 - The CI treats each fold's trained model as fixed, so it **excludes training randomness**. Seed-only arms can get
   CIs that exclude 0. Count an effect only when the CI excludes 0 **and** the arm is outside the floor.
 - `bias` / `|bias|` are kWh/day; `mae` is kWh/h.
+- `mae3` is the 3 h-block MAE (kWh per block; clock-aligned blocks with all 3 hours scored) and `dMAE3%` its paired difference against base. Same per-hour definition as the live `block_mae_*` sensors; aggregation differs on days with gaps. Result files from before this column existed show it empty.
+- The `naive same-hour mean` line under each segment header is the guardrail: mean of the same hour on days −2..−8, scored on the reference arm's hours (`mae` in kWh/h, `mae3` in kWh per block). An arm that does not beat it is not adding value.
 - The ALL / COLD / WARM segments split on a daily mean temperature of ≤ 10 °C.
 
 ## Accepted risks

@@ -127,3 +127,48 @@ def test_duplicate_arm_names_raise(synth, monkeypatch):
     with pytest.raises(ValueError, match="duplicate"):
         run_experiment([Arm("a"), Arm("a", drop=("temp_c",))], [synth.fold], synth.inputs, synth.weather, DEFAULTS)
     assert not calls.train
+
+
+def test_row_block_and_naive_metrics():
+    from backtest.runner import _row
+
+    idx = pd.date_range("2026-11-10", periods=24, freq="1h")
+    a = pd.Series(1.0, index=idx)
+    p = pd.Series(1.5, index=idx)
+    n = pd.Series(1.25, index=idx)
+    fold = SimpleNamespace(name="f")
+    row = _row(Arm("base"), fold, idx[0], 18, False, a, p, n)
+    assert row["mae3"] == pytest.approx(1.5)
+    assert row["naive_mae"] == pytest.approx(0.25) and row["naive_mae3"] == pytest.approx(0.75)
+    no_n = _row(Arm("base"), fold, idx[0], 18, False, a, p)
+    assert np.isnan(no_n["naive_mae"]) and np.isnan(no_n["naive_mae3"]) and no_n["mae3"] == pytest.approx(1.5)
+
+
+def test_row_block_metrics_skip_incomplete_blocks():
+    from backtest.runner import _row
+
+    idx = pd.date_range("2026-11-10", periods=24, freq="1h")
+    a = pd.Series(1.0, index=idx)
+    p = pd.Series(1.0, index=idx)
+    p.iloc[:3] = 2.0  # block 0: |sum e| = 3
+    p.iloc[3:6] = [2.0, 0.0, 1.0]  # block 1: e = 1,-1,0 -> 0
+    a.iloc[7] = np.nan  # block 2 incomplete -> not counted (hours 6, 8 still scored)
+    n = pd.Series(1.0, index=idx)
+    n.iloc[0] = np.nan  # naive block 0 incomplete
+    row = _row(Arm("base"), SimpleNamespace(name="f"), idx[0], 18, False, a, p, n)
+    assert row["mae3"] == pytest.approx(3.0 / 7)
+    assert row["naive_mae3"] == pytest.approx(0.0)
+    assert row["naive_mae"] == pytest.approx(0.0)
+    # clock-aligned: a window starting at 01:00 drops the partial 00-02 block (its errors of 1 are not counted)
+    a2 = pd.Series(1.0, index=idx)
+    p2 = pd.Series(1.0, index=idx)
+    p2.iloc[:3] = 2.0
+    sl = slice(1, 24)
+    row2 = _row(Arm("base"), SimpleNamespace(name="f"), idx[0], 18, False, a2.iloc[sl], p2.iloc[sl])
+    assert row2["mae3"] == pytest.approx(0.0)
+
+
+def test_run_arm_rows_carry_naive_columns(base_rows):
+    assert all({"mae3", "naive_mae", "naive_mae3"} <= set(r) for r in base_rows)
+    assert any(np.isfinite(r["naive_mae"]) for r in base_rows)
+    assert any(np.isfinite(r["naive_mae3"]) for r in base_rows)

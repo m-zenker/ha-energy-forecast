@@ -19,6 +19,7 @@ import pandas as pd
 from .arms import Arm, feature_drop
 from .data import Fold, Inputs
 from .env import TZ, frozen_now, lgbm_seed
+from .wf_score import naive_same_hour_mean
 
 Origins = tuple[int, ...] | Literal["lead25"]
 WINDOW_HISTORY = pd.Timedelta(days=15)
@@ -69,11 +70,23 @@ def _predict(model, weather: pd.DataFrame, energy: pd.DataFrame, t_o: pd.Timesta
     return out.set_index("timestamp")["predicted_kwh"]
 
 
-def _row(arm, fold, day, origin, cold, a: pd.Series, p: pd.Series) -> dict | None:
+def _block_mae(err: pd.Series) -> float:
+    """Mean |sum of err| over clock-aligned 3 h blocks whose 3 hours are all present; NaN if none is complete."""
+    idx = pd.DatetimeIndex(err.index)
+    sums = err.groupby([idx.normalize(), idx.hour // 3]).sum(min_count=3)
+    return float(sums.abs().mean()) if sums.notna().any() else np.nan
+
+
+def _row(arm, fold, day, origin, cold, a: pd.Series, p: pd.Series, n: pd.Series | None = None) -> dict | None:
     m = a.notna() & p.notna()
     if m.sum() < MIN_SCORED_HOURS:
         return None
     err = p[m] - a[m]
+    naive_mae = naive_mae3 = np.nan
+    if n is not None:
+        e_n = (n - a).where(m)
+        naive_mae = float(e_n.abs().mean()) if e_n.notna().any() else np.nan
+        naive_mae3 = _block_mae(e_n)
     return dict(
         arm=arm.name,
         fold=fold.name,
@@ -81,6 +94,9 @@ def _row(arm, fold, day, origin, cold, a: pd.Series, p: pd.Series) -> dict | Non
         origin=origin,
         cold=cold,
         mae=float(err.abs().mean()),
+        mae3=_block_mae((p - a).where(m)),
+        naive_mae=naive_mae,
+        naive_mae3=naive_mae3,
         bias=float(err.sum() * 24 / m.sum()),
         pred=p.where(m).to_numpy(dtype=float),
         ts0=day,
@@ -99,6 +115,7 @@ def run_arm(
     """One train on data before ``fold.start``; one row per scorable target day × origin."""
     energy = inputs.energy
     actual = energy.drop_duplicates("timestamp", keep="last").set_index("timestamp")["gross_kwh"]
+    naive = naive_same_hour_mean(actual)
     days = _scorable_days(actual, fold, days_limit)
     if not days:
         return []
@@ -112,13 +129,13 @@ def run_arm(
             p = pd.Series(np.nan, index=a.index)
             for ts in a.index[a.notna()]:
                 p[ts] = _predict(model, wa, energy, ts - pd.Timedelta(hours=25)).get(ts, np.nan)
-            row = _row(arm, fold, day, "lead25", cold, a, p)
+            row = _row(arm, fold, day, "lead25", cold, a, p, naive.reindex(a.index))
             rows += [row] if row else []
             continue
         for h in origins:
             t_o = day - pd.Timedelta(days=1) + pd.Timedelta(hours=int(h))
             p = _predict(model, wa, energy, t_o).reindex(a.index)
-            row = _row(arm, fold, day, int(h), cold, a, p)
+            row = _row(arm, fold, day, int(h), cold, a, p, naive.reindex(a.index))
             rows += [row] if row else []
     return rows
 

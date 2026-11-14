@@ -630,18 +630,20 @@ These sensors carry `ev_threshold_kwh` and `ev_charger_kw` as attributes.
 | Entity ID | Description |
 |-----------|-------------|
 | `sensor.energy_forecast_model_mae` | Model mean absolute error (kWh). Attributes include `cv_mae`, `model_engine`, `last_trained` |
-| `sensor.energy_forecast_mae_7d` | Rolling mean absolute error over the last 7 days. Attribute `n_pairs` shows how many prediction–actual pairs were used. State is `"0.0"` until enough history accumulates. |
-| `sensor.energy_forecast_mae_30d` | Rolling MAE over the last 30 days (`n_pairs` attribute). Reaches full depth after ~30 days. |
+| `sensor.energy_forecast_mae_7d` | Rolling mean absolute error over the last 7 days. Attribute `n_pairs` shows how many prediction–actual pairs were used. State is `"0.0"` until enough history accumulates. With `baseline_mode`, actuals exclude the energy of the `baseline_mode` sub-meters (the same definition the model trains on). |
+| `sensor.energy_forecast_mae_30d` | Rolling MAE over the last 30 days (`n_pairs` attribute). Reaches full depth after ~30 days. Same actuals definition as `mae_7d`. |
 | `sensor.energy_forecast_setup_status` | Setup health check. State is `ok` when all packages loaded correctly, or `missing_packages` when one or more pip packages failed to import. The `missing_packages` attribute lists the affected package names — use it to diagnose install issues directly from **Developer Tools → States** without reading AppDaemon logs. |
-| `sensor.energy_forecast_relative_mae_7d` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. |
-| `sensor.energy_forecast_relative_mae_30d` | Rolling relative MAE over the last 30 days (%). |
+| `sensor.energy_forecast_relative_mae_7d` | Rolling relative MAE over the last 7 days (%). Normalized accuracy independent of consumption scale. Same actuals definition as `mae_7d`. |
+| `sensor.energy_forecast_relative_mae_30d` | Rolling relative MAE over the last 30 days (%). Same actuals definition as `mae_7d`. |
+| `sensor.energy_forecast_block_mae_7d` / `_30d` | Mean absolute error of the 3 h block totals (kWh per block; clock-aligned blocks, counted only when all 3 hours have actuals). With the daily bias below, this is the primary accuracy number; hourly MAE is secondary because it rewards under-forecasting. Attributes: `n_blocks`, `naive_block_mae` and `skill_vs_naive_pct` (against the naive same-hour mean of the 2–8 days before; above 0 means the forecast beats it), `hourly_mae`, `hourly_naive_mae`, `hourly_skill_vs_naive_pct`, `block_hours`. `hourly_mae` covers all scored hours while `hourly_naive_mae` covers only hours that have a naive value, so `1 − hourly_mae / hourly_naive_mae` need not equal `hourly_skill_vs_naive_pct`. In the 30-day window the naive baseline is thin for the first days, because actuals are kept for 30 days. `unavailable` until enough history accumulates. |
+| `sensor.energy_forecast_daily_bias_7d` / `_30d` | Mean daily bias, forecast minus actual (kWh/day; negative means under-forecast), over days with at least 22 hours of actuals. Attributes: `bias_pct` (% of actual consumption on those days), `daily_abs_error`, `n_days`. `unavailable` when no day qualifies. |
 | `sensor.energy_forecast_thermal_pressure_net` | Thermal pressure (heat deficit minus solar gain) for the current hour. Unit: °C·m². Attribute: `tau_hours` (building thermal time constant in hours; `null` when uncalibrated). Consumed by `ha-energy-manager` heat pump optimiser. |
 
 ### Anomaly detection
 
 | Entity ID | Description |
 |-----------|-------------|
-| `binary_sensor.energy_forecast_unusual_consumption` | `on` when the latest actual consumption deviates more than `anomaly_sigma_threshold` std-deviations from the stored day-ahead prediction. `off` during cold-start (< 10 matched hours). Attributes: `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`. |
+| `binary_sensor.energy_forecast_unusual_consumption` | `on` when the latest actual consumption deviates more than `anomaly_sigma_threshold` std-deviations from the stored day-ahead prediction. `off` during cold-start (< 10 matched hours). Same actuals definition as `mae_7d`. Attributes: `residual_kwh`, `residual_std_kwh`, `sigma_threshold`, `n_pairs`. |
 
 ### Physics diagnostics (when `physics:` is configured)
 

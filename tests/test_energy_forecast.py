@@ -1994,148 +1994,7 @@ class TestRollingMaeSensors:
             f"mae_30d state topic not found in: {state_topics}"
         )
 
-    # ── full_actuals vs recent_actuals for _actuals_history ──
-
-    def test_actuals_history_stores_raw_kwh_not_sub_sensor_subtracted(self):
-        """_actuals_history must store raw gross_kwh from full_actuals, not sub-sensor-subtracted recent_actuals.
-
-        When sub-sensors reduce recent_actuals kWh, _actuals_history must still hold the
-        original full_actuals values (consistent with training, which uses EV-subtracted
-        gross_kwh without sub-sensor subtraction).
-        """
-        import pandas as pd
-
-        # Simulate the production loop with both full_actuals and recent_actuals available,
-        # where recent_actuals has reduced kWh (sub-sensor subtracted).
-        now = pd.Timestamp("2026-06-01 10:00")
-        timestamps = pd.date_range(now - pd.Timedelta(hours=3), periods=3, freq="1h")
-
-        full_actuals = pd.DataFrame({"timestamp": timestamps, "gross_kwh": [2.0, 3.0, 4.0]})
-        # recent_actuals: same timestamps, 1.0 kWh less (sub-sensor subtracted)
-        recent_actuals_kwh = [1.0, 2.0, 3.0]  # noqa: F841 — kept for documentation
-
-        ev_hour_set: set = set()
-
-        actuals_history: dict = {}
-
-        # Simulate the FIXED production loop (full_actuals):
-        for _ts, _kwh in zip(
-            pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
-            full_actuals["gross_kwh"].astype(float),
-        ):
-            if _ts not in ev_hour_set:
-                actuals_history[_ts] = _kwh
-
-        # Values must be raw (2.0, 3.0, 4.0), not sub-sensor-subtracted (1.0, 2.0, 3.0)
-        assert list(actuals_history.values()) == [2.0, 3.0, 4.0], (
-            f"Expected raw full_actuals values [2.0, 3.0, 4.0], got {list(actuals_history.values())}"
-        )
-
     # ── Partial-hour and retroactive-eviction guards ──
-
-    def test_incomplete_current_hour_not_stored(self):
-        """The current (not-yet-complete) hourly bucket must not be stored in _actuals_history.
-
-        At cycle time 10:32 the 10:00 bucket contains only ~32 min of data.  Without the
-        completed_cutoff guard it gets stored with a low kWh value, inflating MAE until the
-        next cycle overwrites it.
-        """
-        import pandas as pd
-
-        now_ts = pd.Timestamp("2026-06-07 10:32")
-        completed_cutoff = now_ts.floor("1h")  # 10:00
-
-        timestamps = [
-            pd.Timestamp("2026-06-07 08:00"),
-            pd.Timestamp("2026-06-07 09:00"),
-            pd.Timestamp("2026-06-07 10:00"),  # current hour — only partial data
-        ]
-        gross_kwh = [2.1, 2.3, 0.3]  # 10:00 is below EV threshold, looks "normal"
-
-        ev_mae_excluded: set = set()
-        actuals_history: dict = {}
-
-        for _ts, _kwh in zip(timestamps, gross_kwh):
-            if _ts >= completed_cutoff:  # fix: skip current/future hours
-                continue
-            if _ts not in ev_mae_excluded:
-                actuals_history[_ts] = _kwh
-
-        assert pd.Timestamp("2026-06-07 08:00") in actuals_history
-        assert pd.Timestamp("2026-06-07 09:00") in actuals_history
-        assert pd.Timestamp("2026-06-07 10:00") not in actuals_history, (
-            "Current (incomplete) hour must not be stored in actuals_history"
-        )
-
-    def test_retroactive_eviction_removes_stale_ev_adjacent_actuals(self):
-        """Actuals stored before EV was detected must be evicted when ev_mae_excluded is populated.
-
-        Scenario: at 08:01 the first minute of an EV session (0.002 kWh) is stored for 08:00
-        because it's below the 7 kWh threshold.  At 09:01 the full session is visible and 08:00
-        enters ev_mae_excluded — the retroactive eviction pop must remove the stale entry.
-        """
-        import pandas as pd
-
-        base = pd.Timestamp("2026-06-07 06:00")  # 2h before EV — not adjacent, must be kept
-        ev_ts = pd.Timestamp("2026-06-07 08:00")
-        adjacent_ts = pd.Timestamp("2026-06-07 09:00")  # 1h after EV hour
-
-        # Pre-populate: stale / contaminated values already in actuals_history
-        actuals_history: dict = {
-            base: 2.5,  # clean normal hour (not adjacent)
-            ev_ts: 0.002,  # minute-1 partial — stored before session was detected
-            adjacent_ts: 6.177,  # ramp-down hour stored before adjacent exclusion kicked in
-        }
-
-        ev_hour_set = {ev_ts}
-        _ev_adjacent = {ev_ts + pd.Timedelta(hours=d) for ev_ts in ev_hour_set for d in (-1, 1)}
-        ev_mae_excluded = ev_hour_set | _ev_adjacent
-
-        # Retroactive eviction (fix)
-        for _ts in ev_mae_excluded:
-            actuals_history.pop(_ts, None)
-
-        assert base in actuals_history, "Clean hour must be preserved"
-        assert ev_ts not in actuals_history, "EV hour must be evicted"
-        assert adjacent_ts not in actuals_history, "EV-adjacent hour must be evicted"
-        assert actuals_history[base] == 2.5
-
-    def test_restart_mid_session_partial_hour_not_stored(self):
-        """After a restart mid-EV-session the partial current hour must not be stored.
-
-        Scenario: app restarts at 16:32 during an EV session.  The 16:00 bucket has ~32 min of
-        charging (4.99 kWh), which is below the 7 kWh threshold so ev_hour_set is empty.
-        Without the completed_cutoff guard 16:00 gets stored with 4.99 kWh, inflating MAE.
-        """
-        import pandas as pd
-
-        now_ts = pd.Timestamp("2026-06-07 16:32")
-        completed_cutoff = now_ts.floor("1h")  # 16:00
-
-        timestamps = [
-            pd.Timestamp("2026-06-07 14:00"),
-            pd.Timestamp("2026-06-07 15:00"),
-            pd.Timestamp("2026-06-07 16:00"),  # partial mid-session, below threshold
-        ]
-        gross_kwh = [2.0, 2.1, 4.99]
-
-        ev_mae_excluded: set = set()  # EV not yet detected (partial hour)
-        actuals_history: dict = {}
-
-        for _ts in ev_mae_excluded:  # no-op here; eviction still runs
-            actuals_history.pop(_ts, None)
-
-        for _ts, _kwh in zip(timestamps, gross_kwh):
-            if _ts >= completed_cutoff:
-                continue
-            if _ts not in ev_mae_excluded:
-                actuals_history[_ts] = _kwh
-
-        assert pd.Timestamp("2026-06-07 14:00") in actuals_history
-        assert pd.Timestamp("2026-06-07 15:00") in actuals_history
-        assert pd.Timestamp("2026-06-07 16:00") not in actuals_history, (
-            "Partial current hour after restart must not be stored (causes MAE inflation)"
-        )
 
     # ── _actuals_for_retrain and _retrain EV-adjacency guards ──
 
@@ -2223,6 +2082,189 @@ class TestRollingMaeSensors:
         assert any("energy_forecast_mae_30d/config" in t for t in config_topics), (
             f"mae_30d config topic not found in: {config_topics}"
         )
+
+    # ── block / daily accuracy sensors (#114) ──
+
+    @staticmethod
+    def _accuracy_data(with_accuracy: bool = True) -> dict:
+        nan = float("nan")
+        data = {
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "mae_7d": 0.25,
+            "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24,
+            "mae_30d_n_pairs": 120,
+        }
+        if with_accuracy:
+            data["accuracy_7d"] = {
+                "block_mae": 0.61234,
+                "n_blocks": 50,
+                "naive_block_mae": 0.7,
+                "block_skill_pct": 12.5,
+                "mae": 0.3,
+                "naive_mae": 0.31,
+                "skill_pct": 3.2,
+                "daily_bias": -1.2345,
+                "daily_bias_pct": -5.1,
+                "daily_abs_error": 2.0,
+                "n_days": 6,
+                "n_hours": 160,
+            }
+            data["accuracy_30d"] = {
+                "block_mae": nan,
+                "n_blocks": 0,
+                "naive_block_mae": nan,
+                "block_skill_pct": nan,
+                "mae": nan,
+                "naive_mae": nan,
+                "skill_pct": nan,
+                "daily_bias": nan,
+                "daily_bias_pct": nan,
+                "daily_abs_error": nan,
+                "n_days": 0,
+                "n_hours": 0,
+            }
+        return data
+
+    def test_publish_accuracy_attr_inf_becomes_none(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = self._accuracy_data()
+        data["accuracy_7d"]["naive_block_mae"] = float("inf")
+        data["accuracy_7d"]["skill_pct"] = float("-inf")
+        EnergyForecast._publish(fake, data)
+        attrs = fake._states["sensor.energy_forecast_block_mae_7d"]["attributes"]
+        assert attrs["naive_block_mae"] is None and attrs["hourly_skill_vs_naive_pct"] is None
+
+    def test_publish_accuracy_sensors_set_state_mode(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._accuracy_data())
+
+        b7 = fake._states["sensor.energy_forecast_block_mae_7d"]
+        assert b7["state"] == "0.6123"
+        assert b7["attributes"]["n_blocks"] == 50
+        assert b7["attributes"]["skill_vs_naive_pct"] == 12.5
+        assert b7["attributes"]["naive_block_mae"] == 0.7
+        assert b7["attributes"]["hourly_mae"] == 0.3
+        assert b7["attributes"]["hourly_naive_mae"] == 0.31
+        assert b7["attributes"]["hourly_skill_vs_naive_pct"] == 3.2
+        assert b7["attributes"]["block_hours"] == 3
+        assert b7["attributes"]["unit_of_measurement"] == "kWh"
+        assert b7["attributes"]["friendly_name"] == "Energy Forecast Block MAE 7d"
+        assert b7["attributes"]["unique_id"] == "energy_forecast_block_mae_7d"
+        assert b7["attributes"]["icon"] == "mdi:chart-timeline-variant"
+
+        d7 = fake._states["sensor.energy_forecast_daily_bias_7d"]
+        assert d7["state"] in ("-1.234", "-1.235")
+        assert d7["attributes"]["bias_pct"] == -5.1
+        assert d7["attributes"]["n_days"] == 6
+        assert d7["attributes"]["daily_abs_error"] == 2.0
+        assert d7["attributes"]["friendly_name"] == "Energy Forecast Daily Bias 7d"
+        assert d7["attributes"]["icon"] == "mdi:scale-unbalanced"
+        assert d7["attributes"]["unit_of_measurement"] == "kWh"
+
+        b30 = fake._states["sensor.energy_forecast_block_mae_30d"]
+        assert b30["state"] == "unavailable"
+        assert b30["attributes"]["naive_block_mae"] is None
+        assert b30["attributes"]["n_blocks"] == 0
+        d30 = fake._states["sensor.energy_forecast_daily_bias_30d"]
+        assert d30["state"] == "unavailable"
+        assert d30["attributes"]["bias_pct"] is None
+        assert d30["attributes"]["n_days"] == 0
+
+    def test_publish_accuracy_sensors_mqtt_mode(self):
+        from unittest.mock import MagicMock
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        real_set = fake._mqtt_set_sensor
+        real_raw = fake._mqtt_set_sensor_raw
+        fake._mqtt_set_sensor = MagicMock(side_effect=real_set)
+        fake._mqtt_set_sensor_raw = MagicMock(side_effect=real_raw)
+        EnergyForecast._publish(fake, self._accuracy_data())
+
+        set_uids = [c.args[0] for c in fake._mqtt_set_sensor.call_args_list]
+        raw_calls = {c.args[0]: c.args[1] for c in fake._mqtt_set_sensor_raw.call_args_list}
+
+        # valid window -> numeric publish
+        assert "energy_forecast_block_mae_7d" in set_uids
+        assert "energy_forecast_daily_bias_7d" in set_uids
+        assert "energy_forecast_block_mae_7d" not in raw_calls
+        # NaN window -> raw "unavailable", never the NaN->0.0 path
+        for uid in ("energy_forecast_block_mae_30d", "energy_forecast_daily_bias_30d"):
+            assert raw_calls.get(uid) == "unavailable"
+            assert uid not in set_uids
+
+        prefix = "homeassistant/energy_forecast/sensor"
+        payloads = {p["topic"]: p["payload"] for p in fake._publishes}
+        assert float(payloads[f"{prefix}/energy_forecast_block_mae_7d/state"]) == 0.6123
+        assert float(payloads[f"{prefix}/energy_forecast_daily_bias_7d/state"]) in (-1.234, -1.235)
+        assert payloads[f"{prefix}/energy_forecast_block_mae_30d/state"] == "unavailable"
+        assert payloads[f"{prefix}/energy_forecast_daily_bias_30d/state"] == "unavailable"
+
+        import json
+
+        for uid in (
+            "energy_forecast_block_mae_7d",
+            "energy_forecast_daily_bias_7d",
+            "energy_forecast_block_mae_30d",
+            "energy_forecast_daily_bias_30d",
+        ):
+            assert f"{prefix}/{uid}/attributes" in payloads
+        a7 = json.loads(payloads[f"{prefix}/energy_forecast_block_mae_7d/attributes"])
+        assert a7["n_blocks"] == 50
+        assert a7["block_hours"] == 3
+        a30 = json.loads(payloads[f"{prefix}/energy_forecast_daily_bias_30d/attributes"])
+        assert a30["bias_pct"] is None
+        assert a30["n_days"] == 0
+
+    def test_mqtt_discovery_includes_accuracy_sensors(self):
+        import json
+
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        configs = {p["topic"]: p["payload"] for p in fake._publishes if "/config" in p["topic"]}
+        for w in ("7d", "30d"):
+            for base in ("block_mae", "daily_bias"):
+                uid = f"energy_forecast_{base}_{w}"
+                matches = [t for t in configs if t.endswith(f"{uid}/config")]
+                assert matches, f"{uid} config not found in {list(configs)}"
+                payload = json.loads(configs[matches[0]])
+                assert payload["json_attributes_topic"].endswith(f"/sensor/{uid}/attributes")
+                assert payload["unit_of_measurement"] == "kWh"
+                assert payload["state_class"] == "measurement"
+                assert "device_class" not in payload or payload["device_class"] is None
+
+    def test_publish_without_accuracy_keys_does_not_raise(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        for mqtt in (False, True):
+            fake = _FakeMqttSelf(mqtt_discovery=mqtt)
+            EnergyForecast._publish(fake, self._accuracy_data(with_accuracy=False))
+            if mqtt:
+                payloads = {p["topic"]: p["payload"] for p in fake._publishes}
+                for uid in (
+                    "energy_forecast_block_mae_7d",
+                    "energy_forecast_daily_bias_7d",
+                    "energy_forecast_block_mae_30d",
+                    "energy_forecast_daily_bias_30d",
+                ):
+                    assert payloads[f"homeassistant/energy_forecast/sensor/{uid}/state"] == "unavailable"
+            else:
+                for w in ("7d", "30d"):
+                    assert fake._states[f"sensor.energy_forecast_block_mae_{w}"]["state"] == "unavailable"
+                    assert fake._states[f"sensor.energy_forecast_daily_bias_{w}"]["state"] == "unavailable"
 
 
 class TestPublishBlockIntervalSensors:
@@ -2930,6 +2972,7 @@ class TestPredHistoryPersistence:
         now = pd.Timestamp.now().normalize()
         app._pred_history = {now - pd.Timedelta(days=1): 1.5}
         app._actuals_history = {now - pd.Timedelta(days=2): 2.0}
+        app._actuals_on_target_basis = True
 
         # Save
         EnergyForecast._save_pred_history(app)
@@ -2960,6 +3003,7 @@ class TestPredHistoryPersistence:
         app._timezone = "Europe/Zurich"
         app._pred_history = {}
         app._actuals_history = {}
+        app._actuals_on_target_basis = True
 
         # Mock open to raise OSError
         mock_open = MagicMock()
@@ -2970,6 +3014,60 @@ class TestPredHistoryPersistence:
             EnergyForecast._save_pred_history(app)
 
         assert any("Failed to save" in r.message for r in caplog.records)
+
+    def _basis_app(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+        app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+        return app, mock_path
+
+    def test_save_writes_actuals_basis_marker(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        app._actuals_on_target_basis = True
+        EnergyForecast._save_pred_history(app)
+        assert json.loads(path.read_text())["actuals_basis"] == "target"
+        app._actuals_on_target_basis = False
+        EnergyForecast._save_pred_history(app)
+        assert json.loads(path.read_text())["actuals_basis"] == "gross"
+
+    def test_load_old_file_without_marker_needs_migration(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        recent = (pd.Timestamp.now().floor("1h") - pd.Timedelta(hours=5)).isoformat()
+        path.write_text(json.dumps({"pred": {}, "actuals": {recent: 1.0}}))
+        app._actuals_on_target_basis = True
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is False
+
+    def test_load_marked_file_and_missing_file_need_no_migration(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        recent = (pd.Timestamp.now().floor("1h") - pd.Timedelta(hours=5)).isoformat()
+        path.write_text(json.dumps({"pred": {}, "actuals": {recent: 1.0}, "actuals_basis": "target"}))
+        app._actuals_on_target_basis = False
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is True
+
+        path.unlink()
+        app._actuals_on_target_basis = True
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is True
 
 
 class TestUpdateCheckStatePersistence:
@@ -4432,6 +4530,9 @@ class _FakeUpdateSensors:
         self._mqtt_discovery = False
         self._pred_history = {}
         self._actuals_history = {}
+        self._actuals_on_target_basis = True
+        self._actuals_migration_warned = frozenset()
+        self._baseline_included_sensors = []
         self._ml_model = _FakeMLModelForUpdateSensors()
         self.set_state_calls = []
         self._excluded_range_warned = set()
@@ -4458,6 +4559,22 @@ class _FakeUpdateSensors:
         from energy_forecast.energy_forecast import EnergyForecast
 
         return EnergyForecast._read_live_temp(self)
+
+    # Pure helpers used by the baseline_mode / actuals-migration wiring (#117).
+    def _sub_sensor_prefix(self, entity_id):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._sub_sensor_prefix(self, entity_id)
+
+    def _sub_sensor_cache_path(self, entity_id):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._sub_sensor_cache_path(self, entity_id)
+
+    def _subtract_only_dict(self, sub_dict):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        return EnergyForecast._subtract_only_dict(self, sub_dict)
 
     def _build_away_prediction_series(self, now_ts):
         from energy_forecast.energy_forecast import EnergyForecast
@@ -4741,6 +4858,169 @@ class TestUpdateSensorsExcludedRanges:
         assert not any(r.levelno == logging.WARNING for r in caplog.records), (
             "second hourly call on the same stub must downgrade to INFO, not repeat the WARNING"
         )
+
+
+class TestUpdateSensorsActualsBasis:
+    """_update_sensors() wiring of the actuals-history target basis and the one-time
+    gross -> net migration (#117)."""
+
+    N = 48  # hours of recent history served per cycle
+
+    def _setup(self, monkeypatch, tmp_path, sub_entities=("sensor.sub_a",), baseline=True):
+        import energy_forecast.ha_data as ha_data_mod
+
+        helper = TestUpdateSensorsExcludedRanges()
+        self.state = {"energy": None, "subs": {}}
+        helper._patch_update_sensors_deps(monkeypatch, _make_energy_df(24), tmp_path)
+
+        def fake_energy(*a, **kw):
+            return self.state["energy"].copy()
+
+        def fake_sub(app, entity_id, cache_path, **kw):
+            df = self.state["subs"].get(entity_id)
+            if df is None:
+                raise OSError("no history yet")
+            return df.copy()
+
+        monkeypatch.setattr(ha_data_mod, "fetch_recent_energy", fake_energy)
+        monkeypatch.setattr(ha_data_mod, "fetch_recent_sub_sensor", fake_sub)
+
+        stub = _FakeUpdateSensors(tmp_path / "energy_history.csv")
+        stub._baseline_mode = baseline
+        stub._sub_energy_sensors = list(sub_entities)
+        self.h = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+        return stub
+
+    def _hours(self, first, last):
+        return list(pd.date_range(self.h - pd.Timedelta(hours=first), self.h - pd.Timedelta(hours=last), freq="1h"))
+
+    def _frame(self, hours, col, value):
+        return pd.DataFrame({"timestamp": hours, col: [value] * len(hours)})
+
+    def _serve(self, first, last, subs):
+        hours = self._hours(first, last)
+        self.state["energy"] = self._frame(hours, "gross_kwh", 3.0)
+        self.state["subs"] = {
+            e: (None if v is None else self._frame(self._hours(100, 1), "kwh", v)) for e, v in subs.items()
+        }
+
+    def _cycle(self, stub, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            EnergyForecast._update_sensors(stub)
+        return [r for r in caplog.records if "training-target basis" in r.getMessage()]
+
+    def test_legacy_gross_history_migrated_exactly_once(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        stub = self._setup(monkeypatch, tmp_path)
+        stub._actuals_on_target_basis = False
+        old, recent = self._hours(80, 60), self._hours(47, 1)
+        stub._actuals_history = {t: 3.0 for t in old + recent}
+        self._serve(47, 1, {"sensor.sub_a": 1.0})
+
+        msgs = self._cycle(stub, caplog)
+        assert len(msgs) == 1 and msgs[0].levelno == logging.INFO
+        assert stub._actuals_on_target_basis is True
+        assert all(stub._actuals_history[t] == pytest.approx(2.0) for t in old)
+        # recent window: migrated once (3 -> 2) then rewritten net (3 - 1 = 2); never 1.0
+        assert all(stub._actuals_history[t] == pytest.approx(2.0) for t in recent)
+
+        snapshot = dict(stub._actuals_history)
+        assert self._cycle(stub, caplog) == []
+        assert stub._actuals_history == snapshot
+
+    def test_pending_migration_stores_gross_warns_once_and_never_double_subtracts(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        stub = self._setup(monkeypatch, tmp_path, sub_entities=("sensor.sub_a", "sensor.sub_b"))
+        stub._actuals_on_target_basis = False
+        old = self._hours(80, 60)
+        stub._actuals_history = {t: 3.0 for t in old}
+
+        # Cycle 1: sub_b has no history yet -> migration pending, scoring stays gross.
+        self._serve(47, 1, {"sensor.sub_a": 1.0, "sensor.sub_b": None})
+        msgs = self._cycle(stub, caplog)
+        assert [m.levelno for m in msgs] == [logging.WARNING]
+        assert "sub_sub_b" in msgs[0].getMessage()
+        assert "sub_sub_a" not in msgs[0].getMessage()
+        assert stub._actuals_on_target_basis is False
+        assert all(stub._actuals_history[t] == 3.0 for t in old)
+        assert all(stub._actuals_history[t] == pytest.approx(3.0) for t in self._hours(47, 1)), (
+            "while pending, fresh hours must be stored gross"
+        )
+
+        # Cycle 2: still pending -> no repeat WARNING.
+        assert self._cycle(stub, caplog) == []
+
+        # Cycle 3: sub_b arrives; the served window has moved on (only the last 24 h).
+        # Hours 47..25 exist only from the pending cycles and must be subtracted once.
+        self._serve(24, 1, {"sensor.sub_a": 1.0, "sensor.sub_b": 0.5})
+        msgs = self._cycle(stub, caplog)
+        assert [m.levelno for m in msgs] == [logging.INFO]
+        assert stub._actuals_on_target_basis is True
+        assert stub._actuals_migration_warned == frozenset()
+        for t in old + self._hours(47, 1):
+            assert stub._actuals_history[t] == pytest.approx(1.5), t  # 3.0 - 1.0 - 0.5, exactly once
+
+    def test_retroactive_eviction_removes_stale_ev_hours(self, tmp_path, monkeypatch, caplog):
+        import energy_forecast.energy_forecast as ef_mod
+
+        stub = self._setup(monkeypatch, tmp_path, sub_entities=(), baseline=False)
+        ev_hour = self.h - pd.Timedelta(hours=10)
+        keep = self.h - pd.Timedelta(hours=60)  # outside the served window, must survive
+        stub._actuals_history = {keep: 2.5, ev_hour: 0.002}
+        self._serve(47, 1, {})
+        monkeypatch.setattr(ef_mod, "_ev_mae_excluded_hours", lambda ev: {ev_hour})
+
+        self._cycle(stub, caplog)
+
+        assert ev_hour not in stub._actuals_history
+        assert stub._actuals_history[keep] == 2.5
+        assert self.h - pd.Timedelta(hours=11) in stub._actuals_history
+
+    def test_baseline_mode_off_stores_gross_values(self, tmp_path, monkeypatch, caplog):
+        stub = self._setup(monkeypatch, tmp_path, sub_entities=("sensor.sub_a",), baseline=False)
+        stub._actuals_on_target_basis = False
+        self._serve(47, 1, {"sensor.sub_a": 1.0})
+
+        msgs = self._cycle(stub, caplog)
+
+        assert len(msgs) == 1  # no expected sub-meters: migration completes immediately
+        assert stub._actuals_on_target_basis is True
+        assert all(stub._actuals_history[t] == pytest.approx(3.0) for t in self._hours(47, 1))
+
+    def test_no_sub_sensors_configured_behaves_as_before(self, tmp_path, monkeypatch, caplog):
+        stub = self._setup(monkeypatch, tmp_path, sub_entities=(), baseline=True)
+        self._serve(47, 1, {})
+
+        assert self._cycle(stub, caplog) == []  # flag already True: no migration step
+        assert all(stub._actuals_history[t] == pytest.approx(3.0) for t in self._hours(47, 1))
+
+    def test_accuracy_failure_logs_warning_and_does_not_propagate(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import energy_forecast.energy_forecast as ef_mod
+
+        def boom(*a, **kw):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(ef_mod, "_accuracy_windows", boom)
+        stub = self._setup(monkeypatch, tmp_path)
+        stub._actuals_on_target_basis = True
+        stub._actuals_history = {}
+        self._serve(47, 1, {"sensor.sub_a": 1.0})
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            ef_mod.EnergyForecast._update_sensors(stub)  # must not raise
+        msgs = [r.getMessage() for r in caplog.records if "Accuracy metrics failed" in r.getMessage()]
+        assert len(msgs) == 1 and "kaboom" in msgs[0]
+        assert stub.set_state_calls, "forecast publish must still happen"
 
 
 class TestRetrainEvCachePathBug:
@@ -5064,3 +5344,89 @@ class TestRegimeLog:
         with caplog.at_level("WARNING", logger="energy_forecast"):
             _append_regime_log(tmp_path / "x.jsonl", {"a": 1})
         assert any("regime" in r.message.lower() for r in caplog.records)
+
+
+class TestScoringActuals:
+    """ROADMAP #117: stored actuals use the training-target definition."""
+
+    T0 = pd.Timestamp("2026-11-10 08:00")
+
+    def _full(self, kwh):
+        return pd.DataFrame({"timestamp": pd.date_range(self.T0, periods=len(kwh), freq="1h"), "gross_kwh": kwh})
+
+    def _sub(self, kwh):
+        return pd.DataFrame({"timestamp": pd.date_range(self.T0, periods=len(kwh), freq="1h"), "kwh": kwh})
+
+    def test_appliance_run_is_subtracted(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        out = _scoring_actuals(
+            self._full([1.0, 2.5, 1.0]),
+            {"sub_dw": self._sub([0.0, 1.2, 0.0])},
+            set(),
+            {},
+            self.T0 + pd.Timedelta(hours=3),
+        )
+        assert out == pytest.approx(
+            {self.T0: 1.0, self.T0 + pd.Timedelta(hours=1): 1.3, self.T0 + pd.Timedelta(hours=2): 1.0}
+        )
+
+    def test_no_sub_sensors_keeps_values(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        out = _scoring_actuals(self._full([1.0, 2.5]), None, set(), {}, self.T0 + pd.Timedelta(hours=2))
+        assert list(out.values()) == [1.0, 2.5]
+
+    def test_floor_at_zero_and_ev_sensor_also_subtracted(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        t1 = self.T0 + pd.Timedelta(hours=1)
+        out = _scoring_actuals(
+            self._full([0.5, 9.0]), {"sub_dw": self._sub([0.8, 1.0])}, set(), {t1: 7.0}, self.T0 + pd.Timedelta(hours=2)
+        )
+        assert out[self.T0] == 0.0
+        assert out[t1] == pytest.approx(1.0)
+
+    def test_ev_excluded_and_incomplete_hours_are_not_stored(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        t1 = self.T0 + pd.Timedelta(hours=1)
+        out = _scoring_actuals(self._full([1.0, 6.0, 1.0]), None, {t1}, {}, self.T0 + pd.Timedelta(hours=2))
+        assert list(out) == [self.T0]  # t1 is EV-excluded, t2 is the open hour
+
+    def test_migration_subtracts_cached_sub_history(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        hist = {self.T0: 2.0, self.T0 + pd.Timedelta(hours=1): 0.3}
+        new, done = _migrate_actuals_to_target(hist, {"sub_dw": self._sub([1.5, 0.5])}, {"sub_dw"})
+        assert done is True
+        assert new == pytest.approx({self.T0: 0.5, self.T0 + pd.Timedelta(hours=1): 0.0})
+        assert hist[self.T0] == 2.0  # input not mutated
+
+    def test_migration_waits_for_missing_or_empty_sub_sensor(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        hist = {self.T0: 2.0}
+        for subs in ({}, None, {"sub_dw": self._sub([])}, {"sub_other": self._sub([1.0])}):
+            new, done = _migrate_actuals_to_target(hist, subs, {"sub_dw"})
+            assert done is False and new == hist
+
+    def test_migration_with_nothing_to_subtract_is_done(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        new, done = _migrate_actuals_to_target({self.T0: 2.0}, None, set())
+        assert done is True and new == {self.T0: 2.0}
+
+
+def test_accuracy_windows_helper():
+    from energy_forecast.energy_forecast import _accuracy_windows
+
+    now = pd.Timestamp("2026-11-14 10:00")
+    hours = pd.date_range(now - pd.Timedelta(days=20), now - pd.Timedelta(hours=1), freq="1h")
+    actual = {ts: 2.0 for ts in hours}
+    pred = {ts: 2.5 for ts in hours}
+    out = _accuracy_windows(pred, actual, now)
+    assert set(out) == {"accuracy_7d", "accuracy_30d"}
+    assert out["accuracy_7d"]["n_hours"] == 7 * 24
+    assert out["accuracy_30d"]["n_hours"] == len(hours)
+    assert out["accuracy_7d"]["block_mae"] == pytest.approx(1.5)
