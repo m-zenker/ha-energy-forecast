@@ -2083,6 +2083,178 @@ class TestRollingMaeSensors:
             f"mae_30d config topic not found in: {config_topics}"
         )
 
+    # ── block / daily accuracy sensors (#114) ──
+
+    @staticmethod
+    def _accuracy_data(with_accuracy: bool = True) -> dict:
+        nan = float("nan")
+        data = {
+            "next_1h": 0.5,
+            "next_3h": 1.0,
+            "today": 5.0,
+            "tomorrow": 6.0,
+            "blocks_today": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "blocks_tomorrow": {f"{h:02d}_{h + 3:02d}": 1.0 for h in range(0, 24, 3)},
+            "ev_today": 0.0,
+            "ev_yesterday": 0.0,
+            "mae_7d": 0.25,
+            "mae_30d": 0.30,
+            "mae_7d_n_pairs": 24,
+            "mae_30d_n_pairs": 120,
+        }
+        if with_accuracy:
+            data["accuracy_7d"] = {
+                "block_mae": 0.61234,
+                "n_blocks": 50,
+                "naive_block_mae": 0.7,
+                "block_skill_pct": 12.5,
+                "mae": 0.3,
+                "naive_mae": 0.31,
+                "skill_pct": 3.2,
+                "daily_bias": -1.2345,
+                "daily_bias_pct": -5.1,
+                "daily_abs_error": 2.0,
+                "n_days": 6,
+                "n_hours": 160,
+            }
+            data["accuracy_30d"] = {
+                "block_mae": nan,
+                "n_blocks": 0,
+                "naive_block_mae": nan,
+                "block_skill_pct": nan,
+                "mae": nan,
+                "naive_mae": nan,
+                "skill_pct": nan,
+                "daily_bias": nan,
+                "daily_bias_pct": nan,
+                "daily_abs_error": nan,
+                "n_days": 0,
+                "n_hours": 0,
+            }
+        return data
+
+    def test_publish_accuracy_sensors_set_state_mode(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        EnergyForecast._publish(fake, self._accuracy_data())
+
+        b7 = fake._states["sensor.energy_forecast_block_mae_7d"]
+        assert b7["state"] == "0.6123"
+        assert b7["attributes"]["n_blocks"] == 50
+        assert b7["attributes"]["skill_vs_naive_pct"] == 12.5
+        assert b7["attributes"]["naive_block_mae"] == 0.7
+        assert b7["attributes"]["hourly_mae"] == 0.3
+        assert b7["attributes"]["hourly_naive_mae"] == 0.31
+        assert b7["attributes"]["hourly_skill_vs_naive_pct"] == 3.2
+        assert b7["attributes"]["block_hours"] == 3
+        assert b7["attributes"]["unit_of_measurement"] == "kWh"
+        assert b7["attributes"]["friendly_name"] == "Energy Forecast Block MAE 7d"
+        assert b7["attributes"]["unique_id"] == "energy_forecast_block_mae_7d"
+        assert b7["attributes"]["icon"] == "mdi:chart-timeline-variant"
+
+        d7 = fake._states["sensor.energy_forecast_daily_bias_7d"]
+        assert d7["state"] in ("-1.234", "-1.235")
+        assert d7["attributes"]["bias_pct"] == -5.1
+        assert d7["attributes"]["n_days"] == 6
+        assert d7["attributes"]["daily_abs_error"] == 2.0
+        assert d7["attributes"]["friendly_name"] == "Energy Forecast Daily Bias 7d"
+        assert d7["attributes"]["icon"] == "mdi:scale-unbalanced"
+        assert d7["attributes"]["unit_of_measurement"] == "kWh"
+
+        b30 = fake._states["sensor.energy_forecast_block_mae_30d"]
+        assert b30["state"] == "unavailable"
+        assert b30["attributes"]["naive_block_mae"] is None
+        assert b30["attributes"]["n_blocks"] == 0
+        d30 = fake._states["sensor.energy_forecast_daily_bias_30d"]
+        assert d30["state"] == "unavailable"
+        assert d30["attributes"]["bias_pct"] is None
+        assert d30["attributes"]["n_days"] == 0
+
+    def test_publish_accuracy_sensors_mqtt_mode(self):
+        from unittest.mock import MagicMock
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=True)
+        real_set = fake._mqtt_set_sensor
+        real_raw = fake._mqtt_set_sensor_raw
+        fake._mqtt_set_sensor = MagicMock(side_effect=real_set)
+        fake._mqtt_set_sensor_raw = MagicMock(side_effect=real_raw)
+        EnergyForecast._publish(fake, self._accuracy_data())
+
+        set_uids = [c.args[0] for c in fake._mqtt_set_sensor.call_args_list]
+        raw_calls = {c.args[0]: c.args[1] for c in fake._mqtt_set_sensor_raw.call_args_list}
+
+        # valid window -> numeric publish
+        assert "energy_forecast_block_mae_7d" in set_uids
+        assert "energy_forecast_daily_bias_7d" in set_uids
+        assert "energy_forecast_block_mae_7d" not in raw_calls
+        # NaN window -> raw "unavailable", never the NaN->0.0 path
+        for uid in ("energy_forecast_block_mae_30d", "energy_forecast_daily_bias_30d"):
+            assert raw_calls.get(uid) == "unavailable"
+            assert uid not in set_uids
+
+        prefix = "homeassistant/energy_forecast/sensor"
+        payloads = {p["topic"]: p["payload"] for p in fake._publishes}
+        assert float(payloads[f"{prefix}/energy_forecast_block_mae_7d/state"]) == 0.61234
+        assert float(payloads[f"{prefix}/energy_forecast_daily_bias_7d/state"]) == -1.2345
+        assert payloads[f"{prefix}/energy_forecast_block_mae_30d/state"] == "unavailable"
+        assert payloads[f"{prefix}/energy_forecast_daily_bias_30d/state"] == "unavailable"
+
+        import json
+
+        for uid in (
+            "energy_forecast_block_mae_7d",
+            "energy_forecast_daily_bias_7d",
+            "energy_forecast_block_mae_30d",
+            "energy_forecast_daily_bias_30d",
+        ):
+            assert f"{prefix}/{uid}/attributes" in payloads
+        a7 = json.loads(payloads[f"{prefix}/energy_forecast_block_mae_7d/attributes"])
+        assert a7["n_blocks"] == 50
+        assert a7["block_hours"] == 3
+        a30 = json.loads(payloads[f"{prefix}/energy_forecast_daily_bias_30d/attributes"])
+        assert a30["bias_pct"] is None
+        assert a30["n_days"] == 0
+
+    def test_mqtt_discovery_includes_accuracy_sensors(self):
+        import json
+
+        fake = _FakeMqttSelf()
+        fake._mqtt_publish_all_discovery()
+        configs = {p["topic"]: p["payload"] for p in fake._publishes if "/config" in p["topic"]}
+        for w in ("7d", "30d"):
+            for base in ("block_mae", "daily_bias"):
+                uid = f"energy_forecast_{base}_{w}"
+                matches = [t for t in configs if t.endswith(f"{uid}/config")]
+                assert matches, f"{uid} config not found in {list(configs)}"
+                payload = json.loads(configs[matches[0]])
+                assert payload["json_attributes_topic"].endswith(f"/sensor/{uid}/attributes")
+                assert payload["unit_of_measurement"] == "kWh"
+                assert payload["state_class"] == "measurement"
+                assert "device_class" not in payload or payload["device_class"] is None
+
+    def test_publish_without_accuracy_keys_does_not_raise(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        for mqtt in (False, True):
+            fake = _FakeMqttSelf(mqtt_discovery=mqtt)
+            EnergyForecast._publish(fake, self._accuracy_data(with_accuracy=False))
+            if mqtt:
+                payloads = {p["topic"]: p["payload"] for p in fake._publishes}
+                for uid in (
+                    "energy_forecast_block_mae_7d",
+                    "energy_forecast_daily_bias_7d",
+                    "energy_forecast_block_mae_30d",
+                    "energy_forecast_daily_bias_30d",
+                ):
+                    assert payloads[f"homeassistant/energy_forecast/sensor/{uid}/state"] == "unavailable"
+            else:
+                for w in ("7d", "30d"):
+                    assert fake._states[f"sensor.energy_forecast_block_mae_{w}"]["state"] == "unavailable"
+                    assert fake._states[f"sensor.energy_forecast_daily_bias_{w}"]["state"] == "unavailable"
+
 
 class TestPublishBlockIntervalSensors:
     """_publish() must create separate _10th_pct/_90th_pct sensors (not attributes)."""

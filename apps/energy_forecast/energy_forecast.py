@@ -1058,6 +1058,21 @@ class EnergyForecast(hass.Hass):
             ("energy_forecast_relative_mae_30d", "Energy Forecast Relative MAE 30d"),
         ]:
             self._mqtt_publish_discovery(uid, name, "%", "mdi:percent", None, "measurement")
+        # Block / daily accuracy sensors (#114)
+        for _w in ("7d", "30d"):
+            for uid, name, icon in [
+                (f"energy_forecast_block_mae_{_w}", f"Energy Forecast Block MAE {_w}", "mdi:chart-timeline-variant"),
+                (f"energy_forecast_daily_bias_{_w}", f"Energy Forecast Daily Bias {_w}", "mdi:scale-unbalanced"),
+            ]:
+                self._mqtt_publish_discovery(
+                    uid,
+                    name,
+                    "kWh",
+                    icon,
+                    None,
+                    "measurement",
+                    json_attributes_topic=f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{uid}/attributes",
+                )
         # Anomaly detection sensor (#39)
         _anomaly_attrs_topic = (
             f"{self._mqtt_discovery_prefix}/energy_forecast"
@@ -2720,6 +2735,11 @@ class EnergyForecast(hass.Hass):
             # Relative MAE sensors (#54)
             "sensor.energy_forecast_relative_mae_7d",
             "sensor.energy_forecast_relative_mae_30d",
+            # Block / daily accuracy sensors (#114)
+            "sensor.energy_forecast_block_mae_7d",
+            "sensor.energy_forecast_block_mae_30d",
+            "sensor.energy_forecast_daily_bias_7d",
+            "sensor.energy_forecast_daily_bias_30d",
             # Anomaly detection sensor (#39)
             "binary_sensor.energy_forecast_unusual_consumption",
             # Interval sensors
@@ -3148,6 +3168,73 @@ class EnergyForecast(hass.Hass):
                     },
                     replace=True,
                 )
+
+        # ── Block / daily accuracy sensors (#114) ───────────────────────────────
+        def _acc_num(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        def _acc_attr(v: Any) -> Any:
+            f = _acc_num(v)
+            return None if math.isnan(f) else round(f, 3)
+
+        for _w in ("7d", "30d"):
+            acc = data.get(f"accuracy_{_w}") or {}
+            block_attrs = {
+                "n_blocks": int(acc.get("n_blocks") or 0),
+                "naive_block_mae": _acc_attr(acc.get("naive_block_mae")),
+                "skill_vs_naive_pct": _acc_attr(acc.get("block_skill_pct")),
+                "hourly_mae": _acc_attr(acc.get("mae")),
+                "hourly_naive_mae": _acc_attr(acc.get("naive_mae")),
+                "hourly_skill_vs_naive_pct": _acc_attr(acc.get("skill_pct")),
+                "block_hours": 3,
+            }
+            bias_attrs = {
+                "bias_pct": _acc_attr(acc.get("daily_bias_pct")),
+                "daily_abs_error": _acc_attr(acc.get("daily_abs_error")),
+                "n_days": int(acc.get("n_days") or 0),
+            }
+            for uid, label, icon, val, decimals, attrs in [
+                (
+                    f"energy_forecast_block_mae_{_w}",
+                    f"Block MAE {_w}",
+                    "mdi:chart-timeline-variant",
+                    _acc_num(acc.get("block_mae")),
+                    4,
+                    block_attrs,
+                ),
+                (
+                    f"energy_forecast_daily_bias_{_w}",
+                    f"Daily Bias {_w}",
+                    "mdi:scale-unbalanced",
+                    _acc_num(acc.get("daily_bias")),
+                    3,
+                    bias_attrs,
+                ),
+            ]:
+                invalid = math.isnan(val) or math.isinf(val)
+                if self._mqtt_discovery:
+                    if invalid:
+                        self._mqtt_set_sensor_raw(uid, "unavailable")
+                    else:
+                        self._mqtt_set_sensor(uid, val)
+                    self._mqtt_publish_sensor_attributes(uid, attrs)
+                else:
+                    self.set_state(
+                        f"sensor.{uid}",
+                        state="unavailable" if invalid else f"{val:.{decimals}f}",
+                        attributes={
+                            "unit_of_measurement": "kWh",
+                            "friendly_name": f"Energy Forecast {label}",
+                            "unique_id": uid,
+                            "icon": icon,
+                            "attribution": ATTRIBUTION,
+                            **attrs,
+                        },
+                        replace=True,
+                    )
 
         # ── Anomaly detection sensor (#39) ────────────────────────────────────
         is_anomaly = data.get("is_anomaly", False)
