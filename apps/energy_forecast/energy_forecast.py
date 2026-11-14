@@ -508,6 +508,7 @@ class EnergyForecast(hass.Hass):
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float] = {}
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
+        self._actuals_on_target_basis: bool = True  # False until legacy gross actuals are migrated (#117)
         self._last_adaptive_retrain: datetime = datetime.min
 
         # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
@@ -2303,27 +2304,42 @@ class EnergyForecast(hass.Hass):
         # ── Store predictions for adaptive retrain tracking ───────────────────
         self._pred_history = _accumulate_pred_history(self._pred_history, predictions, now_ts)
 
-        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
+        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41, #117) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
-        # Use full_actuals (pre-split, pre-sub-sensor-subtraction, but target-corrected)
-        # so stored kWh matches the training target on non-EV hours.
+        # Stored kWh = target-corrected consumption minus the baseline_mode sub-meters
+        # (same set as the training target) minus wallbox EV kWh.
         # Wallbox-sensor EV hours are stored net of the exact wallbox kWh; threshold-inferred
         # EV hours (+-1 h) are excluded. Keep-last means a late wallbox reading self-corrects.
+        _score_subs = (
+            self._subtract_only_dict(sub_sensors_recent) if (self._baseline_mode and sub_sensors_recent) else None
+        )
+        if not self._actuals_on_target_basis:
+            if self._baseline_mode:
+                _expected = {self._sub_sensor_prefix(e) for e in self._sub_energy_sensors} - {
+                    self._sub_sensor_prefix(e) for e in self._baseline_included_sensors
+                }
+            else:
+                _expected = set()
+            _migrated, _done = _migrate_actuals_to_target(self._actuals_history, _score_subs, _expected)
+            if _done:
+                _removed = sum(self._actuals_history.get(k, 0.0) - v for k, v in _migrated.items())
+                self._actuals_history = _migrated
+                self._actuals_on_target_basis = True
+                _LOGGER.info(
+                    "Stored actuals migrated to the training-target basis "
+                    "(%d hours, %.2f kWh appliance energy removed)",
+                    len(_migrated),
+                    _removed,
+                )
         if full_actuals is not None and not full_actuals.empty:
-            completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
             # Retroactively evict EV hours + neighbors already in actuals_history.
             # Handles stale partials stored before the session was fully detected and
             # ramp-down hours stored before adjacent exclusion kicked in.
             for _ts in ev_mae_excluded:
                 self._actuals_history.pop(_ts, None)
-            for _ts, _kwh in zip(
-                pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
-                full_actuals["gross_kwh"].astype(float),
-            ):
-                if _ts >= completed_cutoff:  # skip current (partial) hour
-                    continue
-                if _ts not in ev_mae_excluded:
-                    self._actuals_history[_ts] = max(0.0, _kwh - ev_sensor_kwh.get(_ts, 0.0))
+            self._actuals_history.update(
+                _scoring_actuals(full_actuals, _score_subs, ev_mae_excluded, ev_sensor_kwh, now_ts.floor("1h"))
+            )
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items() if pd.Timestamp(ts) >= actuals_cutoff
@@ -3352,6 +3368,8 @@ class EnergyForecast(hass.Hass):
             _LOGGER.warning("Failed to load pred_history: %s", exc)
             return
 
+        self._actuals_on_target_basis = data.get("actuals_basis") == "target"
+
         try:
             now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
             cutoff = now.floor("1h") - pd.Timedelta(days=30)
@@ -3385,6 +3403,7 @@ class EnergyForecast(hass.Hass):
             data = {
                 "pred": {ts.isoformat(): float(kwh) for ts, kwh in self._pred_history.items()},
                 "actuals": {ts.isoformat(): float(kwh) for ts, kwh in self._actuals_history.items()},
+                "actuals_basis": "target" if self._actuals_on_target_basis else "gross",
             }
             tmp_path = PRED_HISTORY_PATH.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:

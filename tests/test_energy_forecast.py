@@ -1994,43 +1994,6 @@ class TestRollingMaeSensors:
             f"mae_30d state topic not found in: {state_topics}"
         )
 
-    # ── full_actuals vs recent_actuals for _actuals_history ──
-
-    def test_actuals_history_stores_raw_kwh_not_sub_sensor_subtracted(self):
-        """_actuals_history must store raw gross_kwh from full_actuals, not sub-sensor-subtracted recent_actuals.
-
-        When sub-sensors reduce recent_actuals kWh, _actuals_history must still hold the
-        original full_actuals values (consistent with training, which uses EV-subtracted
-        gross_kwh without sub-sensor subtraction).
-        """
-        import pandas as pd
-
-        # Simulate the production loop with both full_actuals and recent_actuals available,
-        # where recent_actuals has reduced kWh (sub-sensor subtracted).
-        now = pd.Timestamp("2026-06-01 10:00")
-        timestamps = pd.date_range(now - pd.Timedelta(hours=3), periods=3, freq="1h")
-
-        full_actuals = pd.DataFrame({"timestamp": timestamps, "gross_kwh": [2.0, 3.0, 4.0]})
-        # recent_actuals: same timestamps, 1.0 kWh less (sub-sensor subtracted)
-        recent_actuals_kwh = [1.0, 2.0, 3.0]  # noqa: F841 — kept for documentation
-
-        ev_hour_set: set = set()
-
-        actuals_history: dict = {}
-
-        # Simulate the FIXED production loop (full_actuals):
-        for _ts, _kwh in zip(
-            pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
-            full_actuals["gross_kwh"].astype(float),
-        ):
-            if _ts not in ev_hour_set:
-                actuals_history[_ts] = _kwh
-
-        # Values must be raw (2.0, 3.0, 4.0), not sub-sensor-subtracted (1.0, 2.0, 3.0)
-        assert list(actuals_history.values()) == [2.0, 3.0, 4.0], (
-            f"Expected raw full_actuals values [2.0, 3.0, 4.0], got {list(actuals_history.values())}"
-        )
-
     # ── Partial-hour and retroactive-eviction guards ──
 
     def test_incomplete_current_hour_not_stored(self):
@@ -2930,6 +2893,7 @@ class TestPredHistoryPersistence:
         now = pd.Timestamp.now().normalize()
         app._pred_history = {now - pd.Timedelta(days=1): 1.5}
         app._actuals_history = {now - pd.Timedelta(days=2): 2.0}
+        app._actuals_on_target_basis = True
 
         # Save
         EnergyForecast._save_pred_history(app)
@@ -2960,6 +2924,7 @@ class TestPredHistoryPersistence:
         app._timezone = "Europe/Zurich"
         app._pred_history = {}
         app._actuals_history = {}
+        app._actuals_on_target_basis = True
 
         # Mock open to raise OSError
         mock_open = MagicMock()
@@ -2970,6 +2935,60 @@ class TestPredHistoryPersistence:
             EnergyForecast._save_pred_history(app)
 
         assert any("Failed to save" in r.message for r in caplog.records)
+
+    def _basis_app(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        mock_path = tmp_path / "pred_history.json"
+        monkeypatch.setattr("energy_forecast.energy_forecast.PRED_HISTORY_PATH", mock_path)
+        app = MagicMock(spec=EnergyForecast)
+        app._timezone = "Europe/Zurich"
+        app.log = MagicMock()
+        app._pred_history = {}
+        app._actuals_history = {}
+        return app, mock_path
+
+    def test_save_writes_actuals_basis_marker(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        app._actuals_on_target_basis = True
+        EnergyForecast._save_pred_history(app)
+        assert json.loads(path.read_text())["actuals_basis"] == "target"
+        app._actuals_on_target_basis = False
+        EnergyForecast._save_pred_history(app)
+        assert json.loads(path.read_text())["actuals_basis"] == "gross"
+
+    def test_load_old_file_without_marker_needs_migration(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        recent = (pd.Timestamp.now().floor("1h") - pd.Timedelta(hours=5)).isoformat()
+        path.write_text(json.dumps({"pred": {}, "actuals": {recent: 1.0}}))
+        app._actuals_on_target_basis = True
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is False
+
+    def test_load_marked_file_and_missing_file_need_no_migration(self, tmp_path, monkeypatch):
+        import json
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app, path = self._basis_app(tmp_path, monkeypatch)
+        recent = (pd.Timestamp.now().floor("1h") - pd.Timedelta(hours=5)).isoformat()
+        path.write_text(json.dumps({"pred": {}, "actuals": {recent: 1.0}, "actuals_basis": "target"}))
+        app._actuals_on_target_basis = False
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is True
+
+        path.unlink()
+        app._actuals_on_target_basis = True
+        EnergyForecast._load_pred_history(app)
+        assert app._actuals_on_target_basis is True
 
 
 class TestUpdateCheckStatePersistence:
@@ -4432,6 +4451,7 @@ class _FakeUpdateSensors:
         self._mqtt_discovery = False
         self._pred_history = {}
         self._actuals_history = {}
+        self._actuals_on_target_basis = True
         self._ml_model = _FakeMLModelForUpdateSensors()
         self.set_state_calls = []
         self._excluded_range_warned = set()
