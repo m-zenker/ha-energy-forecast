@@ -3684,6 +3684,35 @@ def _scoring_actuals(
     return out
 
 
+def _migrate_actuals_to_target(
+    actuals_history: dict,
+    sub_sensors_dict: dict[str, Any] | None,
+    expected_prefixes: set[str],
+) -> tuple[dict, bool]:
+    """One-time conversion of stored gross actuals to the training-target basis (#117).
+
+    Returns ``(new_history, done)``.  ``done`` is False and the history is returned
+    unchanged while any expected sub-sensor prefix is missing or has an empty frame
+    (sub-sensor history not loaded yet).  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    if not expected_prefixes:
+        return dict(actuals_history), True
+    subs = sub_sensors_dict or {}
+    for prefix in expected_prefixes:
+        frame = subs.get(prefix)
+        if frame is None or frame.empty:
+            return dict(actuals_history), False
+    if not actuals_history:
+        return {}, True
+
+    stamps = list(actuals_history)
+    df = pd.DataFrame({"timestamp": stamps, "gross_kwh": [float(actuals_history[t]) for t in stamps]})
+    corrected, _ = _subtract_sub_sensors(df, {p: subs[p] for p in expected_prefixes})
+    return dict(zip(stamps, corrected["gross_kwh"].astype(float))), True
+
+
 def _blend_today_totals(
     p_times: Any,  # np.ndarray of datetime64[ns] — prediction timestamps
     p_vals: Any,  # np.ndarray of float — predicted kWh per hour

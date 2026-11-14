@@ -5113,3 +5113,26 @@ class TestScoringActuals:
         t1 = self.T0 + pd.Timedelta(hours=1)
         out = _scoring_actuals(self._full([1.0, 6.0, 1.0]), None, {t1}, {}, self.T0 + pd.Timedelta(hours=2))
         assert list(out) == [self.T0]  # t1 is EV-excluded, t2 is the open hour
+
+    def test_migration_subtracts_cached_sub_history(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        hist = {self.T0: 2.0, self.T0 + pd.Timedelta(hours=1): 0.3}
+        new, done = _migrate_actuals_to_target(hist, {"sub_dw": self._sub([1.5, 0.5])}, {"sub_dw"})
+        assert done is True
+        assert new == pytest.approx({self.T0: 0.5, self.T0 + pd.Timedelta(hours=1): 0.0})
+        assert hist[self.T0] == 2.0  # input not mutated
+
+    def test_migration_waits_for_missing_or_empty_sub_sensor(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        hist = {self.T0: 2.0}
+        for subs in ({}, None, {"sub_dw": self._sub([])}, {"sub_other": self._sub([1.0])}):
+            new, done = _migrate_actuals_to_target(hist, subs, {"sub_dw"})
+            assert done is False and new == hist
+
+    def test_migration_with_nothing_to_subtract_is_done(self):
+        from energy_forecast.energy_forecast import _migrate_actuals_to_target
+
+        new, done = _migrate_actuals_to_target({self.T0: 2.0}, None, set())
+        assert done is True and new == {self.T0: 2.0}
