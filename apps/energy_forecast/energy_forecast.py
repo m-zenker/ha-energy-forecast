@@ -509,6 +509,7 @@ class EnergyForecast(hass.Hass):
         self._pred_history: dict[Any, float] = {}
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
         self._actuals_on_target_basis: bool = True  # False until legacy gross actuals are migrated (#117)
+        self._actuals_migration_warned: frozenset = frozenset()  # dedupe: missing-prefix set already warned about
         self._last_adaptive_retrain: datetime = datetime.min
 
         # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
@@ -2310,6 +2311,8 @@ class EnergyForecast(hass.Hass):
         # (same set as the training target) minus wallbox EV kWh.
         # Wallbox-sensor EV hours are stored net of the exact wallbox kWh; threshold-inferred
         # EV hours (+-1 h) are excluded. Keep-last means a late wallbox reading self-corrects.
+        # While the one-time migration is pending, history stays GROSS (no sub-meter
+        # subtraction) so the migration converts every stored hour exactly once.
         _score_subs = (
             self._subtract_only_dict(sub_sensors_recent) if (self._baseline_mode and sub_sensors_recent) else None
         )
@@ -2321,7 +2324,17 @@ class EnergyForecast(hass.Hass):
             else:
                 _expected = set()
             _migrated, _done = _migrate_actuals_to_target(self._actuals_history, _score_subs, _expected)
-            if _done:
+            if not _done:
+                _missing = frozenset(_missing_sub_prefixes(_score_subs, _expected))
+                if _missing != self._actuals_migration_warned:
+                    self._actuals_migration_warned = _missing
+                    _LOGGER.warning(
+                        "Actuals migration to the training-target basis is waiting for sub-meter history: %s; "
+                        "scoring stays on the old basis until it loads",
+                        ", ".join(sorted(_missing)),
+                    )
+            else:
+                self._actuals_migration_warned = frozenset()
                 _removed = sum(self._actuals_history.get(k, 0.0) - v for k, v in _migrated.items())
                 self._actuals_history = _migrated
                 self._actuals_on_target_basis = True
@@ -2338,7 +2351,13 @@ class EnergyForecast(hass.Hass):
             for _ts in ev_mae_excluded:
                 self._actuals_history.pop(_ts, None)
             self._actuals_history.update(
-                _scoring_actuals(full_actuals, _score_subs, ev_mae_excluded, ev_sensor_kwh, now_ts.floor("1h"))
+                _scoring_actuals(
+                    full_actuals,
+                    _score_subs if self._actuals_on_target_basis else None,
+                    ev_mae_excluded,
+                    ev_sensor_kwh,
+                    now_ts.floor("1h"),
+                )
             )
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
@@ -3703,6 +3722,12 @@ def _scoring_actuals(
     return out
 
 
+def _missing_sub_prefixes(sub_sensors_dict: dict[str, Any] | None, expected_prefixes: set[str]) -> set[str]:
+    """Expected sub-sensor prefixes whose frame is missing or empty (history not loaded yet)."""
+    subs = sub_sensors_dict or {}
+    return {p for p in expected_prefixes if subs.get(p) is None or subs[p].empty}
+
+
 def _migrate_actuals_to_target(
     actuals_history: dict,
     sub_sensors_dict: dict[str, Any] | None,
@@ -3719,10 +3744,8 @@ def _migrate_actuals_to_target(
     if not expected_prefixes:
         return dict(actuals_history), True
     subs = sub_sensors_dict or {}
-    for prefix in expected_prefixes:
-        frame = subs.get(prefix)
-        if frame is None or frame.empty:
-            return dict(actuals_history), False
+    if _missing_sub_prefixes(subs, expected_prefixes):
+        return dict(actuals_history), False
     if not actuals_history:
         return {}, True
 
