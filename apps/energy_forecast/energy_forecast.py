@@ -34,7 +34,7 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, capture, ha_data, heating_season, weather
+from . import __version__, accuracy, capture, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
     CAPTURE_DIR,
@@ -1058,6 +1058,21 @@ class EnergyForecast(hass.Hass):
             ("energy_forecast_relative_mae_30d", "Energy Forecast Relative MAE 30d"),
         ]:
             self._mqtt_publish_discovery(uid, name, "%", "mdi:percent", None, "measurement")
+        # Block / daily accuracy sensors (#114)
+        for _w in ("7d", "30d"):
+            for uid, name, icon in [
+                (f"energy_forecast_block_mae_{_w}", f"Energy Forecast Block MAE {_w}", "mdi:chart-timeline-variant"),
+                (f"energy_forecast_daily_bias_{_w}", f"Energy Forecast Daily Bias {_w}", "mdi:scale-unbalanced"),
+            ]:
+                self._mqtt_publish_discovery(
+                    uid,
+                    name,
+                    "kWh",
+                    icon,
+                    None,
+                    "measurement",
+                    json_attributes_topic=f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{uid}/attributes",
+                )
         # Anomaly detection sensor (#39)
         _anomaly_attrs_topic = (
             f"{self._mqtt_discovery_prefix}/energy_forecast"
@@ -2462,6 +2477,10 @@ class EnergyForecast(hass.Hass):
         aggregated["mae_30d_pct"] = mae_30d_pct
         aggregated["mae_7d_n_pairs"] = n_7d
         aggregated["mae_30d_n_pairs"] = n_30d
+        try:
+            aggregated.update(_accuracy_windows(self._pred_history, self._actuals_history, now_ts))
+        except Exception as exc:  # never let the new metrics stop the forecast publish
+            _LOGGER.warning("Accuracy metrics failed: %s", exc)
         aggregated["is_anomaly"] = is_anomaly
         aggregated["anomaly_residual"] = anomaly_residual
         aggregated["anomaly_std"] = anomaly_std
@@ -2716,6 +2735,11 @@ class EnergyForecast(hass.Hass):
             # Relative MAE sensors (#54)
             "sensor.energy_forecast_relative_mae_7d",
             "sensor.energy_forecast_relative_mae_30d",
+            # Block / daily accuracy sensors (#114)
+            "sensor.energy_forecast_block_mae_7d",
+            "sensor.energy_forecast_block_mae_30d",
+            "sensor.energy_forecast_daily_bias_7d",
+            "sensor.energy_forecast_daily_bias_30d",
             # Anomaly detection sensor (#39)
             "binary_sensor.energy_forecast_unusual_consumption",
             # Interval sensors
@@ -3145,6 +3169,73 @@ class EnergyForecast(hass.Hass):
                     replace=True,
                 )
 
+        # ── Block / daily accuracy sensors (#114) ───────────────────────────────
+        def _acc_num(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        def _acc_attr(v: Any) -> Any:
+            f = _acc_num(v)
+            return round(f, 3) if math.isfinite(f) else None
+
+        for _w in ("7d", "30d"):
+            acc = data.get(f"accuracy_{_w}") or {}
+            block_attrs = {
+                "n_blocks": int(acc.get("n_blocks") or 0),
+                "naive_block_mae": _acc_attr(acc.get("naive_block_mae")),
+                "skill_vs_naive_pct": _acc_attr(acc.get("block_skill_pct")),
+                "hourly_mae": _acc_attr(acc.get("mae")),
+                "hourly_naive_mae": _acc_attr(acc.get("naive_mae")),
+                "hourly_skill_vs_naive_pct": _acc_attr(acc.get("skill_pct")),
+                "block_hours": 3,
+            }
+            bias_attrs = {
+                "bias_pct": _acc_attr(acc.get("daily_bias_pct")),
+                "daily_abs_error": _acc_attr(acc.get("daily_abs_error")),
+                "n_days": int(acc.get("n_days") or 0),
+            }
+            for uid, label, icon, val, decimals, attrs in [
+                (
+                    f"energy_forecast_block_mae_{_w}",
+                    f"Block MAE {_w}",
+                    "mdi:chart-timeline-variant",
+                    _acc_num(acc.get("block_mae")),
+                    4,
+                    block_attrs,
+                ),
+                (
+                    f"energy_forecast_daily_bias_{_w}",
+                    f"Daily Bias {_w}",
+                    "mdi:scale-unbalanced",
+                    _acc_num(acc.get("daily_bias")),
+                    3,
+                    bias_attrs,
+                ),
+            ]:
+                invalid = math.isnan(val) or math.isinf(val)
+                if self._mqtt_discovery:
+                    if invalid:
+                        self._mqtt_set_sensor_raw(uid, "unavailable")
+                    else:
+                        self._mqtt_set_sensor(uid, round(val, decimals))
+                    self._mqtt_publish_sensor_attributes(uid, attrs)
+                else:
+                    self.set_state(
+                        f"sensor.{uid}",
+                        state="unavailable" if invalid else f"{val:.{decimals}f}",
+                        attributes={
+                            "unit_of_measurement": "kWh",
+                            "friendly_name": f"Energy Forecast {label}",
+                            "unique_id": uid,
+                            "icon": icon,
+                            "attribution": ATTRIBUTION,
+                            **attrs,
+                        },
+                        replace=True,
+                    )
+
         # ── Anomaly detection sensor (#39) ────────────────────────────────────
         is_anomaly = data.get("is_anomaly", False)
         anomaly_attrs = {
@@ -3467,6 +3558,20 @@ class EnergyForecast(hass.Hass):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _accuracy_windows(pred_history: dict, actuals_history: dict, now_ts: pd.Timestamp) -> dict[str, dict]:
+    """Block/daily/naive accuracy summaries over the trailing 7 days and the full history (#114)."""
+    import pandas as pd
+
+    since_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
+    # The 30-day window relies on _pred_history/_actuals_history being pruned to 30 days (same as mae_30d). The naive
+    # baseline is thin at its start: actuals are pruned to 30 days too, so the first 2 days have no naive and days
+    # 3-8 average fewer than 7 lookback days.
+    return {
+        "accuracy_7d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=since_7d)),
+        "accuracy_30d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=None)),
+    }
 
 
 def _tomorrow_local_date(now_local: Any) -> date:
