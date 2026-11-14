@@ -134,7 +134,7 @@ Both still simulate over `forecast_df`'s past tail, seeded with the latest tank 
 
 ### #114 — Report Block and Daily Accuracy, Not Just Hourly MAE
 
-**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** planned 2026-11-14, not started: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. The capture-frame scorer (`backtest/wf_score.py`) already has block, daily and naive metrics; what is left is the live sensors and the lean kit's summary.
+**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the definitions are pinned by a parity test.
 
 **Extended 2026-11-13:** also publish the naive same-hour mean (days −2..−8) MAE as a guardrail, and add the block, daily and naive columns to `backtest/score.py`. Evidence: scaling the replayed forecast by 0.8 improves hourly MAE by 6 % while bias goes to −2.5 kWh/day; daily error is best at scale 1.0. The naive mean ties current code on hourly MAE and is 10–16 % worse on 3 h blocks.
 
@@ -624,7 +624,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 111 | Horizon-consistent model shadow trial | — | — | **parked 2026-11-13** — reopen only on a 3 h-block win on #119 |
 | 112 | Live vs replay gap | — | — | **closed 2026-11-13** — input difference; round trips exact |
 | 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | **blocker for Phase 2** — planned (batch phase 4) |
-| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — planned (batch phase 2), after #117 |
+| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — implemented on `train/next` (2026-11-14), not deployed |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
 | 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
 | 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — implemented on `train/next` (2026-11-14), not deployed |

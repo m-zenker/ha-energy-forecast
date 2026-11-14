@@ -107,6 +107,8 @@ physics state is the capture's at every cutoff; days before a sensor existed hav
 - The CI treats each fold's trained model as fixed, so it **excludes training randomness**. Seed-only arms can get
   CIs that exclude 0. Count an effect only when the CI excludes 0 **and** the arm is outside the floor.
 - `bias` / `|bias|` are kWh/day; `mae` is kWh/h.
+- `mae3` is the 3 h-block MAE (kWh per block; clock-aligned blocks with all 3 hours scored) and `dMAE3%` its paired difference against base. Same definition as the live `block_mae_*` sensors. Result files from before this column existed show it empty.
+- The `naive same-hour mean` line under each segment header is the guardrail: mean of the same hour on days −2..−8, scored on the reference arm's hours (`mae` in kWh/h, `mae3` in kWh per block). An arm that does not beat it is not adding value.
 - The ALL / COLD / WARM segments split on a daily mean temperature of ≤ 10 °C.
 
 ## Accepted risks
