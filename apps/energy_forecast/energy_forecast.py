@@ -3657,6 +3657,33 @@ def _subtract_sub_sensors(
     return df, removed_kwh
 
 
+def _scoring_actuals(
+    full_actuals: Any,
+    sub_sensors_dict: dict[str, Any] | None,
+    ev_excluded: set,
+    ev_sensor_kwh: dict,
+    completed_cutoff: Any,
+) -> dict:
+    """Per-hour actuals for MAE/bias scoring, using the training-target definition (#117).
+
+    Appliance sub-meter energy is subtracted (floored at 0), then wallbox EV kWh is
+    subtracted (floored at 0).  EV-excluded hours and hours at/after ``completed_cutoff``
+    are skipped.  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    corrected, _ = _subtract_sub_sensors(full_actuals, sub_sensors_dict)
+    out: dict = {}
+    for ts, kwh in zip(
+        pd.to_datetime(corrected["timestamp"]).dt.floor("1h"),
+        corrected["gross_kwh"].astype(float),
+    ):
+        if ts >= completed_cutoff or ts in ev_excluded:
+            continue
+        out[ts] = max(0.0, kwh - ev_sensor_kwh.get(ts, 0.0))
+    return out
+
+
 def _blend_today_totals(
     p_times: Any,  # np.ndarray of datetime64[ns] — prediction timestamps
     p_vals: Any,  # np.ndarray of float — predicted kWh per hour

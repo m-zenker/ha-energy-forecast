@@ -5064,3 +5064,52 @@ class TestRegimeLog:
         with caplog.at_level("WARNING", logger="energy_forecast"):
             _append_regime_log(tmp_path / "x.jsonl", {"a": 1})
         assert any("regime" in r.message.lower() for r in caplog.records)
+
+
+class TestScoringActuals:
+    """ROADMAP #117: stored actuals use the training-target definition."""
+
+    T0 = pd.Timestamp("2026-11-10 08:00")
+
+    def _full(self, kwh):
+        return pd.DataFrame({"timestamp": pd.date_range(self.T0, periods=len(kwh), freq="1h"), "gross_kwh": kwh})
+
+    def _sub(self, kwh):
+        return pd.DataFrame({"timestamp": pd.date_range(self.T0, periods=len(kwh), freq="1h"), "kwh": kwh})
+
+    def test_appliance_run_is_subtracted(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        out = _scoring_actuals(
+            self._full([1.0, 2.5, 1.0]),
+            {"sub_dw": self._sub([0.0, 1.2, 0.0])},
+            set(),
+            {},
+            self.T0 + pd.Timedelta(hours=3),
+        )
+        assert out == pytest.approx(
+            {self.T0: 1.0, self.T0 + pd.Timedelta(hours=1): 1.3, self.T0 + pd.Timedelta(hours=2): 1.0}
+        )
+
+    def test_no_sub_sensors_keeps_values(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        out = _scoring_actuals(self._full([1.0, 2.5]), None, set(), {}, self.T0 + pd.Timedelta(hours=2))
+        assert list(out.values()) == [1.0, 2.5]
+
+    def test_floor_at_zero_and_ev_sensor_also_subtracted(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        t1 = self.T0 + pd.Timedelta(hours=1)
+        out = _scoring_actuals(
+            self._full([0.5, 9.0]), {"sub_dw": self._sub([0.8, 1.0])}, set(), {t1: 7.0}, self.T0 + pd.Timedelta(hours=2)
+        )
+        assert out[self.T0] == 0.0
+        assert out[t1] == pytest.approx(1.0)
+
+    def test_ev_excluded_and_incomplete_hours_are_not_stored(self):
+        from energy_forecast.energy_forecast import _scoring_actuals
+
+        t1 = self.T0 + pd.Timedelta(hours=1)
+        out = _scoring_actuals(self._full([1.0, 6.0, 1.0]), None, {t1}, {}, self.T0 + pd.Timedelta(hours=2))
+        assert list(out) == [self.T0]  # t1 is EV-excluded, t2 is the open hour
