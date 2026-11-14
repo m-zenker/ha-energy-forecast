@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **dev v0.12.0-alpha-39** (2026-11-13, deployed, 1463 tests) · **main v0.11.18** (2026-10-26).
+Current: **dev v0.12.0-alpha-40** (2026-11-14, deployed, 1518 tests) · **main v0.11.18** (2026-10-26).
 
 ---
 
@@ -14,7 +14,7 @@ Start here. Everything below this section is detail and history.
 |---|---|---|---|---|
 | 1 | Owner decisions: batch decisions D1–D8 (`docs/superpowers/plans/2026-11-14-audit-batch-index.md`) and the #105 go-live criteria (`docs/superpowers/specs/2026-11-14-105-go-live-criteria.md`) | owner | **done** 2026-11-14 | — |
 | 2 | Dated checks: alpha-34 override verification (due about 2026-11-14, HA keeps ~10 days of history); #110 regime stability check, `scripts/check_regime_stability.py`, **no later than 2026-11-21** | owner / PM | open | — |
-| 3 | Ship the current train (b03b19d: #119 backtest capture frame, tooling only) | `/pm evening` | ready | — |
+| 3 | Ship the current train (#117, #114, #119) | `/pm evening` | **done** — alpha-40 2026-11-14 (e784479); verify #117 migration log line and #114 sensors at the next dawn check | — |
 | 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **ready to start** | — |
 | 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | **ready to start** | can run beside track A |
 | 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **ready to start** | independent |
@@ -38,7 +38,7 @@ Start here. Everything below this section is detail and history.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
+**dev:** v0.12.0-alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
 
 **Cold-onset over-forecast (2026-10-15): C verdict PASSED 2026-10-27 (pooled); A+B re-baseline FAILED the bias criterion 2026-11-03 — see the re-baseline paragraph below.** `mae_7d` jumped 0.196 → 0.477 after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term and compared every room to one shared setpoint. **C Task 1** (alpha-26, 2026-10-16): thermostat floor + per-room setpoint; replay 2026-10-08..14 MAE 24–47 h 0.485 → 0.255. **D Task 1** (alpha-25, 2026-10-16): `heating_power_request` valve demand cached in `climate_*.csv`; the ≥ 14 valve-closed-night data gate was met 2026-10-21.
 - **C check 2026-10-21: NOT MET.** 10-17 −2.2 (pass), 10-18 +6.2 and 10-19 +4.7 kWh/day (fail); pooled ≈ +3.5 vs +5.9 before C; point-in-band 87.5 % (< 90 %). Night hours (22–03 h) over-forecast ≈ 0.3–0.5 kWh/h.
@@ -134,7 +134,7 @@ Both still simulate over `forecast_df`'s past tail, seeded with the latest tank 
 
 ### #114 — Report Block and Daily Accuracy, Not Just Hourly MAE
 
-**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the naive same-hour mean is pinned by a parity test against `wf_score` and the per-hour definitions mirror it.
+**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** shipped alpha-40 (2026-11-14), live verification pending. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the naive same-hour mean is pinned by a parity test against `wf_score` and the per-hour definitions mirror it.
 
 **Extended 2026-11-13:** also publish the naive same-hour mean (days −2..−8) MAE as a guardrail, and add the block, daily and naive columns to `backtest/score.py`. Evidence: scaling the replayed forecast by 0.8 improves hourly MAE by 6 % while bias goes to −2.5 kWh/day; daily error is best at scale 1.0. The naive mean ties current code on hourly MAE and is 10–16 % worse on 3 h blocks.
 
@@ -162,7 +162,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #117 — Scoring Bug: Stored Actuals Include Appliance Energy
 
-**Priority:** High. **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
+**Priority:** High. **Status:** shipped alpha-40 (2026-11-14), live verification pending. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
 
 With `baseline_mode: true` the model trains on consumption minus the dishwasher, washer and tumbler sub-meters, but `_actuals_history` is filled from `full_actuals` before that subtraction (`energy_forecast.py:2306-2326`; the comment there says they match). The difference correlates 0.995 with the appliance sub-meters on 771 of 772 hours and is 0.79 kWh/day. Hourly MAE barely moves (0.474 → 0.468), but every bias reading is about 0.8 kWh/day too low: live bias over 32 days is +2.26 against the true target, not +1.47. The naive comparisons made on `pred_history` actuals carry the same error.
 
@@ -178,7 +178,7 @@ New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption,
 
 ### #119 — Backtest Capture-Frame Mode
 
-**Priority:** — . **Status:** DONE on `train/next` (b03b19d, 2026-11-13): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Not yet on `dev`. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
+**Priority:** — . **Status:** DONE, shipped alpha-40 (2026-11-14; b03b19d): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Not yet on `dev`. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
 
 Walk-forward on a retrain capture: truncate the captured live inputs at each cutoff, synthesize the serve inputs, run the real `train()` / `predict()` / `predict_intervals()`. Validated against live: serve inputs within 0.007 kWh/h, retrain at the capture time identical. Scores 3 h-block and daily error, cold-day bias, interval coverage, next-day swing and a jitter arm (same model retrained 1 h earlier) as the noise floor: ±1 % hourly, ±2 % on 3 h blocks, up to ±13 % on daily |bias|. Replaces plan 2 of the parked live-equivalent-frame spec (`docs/superpowers/specs/2026-11-11-live-equivalent-frame-105-gate-design.md`). Needs `/home/jovyan/my_envs/ha-energy-forecast-live`. Also: `scripts/pull_ha_data.py` must pull `.pre/`.
 
@@ -624,12 +624,12 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 111 | Horizon-consistent model shadow trial | — | — | **parked 2026-11-13** — reopen only on a 3 h-block win on #119 |
 | 112 | Live vs replay gap | — | — | **closed 2026-11-13** — input difference; round trips exact |
 | 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | **blocker for Phase 2** — planned (batch phase 4) |
-| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — implemented on `train/next` (2026-11-14), not deployed |
+| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — shipped alpha-40 (2026-11-14), live verification pending |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
 | 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
-| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — implemented on `train/next` (2026-11-14), not deployed |
+| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — shipped alpha-40 (2026-11-14), live verification pending |
 | 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — planned (batch phase 3) |
-| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done** on `train/next` 2026-11-13 (b03b19d), not yet on `dev` |
+| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
 | 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag planned (batch phase 5); 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
