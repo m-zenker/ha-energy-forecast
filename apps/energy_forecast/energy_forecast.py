@@ -34,7 +34,7 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, capture, ha_data, heating_season, weather
+from . import __version__, accuracy, capture, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
     CAPTURE_DIR,
@@ -2462,6 +2462,10 @@ class EnergyForecast(hass.Hass):
         aggregated["mae_30d_pct"] = mae_30d_pct
         aggregated["mae_7d_n_pairs"] = n_7d
         aggregated["mae_30d_n_pairs"] = n_30d
+        try:
+            aggregated.update(_accuracy_windows(self._pred_history, self._actuals_history, now_ts))
+        except Exception as exc:  # never let the new metrics stop the forecast publish
+            _LOGGER.warning("Accuracy metrics failed: %s", exc)
         aggregated["is_anomaly"] = is_anomaly
         aggregated["anomaly_residual"] = anomaly_residual
         aggregated["anomaly_std"] = anomaly_std
@@ -3467,6 +3471,17 @@ class EnergyForecast(hass.Hass):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _accuracy_windows(pred_history: dict, actuals_history: dict, now_ts: pd.Timestamp) -> dict[str, dict]:
+    """Block/daily/naive accuracy summaries over the trailing 7 days and the full history (#114)."""
+    import pandas as pd
+
+    since_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
+    return {
+        "accuracy_7d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=since_7d)),
+        "accuracy_30d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=None)),
+    }
 
 
 def _tomorrow_local_date(now_local: Any) -> date:

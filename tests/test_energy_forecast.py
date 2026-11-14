@@ -4818,6 +4818,27 @@ class TestUpdateSensorsActualsBasis:
         assert self._cycle(stub, caplog) == []  # flag already True: no migration step
         assert all(stub._actuals_history[t] == pytest.approx(3.0) for t in self._hours(47, 1))
 
+    def test_accuracy_failure_logs_warning_and_does_not_propagate(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import energy_forecast.energy_forecast as ef_mod
+
+        def boom(*a, **kw):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(ef_mod, "_accuracy_windows", boom)
+        stub = self._setup(monkeypatch, tmp_path)
+        stub._actuals_on_target_basis = True
+        stub._actuals_history = {}
+        self._serve(47, 1, {"sensor.sub_a": 1.0})
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            ef_mod.EnergyForecast._update_sensors(stub)  # must not raise
+        msgs = [r.getMessage() for r in caplog.records if "Accuracy metrics failed" in r.getMessage()]
+        assert len(msgs) == 1 and "kaboom" in msgs[0]
+        assert stub.set_state_calls, "forecast publish must still happen"
+
 
 class TestRetrainEvCachePathBug:
     """Regression test for GitHub discussion #15 (2026-07-10): configuring
@@ -5212,3 +5233,17 @@ class TestScoringActuals:
 
         new, done = _migrate_actuals_to_target({self.T0: 2.0}, None, set())
         assert done is True and new == {self.T0: 2.0}
+
+
+def test_accuracy_windows_helper():
+    from energy_forecast.energy_forecast import _accuracy_windows
+
+    now = pd.Timestamp("2026-11-14 10:00")
+    hours = pd.date_range(now - pd.Timedelta(days=20), now - pd.Timedelta(hours=1), freq="1h")
+    actual = {ts: 2.0 for ts in hours}
+    pred = {ts: 2.5 for ts in hours}
+    out = _accuracy_windows(pred, actual, now)
+    assert set(out) == {"accuracy_7d", "accuracy_30d"}
+    assert out["accuracy_7d"]["n_hours"] == 7 * 24
+    assert out["accuracy_30d"]["n_hours"] == len(hours)
+    assert out["accuracy_7d"]["block_mae"] == pytest.approx(1.5)
