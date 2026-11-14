@@ -71,13 +71,17 @@ def _segment_table(df: pd.DataFrame, ref: str) -> pd.DataFrame:
             mae=sub["mae"].mean(),
             bias=sub["bias"].mean(),
             abs_bias=sub["bias"].abs().mean(),
+            **{c: (sub[c].mean() if c in sub else np.nan) for c in ("mae3", "naive_mae", "naive_mae3")},
         )
+        row["mae3_pct"] = np.nan
         if arm == ref:
             row.update(pct=np.nan, lo_pct=np.nan, hi_pct=np.nan, worse_days=np.nan, fold_sign="", abs_bias_pct=np.nan)
         else:
             b = paired_bootstrap(df, arm, ref)
             row.update({k: b[k] for k in ("pct", "lo_pct", "hi_pct", "worse_days", "fold_sign")})
             row["abs_bias_pct"] = paired_bootstrap(df, arm, ref, col="abs_bias")["pct"]
+            if "mae3" in df:
+                row["mae3_pct"] = paired_bootstrap(df, arm, ref, col="mae3")["pct"]
         rows[arm] = row
     return pd.DataFrame.from_dict(rows, orient="index")
 
@@ -103,8 +107,13 @@ def format_summary(tables: dict[str, pd.DataFrame], header: Sequence[str] = (), 
         floor = float(t.loc[seed_arms, "pct"].abs().max()) if seed_arms else None  # per segment: spread differs
         if floor is not None:
             lines.append(f"  seed noise floor: ±{floor:.1f} % (arms marked ~ are inside it)")
+        if ref in t.index and not (np.isnan(t.loc[ref, "naive_mae"]) and np.isnan(t.loc[ref, "naive_mae3"])):
+            lines.append(
+                f"  naive same-hour mean (ref hours): mae {t.loc[ref, 'naive_mae']:.3f}  "
+                f"mae3 {t.loc[ref, 'naive_mae3']:.3f}"
+            )
         lines.append(
-            f"  {'arm':<14}{'days':>5}{'mae':>8}{'bias':>8}{'|bias|':>8}{'dMAE%':>8}"
+            f"  {'arm':<14}{'days':>5}{'mae':>8}{'mae3':>8}{'bias':>8}{'|bias|':>8}{'dMAE%':>8}{'dMAE3%':>8}"
             f"{'95% CI':>18}{'worse':>7}{'folds':>7}{'d|bias|%':>10}"
         )
         for arm, r in t.iterrows():
@@ -112,9 +121,11 @@ def format_summary(tables: dict[str, pd.DataFrame], header: Sequence[str] = (), 
             ci = "" if np.isnan(r["lo_pct"]) else f"[{r['lo_pct']:+.1f},{r['hi_pct']:+.1f}]"
             pct = "" if np.isnan(r["pct"]) else f"{r['pct']:+.1f}"
             worse = "" if np.isnan(r["worse_days"]) else f"{int(r['worse_days'])}"
+            pct3 = "" if np.isnan(r["mae3_pct"]) else f"{r['mae3_pct']:+.1f}"
+            mae3 = "" if np.isnan(r["mae3"]) else f"{r['mae3']:.3f}"
             dab = "" if np.isnan(r["abs_bias_pct"]) else f"{r['abs_bias_pct']:+.1f}"
             lines.append(
-                f"{mark} {arm:<14}{int(r['n_days']):>5}{r['mae']:>8.3f}{r['bias']:>8.2f}{r['abs_bias']:>8.2f}"
-                f"{pct:>8}{ci:>18}{worse:>7}{r['fold_sign']:>7}{dab:>10}"
+                f"{mark} {arm:<14}{int(r['n_days']):>5}{r['mae']:>8.3f}{mae3:>8}{r['bias']:>8.2f}{r['abs_bias']:>8.2f}"
+                f"{pct:>8}{pct3:>8}{ci:>18}{worse:>7}{r['fold_sign']:>7}{dab:>10}"
             )
     return "\n".join(lines)
