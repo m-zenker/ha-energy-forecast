@@ -508,6 +508,8 @@ class EnergyForecast(hass.Hass):
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float] = {}
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
+        self._actuals_on_target_basis: bool = True  # False until legacy gross actuals are migrated (#117)
+        self._actuals_migration_warned: frozenset = frozenset()  # dedupe: missing-prefix set already warned about
         self._last_adaptive_retrain: datetime = datetime.min
 
         # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
@@ -2303,27 +2305,60 @@ class EnergyForecast(hass.Hass):
         # ── Store predictions for adaptive retrain tracking ───────────────────
         self._pred_history = _accumulate_pred_history(self._pred_history, predictions, now_ts)
 
-        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
+        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41, #117) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
-        # Use full_actuals (pre-split, pre-sub-sensor-subtraction, but target-corrected)
-        # so stored kWh matches the training target on non-EV hours.
+        # Stored kWh = target-corrected consumption minus the baseline_mode sub-meters
+        # (same set as the training target) minus wallbox EV kWh.
         # Wallbox-sensor EV hours are stored net of the exact wallbox kWh; threshold-inferred
         # EV hours (+-1 h) are excluded. Keep-last means a late wallbox reading self-corrects.
+        # While the one-time migration is pending, history stays GROSS (no sub-meter
+        # subtraction) so the migration converts every stored hour exactly once.
+        _score_subs = (
+            self._subtract_only_dict(sub_sensors_recent) if (self._baseline_mode and sub_sensors_recent) else None
+        )
+        if not self._actuals_on_target_basis:
+            if self._baseline_mode:
+                _expected = {self._sub_sensor_prefix(e) for e in self._sub_energy_sensors} - {
+                    self._sub_sensor_prefix(e) for e in self._baseline_included_sensors
+                }
+            else:
+                _expected = set()
+            _migrated, _done = _migrate_actuals_to_target(self._actuals_history, _score_subs, _expected)
+            if not _done:
+                _missing = frozenset(_missing_sub_prefixes(_score_subs, _expected))
+                if _missing != self._actuals_migration_warned:
+                    self._actuals_migration_warned = _missing
+                    _LOGGER.warning(
+                        "Actuals migration to the training-target basis is waiting for sub-meter history: %s; "
+                        "scoring stays on the old basis until it loads",
+                        ", ".join(sorted(_missing)),
+                    )
+            else:
+                self._actuals_migration_warned = frozenset()
+                _removed = sum(self._actuals_history.get(k, 0.0) - v for k, v in _migrated.items())
+                self._actuals_history = _migrated
+                self._actuals_on_target_basis = True
+                _LOGGER.info(
+                    "Stored actuals migrated to the training-target basis "
+                    "(%d hours, %.2f kWh appliance energy removed)",
+                    len(_migrated),
+                    _removed,
+                )
         if full_actuals is not None and not full_actuals.empty:
-            completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
             # Retroactively evict EV hours + neighbors already in actuals_history.
             # Handles stale partials stored before the session was fully detected and
             # ramp-down hours stored before adjacent exclusion kicked in.
             for _ts in ev_mae_excluded:
                 self._actuals_history.pop(_ts, None)
-            for _ts, _kwh in zip(
-                pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
-                full_actuals["gross_kwh"].astype(float),
-            ):
-                if _ts >= completed_cutoff:  # skip current (partial) hour
-                    continue
-                if _ts not in ev_mae_excluded:
-                    self._actuals_history[_ts] = max(0.0, _kwh - ev_sensor_kwh.get(_ts, 0.0))
+            self._actuals_history.update(
+                _scoring_actuals(
+                    full_actuals,
+                    _score_subs if self._actuals_on_target_basis else None,
+                    ev_mae_excluded,
+                    ev_sensor_kwh,
+                    now_ts.floor("1h"),
+                )
+            )
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items() if pd.Timestamp(ts) >= actuals_cutoff
@@ -3352,6 +3387,8 @@ class EnergyForecast(hass.Hass):
             _LOGGER.warning("Failed to load pred_history: %s", exc)
             return
 
+        self._actuals_on_target_basis = data.get("actuals_basis") == "target"
+
         try:
             now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
             cutoff = now.floor("1h") - pd.Timedelta(days=30)
@@ -3385,6 +3422,7 @@ class EnergyForecast(hass.Hass):
             data = {
                 "pred": {ts.isoformat(): float(kwh) for ts, kwh in self._pred_history.items()},
                 "actuals": {ts.isoformat(): float(kwh) for ts, kwh in self._actuals_history.items()},
+                "actuals_basis": "target" if self._actuals_on_target_basis else "gross",
             }
             tmp_path = PRED_HISTORY_PATH.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:
@@ -3655,6 +3693,66 @@ def _subtract_sub_sensors(
     removed_kwh = float(sub_total.sum())
     df[column] = (df[column] - sub_total.values).clip(lower=0.0)
     return df, removed_kwh
+
+
+def _scoring_actuals(
+    full_actuals: Any,
+    sub_sensors_dict: dict[str, Any] | None,
+    ev_excluded: set,
+    ev_sensor_kwh: dict,
+    completed_cutoff: Any,
+) -> dict:
+    """Per-hour actuals for MAE/bias scoring, using the training-target definition (#117).
+
+    Appliance sub-meter energy is subtracted (floored at 0), then wallbox EV kWh is
+    subtracted (floored at 0).  EV-excluded hours and hours at/after ``completed_cutoff``
+    are skipped.  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    corrected, _ = _subtract_sub_sensors(full_actuals, sub_sensors_dict)
+    out: dict = {}
+    for ts, kwh in zip(
+        pd.to_datetime(corrected["timestamp"]).dt.floor("1h"),
+        corrected["gross_kwh"].astype(float),
+    ):
+        if ts >= completed_cutoff or ts in ev_excluded:
+            continue
+        out[ts] = max(0.0, kwh - ev_sensor_kwh.get(ts, 0.0))
+    return out
+
+
+def _missing_sub_prefixes(sub_sensors_dict: dict[str, Any] | None, expected_prefixes: set[str]) -> set[str]:
+    """Expected sub-sensor prefixes whose frame is missing or empty (history not loaded yet)."""
+    subs = sub_sensors_dict or {}
+    return {p for p in expected_prefixes if subs.get(p) is None or subs[p].empty}
+
+
+def _migrate_actuals_to_target(
+    actuals_history: dict,
+    sub_sensors_dict: dict[str, Any] | None,
+    expected_prefixes: set[str],
+) -> tuple[dict, bool]:
+    """One-time conversion of stored gross actuals to the training-target basis (#117).
+
+    Returns ``(new_history, done)``.  ``done`` is False and the history is returned
+    unchanged while any expected sub-sensor prefix is missing or has an empty frame
+    (sub-sensor history not loaded yet).  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    if not expected_prefixes:
+        return dict(actuals_history), True
+    subs = sub_sensors_dict or {}
+    if _missing_sub_prefixes(subs, expected_prefixes):
+        return dict(actuals_history), False
+    if not actuals_history:
+        return {}, True
+
+    stamps = list(actuals_history)
+    df = pd.DataFrame({"timestamp": stamps, "gross_kwh": [float(actuals_history[t]) for t in stamps]})
+    corrected, _ = _subtract_sub_sensors(df, {p: subs[p] for p in expected_prefixes})
+    return dict(zip(stamps, corrected["gross_kwh"].astype(float))), True
 
 
 def _blend_today_totals(

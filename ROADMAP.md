@@ -162,7 +162,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #117 — Scoring Bug: Stored Actuals Include Appliance Energy
 
-**Priority:** High. **Status:** confirmed 2026-11-13; not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
+**Priority:** High. **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
 
 With `baseline_mode: true` the model trains on consumption minus the dishwasher, washer and tumbler sub-meters, but `_actuals_history` is filled from `full_actuals` before that subtraction (`energy_forecast.py:2306-2326`; the comment there says they match). The difference correlates 0.995 with the appliance sub-meters on 771 of 772 hours and is 0.79 kWh/day. Hourly MAE barely moves (0.474 → 0.468), but every bias reading is about 0.8 kWh/day too low: live bias over 32 days is +2.26 against the true target, not +1.47. The naive comparisons made on `pred_history` actuals carry the same error.
 
@@ -627,7 +627,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — planned (batch phase 2), after #117 |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
 | 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
-| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — planned (batch phase 1) |
+| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — implemented on `train/next` (2026-11-14), not deployed |
 | 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — planned (batch phase 3) |
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done** on `train/next` 2026-11-13 (b03b19d), not yet on `dev` |
 | 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag planned (batch phase 5); 14-day shadow earliest 2026-11-27 |
