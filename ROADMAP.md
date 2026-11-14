@@ -4,6 +4,38 @@ Current: **dev v0.12.0-alpha-39** (2026-11-13, deployed, 1463 tests) · **main v
 
 ---
 
+## Next Steps (as of 2026-11-14)
+
+Start here. Everything below this section is detail and history.
+
+**The situation in one paragraph.** The 2026-11-13 audit found the forecast at its hourly day-ahead floor; no model change beat current code. What is wrong is the measurement: stored actuals include appliance energy, the sensors report only hourly MAE, and the cold-day gate did not scale with load. So the next work fixes the yardstick, then removes two blockers behind it. #105 (daily `UA_eff`) waits for that.
+
+| # | Step | Who | Status | Depends on |
+|---|---|---|---|---|
+| 1 | Owner decisions: batch decisions D1–D8 (`docs/superpowers/plans/2026-11-14-audit-batch-index.md`) and the #105 go-live criteria (`docs/superpowers/specs/2026-11-14-105-go-live-criteria.md`) | owner | **done** 2026-11-14 | — |
+| 2 | Dated checks: alpha-34 override verification (due about 2026-11-14, HA keeps ~10 days of history); #110 regime stability check, `scripts/check_regime_stability.py`, **no later than 2026-11-21** | owner / PM | open | — |
+| 3 | Ship the current train (b03b19d: #119 backtest capture frame, tooling only) | `/pm evening` | ready | — |
+| 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **ready to start** | — |
+| 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | **ready to start** | can run beside track A |
+| 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **ready to start** | independent |
+| 7 | Ship the batch; check that `pred_history.json` carries `"actuals_basis": "target"` and note the timestamp at which `mae_*` step | `/pm evening` | — | steps 4–6 |
+| 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
+| 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
+| 10 | #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
+| 11 | #124 verify override history against the tank before training replay | plan to be written (small, hef only) | investigated 2026-11-14 | none; after the batch |
+| 12 | #121, #122, #123 | — | as capacity allows | #122 needs ≥ 5 overrides in the captures |
+
+**Rules that apply to all of it.**
+- Judge changes on 3 h-block MAE and daily bias; hourly MAE is secondary (Design Decisions).
+- One forecast-changing step per deploy window. Steps 4–6 do not change the published forecast at default config; the #120 flip (step 9) and #105 (step 10) do, and each gets its own window.
+- Phase 2 (`use_physics_residual`) stays off. #113 removes a crash; activation still needs a per-season check.
+
+**Open decision, not scheduled:** physics release strategy (v0.12.0 opt-in on `main`, or more cherry-picks). `dev` is over 110 commits ahead of `main` and this batch adds six branches.
+
+**Parked or closed, so not on this list:** #111 (parked), #112 and #115 (closed), #96 cooling mode (parked 2026-11-09), #103 and #106 (demoted, need a new justification), HACS items #46/#16/#18.
+
+---
+
 ## Current Status
 
 **dev:** v0.12.0-alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
@@ -94,7 +126,7 @@ The same code replayed offline beats live: 0.359 vs 0.463 (686 h); 0.448 vs 0.50
 
 ### #113 — Physics Past Tail in `predict_series` / `predict_scenario`
 
-**Priority:** **Blocker for Phase 2** (raised 2026-11-13). **Status:** confirmed by replay; not fixed.
+**Priority:** **Blocker for Phase 2** (raised 2026-11-13). **Status:** confirmed by replay; not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-4-phase2-reconstruction-past-tail.md`.
 
 **Added 2026-11-13:** `predict()` adds a physics baseline indexed on the whole forecast frame to the 48 predictions (`model.py:1395-1405`). With any frame that is not 48 rows it raises `operands could not be broadcast together with shapes (170,) (48,)`, falls back to "ML-only" and publishes the bare residual: 26.4 instead of 36.4 kWh over 48 h in the replay. `predict_intervals()` never adds the baseline. Unit tests pass because they use 48-row frames. Fix both and add a regression test with a 170-row frame before `use_physics_residual` is turned on anywhere.
 
@@ -102,7 +134,7 @@ Both still simulate over `forecast_df`'s past tail, seeded with the latest tank 
 
 ### #114 — Report Block and Daily Accuracy, Not Just Hourly MAE
 
-**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** proposed.
+**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** planned 2026-11-14, not started: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. The capture-frame scorer (`backtest/wf_score.py`) already has block, daily and naive metrics; what is left is the live sensors and the lean kit's summary.
 
 **Extended 2026-11-13:** also publish the naive same-hour mean (days −2..−8) MAE as a guardrail, and add the block, daily and naive columns to `backtest/score.py`. Evidence: scaling the replayed forecast by 0.8 improves hourly MAE by 6 % while bias goes to −2.5 kWh/day; daily error is best at scale 1.0. The naive mean ties current code on hourly MAE and is 10–16 % worse on 3 h blocks.
 
@@ -118,7 +150,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #116 — Retrain Age Off by the UTC Offset (`last_trained` Is Local, Read as UTC)
 
-**Priority:** Low. **Status:** confirmed by code reading and the live log (2026-11-09); not fixed.
+**Priority:** Low. **Status:** confirmed by code reading and the live log (2026-11-09); not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-6-retrain-age-timezone.md`.
 
 **Note 2026-11-13:** in the audit's walk-forward, daily against weekly retraining made no accuracy difference on the dev windows (hourly −1.2 %, CI spans 0). Weekly had smaller next-day swings (0.88 against 1.41 kWh) but a worse 6 h-block result on the 9-day holdout (+15.6 %). No change to the cadence is planned.
 
@@ -130,7 +162,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #117 — Scoring Bug: Stored Actuals Include Appliance Energy
 
-**Priority:** High. **Status:** confirmed 2026-11-13; not fixed. Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
+**Priority:** High. **Status:** confirmed 2026-11-13; not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
 
 With `baseline_mode: true` the model trains on consumption minus the dishwasher, washer and tumbler sub-meters, but `_actuals_history` is filled from `full_actuals` before that subtraction (`energy_forecast.py:2306-2326`; the comment there says they match). The difference correlates 0.995 with the appliance sub-meters on 771 of 772 hours and is 0.79 kWh/day. Hourly MAE barely moves (0.474 → 0.468), but every bias reading is about 0.8 kWh/day too low: live bias over 32 days is +2.26 against the true target, not +1.47. The naive comparisons made on `pred_history` actuals carry the same error.
 
@@ -138,7 +170,7 @@ With `baseline_mode: true` the model trains on consumption minus the dishwasher,
 
 ### #118 — Replace the Cold-Day Bias Gate
 
-**Priority:** High. **Status:** decided 2026-11-13; gate script not updated.
+**Priority:** High. **Status:** decided 2026-11-13; `wf_score.cold_gate()` exists for walk-forward rows; the gate on live `pred_history.json` is planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-3-relative-cold-day-gate.md`. Cold day = daily mean ≤ 10 °C, as in the audit (owner, 2026-11-14); the old script's < 13.5 °C is dropped.
 
 New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption, over at least 14 cold days, on appliance-free actuals (#117). Fewer days is INCONCLUSIVE. It replaces [−3, +1] kWh/day, which was shaped around an expected −2 kWh/day residual from fix C. Reasons: load runs from about 16 kWh/day in autumn to over 30 in winter; a median-like forecast is expected to sit 5–7 % low; daily error is about 2 kWh, so a 7-day mean has a standard error near 0.75 kWh/day, and the retrain jitter alone moves daily |bias| by up to 13 %. Current code replayed: +0.49 kWh/day on 16 cold days in 10-01..11-03 (about +3 %); +1.76 on 7 cold days in 11-04..11-12 (about +9 %, inconclusive).
 
@@ -146,13 +178,13 @@ New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption,
 
 ### #119 — Backtest Capture-Frame Mode
 
-**Priority:** High (enabler for #105, #120 and any feature touching climate, tank or sub-meter inputs). **Status:** scratch version built and validated in the 2026-11-13 audit (`scripts/forecast_audit_2026_11_13/`, local); not in `backtest/`.
+**Priority:** — . **Status:** DONE on `train/next` (b03b19d, 2026-11-13): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Not yet on `dev`. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
 
 Walk-forward on a retrain capture: truncate the captured live inputs at each cutoff, synthesize the serve inputs, run the real `train()` / `predict()` / `predict_intervals()`. Validated against live: serve inputs within 0.007 kWh/h, retrain at the capture time identical. Scores 3 h-block and daily error, cold-day bias, interval coverage, next-day swing and a jitter arm (same model retrained 1 h earlier) as the noise floor: ±1 % hourly, ±2 % on 3 h blocks, up to ±13 % on daily |bias|. Replaces plan 2 of the parked live-equivalent-frame spec (`docs/superpowers/specs/2026-11-11-live-equivalent-frame-105-gate-design.md`). Needs `/home/jovyan/my_envs/ha-energy-forecast-live`. Also: `scripts/pull_ha_data.py` must pull `.pre/`.
 
 ### #120 — Drop the Thermal-Pressure Feature Family
 
-**Priority:** Medium. **Status:** simulated 2026-11-13; not implemented. Needs #119.
+**Priority:** Medium. **Status:** simulated 2026-11-13; not implemented. Flag and shadow tooling planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow itself needs ≥ 14 capture days after 2026-11-12.
 
 `thermal_pressure`, `_max`, `_std`, `_cop`, `_net` and `infiltration_pressure`: the served values have about zero correlation with the values later trained on (−0.06 at 24–47 h, −0.03 at 1–5 h), and a 0.4 K projected room deficit moved the 11-14 forecast between 25.0 and 31.4 kWh. Dropping them: hourly +0.2 % (CI −1.0..+1.3) and 3 h −0.4 % pooled over dev; holdout hourly −0.8 %, cold-day bias +0.95 against +1.76; spread of the next-day total across the previous day's four forecasts 1.25 → 0.57 kWh (Sep), 1.41 → 1.33 (Oct), 2.44 → 1.39 (holdout). Not testable on last winter (no climate data then).
 
@@ -181,6 +213,18 @@ With an override pending, each update adds about +1 kWh at the override hour, a 
 3. **Imputation:** short lags are filled with same-hour means, `lag_24h` and the sub-meter lags with medians (heating `lag_24h` served 0.001 against 0.185 trained), and `rolling_std_24h` is served as exactly 0. Use one rule.
 4. **Dead features:** 13 have zero gain (`physics_kwh`, `hours_ahead`, `heating_active`, `is_away`, `people_home`, the three holiday features, `likely_ev_hour`, `season`, `month_cos`, two sub-meter columns). `away_df` holds 10 days of zeros.
 5. **Weather source:** SRG wind runs about 45 % above the archive wind used in training, and SRG sunshine at 0–40 % of it. Accuracy effect 1–2 %; record only.
+
+### #124 — Verify Override History Against the Tank Before Training Replay
+
+**Priority:** Low-medium. **Status:** investigated 2026-11-14; no plan yet. hef only. Replaces the "phantom overrides need a cross-repo plan" note under #93.
+
+Training subtracts a DHW override delta for every non-cancelled entry in `override_history`. Of 48 past entries (2026-09-02..11-11), none is marked cancelled, and checked against the hourly tank temperature: 8 never ran (tank rise under 2 °C), 6 are same-day duplicates, 8 ran but stopped short of the committed target, 26 ran as committed.
+
+**Causes (code reading).** hef: `commit_dhw_schedule` replaces `committed_override[kind]` without cancelling the previous history entry, and dedups on (kind, date, hour), so each same-day legionella retry at a new hour adds an entry (12, 13, 14 h on 10-29 and 11-08). `ha-energy-manager`: a denied legionella start ignores a failed retry scheduling (`heat_pump.py` ≈ 6306), and an unsuccessful cycle does not notify hef. Not established: why the existing clear calls left no trace (the live log API returns only 100 lines).
+
+**Effect.** Replaying the real delta function with and without the 14 bad entries (constant 21 °C ambient, so an estimate): the training target differs on 37 of 1 867 hours, on 20 of 78 days, about 1.9 kWh moved per affected day, daily net near zero. Noon hours are about 1 kWh too low, evening hours too high. Timing only; same size class as #123.
+
+**Fix.** At training replay keep the last-committed entry per (kind, date) and verify it against the tank series: drop it when the tank did not rise ≥ 2 °C within hour..hour + 3 h, cap its target at the observed peak, keep it unchanged when tank data is missing. This also covers lost service calls. A clear-on-abandon in `ha-energy-manager` is optional. Size S. Details: `memory/project_dhw_override_phase_a.md`.
 
 ### #83 — Add `predicted_day_total` Feature (Temperature Regression)
 
@@ -552,7 +596,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 |---|------|--------|--------|----------|
 | 83 | `predicted_day_total` scale feature | medium | 3 h | low — degree-day total model was worse in winter in the 2026-11-13 audit; retest on #119 first |
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
-| 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | done — Phase A deployed 2026-08-27 (hef `v0.12.0-alpha-13`), exit gate passed 2026-09-18, Phase B live (EM). Open: 10 phantom overrides (7 legionella, 3 comfort boost; never executed, never cancelled) replayed in training reconstruction — needs a cross-repo plan, see `memory/project_dhw_override_phase_a.md` |
+| 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | done — Phase A deployed 2026-08-27 (hef `v0.12.0-alpha-13`), exit gate passed 2026-09-18, Phase B live (EM). Open follow-up moved to #124 (override entries that never ran are replayed in training) |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | low — inputs degenerate at day-ahead lead; retest first |
 | 88 | Temperature-similarity sample weighting | low-medium | 3 h | low-medium — re-scoped: test on #119 with the cold-onset stability metric |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
@@ -571,7 +615,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 102 | Cold-onset B: EV wallbox-sensor hours no longer treated as contamination (`fix/ev-sensor-trust`) | small MAE gain, more training/MAE coverage | 2–3 h | **deployed 2026-10-27** with A (alpha-32); `mae_*` jumped at deploy by construction |
 | 103 | Cold-onset C Task 4: opt-in `heat_loss_deg` feature (steady-state heat-loss gradient) | targets the expected ≈ −2 kWh/day residual | 3–4 h | gated — own branch, backtest + paired sign test, flag on only after ≥ 14 cold days of C baseline **2026-11-13:** demoted to low. The ≈ −2 kWh/day residual it targets is not there (current code replays at +0.5 on corrected actuals); re-justify first. |
 | 104 | Cold-onset D Task 3: pooled valve-closed τ estimator behind `tau_estimator` flag | low (τ only matters in heating-off hours) | 1 day | gated — needs ≥ 14 valve-closed nights in the D1 cache |
-| 105 | Cold-onset D Task 4: daily heat-balance `UA_eff` behind `physics.ua_eff_method` flag (`feat/ua-eff-daily`); incl. Step 3b NaN-robust indoor averaging + DHW ODE guard (training `physics_kwh` constant since 2026-04-12, 0 gain) | activates physics heating for the first time (live `UA_eff` is null: hourly night fit fails the R² ≥ 0.5 gate) | 1 day | gated — not on D3 (Task 4 decouples `c_building` from the ML τ); hard gates: (1) C (+ #109 smoothing) verified over ≥ 3 cold days, because non-null UA shifts `physics_kwh` (ML feature) at the first retrain; (2) full-feature backtest harness `scripts/backtest_heat_loss_feature.py` (Plan C Task 4 Step 5) exists; (3) COP scale resolved (formula ≈ 3.2 vs live sensor ≈ 5.6, UA uncertain up to ×1.75). Gate = cold-fold MAE not > 2 % worse + sign test, physics daily heating MAE < 50 % of meter daily mean, `solar_gain_area` in [0, 20]. Phase 2 cold-start counter changes unit to heating days (~57 live) **2026-11-13:** hold stays. Success criterion changed: forecast stability and bias on the first days at a new temperature low, judged on #119 with the #118 gate. |
+| 105 | Cold-onset D Task 4: daily heat-balance `UA_eff` behind `physics.ua_eff_method` flag (`feat/ua-eff-daily`); incl. Step 3b NaN-robust indoor averaging + DHW ODE guard (training `physics_kwh` constant since 2026-04-12, 0 gain) | activates physics heating for the first time (live `UA_eff` is null: hourly night fit fails the R² ≥ 0.5 gate) | 1 day | gated — not on D3 (Task 4 decouples `c_building` from the ML τ); hard gates: (1) C (+ #109 smoothing) verified over ≥ 3 cold days, because non-null UA shifts `physics_kwh` (ML feature) at the first retrain; (2) full-feature backtest harness `scripts/backtest_heat_loss_feature.py` (Plan C Task 4 Step 5) exists; (3) COP scale resolved (formula ≈ 3.2 vs live sensor ≈ 5.6, UA uncertain up to ×1.75). Gate = cold-fold MAE not > 2 % worse + sign test, physics daily heating MAE < 50 % of meter daily mean, `solar_gain_area` in [0, 20]. Phase 2 cold-start counter changes unit to heating days (~57 live) **2026-11-13:** hold stays. Success criterion changed: forecast stability and bias on the first days at a new temperature low, judged on #119 with the #118 gate. **2026-11-14:** go-live criteria approved and frozen (supersede the gate text earlier in this cell): `docs/superpowers/specs/2026-11-14-105-go-live-criteria.md`. PASS needs non-inferiority only; judged at the low edge of temperature on bias, retrain sensitivity and swing, plus the #118 gate and 3 h / hourly MAE guards. Branch is 35 commits behind `train/next`. |
 | 106 | Cold-onset D Task 5: `heating_intensity_7d` ML feature behind `heating_intensity_feature` flag | lever for the 2025 Oct–Nov regime shift (16–26 kWh/day at 5–9 °C) | 1 day | gated — cold-day MAE −5 % vs 14-day baseline **2026-11-13:** demoted to low; same reason as #103. |
 | 107 | Deficit fade in indoor projection (`fix/deficit-fade`): transient hour-0 room deficit decays (τ_r 2 h) to the room's same-setpoint steady deficit instead of being held 48 h; NaN climate rows skipped | removes the deficit-driven hourly swings of the tomorrow forecast (10-12 04 h replay jump 13.0 → 6.9 kWh); cold 24–47 h MAE −0.9 % (live-model replay, in-sample) | deployed alpha-28 (2026-10-19) | written gate STOP on total stability (18 % < 25 %) overridden: remaining swings are `heating_buffer_temp` (see memory); shipped ahead of the C verdict as bias-neutral (−0.15 kWh/day replay), C count continues |
 | 108 | Extend the last climate state to the current hour when the entity is still available (`fetch_recent_climate`) — live projection treats > 2 h without a recorded change as stale (start at setpoint, deficit 0) while training forward-fills between changes | train/serve consistency; today 58 % of room-hours are stale but 0 of 4372 stale room-hours (since 10-01) had a deficit, so no measurable effect yet | ~½ day | gated: re-run the stale-with-deficit check after the first real cold spell; do as its own plan if non-zero **2026-11-13:** superseded if #120 (drop thermal-pressure features) passes. |
@@ -579,17 +623,18 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 110 | Regime label train/serve leak + hard-label flip on weather-source switch | medium (tomorrow stability, feature-ranking honesty) | ~½ day backtest + 1 day | Part A (regime log) deployed alpha-33 2026-11-03; Parts B–C done 2026-11-05 (backtest: T with blocked folds chosen); deployed alpha-35 2026-11-05 (gate waived by user) — see #110 detail. Leading suspect for the post-A+B over-forecast **2026-11-13:** regimes off is worse (3 h +12.4 % on the audit holdout); close after the 11-19..21 stability check. |
 | 111 | Horizon-consistent model shadow trial | — | — | **parked 2026-11-13** — reopen only on a 3 h-block win on #119 |
 | 112 | Live vs replay gap | — | — | **closed 2026-11-13** — input difference; round trips exact |
-| 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | **blocker for Phase 2** |
-| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — after #117 |
+| 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | **blocker for Phase 2** — planned (batch phase 4) |
+| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — planned (batch phase 2), after #117 |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
-| 116 | Retrain age off by the UTC offset | retrain timing | S | low |
-| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** |
-| 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — decided; script update pending |
-| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **high** |
-| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — needs #119, 14-day shadow |
+| 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
+| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — planned (batch phase 1) |
+| 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — planned (batch phase 3) |
+| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done** on `train/next` 2026-11-13 (b03b19d), not yet on `dev` |
+| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag planned (batch phase 5); 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
+| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — investigated 2026-11-14; plan to be written |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
@@ -601,7 +646,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 6. #106, #104, #103 after ≥ 14 cold days of baseline (or ≥ 14 valve-closed nights for #104). Gate #103 and #105 separately — both target the same residual, so don't default both on. **2026-11-13:** #103 and #106 are demoted to low and need a new justification first (see the table).
 Open decision at the C verdict: physics release strategy (v0.12.0 opt-in vs further Rule 3 cherry-picks); alpha-26 likely does not port to main.
 
-**Audit sequencing (agreed 2026-11-13).** 1. #117, then #114 and #118 (the yardstick). 2. #119 (tooling). 3. #113. 4. #120 with a 14-day shadow. 5. #121, #122, #123 as capacity allows. #105 stays on hold until 1 and 2 are done.
+**Audit sequencing (agreed 2026-11-13; planned 2026-11-14).** 1. #117, then #114 and #118 (the yardstick). 2. #119 (tooling) — done on `train/next`. 3. #113. 4. #120 with a 14-day shadow. 5. #121, #122, #123, #124 as capacity allows. #105 stays on hold until 1 and 2 are done. Steps 1, 3, the #120 flag and #116 are one batch of six phases: `docs/superpowers/plans/2026-11-14-audit-batch-index.md`. The current order of work is the **Next Steps** table at the top.
 
 ---
 
