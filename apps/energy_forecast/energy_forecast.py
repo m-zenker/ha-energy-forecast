@@ -3178,7 +3178,7 @@ class EnergyForecast(hass.Hass):
 
         def _acc_attr(v: Any) -> Any:
             f = _acc_num(v)
-            return None if math.isnan(f) else round(f, 3)
+            return round(f, 3) if math.isfinite(f) else None
 
         for _w in ("7d", "30d"):
             acc = data.get(f"accuracy_{_w}") or {}
@@ -3219,7 +3219,7 @@ class EnergyForecast(hass.Hass):
                     if invalid:
                         self._mqtt_set_sensor_raw(uid, "unavailable")
                     else:
-                        self._mqtt_set_sensor(uid, val)
+                        self._mqtt_set_sensor(uid, round(val, decimals))
                     self._mqtt_publish_sensor_attributes(uid, attrs)
                 else:
                     self.set_state(
@@ -3565,6 +3565,9 @@ def _accuracy_windows(pred_history: dict, actuals_history: dict, now_ts: pd.Time
     import pandas as pd
 
     since_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
+    # The 30-day window relies on _pred_history/_actuals_history being pruned to 30 days (same as mae_30d). The naive
+    # baseline is thin at its start: actuals are pruned to 30 days too, so the first 2 days have no naive and days
+    # 3-8 average fewer than 7 lookback days.
     return {
         "accuracy_7d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=since_7d)),
         "accuracy_30d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=None)),

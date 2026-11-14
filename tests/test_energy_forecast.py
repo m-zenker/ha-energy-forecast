@@ -2133,6 +2133,17 @@ class TestRollingMaeSensors:
             }
         return data
 
+    def test_publish_accuracy_attr_inf_becomes_none(self):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        fake = _FakeMqttSelf(mqtt_discovery=False)
+        data = self._accuracy_data()
+        data["accuracy_7d"]["naive_block_mae"] = float("inf")
+        data["accuracy_7d"]["skill_pct"] = float("-inf")
+        EnergyForecast._publish(fake, data)
+        attrs = fake._states["sensor.energy_forecast_block_mae_7d"]["attributes"]
+        assert attrs["naive_block_mae"] is None and attrs["hourly_skill_vs_naive_pct"] is None
+
     def test_publish_accuracy_sensors_set_state_mode(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -2197,8 +2208,8 @@ class TestRollingMaeSensors:
 
         prefix = "homeassistant/energy_forecast/sensor"
         payloads = {p["topic"]: p["payload"] for p in fake._publishes}
-        assert float(payloads[f"{prefix}/energy_forecast_block_mae_7d/state"]) == 0.61234
-        assert float(payloads[f"{prefix}/energy_forecast_daily_bias_7d/state"]) == -1.2345
+        assert float(payloads[f"{prefix}/energy_forecast_block_mae_7d/state"]) == 0.6123
+        assert float(payloads[f"{prefix}/energy_forecast_daily_bias_7d/state"]) in (-1.234, -1.235)
         assert payloads[f"{prefix}/energy_forecast_block_mae_30d/state"] == "unavailable"
         assert payloads[f"{prefix}/energy_forecast_daily_bias_30d/state"] == "unavailable"
 

@@ -1,4 +1,12 @@
-"""Block, daily and naive-guardrail metrics; definitions mirror backtest/wf_score.py (pinned by tests)."""
+"""Block, daily and naive-guardrail metrics for the live accuracy sensors.
+
+The per-hour definitions (error = pred - actual, clock-aligned complete 3 h blocks, days with >= 22 hours, naive =
+mean of the same hour on days -2..-8) mirror ``backtest/wf_score.py``. Tests pin ``naive_same_hour_mean`` and the
+block/hourly numbers on complete days against it. Aggregation differs: live pools ALL complete blocks in the window,
+including blocks on days that are not scored (e.g. EV days); ``wf_score.day_table`` scores blocks only on days with
+>= 22 hours and averages per-day means; ``backtest/runner._row`` averages per (day, origin) with an 18 h gate. All
+agree when every day is complete.
+"""
 
 from __future__ import annotations
 

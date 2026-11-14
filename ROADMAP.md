@@ -134,7 +134,7 @@ Both still simulate over `forecast_df`'s past tail, seeded with the latest tank 
 
 ### #114 — Report Block and Daily Accuracy, Not Just Hourly MAE
 
-**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the definitions are pinned by a parity test.
+**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the naive same-hour mean is pinned by a parity test against `wf_score` and the per-hour definitions mirror it.
 
 **Extended 2026-11-13:** also publish the naive same-hour mean (days −2..−8) MAE as a guardrail, and add the block, daily and naive columns to `backtest/score.py`. Evidence: scaling the replayed forecast by 0.8 improves hourly MAE by 6 % while bias goes to −2.5 kWh/day; daily error is best at scale 1.0. The naive mean ties current code on hourly MAE and is 10–16 % worse on 3 h blocks.
 

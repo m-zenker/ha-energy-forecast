@@ -170,3 +170,5 @@ def test_row_block_metrics_skip_incomplete_blocks():
 
 def test_run_arm_rows_carry_naive_columns(base_rows):
     assert all({"mae3", "naive_mae", "naive_mae3"} <= set(r) for r in base_rows)
+    assert any(np.isfinite(r["naive_mae"]) for r in base_rows)
+    assert any(np.isfinite(r["naive_mae3"]) for r in base_rows)

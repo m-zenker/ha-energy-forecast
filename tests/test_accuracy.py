@@ -45,6 +45,32 @@ def test_incomplete_day_and_block_are_not_scored():
     assert s["n_blocks"] == 7 and s["mae"] == pytest.approx(0.5)
 
 
+def test_mid_block_hole_block_is_not_scored():
+    actual = _hist([2.0] * 240)
+    last = list(actual)[-24:]
+    pred = {ts: 2.5 for ts in last}
+    full = accuracy.summarize(accuracy.paired_errors(pred, actual))
+    hole = dict(actual)
+    del hole[last[4]]  # 04:00 -> block 03-06 has only 2 paired hours
+    s = accuracy.summarize(accuracy.paired_errors(pred, hole))
+    assert full["n_blocks"] == 8 and s["n_blocks"] == 7 and s["n_hours"] == 23
+    assert s["block_mae"] == pytest.approx(1.5)  # only complete blocks: 3 * 0.5 each
+    assert s["mae"] == pytest.approx(0.5) and s["n_days"] == 1  # 23 h still counts as a day
+
+
+def test_block_mae_matches_wf_score_on_complete_days():
+    rng = np.random.default_rng(1)
+    actual = pd.Series(rng.uniform(0, 3, 24 * 12), index=pd.date_range(START, periods=24 * 12, freq="1h"))
+    pred = actual.iloc[-72:] + rng.normal(0, 0.5, 72)
+    s = accuracy.summarize(accuracy.paired_errors(pred.to_dict(), actual.to_dict()))
+    rows = pd.DataFrame({"arm": "a", "ts": pred.index, "y": actual.loc[pred.index].values, "p50": pred.values})
+    rows["day"] = rows["ts"].dt.normalize()
+    table = wf_score.day_table(rows)
+    assert len(table) == 3
+    assert s["block_mae"] == pytest.approx(table["mae3"].mean())
+    assert s["mae"] == pytest.approx(table["mae"].mean())
+
+
 def test_skill_against_naive():
     actual = _hist([1.0] * 216 + [3.0] * 24)  # last day jumps to 3.0; naive says 1.0
     last = list(actual)[-24:]
