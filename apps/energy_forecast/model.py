@@ -1123,10 +1123,15 @@ class EnergyForecastModel:
         # which is the RC-ODE-projected version built for _engineer_features()'s own
         # climate feature) — predict_series() does its own internal projection.
         physics_kwh_series = None
-        if physics_model is not None:
+        # The frame carries a past tail (past_days=3); simulating over it would seed the tank days
+        # ago (same reasoning as the override-delta fix in energy_forecast.py, alpha-34).
+        _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]]
+        if physics_model is not None and _serving_df.empty:
+            _LOGGER.warning("Physics baseline skipped: no forecast rows at or after the first predicted hour")
+        elif physics_model is not None:
             try:
                 physics_kwh_series = physics_model.predict_series(
-                    forecast_df,
+                    _serving_df,
                     climate_recent=climate_recent,
                     dhw_recent=dhw_recent,
                     room_areas=room_areas,
@@ -1397,9 +1402,7 @@ class EnergyForecastModel:
                 physics_kwh_series = self._last_physics_kwh_series
                 if physics_kwh_series is None:
                     raise ValueError("physics baseline unavailable")
-                physics_baseline = (
-                    physics_kwh_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0).values
-                )
+                physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
                 preds = physics_baseline + preds
             except Exception as e:
                 _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
@@ -1421,12 +1424,17 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        *,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
-        Returns None when quantile models are not yet trained.  low_kwh and
-        high_kwh are guaranteed non-negative and ordered (low ≤ high).
+        Returns None when quantile models are not yet trained, or in Phase 2
+        (physics residual) when the physics baseline is unavailable.  low_kwh and
+        high_kwh are guaranteed non-negative and ordered (low ≤ high).  In Phase 2
+        the bands are gross kWh (physics baseline + residual quantiles).
         """
         import numpy as np
         import pandas as pd
@@ -1450,6 +1458,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1459,6 +1469,14 @@ class EnergyForecastModel:
             high += correction
             low = np.expm1(low)
             high = np.expm1(high)
+        if self._use_physics_residual:
+            physics_kwh_series = self._last_physics_kwh_series
+            if physics_kwh_series is None:
+                _LOGGER.warning("Phase 2 intervals skipped: physics baseline unavailable")
+                return None
+            physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
+            low = low + physics_baseline
+            high = high + physics_baseline
         low = np.maximum(0, low)
         high = np.maximum(0, high)
         # Enforce ordering in case of quantile crossing
