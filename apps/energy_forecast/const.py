@@ -1,6 +1,7 @@
 """Constants for the Energy Forecast app."""
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -141,3 +142,35 @@ def resolve_timezone(configured: str | None, ha_timezone: Any, logger: logging.L
             )
         return configured
     return ha_timezone or "Europe/Zurich"
+
+
+# Named groups of model features that `drop_feature_groups` can leave out of training (ROADMAP #120).
+FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
+    "thermal_pressure": (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    ),
+    "heating_buffer": ("heating_buffer_temp",),
+}
+
+
+def resolve_feature_groups(groups: Iterable[str]) -> tuple[str, ...]:
+    """Feature names for the given group names, in group order, without duplicates.
+
+    Raises ValueError for an unknown group so a config typo stops startup instead of silently
+    training the full model.
+    """
+    groups = list(groups)
+    bad = [g for g in groups if g not in FEATURE_GROUPS]
+    if bad:
+        raise ValueError(f"unknown feature group(s) {bad}; known: {sorted(FEATURE_GROUPS)}")
+    names: list[str] = []
+    for g in groups:
+        for name in FEATURE_GROUPS[g]:
+            if name not in names:
+                names.append(name)
+    return tuple(names)
