@@ -7377,6 +7377,60 @@ class TestPhase2Predict:
         assert not result.empty  # no exception propagates; falls back to ML-only reconstruction
 
 
+def _phase2_physics(tmp_path):
+    from energy_forecast.physics import ThermalPhysicsModel
+
+    pm = ThermalPhysicsModel(
+        tmp_path / "physics_models",
+        {
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": True,
+        },
+    )
+    pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+    return pm
+
+
+def _with_past_tail(forecast_df: pd.DataFrame, hours: int = 122) -> pd.DataFrame:
+    """Live-shaped frame: *hours* past rows in front of the 48 future rows (same columns, same values)."""
+    first = forecast_df["timestamp"].iloc[0]
+    tail = pd.concat([forecast_df.iloc[[0]]] * hours, ignore_index=True)
+    tail["timestamp"] = pd.date_range(first - pd.Timedelta(hours=hours), periods=hours, freq="1h")
+    return pd.concat([tail, forecast_df], ignore_index=True)
+
+
+class TestPhase2LiveShapedFrame:
+    """ROADMAP #113: Phase 2 must work on a forecast frame that carries a past tail (170 rows live)."""
+
+    def test_predict_adds_baseline_on_170_row_frame(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        long_df = _with_past_tail(forecast_df)
+        assert len(long_df) == 170
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(long_df, live_temp=5.0, physics_model=pm)
+        assert "Phase 2 physics reconstruction failed" not in caplog.text
+        assert len(result) == 48
+        baseline = model._last_physics_kwh_series.reindex(pd.DatetimeIndex(result["timestamp"])).fillna(0).to_numpy()
+        assert baseline.sum() > 0
+        # gross forecast is at least the clipped baseline-plus-residual, and clearly above the bare residual
+        raw = model.model.predict(model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)[1])
+        np.testing.assert_allclose(result["predicted_kwh"].to_numpy(), np.maximum(0, baseline + raw), rtol=1e-9)
+
+    def test_short_frame_fills_missing_baseline_hours_with_zero(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(forecast_df.iloc[:40], live_temp=5.0, physics_model=pm)
+        assert len(result) == 48
+        assert "Phase 2 physics reconstruction failed" not in caplog.text
+
+
 class TestGrossMAEReporting:
     def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):
         model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)

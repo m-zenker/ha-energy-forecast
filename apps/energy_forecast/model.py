@@ -1397,9 +1397,7 @@ class EnergyForecastModel:
                 physics_kwh_series = self._last_physics_kwh_series
                 if physics_kwh_series is None:
                     raise ValueError("physics baseline unavailable")
-                physics_baseline = (
-                    physics_kwh_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0).values
-                )
+                physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
                 preds = physics_baseline + preds
             except Exception as e:
                 _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
