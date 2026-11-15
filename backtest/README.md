@@ -97,6 +97,28 @@ ws.summarize(table); ws.paired(table, "droptp", metric="mae3"); ws.next_day_swin
 Limits: perfect weather (measured cost of real forecast weather: 1–2 %); history is today's view of the past; the
 physics state is the capture's at every cutoff; days before a sensor existed have no such inputs, as live had none.
 
+## Gate on live data
+
+```
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast/bin/python -m backtest.live_gate data --since "2026-11-05 17:28"
+```
+
+Scores the live `pred_history.json` (pulled into `data/`) with the cold-day gate of ROADMAP #118 and ends with one
+line `GATE: <verdict> — <reason>`:
+
+- **PASS**: pooled cold-day bias within −12 % to +6 % of consumption, on at least 14 cold days.
+- **FAIL**: at least 14 cold days and the bias is outside the band.
+- **INCONCLUSIVE**: fewer than 14 cold days (`--min-days`), or the actuals are not on the training-target basis.
+
+`--since` is the local time of the deploy or retrain under test: `pred_history` keeps the first forecast made within
+25 h of a target hour, so only target hours from 24 h after the anchor (rounded up to the hour) count. A cold day has
+a daily mean outdoor temperature ≤ 10 °C (`--cold-below`) and needs ≥ 22 scored hours. Actuals count only when the
+file carries `"actuals_basis": "target"` (written by the app since #117); `--allow-mixed-actuals` scores anyway, for
+a look, not for a gate reading. Days without a temperature are never cold: the weather cache in `data/` must reach
+the scored days (without `--no-fetch` the last 7 days are fetched from Open-Meteo), and the command prints a WARNING
+naming the days it could not classify. Run it from the repo root or a worktree root; from another checkout's root
+`-m` picks up that checkout's `backtest/`.
+
 ## Reading the summary
 
 - `dMAE%` / `95% CI` is the paired difference against base. The CI resamples (fold, ISO-week) blocks, not days.
