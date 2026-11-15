@@ -59,7 +59,7 @@ inputs live had then.
 
 ```bash
 PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.walkforward \
-    data/captures --start 2026-10-01 --end 2026-11-12 --arms base jit droptp --out data/backtest/wf
+    data/captures --start 2026-10-01 --end 2026-11-12 --arms base jit droptp droptp_nb --out data/backtest/wf
 ```
 
 - It runs the real `train()` / `predict()` / `predict_intervals()`: daily retrain at 18:00 seeded from the previous
@@ -88,6 +88,33 @@ ws.summarize(table); ws.paired(table, "droptp", metric="mae3"); ws.next_day_swin
   under-forecasting, and `ha-energy-manager` consumes 3 h blocks.
 - `cold_gate()` applies the ROADMAP #118 rule: pooled cold-day bias within −12 % to +6 % of consumption over at
   least 14 cold days, else INCONCLUSIVE.
+
+
+## Shadow check for #120
+
+Needs captures covering at least 14 target days after 2026-11-12 (the earlier holdout is spent). Start the run one
+week before the first scored day (burn-in).
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.walkforward \
+    data/captures --start <first scored day - 7 d> --end <last day> \
+    --arms base jit droptp droptp_nb --out data/backtest/wf_shadow
+```
+
+```python
+from backtest import wf_score as ws
+rows = ws.attach_actuals(rows, frame.actuals(), daily_temp)
+rows = rows[rows["day"] >= "<first scored day>"]
+table = ws.day_table(ws.add_naive(ws.day_ahead(rows)))
+swing = ws.next_day_swing(rows)
+for arm in ("droptp", "droptp_nb", "jit"):
+    print(arm, ws.shadow_verdict(table, swing, arm))
+```
+
+`shadow_verdict` applies the #120 criteria: hourly and 3 h MAE non-inferior at 2 %, next-day swing at least 25 %
+lower, cold-day bias not larger in magnitude; no cold day in the window gives INCONCLUSIVE. `jit` is the noise
+floor: an arm no further from `base` than `jit` is shows no effect. PASS on `droptp` is the trigger for the owner to
+set `drop_feature_groups: [thermal_pressure]`; the flip is a forecast-changing deploy and gets its own window.
 - `naive` is the same-hour mean of days −2..−8, the baseline a change has to beat.
 - `backtest.audit_intervals.report(rows)` gives interval coverage as shipped, recalibrated on served errors, and
   for the summed block and daily bands.

@@ -143,6 +143,59 @@ def paired(table: pd.DataFrame, arm: str, ref: str = "base", metric: str = "mae"
     )
 
 
+def shadow_verdict(
+    table: pd.DataFrame,
+    swing: pd.DataFrame,
+    arm: str,
+    ref: str = "base",
+    ni_pct: float = 2.0,
+    swing_drop_pct: float = 25.0,
+) -> dict:
+    """ROADMAP #120 shadow criteria for *arm* against *ref* (``cold_bias`` compares absolute values).
+
+    PASS needs hourly and 3 h MAE non-inferior at *ni_pct* %, the next-day swing (``range``) at least
+    *swing_drop_pct* % lower, and a cold-day bias no larger in magnitude. A check that cannot be computed
+    (no overlap, no cold days, missing arm) is None and makes the verdict INCONCLUSIVE.
+    """
+
+    def _pct(metric: str) -> float | None:
+        try:
+            res = paired(table, arm, ref, metric)
+        except KeyError:
+            return None
+        return None if res is None else res["pct"]
+
+    mae_pct, mae3_pct = _pct("mae"), _pct("mae3")
+    swing_pct = None
+    if arm in swing.index and ref in swing.index and swing.loc[ref, "range"]:
+        swing_pct = float(100 * (swing.loc[arm, "range"] / swing.loc[ref, "range"] - 1))
+    summary = summarize(table)
+    cold_arm = cold_ref = None
+    if arm in summary.index and ref in summary.index:
+        a, r = summary.loc[arm, "cold_bias"], summary.loc[ref, "cold_bias"]
+        if not (pd.isna(a) or pd.isna(r)):
+            cold_arm, cold_ref = float(a), float(r)
+    checks = {
+        "mae": None if mae_pct is None else mae_pct <= ni_pct,
+        "mae3": None if mae3_pct is None else mae3_pct <= ni_pct,
+        "swing": None if swing_pct is None else swing_pct <= -swing_drop_pct,
+        "cold_bias": None if cold_arm is None else abs(cold_arm) <= abs(cold_ref),
+    }
+    if any(v is None for v in checks.values()):
+        verdict = "INCONCLUSIVE"
+    else:
+        verdict = "PASS" if all(checks.values()) else "FAIL"
+    return dict(
+        mae_pct=mae_pct,
+        mae3_pct=mae3_pct,
+        swing_pct=swing_pct,
+        cold_bias_arm=cold_arm,
+        cold_bias_ref=cold_ref,
+        checks=checks,
+        verdict=verdict,
+    )
+
+
 def next_day_swing(rows: pd.DataFrame) -> pd.DataFrame:
     """Per arm: how much the next-day total moves across the previous day's origins (kWh).
 
