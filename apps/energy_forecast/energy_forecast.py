@@ -1164,21 +1164,24 @@ class EnergyForecast(hass.Hass):
             self._lock.release()
 
     def _last_trained_local(self) -> datetime:
-        """self._ml_model.last_trained as local wall-clock time.
+        """self._ml_model.last_trained as naive wall-clock time in the app's time zone.
 
-        It's persisted via datetime.now() in model.py's train() — system/UTC time in Docker/HA,
-        per the same reasoning already documented at _maybe_adaptive_retrain's local-time
-        construction. Every retrain-cadence comparison in this file uses
-        pd.Timestamp.now(self._timezone).tz_localize(None), so this converts last_trained to the
-        same basis before any comparison — without it, comparisons are off by the UTC offset
-        (1-2h for Europe/Zurich), which lets cooldown gates expire early near their boundary.
+        last_trained is stamped by datetime.now() in model.py's train(), i.e. the container's
+        system-local time (local time in the HA add-on, UTC in a plain Docker container). This
+        converts it to self._timezone so it is comparable with
+        pd.Timestamp.now(self._timezone).tz_localize(None), which every retrain-cadence gate uses.
+        The old code assumed the stamp was UTC, which made the age read 1-2h short on HA (#116).
         """
         import pandas as pd
 
         last_trained = self._ml_model.last_trained
         if last_trained == datetime.min:
             return last_trained
-        return pd.Timestamp(last_trained).tz_localize("UTC").tz_convert(self._timezone).tz_localize(None)
+        # astimezone() with no argument attaches the system zone to a naive datetime.
+        # Go through a plain datetime: pd.Timestamp.astimezone() requires an argument.
+        ts = pd.Timestamp(last_trained)
+        aware = ts.to_pydatetime().astimezone() if ts.tzinfo is None else ts
+        return pd.Timestamp(aware).tz_convert(self._timezone).tz_localize(None)
 
     def _seed_adaptive_cooldown(self) -> None:
         """Seed the adaptive-retrain cooldown from the persisted last-trained timestamp.

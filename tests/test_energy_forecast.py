@@ -3681,7 +3681,7 @@ class TestAdaptiveRetrainLock:
         assert acquired, "Lock must be released even when _retrain raises"
         fake._lock.release()
 
-    def test_seeded_cooldown_prevents_immediate_refire_after_restart(self):
+    def test_seeded_cooldown_prevents_immediate_refire_after_restart(self, system_tz):
         """Regression test for the production bug: simulates a restart 2 hours after the last
         real retrain, using the actual UTC-naive form last_trained is produced in."""
         from datetime import datetime
@@ -3689,6 +3689,7 @@ class TestAdaptiveRetrainLock:
 
         from energy_forecast.energy_forecast import EnergyForecast
 
+        system_tz("UTC")
         fake = self._make_fake()
         fake._ml_model.last_trained = datetime.now(UTC).replace(tzinfo=None) - pd.Timedelta(hours=2)
         EnergyForecast._seed_adaptive_cooldown(fake)
@@ -3702,18 +3703,82 @@ class TestAdaptiveRetrainLock:
         assert retrain_calls == [], "adaptive retrain must respect the cooldown seeded from last_trained"
 
 
+@pytest.fixture
+def system_tz(monkeypatch):
+    """Pin the process time zone; restores the original on teardown."""
+    import time
+
+    def _set(name: str) -> None:
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield _set
+    monkeypatch.undo()
+    time.tzset()
+
+
+class TestLastTrainedLocalSystemZone:
+    """ROADMAP #116: last_trained is naive system-local time (datetime.now()), not UTC."""
+
+    @staticmethod
+    def _fake(stamp, tz="Europe/Zurich"):
+        fake = _FakeSelf()
+        fake._timezone = tz
+        fake._ml_model.last_trained = stamp
+        return fake
+
+    def test_local_container_winter_is_not_shifted(self, system_tz):
+        system_tz("Europe/Zurich")
+        fake = self._fake(datetime(2026, 1, 15, 12, 0))
+        assert fake._last_trained_local() == datetime(2026, 1, 15, 12, 0)
+
+    def test_local_container_summer_is_not_shifted(self, system_tz):
+        system_tz("Europe/Zurich")
+        fake = self._fake(datetime(2026, 7, 15, 12, 0))
+        assert fake._last_trained_local() == datetime(2026, 7, 15, 12, 0)
+
+    def test_utc_container_is_converted_to_app_zone(self, system_tz):
+        system_tz("UTC")
+        assert self._fake(datetime(2026, 1, 15, 12, 0))._last_trained_local() == datetime(2026, 1, 15, 13, 0)
+        assert self._fake(datetime(2026, 7, 15, 12, 0))._last_trained_local() == datetime(2026, 7, 15, 14, 0)
+
+    def test_aware_stamp_is_converted_once(self, system_tz):
+        system_tz("Europe/Zurich")
+        fake = self._fake(datetime(2026, 7, 15, 12, 0, tzinfo=UTC))
+        assert fake._last_trained_local() == datetime(2026, 7, 15, 14, 0)
+
+    def test_never_trained_passes_through(self, system_tz):
+        system_tz("Europe/Zurich")
+        assert self._fake(datetime.min)._last_trained_local() == datetime.min
+
+    def test_fall_back_hour_does_not_raise(self, system_tz):
+        system_tz("Europe/Zurich")
+        out = self._fake(datetime(2026, 10, 25, 2, 30))._last_trained_local()
+        assert out == datetime(2026, 10, 25, 2, 30)
+
+    def test_startup_gate_sees_the_true_age(self, system_tz):
+        # the live symptom: "last retrain was -0.9h ago" for a model trained 9 minutes earlier in CET
+        system_tz("Europe/Zurich")
+        fake = self._fake(datetime.now() - pd.Timedelta(minutes=9))
+        age_h = (
+            pd.Timestamp.now("Europe/Zurich").tz_localize(None) - fake._last_trained_local()
+        ).total_seconds() / 3600
+        assert 0.1 < age_h < 0.2
+
+
 class TestSeedAdaptiveCooldown:
     """Fix C: the adaptive-retrain cooldown must be seeded from the persisted last_trained
     timestamp, converted to local time (not left UTC-naive), so a restart can't immediately
     re-arm it and the cooldown doesn't expire early near its boundary."""
 
-    def test_seed_converts_utc_naive_last_trained_to_local(self):
-        """last_trained is UTC-naive (datetime.now() in model.py) -- this uses the actual
-        production form, not a local-tz value hand-built to look correct."""
+    def test_seed_converts_utc_naive_last_trained_to_local(self, system_tz):
+        """In a UTC container last_trained is UTC-naive (datetime.now() in model.py);
+        pin the system zone so the test states that assumption (#116)."""
         from datetime import datetime
 
         from energy_forecast.energy_forecast import EnergyForecast
 
+        system_tz("UTC")
         fake = _FakeSelf()
         fake._timezone = "Europe/Zurich"
         utc_now = datetime.now(UTC).replace(tzinfo=None)
@@ -3746,11 +3811,12 @@ class TestMaybeStartupRetrain:
     """Fix C: the startup retrain (run_in(..., 10)) must be skipped if a retrain already
     completed within STARTUP_RETRAIN_MIN_GAP_HOURS."""
 
-    def test_skips_when_recently_trained(self):
+    def test_skips_when_recently_trained(self, system_tz):
         from datetime import datetime
 
         from energy_forecast.energy_forecast import EnergyForecast
 
+        system_tz("UTC")
         fake = _FakeSelf()
         fake._timezone = "Europe/Zurich"
         fake._ml_model.last_trained = datetime.now(UTC).replace(tzinfo=None) - pd.Timedelta(hours=2)
