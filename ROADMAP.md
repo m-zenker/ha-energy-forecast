@@ -16,7 +16,7 @@ Start here. Everything below this section is detail and history.
 | 2 | Dated checks: alpha-34 override verification (due about 2026-11-14, HA keeps ~10 days of history); #110 regime stability check, `scripts/check_regime_stability.py`, **no later than 2026-11-21** | owner / PM | open | — |
 | 3 | Ship the current train (#117, #114, #119) | `/pm evening` | **done** — alpha-40 2026-11-14 (e784479); verify #117 migration log line and #114 sensors at the next dawn check | — |
 | 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **done** — #117 and #114 shipped alpha-40 (2026-11-14); #118 gate merged to `train/next` 3ef2b23 (ships at next `/pm evening`). First valid reading needs the #117 migration live and ≥ 14 cold days (step 8) | — |
-| 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | #113 done on its branch 2026-11-15 (merged to `train/next` a55c46b (ships at next `/pm evening`)); #120 after it | can run beside track A |
+| 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | **done** on `train/next` 2026-11-15: #113 (a55c46b) and #120 flag + shadow tooling (ships at next `/pm evening`); the #120 shadow itself is step 9 | can run beside track A |
 | 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **done** on `train/next` 2026-11-15 (ships at next `/pm evening`) | independent |
 | 7 | Ship the batch; check that `pred_history.json` carries `"actuals_basis": "target"` and note the timestamp at which `mae_*` step | `/pm evening` | — | steps 4–6 |
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
@@ -186,7 +186,7 @@ Walk-forward on a retrain capture: truncate the captured live inputs at each cut
 
 ### #120 — Drop the Thermal-Pressure Feature Family
 
-**Priority:** Medium. **Status:** simulated 2026-11-13; not implemented. Flag and shadow tooling planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow itself needs ≥ 14 capture days after 2026-11-12.
+**Priority:** Medium. **Status:** flag (`drop_feature_groups`, default off) and shadow tooling (`droptp` / `droptp_nb` arms, `wf_score.shadow_verdict`) on `train/next` (2026-11-15), not deployed; shadow not started. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow needs ≥ 14 capture days after 2026-11-12.
 
 `thermal_pressure`, `_max`, `_std`, `_cop`, `_net` and `infiltration_pressure`: the served values have about zero correlation with the values later trained on (−0.06 at 24–47 h, −0.03 at 1–5 h), and a 0.4 K projected room deficit moved the 11-14 forecast between 25.0 and 31.4 kWh. Dropping them: hourly +0.2 % (CI −1.0..+1.3) and 3 h −0.4 % pooled over dev; holdout hourly −0.8 %, cold-day bias +0.95 against +1.76; spread of the next-day total across the previous day's four forecasts 1.25 → 0.57 kWh (Sep), 1.41 → 1.33 (Oct), 2.44 → 1.39 (holdout). Not testable on last winter (no climate data then).
 
@@ -632,7 +632,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — shipped alpha-40 (2026-11-14), live verification pending |
 | 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — gate implemented in `backtest/live_gate.py` (2026-11-15); first valid reading pending |
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
-| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag planned (batch phase 5); 14-day shadow earliest 2026-11-27 |
+| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag on `train/next` 2026-11-15; 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
