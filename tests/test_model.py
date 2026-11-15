@@ -7471,6 +7471,43 @@ class TestPhase2LiveShapedFrame:
         b = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
         pd.testing.assert_frame_equal(a, b)  # Phase 1 never adds a baseline
 
+    def test_physics_series_is_simulated_from_the_first_predicted_hour(self, tmp_path, monkeypatch):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        seen = {}
+        real = pm.predict_series
+
+        def spy(frame, **kw):
+            seen["first"] = pd.Timestamp(frame["timestamp"].iloc[0])
+            seen["rows"] = len(frame)
+            return real(frame, **kw)
+
+        monkeypatch.setattr(pm, "predict_series", spy)
+        future_hours, _ = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
+        assert seen["first"] == future_hours[0]
+        # the fixture frame is built from naive container time, the model's horizon from its own timezone,
+        # so derive the expected row count from future_hours instead of assuming 48
+        expected = int((pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]).sum())
+        assert seen["rows"] == expected
+        assert seen["rows"] <= 48
+
+    def test_past_tail_does_not_change_the_physics_feature(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        _, x_short = model._prepare_prediction_X(forecast_df, 5.0, None, physics_model=pm)
+        _, x_long = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
+        np.testing.assert_allclose(x_long["physics_kwh"].to_numpy(), x_short["physics_kwh"].to_numpy())
+
+    def test_frame_without_future_rows_skips_physics(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        past_only = forecast_df.copy()
+        past_only["timestamp"] = past_only["timestamp"] - pd.Timedelta(days=5)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(past_only, live_temp=5.0, physics_model=pm)
+        assert len(result) == 48
+        assert "no forecast rows at or after the first predicted hour" in caplog.text
+
 
 class TestGrossMAEReporting:
     def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):

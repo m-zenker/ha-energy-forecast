@@ -1123,10 +1123,15 @@ class EnergyForecastModel:
         # which is the RC-ODE-projected version built for _engineer_features()'s own
         # climate feature) — predict_series() does its own internal projection.
         physics_kwh_series = None
-        if physics_model is not None:
+        # The frame carries a past tail (past_days=3); simulating over it would seed the tank days
+        # ago (same reasoning as the override-delta fix in energy_forecast.py, alpha-34).
+        _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]]
+        if physics_model is not None and _serving_df.empty:
+            _LOGGER.warning("Physics baseline skipped: no forecast rows at or after the first predicted hour")
+        elif physics_model is not None:
             try:
                 physics_kwh_series = physics_model.predict_series(
-                    forecast_df,
+                    _serving_df,
                     climate_recent=climate_recent,
                     dhw_recent=dhw_recent,
                     room_areas=room_areas,
