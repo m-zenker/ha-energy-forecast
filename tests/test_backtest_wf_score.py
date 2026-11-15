@@ -130,3 +130,38 @@ def test_recalibration_uses_only_earlier_days():
     assert late["day"].nunique() == 10 and ((late["y"] >= late["lo_c"]) & (late["y"] <= late["hi_c"])).mean() > 0.9
     report = ai.report(rows)
     assert report.loc["hourly, recalibrated on served errors", "cover"] > report.loc["hourly, as shipped", "cover"]
+
+
+def _shadow_inputs(arm_mae=1.0, arm_mae3=1.0, arm_bias=0.5, arm_range=0.6, cold=True):
+    days = pd.date_range("2026-11-15", periods=14, freq="D")
+
+    def block(name, mae, mae3, bias):
+        return pd.DataFrame(
+            {"n": 24, "mae": mae, "mae3": mae3, "mae6": 2 * mae3, "bias": bias, "y": 24.0, "cold": cold},
+            index=pd.MultiIndex.from_product([[name], days], names=["arm", "day"]),
+        )
+
+    table = pd.concat([block("base", 1.0, 1.0, 1.0), block("droptp", arm_mae, arm_mae3, arm_bias)])
+    swing = pd.DataFrame(
+        {"step": [0.5, 0.3], "range": [1.0, arm_range], "range_p90": [2.0, 1.2]}, index=["base", "droptp"]
+    )
+    return table, swing
+
+
+def test_shadow_verdict_pass():
+    v = ws.shadow_verdict(*_shadow_inputs(), arm="droptp")
+    assert v["verdict"] == "PASS" and all(v["checks"].values())
+    assert v["swing_pct"] == pytest.approx(-40.0)
+
+
+def test_shadow_verdict_fails_each_criterion():
+    assert ws.shadow_verdict(*_shadow_inputs(arm_mae=1.03), arm="droptp")["checks"]["mae"] is False
+    assert ws.shadow_verdict(*_shadow_inputs(arm_mae3=1.03), arm="droptp")["checks"]["mae3"] is False
+    assert ws.shadow_verdict(*_shadow_inputs(arm_range=0.8), arm="droptp")["checks"]["swing"] is False
+    v = ws.shadow_verdict(*_shadow_inputs(arm_bias=-1.5), arm="droptp")
+    assert v["checks"]["cold_bias"] is False and v["verdict"] == "FAIL"
+
+
+def test_shadow_verdict_inconclusive_without_cold_days():
+    v = ws.shadow_verdict(*_shadow_inputs(cold=False), arm="droptp")
+    assert v["checks"]["cold_bias"] is None and v["verdict"] == "INCONCLUSIVE"

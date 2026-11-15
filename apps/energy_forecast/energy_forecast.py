@@ -45,6 +45,7 @@ from .const import (
     REGIME_LOG_PATH,
     UNIT_TO_KWH,
     drop_dst_duplicates,
+    resolve_feature_groups,
     resolve_timezone,
 )
 from .const import strip_tz as _strip_tz_util
@@ -344,6 +345,9 @@ class EnergyForecast(hass.Hass):
         self._ev_charger_kw: float = float(self.args.get("ev_charger_kw", 9.0))
         self._ev_charging_sensor: str | None = self.args.get("ev_charging_sensor") or None
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
+        # Feature groups left out of training (#120). An unknown group name raises, stopping startup.
+        self._drop_feature_groups: list[str] = list(self.args.get("drop_feature_groups") or [])
+        self._drop_features: tuple[str, ...] = resolve_feature_groups(self._drop_feature_groups)
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
         _energy_unit: str = str(self.args.get("energy_unit", "kWh"))
@@ -629,7 +633,7 @@ class EnergyForecast(hass.Hass):
         _LOGGER.info(
             "Config validated — lat=%s, lon=%s, plz=%s, timezone=%s, "
             "holiday_country=%s, weight_halflife=%sd, baseline_mode=%s, "
-            "ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
+            "drop_feature_groups=%s, ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
             "anomaly_sigma_threshold=%s, shap_top_n=%s, mqtt_discovery=%s",
             self._lat,
             self._lon,
@@ -638,6 +642,7 @@ class EnergyForecast(hass.Hass):
             self._holiday_country,
             self._weight_halflife,
             self._baseline_mode,
+            self._drop_feature_groups,
             self._ev_threshold,
             self._ev_charger_kw,
             len(self._sub_energy_sensors),
@@ -1999,6 +2004,7 @@ class EnergyForecast(hass.Hass):
             heating_buffer_temp_df=self._physics_heating_buffer_df,
             use_physics_residual=self._effective_use_physics_residual(),
             heating_feature_df=heating_feature_df,
+            drop_features=self._drop_features,
         )
         capture_id = _capture_retrain_inputs(self, train_kwargs)
         self._ml_model.train(**train_kwargs)

@@ -8171,3 +8171,93 @@ class TestRegimeSoftOOFVariants:
         with open(m._meta_path, "rb") as fh:
             meta = pickle.load(fh)
         assert "regime_zero" not in meta
+
+
+class TestDropFeatures:
+    """ROADMAP #120: train() can leave out named features; default is unchanged."""
+
+    TP = (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    )
+
+    def _train(self, tmp_path, buffer=False, **kw):
+        energy, weather = train_frames()
+        if buffer:
+            kw["heating_buffer_temp_df"] = pd.DataFrame(
+                {"timestamp": energy["timestamp"], "heating_buffer_temp": 30.0 + np.sin(np.arange(len(energy)))}
+            )
+        m = EnergyForecastModel(tmp_path, timezone="Europe/Zurich")
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, **kw)
+        return m
+
+    def test_default_feature_list_is_unchanged(self, tmp_path):
+        a = self._train(tmp_path / "a")
+        b = self._train(tmp_path / "b", drop_features=())
+        assert a.feature_cols == b.feature_cols
+        assert set(self.TP) <= set(a.feature_cols)
+        assert a._drop_features == ()
+
+    def test_dropped_features_leave_the_model(self, tmp_path):
+        full = self._train(tmp_path / "a")
+        m = self._train(tmp_path / "b", drop_features=self.TP)
+        assert not set(self.TP) & set(m.feature_cols)
+        assert m.feature_cols == [c for c in full.feature_cols if c not in self.TP]  # order preserved
+        assert m._drop_features == self.TP
+
+    def test_unknown_or_lag_feature_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="lag_24h"):
+            self._train(tmp_path / "a", drop_features=("lag_24h",))
+        with pytest.raises(ValueError, match="no_such_feature"):
+            self._train(tmp_path / "b", drop_features=("no_such_feature",))
+
+    def test_drop_survives_save_and_load_and_predicts(self, tmp_path):
+        m = self._train(tmp_path / "m", drop_features=self.TP)
+        reloaded = EnergyForecastModel(tmp_path / "m", timezone="Europe/Zurich")
+        assert reloaded._drop_features == self.TP
+        assert reloaded.feature_cols == m.feature_cols
+        _, forecast = _make_trained_model(tmp_path / "other")  # only for a 48 h forecast frame
+        out = reloaded.predict(forecast, live_temp=None)
+        assert len(out) == 48 and (out["predicted_kwh"] >= 0).all()
+
+    def test_heating_buffer_drop_is_not_re_added(self, tmp_path, caplog):
+        assert "heating_buffer_temp" in self._train(tmp_path / "full", buffer=True).feature_cols
+        m = self._train(tmp_path / "m", buffer=True, drop_features=("heating_buffer_temp",))
+        assert "heating_buffer_temp" not in m.feature_cols
+        _, forecast = _make_trained_model(tmp_path / "other")
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            m.predict(forecast, live_temp=None)
+        assert "heating_buffer_temp in trained feature list" not in caplog.text
+
+    def test_meta_without_drop_features_loads_as_empty(self, tmp_path):
+        import pickle
+
+        from energy_forecast.model import _write_hash
+
+        self._train(tmp_path / "m")
+        meta_path = tmp_path / "m" / "meta.pkl"
+        meta = pickle.loads(meta_path.read_bytes())
+        meta.pop("drop_features")
+        meta_path.write_bytes(pickle.dumps(meta))
+        _write_hash(meta_path)
+        assert EnergyForecastModel(tmp_path / "m", timezone="Europe/Zurich")._drop_features == ()
+
+    def test_thermal_pressure_sensor_value_survives_the_drop(self, tmp_path, monkeypatch):
+        import energy_forecast.model as mm
+
+        m = self._train(tmp_path / "m", drop_features=self.TP)
+        real = mm._engineer_features
+
+        def fake(*a, **kw):
+            df = real(*a, **kw)
+            df["thermal_pressure_net"] = 1.23
+            return df
+
+        monkeypatch.setattr(mm, "_engineer_features", fake)
+        _, forecast = _make_trained_model(tmp_path / "other")
+        m.predict(forecast, live_temp=None)
+        assert m._latest_thermal_pressure_net == pytest.approx(1.23)

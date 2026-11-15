@@ -44,6 +44,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
     import pandas as pd
 
@@ -164,6 +166,12 @@ _FEATURES_BASE = [
     "dhw_pressure",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
+
+
+def _droppable_features() -> set[str]:
+    """Names train(drop_features=...) accepts: base features except the autoregressive lags, plus the buffer sensor."""
+    lags = {f"lag_{lag}h" for lag in LAG_HOURS}
+    return {c for c in _FEATURES_BASE if c not in lags} | {"heating_buffer_temp"}
 
 
 def _write_hash(path: Path) -> None:
@@ -305,6 +313,8 @@ class EnergyForecastModel:
         self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
+        # Features this model was trained without (#120); informational, serving slices by feature_cols
+        self._drop_features: tuple[str, ...] = ()
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
@@ -357,6 +367,7 @@ class EnergyForecastModel:
         heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
         regime_mode: str = "soft_oof",  # "soft_oof": out-of-fold probabilities (#110); "hard": true daily labels
         regime_oof_cv: str = "blocked",  # soft_oof folds: "blocked" (contiguous, default) | "shuffled" (backtest only)
+        drop_features: Sequence[str] = (),  # feature names to leave out of the model (#120); default: none
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -366,6 +377,10 @@ class EnergyForecastModel:
             raise ValueError(f"regime_mode must be 'hard' or 'soft_oof', got {regime_mode!r}")
         if regime_oof_cv not in ("shuffled", "blocked"):
             raise ValueError(f"regime_oof_cv must be 'shuffled' or 'blocked', got {regime_oof_cv!r}")
+        drop_features = tuple(drop_features)
+        _bad_drop = [f for f in drop_features if f not in _droppable_features()]
+        if _bad_drop:
+            raise ValueError(f"cannot drop {_bad_drop}: not a droppable feature")
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
@@ -715,6 +730,9 @@ class EnergyForecastModel:
             base_features = [*base_features, "physics_kwh"]
         if heating_buffer_temp_series is not None:
             base_features = [*base_features, "heating_buffer_temp"]
+        if drop_features:
+            base_features = [c for c in base_features if c not in drop_features]
+            _LOGGER.info("Training without %d dropped feature(s): %s", len(drop_features), list(drop_features))
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns
@@ -958,6 +976,7 @@ class EnergyForecastModel:
 
         self.model = model
         self.feature_cols = feature_cols
+        self._drop_features = drop_features
         self._heating_buffer_smooth_h = smooth_h
         self.last_trained = datetime.now()
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
@@ -1339,6 +1358,15 @@ class EnergyForecastModel:
                     feat_df[col] = feat_df[col].fillna(global_med)
 
         X = feat_df[self.feature_cols].fillna(0)
+        # thermal_pressure_net feeds a published sensor even when the model was trained without it (#120):
+        # carry the value on X so predict() can set it whether or not the column is a model feature.
+        if "thermal_pressure_net" in X.columns:
+            _tpn = float(X["thermal_pressure_net"].iloc[0])
+        elif "thermal_pressure_net" in feat_df.columns:
+            _tpn = float(feat_df["thermal_pressure_net"].fillna(0.0).iloc[0])
+        else:
+            _tpn = 0.0
+        X.attrs["thermal_pressure_net"] = _tpn
         return future_hours, X
 
     def predict(
@@ -1387,11 +1415,11 @@ class EnergyForecastModel:
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
             )
-        if "thermal_pressure_net" in X.columns:
+        if "thermal_pressure_net" in X.attrs:
+            self._latest_thermal_pressure_net = float(X.attrs["thermal_pressure_net"])
+        elif "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
         else:
-            # Defensive fallback: thermal_pressure_net is always in _FEATURES_BASE,
-            # so this branch should never execute in practice.
             self._latest_thermal_pressure_net = 0.0
         preds = self.model.predict(X)
         if self._log_transform:
@@ -1783,6 +1811,7 @@ class EnergyForecastModel:
 
         meta = {
             "feature_cols": self.feature_cols,
+            "drop_features": list(self._drop_features),
             "last_trained": self.last_trained,
             "last_mae": self.last_mae,
             "last_cv_mae": self.last_cv_mae,
@@ -2232,6 +2261,7 @@ class EnergyForecastModel:
                     with open(self._meta_path, "rb") as fh:
                         meta = pickle.load(fh)
                     self.feature_cols = meta.get("feature_cols", _FEATURES_BASE)
+                    self._drop_features = tuple(meta.get("drop_features", []))
                     self.last_trained = meta.get("last_trained", datetime.min)
                     self.last_mae = meta.get("last_mae")
                     self.last_cv_mae = meta.get("last_cv_mae")

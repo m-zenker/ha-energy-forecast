@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 
 class TestResolveTimezone:
     """resolve_timezone(): explicit config wins, warns on mismatch, falls back to HA then Zurich."""
@@ -112,3 +114,27 @@ class TestDropDstDuplicates:
         assert drop_dst_duplicates(pd.DataFrame()).empty
         df = pd.DataFrame({"x": [1, 1]})
         pd.testing.assert_frame_equal(drop_dst_duplicates(df), df)
+
+
+def test_feature_groups_content():
+    from energy_forecast.const import FEATURE_GROUPS
+
+    assert FEATURE_GROUPS["thermal_pressure"] == (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    )
+    assert FEATURE_GROUPS["heating_buffer"] == ("heating_buffer_temp",)
+
+
+def test_resolve_feature_groups():
+    from energy_forecast.const import FEATURE_GROUPS, resolve_feature_groups
+
+    assert resolve_feature_groups([]) == ()
+    both = resolve_feature_groups(["thermal_pressure", "heating_buffer", "thermal_pressure"])
+    assert both == (*FEATURE_GROUPS["thermal_pressure"], "heating_buffer_temp")
+    with pytest.raises(ValueError, match="thermal-pressure"):
+        resolve_feature_groups(["thermal-pressure"])
