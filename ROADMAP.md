@@ -178,7 +178,7 @@ New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption,
 
 ### #119 — Backtest Capture-Frame Mode
 
-**Priority:** — . **Status:** DONE, shipped alpha-40 (2026-11-14; b03b19d): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Not yet on `dev`. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
+**Priority:** — . **Status:** DONE, shipped alpha-40 (2026-11-14; b03b19d): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
 
 Walk-forward on a retrain capture: truncate the captured live inputs at each cutoff, synthesize the serve inputs, run the real `train()` / `predict()` / `predict_intervals()`. Validated against live: serve inputs within 0.007 kWh/h, retrain at the capture time identical. Scores 3 h-block and daily error, cold-day bias, interval coverage, next-day swing and a jitter arm (same model retrained 1 h earlier) as the noise floor: ±1 % hourly, ±2 % on 3 h blocks, up to ±13 % on daily |bias|. Replaces plan 2 of the parked live-equivalent-frame spec (`docs/superpowers/specs/2026-11-11-live-equivalent-frame-105-gate-design.md`). Needs `/home/jovyan/my_envs/ha-energy-forecast-live`. Also: `scripts/pull_ha_data.py` must pull `.pre/`.
 
