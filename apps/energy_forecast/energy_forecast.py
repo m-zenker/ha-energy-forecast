@@ -2815,13 +2815,24 @@ class EnergyForecast(hass.Hass):
         so `ml_adjustment_vals = predicted_kwh - physics_vals` would silently
         misattribute the entire override delta to "ML Adjustment" instead of
         "Physics Base" on the published diagnostic sensors.
+
+        The weather frame is cut to rows at or after the first forecast hour, so
+        the simulation starts there (not on the ~3 days of past rows the live
+        frame carries, which would seed the DHW tank days ago). The published
+        physics base is floored at 0 after the override delta is added;
+        `ml_adjustment_vals` is computed after the floor, so the two sensors
+        still sum to `predicted_kwh`.
         """
         if self._physics_model is None or forecast_df.empty:
             return
         try:
+            import numpy as np
             import pandas as pd
 
             weather_df = self._cached_forecast_df if self._cached_forecast_df is not None else forecast_df
+            _cut = weather_df[weather_df["timestamp"] >= forecast_df["timestamp"].iloc[0]]
+            if not _cut.empty:
+                weather_df = _cut
             physics_series = self._physics_model.predict_series(
                 weather_df,
                 climate_recent=self._physics_climate_dfs,
@@ -2833,6 +2844,7 @@ class EnergyForecast(hass.Hass):
                 physics_vals = (
                     physics_vals + override_delta.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
                 )
+            physics_vals = np.maximum(0.0, physics_vals)
             ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
 
             physics_attrs = {

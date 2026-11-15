@@ -786,6 +786,54 @@ class TestPhysicsSensors:
         )
         assert float(adj_call.kwargs["state"]) < 0
 
+    def test_physics_base_is_floored_at_zero_with_a_negative_override_delta(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
+        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
+        delta = pd.Series(0.0, index=ts)
+        delta.iloc[3] = -1.0
+        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.4] * 48, index=ts))
+        app._publish_physics_sensors(forecast_df, override_delta=delta)
+
+        def _hourly(entity):
+            call = next(c for c in app.set_state.call_args_list if c.args[0] == entity)
+            return call.kwargs["attributes"]["hourly_kwh"]
+
+        base = _hourly("sensor.energy_forecast_physics_base_today")
+        adj = _hourly("sensor.energy_forecast_ml_adjustment_today")
+        assert base[:5] == [0.4, 0.4, 0.4, 0.0, 0.4]
+        assert min(base) >= 0
+        assert adj[3] == 1.0  # predicted_kwh[3] - 0.0
+        assert all(abs(b + a - 1.0) < 1e-6 for b, a in zip(base, adj, strict=True))
+
+    def test_physics_sensor_weather_frame_is_cut_to_the_forecast_hours(self, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.initialize()
+        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
+        app.set_state = MagicMock()
+        all_ts = pd.date_range("2026-01-12", periods=122 + 48, freq="1h")
+        future_ts = all_ts[122:]
+        app._cached_forecast_df = pd.DataFrame({"timestamp": all_ts, "temp_c": 5.0, "direct_radiation_wm2": 0.0})
+        forecast_df = pd.DataFrame({"timestamp": future_ts, "predicted_kwh": [1.0] * 48})
+        seen = []
+
+        def _spy(df, *a, **kw):
+            seen.append(df)
+            return pd.Series([0.4] * len(df), index=pd.DatetimeIndex(df["timestamp"]))
+
+        monkeypatch.setattr(app._physics_model, "predict_series", _spy)
+        app._publish_physics_sensors(forecast_df)
+        assert len(seen) == 1
+        assert seen[0]["timestamp"].iloc[0] == forecast_df["timestamp"].iloc[0]
+        assert len(seen[0]) == 48
+
     def test_physics_sensors_use_mqtt_in_mqtt_mode(self, monkeypatch):
         """In MQTT mode, both sensors must go through _mqtt_set_sensor, not set_state."""
         from energy_forecast.energy_forecast import EnergyForecast
