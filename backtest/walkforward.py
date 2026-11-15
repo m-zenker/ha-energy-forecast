@@ -25,18 +25,15 @@ from typing import Any
 
 import pandas as pd
 
+from . import env  # noqa: F401  (apps/ on sys.path before the app import below)
 from .arms import feature_drop
 from .capture_frame import SERVE_PAST, CaptureFrame, predict, train
 
+# isort: split
+from energy_forecast.const import FEATURE_GROUPS  # needs the env import above (apps/ on sys.path)
+
 ORIGIN_HOURS = (18, 24, 30, 36)  # hours after the retrain day's midnight
-THERMAL_PRESSURE = (
-    "thermal_pressure",
-    "thermal_pressure_max",
-    "thermal_pressure_std",
-    "thermal_pressure_cop",
-    "thermal_pressure_net",
-    "infiltration_pressure",
-)
+_DROP_TP = FEATURE_GROUPS["thermal_pressure"]
 
 
 @dataclass(frozen=True)
@@ -55,7 +52,8 @@ ARMS: dict[str, WfArm] = {
     for a in (
         WfArm("base"),
         WfArm("jit", cutoff_shift_h=-1),
-        WfArm("droptp", drop=THERMAL_PRESSURE),
+        WfArm("droptp", train_kwargs={"drop_features": _DROP_TP}),
+        WfArm("droptp_nb", train_kwargs={"drop_features": (*_DROP_TP, *FEATURE_GROUPS["heating_buffer"])}),
         WfArm("noreg", train_kwargs={"enable_regimes": False}),
         WfArm("weekly", every_days=7),
         WfArm("weekly_gap", every_days=7, live_frame=True),

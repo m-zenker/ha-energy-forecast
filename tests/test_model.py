@@ -7377,6 +7377,138 @@ class TestPhase2Predict:
         assert not result.empty  # no exception propagates; falls back to ML-only reconstruction
 
 
+def _phase2_physics(tmp_path):
+    from energy_forecast.physics import ThermalPhysicsModel
+
+    pm = ThermalPhysicsModel(
+        tmp_path / "physics_models",
+        {
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "internal_gains_fraction": 0.8,
+            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
+            "room_thermostats": [],
+            "use_physics_residual": True,
+        },
+    )
+    pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
+    return pm
+
+
+def _with_past_tail(forecast_df: pd.DataFrame, hours: int = 122) -> pd.DataFrame:
+    """Live-shaped frame: *hours* past rows in front of the 48 future rows (same columns, same values)."""
+    first = forecast_df["timestamp"].iloc[0]
+    tail = pd.concat([forecast_df.iloc[[0]]] * hours, ignore_index=True)
+    tail["timestamp"] = pd.date_range(first - pd.Timedelta(hours=hours), periods=hours, freq="1h")
+    return pd.concat([tail, forecast_df], ignore_index=True)
+
+
+class TestPhase2LiveShapedFrame:
+    """ROADMAP #113: Phase 2 must work on a forecast frame that carries a past tail (170 rows live)."""
+
+    def test_predict_adds_baseline_on_170_row_frame(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        long_df = _with_past_tail(forecast_df)
+        assert len(long_df) == 170
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(long_df, live_temp=5.0, physics_model=pm)
+        assert "Phase 2 physics reconstruction failed" not in caplog.text
+        assert len(result) == 48
+        baseline = model._last_physics_kwh_series.reindex(pd.DatetimeIndex(result["timestamp"])).fillna(0).to_numpy()
+        assert baseline.sum() > 0
+        # gross forecast is at least the clipped baseline-plus-residual, and clearly above the bare residual
+        raw = model.model.predict(model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)[1])
+        np.testing.assert_allclose(result["predicted_kwh"].to_numpy(), np.maximum(0, baseline + raw), rtol=1e-9)
+
+    def test_short_frame_fills_missing_baseline_hours_with_zero(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(forecast_df.iloc[:40], live_temp=5.0, physics_model=pm)
+        assert len(result) == 48
+        assert "Phase 2 physics reconstruction failed" not in caplog.text
+
+    def test_intervals_add_the_baseline_in_phase2(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        long_df = _with_past_tail(forecast_df)
+        prepared = model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)
+        base = model._last_physics_kwh_series
+        a = model.predict_intervals(long_df, 5.0, _prepared=prepared)
+        model._last_physics_kwh_series = base + 2.0
+        b = model.predict_intervals(long_df, 5.0, _prepared=prepared)
+        assert a is not None and len(a) == 48
+        # hours the baseline covers (the fixture's last hour has no baseline row -> filled with 0)
+        covered = base.reindex(pd.DatetimeIndex(prepared[0])).notna().to_numpy()
+        unclipped = (a["high_kwh"].to_numpy() > 0) & covered
+        assert unclipped.any()
+        np.testing.assert_allclose((b["high_kwh"] - a["high_kwh"]).to_numpy()[unclipped], 2.0)
+        assert (a["low_kwh"] <= a["high_kwh"]).all() and (a["low_kwh"] >= 0).all()
+
+    def test_intervals_without_prepared_use_the_physics_model(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        point = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        bands = model.predict_intervals(forecast_df, 5.0, physics_model=pm)
+        assert bands is not None
+        # gross scale: the upper band is not below the point forecast by a whole baseline
+        assert bands["high_kwh"].sum() > 0.5 * point["predicted_kwh"].sum()
+
+    def test_intervals_return_none_when_phase2_baseline_is_missing(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            assert model.predict_intervals(forecast_df, 5.0) is None  # no physics model, no _prepared
+        assert "Phase 2 intervals skipped" in caplog.text
+
+    def test_phase1_intervals_unchanged(self, tmp_path):
+        model, forecast_df = _make_trained_model(tmp_path / "model")
+        prepared = model._prepare_prediction_X(forecast_df, 5.0, None)
+        a = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
+        model._last_physics_kwh_series = pd.Series(9.0, index=pd.DatetimeIndex(prepared[0]))
+        b = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
+        pd.testing.assert_frame_equal(a, b)  # Phase 1 never adds a baseline
+
+    def test_physics_series_is_simulated_from_the_first_predicted_hour(self, tmp_path, monkeypatch):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        seen = {}
+        real = pm.predict_series
+
+        def spy(frame, **kw):
+            seen["first"] = pd.Timestamp(frame["timestamp"].iloc[0])
+            seen["rows"] = len(frame)
+            return real(frame, **kw)
+
+        monkeypatch.setattr(pm, "predict_series", spy)
+        future_hours, _ = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
+        assert seen["first"] == future_hours[0]
+        # the fixture frame is built from naive container time, the model's horizon from its own timezone,
+        # so derive the expected row count from future_hours instead of assuming 48
+        expected = int((pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]).sum())
+        assert seen["rows"] == expected
+        assert seen["rows"] <= 48
+
+    def test_past_tail_does_not_change_the_physics_feature(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        _, x_short = model._prepare_prediction_X(forecast_df, 5.0, None, physics_model=pm)
+        _, x_long = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
+        np.testing.assert_allclose(x_long["physics_kwh"].to_numpy(), x_short["physics_kwh"].to_numpy())
+
+    def test_frame_without_future_rows_skips_physics(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
+        past_only = forecast_df.copy()
+        past_only["timestamp"] = past_only["timestamp"] - pd.Timedelta(days=5)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            result = model.predict(past_only, live_temp=5.0, physics_model=pm)
+        assert len(result) == 48
+        assert "no forecast rows at or after the first predicted hour" in caplog.text
+
+
 class TestGrossMAEReporting:
     def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):
         model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)
@@ -8039,3 +8171,93 @@ class TestRegimeSoftOOFVariants:
         with open(m._meta_path, "rb") as fh:
             meta = pickle.load(fh)
         assert "regime_zero" not in meta
+
+
+class TestDropFeatures:
+    """ROADMAP #120: train() can leave out named features; default is unchanged."""
+
+    TP = (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    )
+
+    def _train(self, tmp_path, buffer=False, **kw):
+        energy, weather = train_frames()
+        if buffer:
+            kw["heating_buffer_temp_df"] = pd.DataFrame(
+                {"timestamp": energy["timestamp"], "heating_buffer_temp": 30.0 + np.sin(np.arange(len(energy)))}
+            )
+        m = EnergyForecastModel(tmp_path, timezone="Europe/Zurich")
+        m.train(energy, weather, outdoor_df=None, weight_halflife_days=0, **kw)
+        return m
+
+    def test_default_feature_list_is_unchanged(self, tmp_path):
+        a = self._train(tmp_path / "a")
+        b = self._train(tmp_path / "b", drop_features=())
+        assert a.feature_cols == b.feature_cols
+        assert set(self.TP) <= set(a.feature_cols)
+        assert a._drop_features == ()
+
+    def test_dropped_features_leave_the_model(self, tmp_path):
+        full = self._train(tmp_path / "a")
+        m = self._train(tmp_path / "b", drop_features=self.TP)
+        assert not set(self.TP) & set(m.feature_cols)
+        assert m.feature_cols == [c for c in full.feature_cols if c not in self.TP]  # order preserved
+        assert m._drop_features == self.TP
+
+    def test_unknown_or_lag_feature_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="lag_24h"):
+            self._train(tmp_path / "a", drop_features=("lag_24h",))
+        with pytest.raises(ValueError, match="no_such_feature"):
+            self._train(tmp_path / "b", drop_features=("no_such_feature",))
+
+    def test_drop_survives_save_and_load_and_predicts(self, tmp_path):
+        m = self._train(tmp_path / "m", drop_features=self.TP)
+        reloaded = EnergyForecastModel(tmp_path / "m", timezone="Europe/Zurich")
+        assert reloaded._drop_features == self.TP
+        assert reloaded.feature_cols == m.feature_cols
+        _, forecast = _make_trained_model(tmp_path / "other")  # only for a 48 h forecast frame
+        out = reloaded.predict(forecast, live_temp=None)
+        assert len(out) == 48 and (out["predicted_kwh"] >= 0).all()
+
+    def test_heating_buffer_drop_is_not_re_added(self, tmp_path, caplog):
+        assert "heating_buffer_temp" in self._train(tmp_path / "full", buffer=True).feature_cols
+        m = self._train(tmp_path / "m", buffer=True, drop_features=("heating_buffer_temp",))
+        assert "heating_buffer_temp" not in m.feature_cols
+        _, forecast = _make_trained_model(tmp_path / "other")
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            m.predict(forecast, live_temp=None)
+        assert "heating_buffer_temp in trained feature list" not in caplog.text
+
+    def test_meta_without_drop_features_loads_as_empty(self, tmp_path):
+        import pickle
+
+        from energy_forecast.model import _write_hash
+
+        self._train(tmp_path / "m")
+        meta_path = tmp_path / "m" / "meta.pkl"
+        meta = pickle.loads(meta_path.read_bytes())
+        meta.pop("drop_features")
+        meta_path.write_bytes(pickle.dumps(meta))
+        _write_hash(meta_path)
+        assert EnergyForecastModel(tmp_path / "m", timezone="Europe/Zurich")._drop_features == ()
+
+    def test_thermal_pressure_sensor_value_survives_the_drop(self, tmp_path, monkeypatch):
+        import energy_forecast.model as mm
+
+        m = self._train(tmp_path / "m", drop_features=self.TP)
+        real = mm._engineer_features
+
+        def fake(*a, **kw):
+            df = real(*a, **kw)
+            df["thermal_pressure_net"] = 1.23
+            return df
+
+        monkeypatch.setattr(mm, "_engineer_features", fake)
+        _, forecast = _make_trained_model(tmp_path / "other")
+        m.predict(forecast, live_temp=None)
+        assert m._latest_thermal_pressure_net == pytest.approx(1.23)

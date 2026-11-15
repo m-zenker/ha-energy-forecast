@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **dev v0.12.0-alpha-39** (2026-11-13, deployed, 1463 tests) · **main v0.11.18** (2026-10-26).
+Current: **dev v0.12.0-alpha-40** (2026-11-14, deployed, 1518 tests) · **main v0.11.18** (2026-10-26).
 
 ---
 
@@ -14,11 +14,11 @@ Start here. Everything below this section is detail and history.
 |---|---|---|---|---|
 | 1 | Owner decisions: batch decisions D1–D8 (`docs/superpowers/plans/2026-11-14-audit-batch-index.md`) and the #105 go-live criteria (`docs/superpowers/specs/2026-11-14-105-go-live-criteria.md`) | owner | **done** 2026-11-14 | — |
 | 2 | Dated checks: alpha-34 override verification (due about 2026-11-14, HA keeps ~10 days of history); #110 regime stability check, `scripts/check_regime_stability.py`, **no later than 2026-11-21** | owner / PM | open | — |
-| 3 | Ship the current train (b03b19d: #119 backtest capture frame, tooling only) | `/pm evening` | ready | — |
-| 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **ready to start** | — |
-| 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | **ready to start** | can run beside track A |
-| 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **ready to start** | independent |
-| 7 | Ship the batch; check that `pred_history.json` carries `"actuals_basis": "target"` and note the timestamp at which `mae_*` step | `/pm evening` | — | steps 4–6 |
+| 3 | Ship the current train (#117, #114, #119) | `/pm evening` | **done** — alpha-40 2026-11-14 (e784479); verify #117 migration log line and #114 sensors at the next dawn check | — |
+| 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **done** — #117 and #114 shipped alpha-40 (2026-11-14); #118 gate merged to `train/next` 3ef2b23 (ships at next `/pm evening`). First valid reading needs the #117 migration live and ≥ 14 cold days (step 8) | — |
+| 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | **done** on `train/next` 2026-11-15: #113 (a55c46b) and #120 flag + shadow tooling (ships at next `/pm evening`); the #120 shadow itself is step 9 | can run beside track A |
+| 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **done** on `train/next` 2026-11-15 (ships at next `/pm evening`) | independent |
+| 7 | Ship the rest of the batch (#113, #116, #118, #120; alpha-41, planned 2026-11-15 evening). #117 and #114 are already live since alpha-40, so the `"actuals_basis": "target"` marker and the `mae_*` step date from the alpha-40 migration (2026-11-14), not from this ship: use that time as the #118 gate anchor. Confirm the marker and the one-time migration log line if the dawn check is still open | `/pm evening` | — | steps 4–6 |
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
 | 10 | #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
@@ -38,7 +38,7 @@ Start here. Everything below this section is detail and history.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
+**dev:** v0.12.0-alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
 
 **Cold-onset over-forecast (2026-10-15): C verdict PASSED 2026-10-27 (pooled); A+B re-baseline FAILED the bias criterion 2026-11-03 — see the re-baseline paragraph below.** `mae_7d` jumped 0.196 → 0.477 after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term and compared every room to one shared setpoint. **C Task 1** (alpha-26, 2026-10-16): thermostat floor + per-room setpoint; replay 2026-10-08..14 MAE 24–47 h 0.485 → 0.255. **D Task 1** (alpha-25, 2026-10-16): `heating_power_request` valve demand cached in `climate_*.csv`; the ≥ 14 valve-closed-night data gate was met 2026-10-21.
 - **C check 2026-10-21: NOT MET.** 10-17 −2.2 (pass), 10-18 +6.2 and 10-19 +4.7 kWh/day (fail); pooled ≈ +3.5 vs +5.9 before C; point-in-band 87.5 % (< 90 %). Night hours (22–03 h) over-forecast ≈ 0.3–0.5 kWh/h.
@@ -61,7 +61,7 @@ Start here. Everything below this section is detail and history.
 
 **Regime label (#110, new 2026-10-21; Part A log deployed alpha-33 2026-11-03 → `regime_log.jsonl` next to `pred_history.json`):** `regime_kwh` is the top feature but is partly a train/serve leak, and its hard label can flip on a weather-source switch (+5.6 kWh tomorrow spike on 10-21). Needs a backtest before any plan. This also answers the old "SHAP check for #82": `regime_kwh` ranks #1, so #83's value depends on #110.
 
-**Physics Phase 2 interval-coverage check (dormant):** once `use_physics_residual: true` has been live ≥ 30 days, verify empirical interval coverage on gross kWh matches the target (80 %, `_calibrate_intervals()`). Phase 2 stays behind the cold-start gate until ≥ 30 winter UA_eff windows (not before winter 2026/27; see #105). Ref: `docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md` §5.2. **2026-11-13 audit:** Phase 2 cannot be enabled as coded (#113: the reconstruction fails on every live-shaped frame). Even with that corrected it was worse in autumn (10-01..11-03 hourly +13.8 %, cold-day bias +4.6 kWh/day) and better only in winter (3 h blocks −3.1 %, bias ≈ 0), so activation needs a per-season check on the capture frame (#119), not just the window count.
+**Physics Phase 2 interval-coverage check (dormant):** once `use_physics_residual: true` has been live ≥ 30 days, verify empirical interval coverage on gross kWh matches the target (80 %, `_calibrate_intervals()`). Phase 2 stays behind the cold-start gate until ≥ 30 winter UA_eff windows (not before winter 2026/27; see #105). Ref: `docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md` §5.2. **2026-11-13 audit:** Phase 2 cannot be enabled as coded (#113: the reconstruction fails on every live-shaped frame). Even with that corrected it was worse in autumn (10-01..11-03 hourly +13.8 %, cold-day bias +4.6 kWh/day) and better only in winter (3 h blocks −3.1 %, bias ≈ 0), so activation needs a per-season check on the capture frame (#119), not just the window count. **2026-11-15:** #113 now fixes the reconstruction (point forecast and interval baseline); Phase 2 intervals are still not conformally calibrated (the correction applies only in log space), so the coverage check above stays open.
 
 ---
 
@@ -126,7 +126,9 @@ The same code replayed offline beats live: 0.359 vs 0.463 (686 h); 0.448 vs 0.50
 
 ### #113 — Physics Past Tail in `predict_series` / `predict_scenario`
 
-**Priority:** **Blocker for Phase 2** (raised 2026-11-13). **Status:** confirmed by replay; not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-4-phase2-reconstruction-past-tail.md`.
+**Priority:** **Blocker for Phase 2** (raised 2026-11-13). **Status:** fixed on `fix/phase2-reconstruction` (2026-11-15), merged to `train/next` a55c46b (ships at next `/pm evening`); capture replay of the 116 live captures PASS (max difference 0.0 kWh/h). Plan: `docs/superpowers/plans/2026-11-14-audit-batch-4-phase2-reconstruction-past-tail.md`. Still open: `energy_forecast.py` calls `predict_intervals()` with `_prepared` only (no `physics_model`), so forward it before Phase 2 goes live.
+
+**Fixed 2026-11-15 on `fix/phase2-reconstruction` (merged to `train/next` a55c46b (ships at next `/pm evening`)):** the two paragraphs below are the 2026-11-13 findings, kept as history. Still open for Phase 2 activation: (a) forward `physics_model` / `heating_buffer_temp_recent` from the `predict_intervals()` call in `energy_forecast.py` (~2302); (b) `predict_intervals(_prepared=...)` reads `self._last_physics_kwh_series` several steps after `_prepare_prediction_X`, and the `get_scenario` service callback (`_get_scenario_cb`, ~1219, no `self._lock`) overwrites that attribute via `predict_scenario`; if AppDaemon runs it on another thread, Phase 2 bands could carry another scenario's baseline (not verified; Phase 1 never reads it). Fix by handing the baseline over together with `_prepared`, or by taking the lock in the callback.
 
 **Added 2026-11-13:** `predict()` adds a physics baseline indexed on the whole forecast frame to the 48 predictions (`model.py:1395-1405`). With any frame that is not 48 rows it raises `operands could not be broadcast together with shapes (170,) (48,)`, falls back to "ML-only" and publishes the bare residual: 26.4 instead of 36.4 kWh over 48 h in the replay. `predict_intervals()` never adds the baseline. Unit tests pass because they use 48-row frames. Fix both and add a regression test with a 170-row frame before `use_physics_residual` is turned on anywhere.
 
@@ -134,7 +136,7 @@ Both still simulate over `forecast_df`'s past tail, seeded with the latest tank 
 
 ### #114 — Report Block and Daily Accuracy, Not Just Hourly MAE
 
-**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the naive same-hour mean is pinned by a parity test against `wf_score` and the per-hour definitions mirror it.
+**Priority:** **High** (raised 2026-11-13; do right after #117). **Status:** shipped alpha-40 (2026-11-14), live verification pending. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-2-block-daily-naive-metrics.md`. New: `accuracy.py`, live sensors `block_mae_{7d,30d}` and `daily_bias_{7d,30d}` (naive same-hour mean as guardrail attributes), and `mae3` / naive columns in the lean kit summary. The capture-frame scorer (`backtest/wf_score.py`) already had these metrics; the naive same-hour mean is pinned by a parity test against `wf_score` and the per-hour definitions mirror it.
 
 **Extended 2026-11-13:** also publish the naive same-hour mean (days −2..−8) MAE as a guardrail, and add the block, daily and naive columns to `backtest/score.py`. Evidence: scaling the replayed forecast by 0.8 improves hourly MAE by 6 % while bias goes to −2.5 kWh/day; daily error is best at scale 1.0. The naive mean ties current code on hourly MAE and is 10–16 % worse on 3 h blocks.
 
@@ -150,7 +152,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #116 — Retrain Age Off by the UTC Offset (`last_trained` Is Local, Read as UTC)
 
-**Priority:** Low. **Status:** confirmed by code reading and the live log (2026-11-09); not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-6-retrain-age-timezone.md`.
+**Priority:** Low. **Status:** fixed on `train/next` (2026-11-15; `_last_trained_local()` now reads the naive stamp as system-local time), not deployed. Was confirmed by code reading and the live log (2026-11-09). Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-6-retrain-age-timezone.md`.
 
 **Note 2026-11-13:** in the audit's walk-forward, daily against weekly retraining made no accuracy difference on the dev windows (hourly −1.2 %, CI spans 0). Weekly had smaller next-day swings (0.88 against 1.41 kWh) but a worse 6 h-block result on the 9-day holdout (+15.6 %). No change to the cadence is planned.
 
@@ -162,7 +164,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #117 — Scoring Bug: Stored Actuals Include Appliance Energy
 
-**Priority:** High. **Status:** implemented on `train/next` (2026-11-14), not deployed. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
+**Priority:** High. **Status:** shipped alpha-40 (2026-11-14), live verification pending. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-1-appliance-free-actuals.md` (includes a one-time migration of the 30 stored days). Size S; tag BEHAVIOUR (`mae_*` and bias readings step once).
 
 With `baseline_mode: true` the model trains on consumption minus the dishwasher, washer and tumbler sub-meters, but `_actuals_history` is filled from `full_actuals` before that subtraction (`energy_forecast.py:2306-2326`; the comment there says they match). The difference correlates 0.995 with the appliance sub-meters on 771 of 772 hours and is 0.79 kWh/day. Hourly MAE barely moves (0.474 → 0.468), but every bias reading is about 0.8 kWh/day too low: live bias over 32 days is +2.26 against the true target, not +1.47. The naive comparisons made on `pred_history` actuals carry the same error.
 
@@ -170,7 +172,7 @@ With `baseline_mode: true` the model trains on consumption minus the dishwasher,
 
 ### #118 — Replace the Cold-Day Bias Gate
 
-**Priority:** High. **Status:** decided 2026-11-13; `wf_score.cold_gate()` exists for walk-forward rows; the gate on live `pred_history.json` is planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-3-relative-cold-day-gate.md`. Cold day = daily mean ≤ 10 °C, as in the audit (owner, 2026-11-14); the old script's < 13.5 °C is dropped.
+**Priority:** High. **Status:** decided 2026-11-13; `wf_score.cold_gate()` exists for walk-forward rows; the gate on live `pred_history.json` is implemented in `backtest/live_gate.py` (2026-11-15, plan `docs/superpowers/plans/2026-11-14-audit-batch-3-relative-cold-day-gate.md`); no valid reading yet (needs the #117 marker in a fresh `data/` pull, ≥ 14 cold days and weather covering them). Cold day = daily mean ≤ 10 °C, as in the audit (owner, 2026-11-14); the old script's < 13.5 °C is dropped.
 
 New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption, over at least 14 cold days, on appliance-free actuals (#117). Fewer days is INCONCLUSIVE. It replaces [−3, +1] kWh/day, which was shaped around an expected −2 kWh/day residual from fix C. Reasons: load runs from about 16 kWh/day in autumn to over 30 in winter; a median-like forecast is expected to sit 5–7 % low; daily error is about 2 kWh, so a 7-day mean has a standard error near 0.75 kWh/day, and the retrain jitter alone moves daily |bias| by up to 13 %. Current code replayed: +0.49 kWh/day on 16 cold days in 10-01..11-03 (about +3 %); +1.76 on 7 cold days in 11-04..11-12 (about +9 %, inconclusive).
 
@@ -178,13 +180,13 @@ New gate: pooled cold-day bias within −12 % to +6 % of mean daily consumption,
 
 ### #119 — Backtest Capture-Frame Mode
 
-**Priority:** — . **Status:** DONE on `train/next` (b03b19d, 2026-11-13): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Not yet on `dev`. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
+**Priority:** — . **Status:** DONE, shipped alpha-40 (2026-11-14; b03b19d): `backtest/capture_frame.py`, `walkforward.py`, `wf_score.py`, audit tools. Left over: `scripts/pull_ha_data.py` must pull `.pre/` (folded into the #118 plan).
 
 Walk-forward on a retrain capture: truncate the captured live inputs at each cutoff, synthesize the serve inputs, run the real `train()` / `predict()` / `predict_intervals()`. Validated against live: serve inputs within 0.007 kWh/h, retrain at the capture time identical. Scores 3 h-block and daily error, cold-day bias, interval coverage, next-day swing and a jitter arm (same model retrained 1 h earlier) as the noise floor: ±1 % hourly, ±2 % on 3 h blocks, up to ±13 % on daily |bias|. Replaces plan 2 of the parked live-equivalent-frame spec (`docs/superpowers/specs/2026-11-11-live-equivalent-frame-105-gate-design.md`). Needs `/home/jovyan/my_envs/ha-energy-forecast-live`. Also: `scripts/pull_ha_data.py` must pull `.pre/`.
 
 ### #120 — Drop the Thermal-Pressure Feature Family
 
-**Priority:** Medium. **Status:** simulated 2026-11-13; not implemented. Flag and shadow tooling planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow itself needs ≥ 14 capture days after 2026-11-12.
+**Priority:** Medium. **Status:** flag (`drop_feature_groups`, default off) and shadow tooling (`droptp` / `droptp_nb` arms, `wf_score.shadow_verdict`) on `train/next` (2026-11-15), not deployed; shadow not started. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow needs ≥ 14 capture days after 2026-11-12.
 
 `thermal_pressure`, `_max`, `_std`, `_cop`, `_net` and `infiltration_pressure`: the served values have about zero correlation with the values later trained on (−0.06 at 24–47 h, −0.03 at 1–5 h), and a 0.4 K projected room deficit moved the 11-14 forecast between 25.0 and 31.4 kWh. Dropping them: hourly +0.2 % (CI −1.0..+1.3) and 3 h −0.4 % pooled over dev; holdout hourly −0.8 %, cold-day bias +0.95 against +1.76; spread of the next-day total across the previous day's four forecasts 1.25 → 0.57 kWh (Sep), 1.41 → 1.33 (Oct), 2.44 → 1.39 (holdout). Not testable on last winter (no climate data then).
 
@@ -623,14 +625,14 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 110 | Regime label train/serve leak + hard-label flip on weather-source switch | medium (tomorrow stability, feature-ranking honesty) | ~½ day backtest + 1 day | Part A (regime log) deployed alpha-33 2026-11-03; Parts B–C done 2026-11-05 (backtest: T with blocked folds chosen); deployed alpha-35 2026-11-05 (gate waived by user) — see #110 detail. Leading suspect for the post-A+B over-forecast **2026-11-13:** regimes off is worse (3 h +12.4 % on the audit holdout); close after the 11-19..21 stability check. |
 | 111 | Horizon-consistent model shadow trial | — | — | **parked 2026-11-13** — reopen only on a 3 h-block win on #119 |
 | 112 | Live vs replay gap | — | — | **closed 2026-11-13** — input difference; round trips exact |
-| 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | **blocker for Phase 2** — planned (batch phase 4) |
-| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — implemented on `train/next` (2026-11-14), not deployed |
+| 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | fixed on `fix/phase2-reconstruction` 2026-11-15, merged to `train/next` a55c46b (ships at next `/pm evening`); Phase 2 activation still gated |
+| 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — shipped alpha-40 (2026-11-14), live verification pending |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
-| 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
-| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — implemented on `train/next` (2026-11-14), not deployed |
-| 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — planned (batch phase 3) |
-| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done** on `train/next` 2026-11-13 (b03b19d), not yet on `dev` |
-| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag planned (batch phase 5); 14-day shadow earliest 2026-11-27 |
+| 116 | Retrain age off by the UTC offset | retrain timing | S | low — fixed on `train/next` 2026-11-15, ships at next `/pm evening` |
+| 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — shipped alpha-40 (2026-11-14), live verification pending |
+| 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — gate implemented in `backtest/live_gate.py` (2026-11-15); first valid reading pending |
+| 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
+| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag on `train/next` 2026-11-15; 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
@@ -640,7 +642,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
 1. ✅ Implement A (#101) and B (#102) on separate branches; deploys held until step 2 (done 2026-10-17).
 2. ✅ (PASS, pooled, 2026-10-27) C verdict: ≥ 3 cold target days on C + #109 smoothing, counted from the 2026-10-20 22:33 retrain (10-21 check on alpha-26 alone: not met); earliest ~10-25. D1 valve data gate already met (2026-10-21).
-3. ✅ Deployed A + B together (alpha-32, 2026-10-27); re-baseline **not yet holding** (bias +2.79 kWh/day on 2026-11-03, +2.43 on 11-06, +2.54 on 11-08, +1.89 on 2026-11-12 (alpha-35 cold days −1.79, beats naive −9 %; `memory/project_deploy_accuracy_review_2026_11_08.md`); #110 shipped alpha-35 2026-11-05; rescore at ≥ 5 alpha-35 cold days). (A shifts actuals ≈ +0.5 kWh/day; B changes the `mae_*` pair population). **2026-11-13:** these readings are on actuals that include appliance energy (about 0.8 kWh/day too low, #117) and on fewer than 14 cold days. Re-read with the #118 gate once #117 is live and ≥ 14 cold days have accumulated.
+3. ✅ Deployed A + B together (alpha-32, 2026-10-27); re-baseline **not yet holding** (bias +2.79 kWh/day on 2026-11-03, +2.43 on 11-06, +2.54 on 11-08, +1.89 on 2026-11-12 (alpha-35 cold days −1.79, beats naive −9 %; `memory/project_deploy_accuracy_review_2026_11_08.md`); #110 shipped alpha-35 2026-11-05; rescore at ≥ 5 alpha-35 cold days). (A shifts actuals ≈ +0.5 kWh/day; B changes the `mae_*` pair population). **2026-11-13:** these readings are on actuals that include appliance energy (about 0.8 kWh/day too low, #117) and on fewer than 14 cold days. Re-read once #117 is live and ≥ 14 cold days have accumulated: `PYTHONPATH=apps:. python -m backtest.live_gate data --since "<deploy or retrain time>"` (#118 gate, `backtest/README.md` "Gate on live data").
 4. Implement #105 (can overlap steps 2–3; needs the backtest harness and the COP-scale question settled first). **2026-11-13:** the harness requirement is #119.
 5. Deploy #105 only after step 3's re-baseline holds under the #118 gate — never in the same window as A/B (first non-null `UA_eff` shifts `physics_kwh`). Judge it on forecast stability and bias on the first days at a new temperature low (#119), not on average MAE.
 6. #106, #104, #103 after ≥ 14 cold days of baseline (or ≥ 14 valve-closed nights for #104). Gate #103 and #105 separately — both target the same residual, so don't default both on. **2026-11-13:** #103 and #106 are demoted to low and need a new justification first (see the table).

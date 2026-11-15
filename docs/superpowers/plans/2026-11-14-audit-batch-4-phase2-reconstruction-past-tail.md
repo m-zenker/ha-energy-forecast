@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+OWNER-APPROVED docs/superpowers/plans/2026-11-14-audit-batch-4-phase2-reconstruction-past-tail.md 2026-11-15
+
 **Goal:** a Phase 2 (`use_physics_residual`) model returns gross kWh for the point forecast and the intervals on a live-shaped forecast frame, and the serving physics simulation starts at the first predicted hour instead of days in the past.
 
 **Architecture:** three small fixes around `EnergyForecastModel._prepare_prediction_X`: (1) the physics baseline is aligned on the 48 predicted hours, not on the whole weather frame; (2) `predict_intervals()` adds the same baseline; (3) the weather frame handed to `ThermalPhysicsModel.predict_series()` is cut to the predicted hours. The diagnostic sensor publisher gets the same cut and a floor at 0.

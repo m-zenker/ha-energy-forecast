@@ -120,7 +120,10 @@ def test_retrain_days_cadence():
 
 def test_arm_registry_has_a_jitter_control():
     assert ARMS["jit"].cutoff_shift_h == -1 and ARMS["base"] == WfArm("base")
-    assert "thermal_pressure" in ARMS["droptp"].drop
+    assert ARMS["droptp"].drop == ()
+    assert "thermal_pressure" in ARMS["droptp"].train_kwargs["drop_features"]
+    assert "heating_buffer_temp" in ARMS["droptp_nb"].train_kwargs["drop_features"]
+    assert set(ARMS["droptp"].train_kwargs["drop_features"]) < set(ARMS["droptp_nb"].train_kwargs["drop_features"])
 
 
 def test_train_and_predict_run_the_real_model(frame, tmp_path):

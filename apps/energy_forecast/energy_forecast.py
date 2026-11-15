@@ -45,6 +45,7 @@ from .const import (
     REGIME_LOG_PATH,
     UNIT_TO_KWH,
     drop_dst_duplicates,
+    resolve_feature_groups,
     resolve_timezone,
 )
 from .const import strip_tz as _strip_tz_util
@@ -344,6 +345,9 @@ class EnergyForecast(hass.Hass):
         self._ev_charger_kw: float = float(self.args.get("ev_charger_kw", 9.0))
         self._ev_charging_sensor: str | None = self.args.get("ev_charging_sensor") or None
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
+        # Feature groups left out of training (#120). An unknown group name raises, stopping startup.
+        self._drop_feature_groups: list[str] = list(self.args.get("drop_feature_groups") or [])
+        self._drop_features: tuple[str, ...] = resolve_feature_groups(self._drop_feature_groups)
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
         _energy_unit: str = str(self.args.get("energy_unit", "kWh"))
@@ -629,7 +633,7 @@ class EnergyForecast(hass.Hass):
         _LOGGER.info(
             "Config validated — lat=%s, lon=%s, plz=%s, timezone=%s, "
             "holiday_country=%s, weight_halflife=%sd, baseline_mode=%s, "
-            "ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
+            "drop_feature_groups=%s, ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
             "anomaly_sigma_threshold=%s, shap_top_n=%s, mqtt_discovery=%s",
             self._lat,
             self._lon,
@@ -638,6 +642,7 @@ class EnergyForecast(hass.Hass):
             self._holiday_country,
             self._weight_halflife,
             self._baseline_mode,
+            self._drop_feature_groups,
             self._ev_threshold,
             self._ev_charger_kw,
             len(self._sub_energy_sensors),
@@ -1164,21 +1169,24 @@ class EnergyForecast(hass.Hass):
             self._lock.release()
 
     def _last_trained_local(self) -> datetime:
-        """self._ml_model.last_trained as local wall-clock time.
+        """self._ml_model.last_trained as naive wall-clock time in the app's time zone.
 
-        It's persisted via datetime.now() in model.py's train() — system/UTC time in Docker/HA,
-        per the same reasoning already documented at _maybe_adaptive_retrain's local-time
-        construction. Every retrain-cadence comparison in this file uses
-        pd.Timestamp.now(self._timezone).tz_localize(None), so this converts last_trained to the
-        same basis before any comparison — without it, comparisons are off by the UTC offset
-        (1-2h for Europe/Zurich), which lets cooldown gates expire early near their boundary.
+        last_trained is stamped by datetime.now() in model.py's train(), i.e. the container's
+        system-local time (local time in the HA add-on, UTC in a plain Docker container). This
+        converts it to self._timezone so it is comparable with
+        pd.Timestamp.now(self._timezone).tz_localize(None), which every retrain-cadence gate uses.
+        The old code assumed the stamp was UTC, which made the age read 1-2h short on HA (#116).
         """
         import pandas as pd
 
         last_trained = self._ml_model.last_trained
         if last_trained == datetime.min:
             return last_trained
-        return pd.Timestamp(last_trained).tz_localize("UTC").tz_convert(self._timezone).tz_localize(None)
+        # astimezone() with no argument attaches the system zone to a naive datetime.
+        # Go through a plain datetime: pd.Timestamp.astimezone() requires an argument.
+        ts = pd.Timestamp(last_trained)
+        aware = ts.to_pydatetime().astimezone() if ts.tzinfo is None else ts
+        return pd.Timestamp(aware).tz_convert(self._timezone).tz_localize(None)
 
     def _seed_adaptive_cooldown(self) -> None:
         """Seed the adaptive-retrain cooldown from the persisted last-trained timestamp.
@@ -1996,6 +2004,7 @@ class EnergyForecast(hass.Hass):
             heating_buffer_temp_df=self._physics_heating_buffer_df,
             use_physics_residual=self._effective_use_physics_residual(),
             heating_feature_df=heating_feature_df,
+            drop_features=self._drop_features,
         )
         capture_id = _capture_retrain_inputs(self, train_kwargs)
         self._ml_model.train(**train_kwargs)
@@ -2815,13 +2824,24 @@ class EnergyForecast(hass.Hass):
         so `ml_adjustment_vals = predicted_kwh - physics_vals` would silently
         misattribute the entire override delta to "ML Adjustment" instead of
         "Physics Base" on the published diagnostic sensors.
+
+        The weather frame is cut to rows at or after the first forecast hour, so
+        the simulation starts there (not on the ~3 days of past rows the live
+        frame carries, which would seed the DHW tank days ago). The published
+        physics base is floored at 0 after the override delta is added;
+        `ml_adjustment_vals` is computed after the floor, so the two sensors
+        still sum to `predicted_kwh`.
         """
         if self._physics_model is None or forecast_df.empty:
             return
         try:
+            import numpy as np
             import pandas as pd
 
             weather_df = self._cached_forecast_df if self._cached_forecast_df is not None else forecast_df
+            _cut = weather_df[weather_df["timestamp"] >= forecast_df["timestamp"].iloc[0]]
+            if not _cut.empty:
+                weather_df = _cut
             physics_series = self._physics_model.predict_series(
                 weather_df,
                 climate_recent=self._physics_climate_dfs,
@@ -2833,6 +2853,7 @@ class EnergyForecast(hass.Hass):
                 physics_vals = (
                     physics_vals + override_delta.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
                 )
+            physics_vals = np.maximum(0.0, physics_vals)
             ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
 
             physics_attrs = {

@@ -44,6 +44,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
     import pandas as pd
 
@@ -164,6 +166,12 @@ _FEATURES_BASE = [
     "dhw_pressure",
 ]
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
+
+
+def _droppable_features() -> set[str]:
+    """Names train(drop_features=...) accepts: base features except the autoregressive lags, plus the buffer sensor."""
+    lags = {f"lag_{lag}h" for lag in LAG_HOURS}
+    return {c for c in _FEATURES_BASE if c not in lags} | {"heating_buffer_temp"}
 
 
 def _write_hash(path: Path) -> None:
@@ -305,6 +313,8 @@ class EnergyForecastModel:
         self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
+        # Features this model was trained without (#120); informational, serving slices by feature_cols
+        self._drop_features: tuple[str, ...] = ()
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
@@ -357,6 +367,7 @@ class EnergyForecastModel:
         heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
         regime_mode: str = "soft_oof",  # "soft_oof": out-of-fold probabilities (#110); "hard": true daily labels
         regime_oof_cv: str = "blocked",  # soft_oof folds: "blocked" (contiguous, default) | "shuffled" (backtest only)
+        drop_features: Sequence[str] = (),  # feature names to leave out of the model (#120); default: none
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
@@ -366,6 +377,10 @@ class EnergyForecastModel:
             raise ValueError(f"regime_mode must be 'hard' or 'soft_oof', got {regime_mode!r}")
         if regime_oof_cv not in ("shuffled", "blocked"):
             raise ValueError(f"regime_oof_cv must be 'shuffled' or 'blocked', got {regime_oof_cv!r}")
+        drop_features = tuple(drop_features)
+        _bad_drop = [f for f in drop_features if f not in _droppable_features()]
+        if _bad_drop:
+            raise ValueError(f"cannot drop {_bad_drop}: not a droppable feature")
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
@@ -715,6 +730,9 @@ class EnergyForecastModel:
             base_features = [*base_features, "physics_kwh"]
         if heating_buffer_temp_series is not None:
             base_features = [*base_features, "heating_buffer_temp"]
+        if drop_features:
+            base_features = [c for c in base_features if c not in drop_features]
+            _LOGGER.info("Training without %d dropped feature(s): %s", len(drop_features), list(drop_features))
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns
@@ -958,6 +976,7 @@ class EnergyForecastModel:
 
         self.model = model
         self.feature_cols = feature_cols
+        self._drop_features = drop_features
         self._heating_buffer_smooth_h = smooth_h
         self.last_trained = datetime.now()
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
@@ -1123,10 +1142,15 @@ class EnergyForecastModel:
         # which is the RC-ODE-projected version built for _engineer_features()'s own
         # climate feature) — predict_series() does its own internal projection.
         physics_kwh_series = None
-        if physics_model is not None:
+        # The frame carries a past tail (past_days=3); simulating over it would seed the tank days
+        # ago (same reasoning as the override-delta fix in energy_forecast.py, alpha-34).
+        _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]]
+        if physics_model is not None and _serving_df.empty:
+            _LOGGER.warning("Physics baseline skipped: no forecast rows at or after the first predicted hour")
+        elif physics_model is not None:
             try:
                 physics_kwh_series = physics_model.predict_series(
-                    forecast_df,
+                    _serving_df,
                     climate_recent=climate_recent,
                     dhw_recent=dhw_recent,
                     room_areas=room_areas,
@@ -1334,6 +1358,15 @@ class EnergyForecastModel:
                     feat_df[col] = feat_df[col].fillna(global_med)
 
         X = feat_df[self.feature_cols].fillna(0)
+        # thermal_pressure_net feeds a published sensor even when the model was trained without it (#120):
+        # carry the value on X so predict() can set it whether or not the column is a model feature.
+        if "thermal_pressure_net" in X.columns:
+            _tpn = float(X["thermal_pressure_net"].iloc[0])
+        elif "thermal_pressure_net" in feat_df.columns:
+            _tpn = float(feat_df["thermal_pressure_net"].fillna(0.0).iloc[0])
+        else:
+            _tpn = 0.0
+        X.attrs["thermal_pressure_net"] = _tpn
         return future_hours, X
 
     def predict(
@@ -1382,11 +1415,11 @@ class EnergyForecastModel:
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
                 dhw_schedule_override=dhw_schedule_override,
             )
-        if "thermal_pressure_net" in X.columns:
+        if "thermal_pressure_net" in X.attrs:
+            self._latest_thermal_pressure_net = float(X.attrs["thermal_pressure_net"])
+        elif "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
         else:
-            # Defensive fallback: thermal_pressure_net is always in _FEATURES_BASE,
-            # so this branch should never execute in practice.
             self._latest_thermal_pressure_net = 0.0
         preds = self.model.predict(X)
         if self._log_transform:
@@ -1397,9 +1430,7 @@ class EnergyForecastModel:
                 physics_kwh_series = self._last_physics_kwh_series
                 if physics_kwh_series is None:
                     raise ValueError("physics baseline unavailable")
-                physics_baseline = (
-                    physics_kwh_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0).values
-                )
+                physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
                 preds = physics_baseline + preds
             except Exception as e:
                 _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
@@ -1421,12 +1452,17 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        *,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
-        Returns None when quantile models are not yet trained.  low_kwh and
-        high_kwh are guaranteed non-negative and ordered (low ≤ high).
+        Returns None when quantile models are not yet trained, or in Phase 2
+        (physics residual) when the physics baseline is unavailable.  low_kwh and
+        high_kwh are guaranteed non-negative and ordered (low ≤ high).  In Phase 2
+        the bands are gross kWh (physics baseline + residual quantiles).
         """
         import numpy as np
         import pandas as pd
@@ -1450,6 +1486,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1459,6 +1497,14 @@ class EnergyForecastModel:
             high += correction
             low = np.expm1(low)
             high = np.expm1(high)
+        if self._use_physics_residual:
+            physics_kwh_series = self._last_physics_kwh_series
+            if physics_kwh_series is None:
+                _LOGGER.warning("Phase 2 intervals skipped: physics baseline unavailable")
+                return None
+            physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
+            low = low + physics_baseline
+            high = high + physics_baseline
         low = np.maximum(0, low)
         high = np.maximum(0, high)
         # Enforce ordering in case of quantile crossing
@@ -1765,6 +1811,7 @@ class EnergyForecastModel:
 
         meta = {
             "feature_cols": self.feature_cols,
+            "drop_features": list(self._drop_features),
             "last_trained": self.last_trained,
             "last_mae": self.last_mae,
             "last_cv_mae": self.last_cv_mae,
@@ -2214,6 +2261,7 @@ class EnergyForecastModel:
                     with open(self._meta_path, "rb") as fh:
                         meta = pickle.load(fh)
                     self.feature_cols = meta.get("feature_cols", _FEATURES_BASE)
+                    self._drop_features = tuple(meta.get("drop_features", []))
                     self.last_trained = meta.get("last_trained", datetime.min)
                     self.last_mae = meta.get("last_mae")
                     self.last_cv_mae = meta.get("last_cv_mae")

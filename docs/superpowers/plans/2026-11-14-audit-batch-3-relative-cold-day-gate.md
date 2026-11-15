@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+OWNER-APPROVED docs/superpowers/plans/2026-11-14-audit-batch-3-relative-cold-day-gate.md 2026-11-15
+
 **Goal:** one command reads the live `pred_history.json` and returns PASS / FAIL / INCONCLUSIVE for the new gate: pooled cold-day bias within −12 % to +6 % of consumption over ≥ 14 cold days, on appliance-free actuals.
 
 **Architecture:** new tracked module `backtest/live_gate.py` turns `pred_history.json` into the row format `backtest/wf_score.py` already scores, and reuses its `day_table`, `summarize` and `cold_gate`. The local, gitignored `scripts/check_cold_onset_gate.py` drops its own absolute-band verdict and calls the module.
