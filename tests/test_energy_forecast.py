@@ -887,6 +887,7 @@ class _FakeValidateSelf:
         self._ev_threshold = ev_threshold
         self._ev_charger_kw = ev_charger_kw
         self._baseline_mode = False
+        self._drop_feature_groups = []
         self._adaptive_retrain_threshold = 2.0
         self._anomaly_sigma_threshold = 3.0
         self._shap_top_n = 5
@@ -1137,6 +1138,43 @@ class TestSensorTypeValidationWiring:
         app._validate_sensor_types = MagicMock()
         app.initialize()
         app._validate_sensor_types.assert_called_once()
+
+
+class TestDropFeatureGroupsConfig:
+    """ROADMAP #120: `drop_feature_groups` maps group names to feature names at startup."""
+
+    THERMAL_PRESSURE = (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    )
+
+    def test_config_maps_to_feature_names(self):
+        app = _make_app({"drop_feature_groups": ["thermal_pressure"]})
+        app.initialize()
+        assert app._drop_features == self.THERMAL_PRESSURE
+
+    def test_default_is_empty(self):
+        app = _make_app({})
+        app.initialize()
+        assert app._drop_features == ()
+
+    def test_unknown_group_fails_startup(self):
+        app = _make_app({"drop_feature_groups": ["thermal-pressure"]})
+        with pytest.raises(ValueError, match="thermal-pressure"):
+            app.initialize()
+
+    def test_retrain_passes_drop_features_to_train(self, tmp_path, monkeypatch):
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        TestRetrainExcludedRanges()._patch_retrain_deps(monkeypatch, _make_energy_df(200))
+        stub = _FakeRetrain(tmp_path / "energy_history.csv")
+        stub._drop_features = self.THERMAL_PRESSURE
+        EnergyForecast._retrain(stub)
+        assert stub._ml_model.train.call_args.kwargs["drop_features"] == self.THERMAL_PRESSURE
 
 
 # ── Setup checker sensor (#17) ────────────────────────────────────────────────
@@ -4224,6 +4262,7 @@ class _FakeRetrain:
         self._sub_energy_sensors = []
         self._program_sensors = {}
         self._baseline_mode = False
+        self._drop_features = ()
         self._baseline_included_sensors = []
         self._lat = 47.0
         self._lon = 8.5
