@@ -1419,12 +1419,17 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        *,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
-        Returns None when quantile models are not yet trained.  low_kwh and
-        high_kwh are guaranteed non-negative and ordered (low ≤ high).
+        Returns None when quantile models are not yet trained, or in Phase 2
+        (physics residual) when the physics baseline is unavailable.  low_kwh and
+        high_kwh are guaranteed non-negative and ordered (low ≤ high).  In Phase 2
+        the bands are gross kWh (physics baseline + residual quantiles).
         """
         import numpy as np
         import pandas as pd
@@ -1448,6 +1453,8 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                physics_model=physics_model,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1457,6 +1464,14 @@ class EnergyForecastModel:
             high += correction
             low = np.expm1(low)
             high = np.expm1(high)
+        if self._use_physics_residual:
+            physics_kwh_series = self._last_physics_kwh_series
+            if physics_kwh_series is None:
+                _LOGGER.warning("Phase 2 intervals skipped: physics baseline unavailable")
+                return None
+            physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
+            low = low + physics_baseline
+            high = high + physics_baseline
         low = np.maximum(0, low)
         high = np.maximum(0, high)
         # Enforce ordering in case of quantile crossing

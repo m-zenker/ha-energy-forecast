@@ -7430,6 +7430,47 @@ class TestPhase2LiveShapedFrame:
         assert len(result) == 48
         assert "Phase 2 physics reconstruction failed" not in caplog.text
 
+    def test_intervals_add_the_baseline_in_phase2(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        long_df = _with_past_tail(forecast_df)
+        prepared = model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)
+        base = model._last_physics_kwh_series
+        a = model.predict_intervals(long_df, 5.0, _prepared=prepared)
+        model._last_physics_kwh_series = base + 2.0
+        b = model.predict_intervals(long_df, 5.0, _prepared=prepared)
+        assert a is not None and len(a) == 48
+        # hours the baseline covers (the fixture's last hour has no baseline row -> filled with 0)
+        covered = base.reindex(pd.DatetimeIndex(prepared[0])).notna().to_numpy()
+        unclipped = (a["high_kwh"].to_numpy() > 0) & covered
+        assert unclipped.any()
+        np.testing.assert_allclose((b["high_kwh"] - a["high_kwh"]).to_numpy()[unclipped], 2.0)
+        assert (a["low_kwh"] <= a["high_kwh"]).all() and (a["low_kwh"] >= 0).all()
+
+    def test_intervals_without_prepared_use_the_physics_model(self, tmp_path):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        point = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
+        bands = model.predict_intervals(forecast_df, 5.0, physics_model=pm)
+        assert bands is not None
+        # gross scale: the upper band is not below the point forecast by a whole baseline
+        assert bands["high_kwh"].sum() > 0.5 * point["predicted_kwh"].sum()
+
+    def test_intervals_return_none_when_phase2_baseline_is_missing(self, tmp_path, caplog):
+        pm = _phase2_physics(tmp_path)
+        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        with caplog.at_level("WARNING", logger="energy_forecast"):
+            assert model.predict_intervals(forecast_df, 5.0) is None  # no physics model, no _prepared
+        assert "Phase 2 intervals skipped" in caplog.text
+
+    def test_phase1_intervals_unchanged(self, tmp_path):
+        model, forecast_df = _make_trained_model(tmp_path / "model")
+        prepared = model._prepare_prediction_X(forecast_df, 5.0, None)
+        a = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
+        model._last_physics_kwh_series = pd.Series(9.0, index=pd.DatetimeIndex(prepared[0]))
+        b = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
+        pd.testing.assert_frame_equal(a, b)  # Phase 1 never adds a baseline
+
 
 class TestGrossMAEReporting:
     def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):
