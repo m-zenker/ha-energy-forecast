@@ -17,7 +17,7 @@ Start here. Everything below this section is detail and history.
 | 3 | Ship the current train (#117, #114, #119) | `/pm evening` | **done** — alpha-40 2026-11-14 (e784479); verify #117 migration log line and #114 sensors at the next dawn check | — |
 | 4 | Audit batch, track A (yardstick), strictly in order: #117 appliance-free actuals → #114 block/daily/naive sensors → #118 gate on live data | one session per phase | **ready to start** | — |
 | 5 | Audit batch, track B: #113 Phase 2 reconstruction and physics past tail → #120 `drop_feature_groups` flag (default off) | one session per phase | #113 done on its branch 2026-11-15 (merged to `train/next` a55c46b (ships at next `/pm evening`)); #120 after it | can run beside track A |
-| 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **ready to start** | independent |
+| 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **done** on `train/next` 2026-11-15 (ships at next `/pm evening`) | independent |
 | 7 | Ship the batch; check that `pred_history.json` carries `"actuals_basis": "target"` and note the timestamp at which `mae_*` step | `/pm evening` | — | steps 4–6 |
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
@@ -152,7 +152,7 @@ Scaling the replayed current model by the trailing 7-day actual/forecast ratio (
 
 ### #116 — Retrain Age Off by the UTC Offset (`last_trained` Is Local, Read as UTC)
 
-**Priority:** Low. **Status:** confirmed by code reading and the live log (2026-11-09); not fixed. Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-6-retrain-age-timezone.md`.
+**Priority:** Low. **Status:** fixed on `train/next` (2026-11-15; `_last_trained_local()` now reads the naive stamp as system-local time), not deployed. Was confirmed by code reading and the live log (2026-11-09). Planned 2026-11-14: `docs/superpowers/plans/2026-11-14-audit-batch-6-retrain-age-timezone.md`.
 
 **Note 2026-11-13:** in the audit's walk-forward, daily against weekly retraining made no accuracy difference on the dev windows (hourly −1.2 %, CI spans 0). Weekly had smaller next-day swings (0.88 against 1.41 kWh) but a worse 6 h-block result on the 9-day holdout (+15.6 %). No change to the cadence is planned.
 
@@ -628,7 +628,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 113 | Phase 2 reconstruction + intervals on live-shaped frames; physics past tail | prevents a ≈ −5 kWh/day failure at activation | S–M | fixed on `fix/phase2-reconstruction` 2026-11-15, merged to `train/next` a55c46b (ships at next `/pm evening`); Phase 2 activation still gated |
 | 114 | Block, daily and naive-guardrail accuracy sensors and kit columns | makes model changes judgeable | M | **high** — shipped alpha-40 (2026-11-14), live verification pending |
 | 115 | Trailing level correction | — | — | **closed 2026-11-13** — forecast stays median-like |
-| 116 | Retrain age off by the UTC offset | retrain timing | S | low — planned (batch phase 6) |
+| 116 | Retrain age off by the UTC offset | retrain timing | S | low — fixed on `train/next` 2026-11-15, ships at next `/pm evening` |
 | 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — shipped alpha-40 (2026-11-14), live verification pending |
 | 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — gate implemented in `backtest/live_gate.py` (2026-11-15); first valid reading pending |
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
