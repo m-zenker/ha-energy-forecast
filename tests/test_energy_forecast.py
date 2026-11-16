@@ -4301,13 +4301,6 @@ class _FakeRetrain:
 
         return EnergyForecast._last_trained_local(self)
 
-    def _effective_use_physics_residual(self):
-        # _retrain() passes this through to self._ml_model.train(). Delegate to the real
-        # implementation; with self._physics_model = None it short-circuits to False.
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._effective_use_physics_residual(self)
-
     def _ev_charging_cache_path(self):
         # _retrain() calls this when self._ev_charging_sensor is set. Delegate to the
         # real implementation for the same reason as _last_trained_local above.

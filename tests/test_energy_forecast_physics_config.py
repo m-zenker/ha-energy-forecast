@@ -533,77 +533,6 @@ class TestRetrainCallsPhysicsFetch:
         assert "dhw_df" in call_kwargs
 
 
-class TestRetrainWiresUsePhysicsResidual:
-    """Final-review fix: `_retrain()` must pass `_effective_use_physics_residual()` through to
-    `EnergyForecastModel.train()` as `use_physics_residual=`. Without this wiring, the
-    cold-start-gate design (config intent AND-ed with calibration-window count) is computed but
-    never actually reaches training, so Phase 2 residual learning can never activate."""
-
-    def _patch_retrain_deps(self, monkeypatch):
-        import pandas as pd
-        from energy_forecast import ha_data as ha_data_mod
-        from energy_forecast import weather as weather_mod
-
-        energy_df = pd.DataFrame(
-            {
-                "timestamp": pd.date_range("2024-01-01", periods=2000, freq="1h"),
-                "gross_kwh": [1.0] * 2000,
-            }
-        )
-        empty_df = pd.DataFrame(columns=["timestamp"])
-
-        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
-        monkeypatch.setattr(
-            ha_data_mod,
-            "split_ev_charging",
-            lambda df, *a, **kw: (df, pd.DataFrame(columns=["timestamp", "gross_kwh"])),
-        )
-        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
-
-    def _make_retrain_ready_app(self, monkeypatch, *, use_physics_residual: bool):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        self._patch_retrain_deps(monkeypatch)
-
-        app = _make_app(
-            {"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": use_physics_residual}}
-        )
-        app.initialize()
-        assert app._physics_model is not None
-
-        app._ml_model = MagicMock()  # avoid a real training cycle
-        app._fetch_physics_sensor_histories = MagicMock()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
-        return app
-
-    def test_retrain_passes_use_physics_residual_true_when_gate_clear(self, monkeypatch):
-        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
-
-        # Clear the cold-start gate so _effective_use_physics_residual() resolves to True.
-        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
-        assert app._physics_model.is_cold_start_gated is False
-
-        app._retrain()
-
-        app._ml_model.train.assert_called_once()
-        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is True
-
-    def test_retrain_passes_use_physics_residual_false_when_gate_not_clear(self, monkeypatch):
-        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
-
-        # Fresh model, no calibration windows accumulated yet — gate stays closed.
-        assert app._physics_model.is_cold_start_gated is True
-
-        app._retrain()
-
-        app._ml_model.train.assert_called_once()
-        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is False
-
-
 class TestRecalibratePhysicsService:
     def test_service_registered_when_physics_enabled(self):
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
@@ -710,38 +639,6 @@ class TestRecalibratePhysicsService:
                 app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
             mock_calibrate.assert_not_called()
         assert any("recalibrate_physics" in r.message.lower() for r in caplog.records)
-
-    def test_cold_start_gate_logs_warning_when_residual_requested_but_gated(self, caplog):
-        import logging
-
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
-        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
-        app.initialize()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        assert app._physics_model.is_cold_start_gated is True  # fresh model, no calibration windows yet
-        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            app._effective_use_physics_residual()
-        assert any("cold-start" in r.message.lower() or "cold start" in r.message.lower() for r in caplog.records)
-
-    def test_phase2_activation_logs_experimental_warning_when_gate_clear(self, caplog):
-        import logging
-
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
-        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
-        app.initialize()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
-        assert app._physics_model.is_cold_start_gated is False
-
-        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            result = app._effective_use_physics_residual()
-
-        assert result is True
-        assert any("experimental" in r.message.lower() and "phase 2" in r.message.lower() for r in caplog.records)
 
 
 class TestPhysicsSensors:
@@ -1011,7 +908,7 @@ class TestModelPhaseAttribute:
 
 
 class TestGetScenarioDhwSchedule:
-    def test_dhw_schedule_forwarded_as_override(self, monkeypatch):
+    def test_dhw_schedule_no_longer_forwarded_to_the_model(self, monkeypatch):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
@@ -1043,10 +940,10 @@ class TestGetScenarioDhwSchedule:
             "get_scenario",
             {"schedule": {}, "dhw_schedule": {"legionella": ["2026-01-16", 10]}},
         )
-        assert received.get("dhw_schedule_override") == {"legionella": ["2026-01-16", 10]}
-        assert received.get("physics_model") is app._physics_model
+        assert "dhw_schedule_override" not in received
+        assert "physics_model" not in received
 
-    def test_no_dhw_schedule_key_forwards_none(self):
+    def test_no_dhw_schedule_key_adds_no_override_kwarg(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
@@ -1073,7 +970,7 @@ class TestGetScenarioDhwSchedule:
         app._ml_model.predict_scenario = _fake_predict_scenario
 
         app._get_scenario_cb("default", "energy_forecast", "get_scenario", {"schedule": {}})
-        assert received.get("dhw_schedule_override") is None
+        assert "dhw_schedule_override" not in received
 
 
 class TestSetDhwScheduleService:

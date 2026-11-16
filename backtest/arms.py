@@ -26,7 +26,7 @@ class Arm:
 def feature_drop(drop: Iterable[str]) -> Iterator[None]:
     """Rebind ``energy_forecast.model._FEATURES_BASE`` without *drop* (train() reads it at call time); restore on exit.
 
-    Only static ``_FEATURES_BASE`` names can be dropped. Names train() re-adds (lag_*h, physics_kwh, sub-sensor
+    Only static ``_FEATURES_BASE`` names can be dropped. Names train() re-adds (lag_*h, sub-sensor
     lags) are caught after training by the runner.
     """
     import energy_forecast.model as mm

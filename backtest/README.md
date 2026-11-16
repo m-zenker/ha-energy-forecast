@@ -24,7 +24,7 @@ ARMS = [
 ```
 
 Train kwargs default to what live `_retrain()` passes, read from `data/apps.yaml`. Only static `_FEATURES_BASE`
-names can be dropped. A drop that `train()` re-adds (`lag_*h`, `physics_kwh`, sub-sensor lags) raises an error
+names can be dropped. A drop that `train()` re-adds (`lag_*h`, sub-sensor lags) raises an error
 rather than silently doing nothing.
 
 ## Running

@@ -55,7 +55,6 @@ def _make_trained_model(
     timezone: str = "Europe/Zurich",
     physics_model=None,
     outdoor_df=None,
-    use_physics_residual: bool = False,
 ) -> tuple:
     """Return (model, forecast_df) after a full train() call."""
     rng = np.random.default_rng(0)
@@ -84,7 +83,6 @@ def _make_trained_model(
         outdoor_df=outdoor_df,
         weight_halflife_days=0,
         physics_model=physics_model,
-        use_physics_residual=use_physics_residual,
     )
     # Build a minimal forecast_df covering the next 48h
     future_ts = pd.date_range(pd.Timestamp.now().floor("1h"), periods=48, freq="1h")
@@ -1113,47 +1111,9 @@ class TestTrainWithPhysics:
             "use_physics_residual": False,
         }
 
-    def test_physics_kwh_in_feature_cols_when_physics_model_given(self, tmp_path):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm)
-        assert "physics_kwh" in model.feature_cols
-
     def test_physics_kwh_absent_from_feature_cols_when_none(self, tmp_path):
         model, _ = _make_trained_model(tmp_path / "model", physics_model=None)
         assert "physics_kwh" not in model.feature_cols
-
-    def test_physics_phase1_diagnostic_populated_when_physics_model_given(self, tmp_path):
-        """train() must wire _validate_physics_phase1 when physics_model is not None (Plan B Task 6)."""
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm)
-        assert model.physics_phase1_diagnostic is not None
-        assert set(model.physics_phase1_diagnostic.keys()) == {
-            "shap_rank",
-            "shap_top5",
-            "ols_slope",
-            "calibration_good",
-        }
-
-    def test_physics_phase1_diagnostic_none_when_no_physics_model(self, tmp_path):
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=None)
-        assert model.physics_phase1_diagnostic is None
-
-    def test_physics_kwh_in_feature_cols_when_sensor_also_configured(self, tmp_path):
-        """Regression test: physics_kwh must survive into feature_cols even when
-        use_sensor is True (outdoor_df provided), i.e. via the sensor_features path,
-        not just the base_features path."""
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        n = 600
-        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
-        outdoor_df = pd.DataFrame({"timestamp": ts, "outdoor_temp_live": np.full(n, 12.0)})
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, outdoor_df=outdoor_df)
-        assert "physics_kwh" in model.feature_cols
 
     def test_calibrate_called_when_calibration_stale(self, tmp_path):
         from energy_forecast.physics import ThermalPhysicsModel
@@ -1164,7 +1124,7 @@ class TestTrainWithPhysics:
             _make_trained_model(tmp_path / "model", physics_model=pm)
             mock_calibrate.assert_called_once()
 
-    def test_train_forwards_ev_df_and_heating_sub_meter_to_calibrate(self, tmp_path):
+    def test_train_forwards_ev_df_to_calibrate(self, tmp_path):
         from energy_forecast.physics import ThermalPhysicsModel
 
         pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
@@ -1183,7 +1143,6 @@ class TestTrainWithPhysics:
             }
         )
         ev_df = pd.DataFrame({"timestamp": ts[:5]})
-        heating_sub_meter_df = pd.DataFrame({"timestamp": ts, "kwh": np.full(n, 0.5)})
 
         m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
         with patch.object(pm, "calibrate") as mock_calibrate:
@@ -1194,11 +1153,10 @@ class TestTrainWithPhysics:
                 weight_halflife_days=0,
                 physics_model=pm,
                 ev_df=ev_df,
-                heating_sub_meter_df=heating_sub_meter_df,
             )
         mock_calibrate.assert_called_once()
         assert mock_calibrate.call_args.kwargs["ev_df"] is ev_df
-        assert mock_calibrate.call_args.kwargs["heating_sub_meter_df"] is heating_sub_meter_df
+        assert "heating_sub_meter_df" not in mock_calibrate.call_args.kwargs
 
     def test_calibrate_skipped_when_fresh(self, tmp_path):
         from energy_forecast.physics import ThermalPhysicsModel, _atomic_write_json, _default_calibration
@@ -1312,7 +1270,7 @@ class TestTrainWithPhysics:
 
         # Model completes and is correctly shaped (the main smoke-test assertion).
         assert m.model is not None
-        assert "physics_kwh" in m.feature_cols
+        assert "physics_kwh" not in m.feature_cols
 
         # Real trigger: the injected single-hour anomaly was actually flagged by the same
         # detect_open_windows() call train() used for down-weighting, and not everything
@@ -1886,44 +1844,9 @@ class TestPredictWithPhysics:
             "use_physics_residual": False,
         }
 
-    def test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time(self, tmp_path, caplog):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-        assert "physics_kwh" in model.feature_cols
-
-        # simulate physics disabled at predict time (sensor outage / config change)
-        with caplog.at_level("WARNING"):
-            result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
-        assert not result.empty  # no exception
-        assert any(
-            "physics" in rec.message.lower() and ("fallback" in rec.message.lower() or "0.0" in rec.message)
-            for rec in caplog.records
-        ), f"expected a physics fallback WARNING, got: {[r.message for r in caplog.records]}"
-
-        # Verify the actual feature matrix used for prediction has physics_kwh == 0.0,
-        # not just that predict() happened to return a non-empty result.
-        _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=None, physics_model=None)
-        assert "physics_kwh" in X.columns
-        assert (X["physics_kwh"] == 0.0).all()
-
-    def test_physics_kwh_computed_when_model_present_at_predict_time(self, tmp_path):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
-        assert not result.empty
-
-        # Verify real physics values (not the 0.0 fallback) were actually used.
-        _, X = model._prepare_prediction_X(forecast_df, live_temp=5.0, recent_actuals=None, physics_model=pm)
-        assert "physics_kwh" in X.columns
-        assert not (X["physics_kwh"] == 0.0).all()
-
     def test_predict_without_physics_ever_trained_unaffected(self, tmp_path):
         model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=None)
-        result = model.predict(forecast_df, live_temp=5.0, physics_model=None)
+        result = model.predict(forecast_df, live_temp=5.0)
         assert not result.empty
         assert "physics_kwh" not in model.feature_cols
 
@@ -4196,35 +4119,12 @@ class TestCompositeForecast:
         assert "delta_kwh" in result.columns
 
     def test_predict_scenario_forwards_heating_buffer_temp_recent(self, tmp_path):
-        """predict_scenario() must forward heating_buffer_temp_recent to both internal
-        predict() calls — regression test for the 2026-08-19 phantom-0.0-buffer-temp bug
-        (predict_scenario() previously had no such parameter at all, so every
-        get_scenario call silently predicted with heating_buffer_temp=0.0).
-
-        Tests forwarding to both natural_baseline_df and scenario_baseline_df predict() calls
-        by providing dhw_schedule_override+physics_model together, which triggers the second
-        predict() call path.
-        """
+        """predict_scenario() must forward heating_buffer_temp_recent to its predict() call —
+        regression test for the 2026-08-19 phantom-0.0-buffer-temp bug (every get_scenario call
+        silently predicted with heating_buffer_temp=0.0)."""
         from unittest.mock import MagicMock
 
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        # Create physics model (same pattern as TestScenarioDhwDelta fixtures)
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
-
-        m, forecast = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
+        m, forecast = _make_trained_model(tmp_path / "model")
         m._appliance_signatures = {
             "sub_dw": {"hourly_profile": [0.1, 0.2], "total_kwh": 0.3, "peak_hour": 1, "n_cycles": 3}
         }
@@ -4232,29 +4132,18 @@ class TestCompositeForecast:
             {"timestamp": pd.date_range("2024-01-01", periods=3, freq="1h"), "heating_buffer_temp": [45.0, 46.0, 47.0]}
         )
 
-        # Create dhw override to exercise the second predict() call path
-        override = {"legionella": (str(forecast["timestamp"].iloc[10].date()), forecast["timestamp"].iloc[10].hour)}
-
-        real_predict = m.predict
-        wrapped = MagicMock(side_effect=real_predict)
+        wrapped = MagicMock(side_effect=m.predict)
         m.predict = wrapped
 
         m.predict_scenario(
             forecast,
             live_temp=5.0,
             schedule={"sub_dw": "12:00"},
-            physics_model=pm,
             heating_buffer_temp_recent=buffer_df,
-            dhw_schedule_override=override,
         )
 
-        # Must have called predict() at least twice: natural_baseline_df and scenario_baseline_df
-        assert wrapped.call_count >= 2, f"Expected at least 2 predict() calls, got {wrapped.call_count}"
-        # Both calls must forward the heating_buffer_temp_recent parameter
-        for i, call in enumerate(wrapped.call_args_list):
-            assert call.kwargs.get("heating_buffer_temp_recent") is buffer_df, (
-                f"predict() call {i} did not receive heating_buffer_temp_recent"
-            )
+        assert wrapped.call_count == 1, f"Expected exactly 1 predict() call, got {wrapped.call_count}"
+        assert wrapped.call_args.kwargs.get("heating_buffer_temp_recent") is buffer_df
 
     def test_next_day_time_string(self):
         """'02:00' when forecast_start=10:00 → placed at hour 16 (next-day 02:00)."""
@@ -4519,217 +4408,10 @@ class TestCompositeDeltaKwhHi:
 
 
 class TestScenarioDhwDelta:
-    def test_delta_kwh_reflects_dhw_shift_vs_natural_baseline(self, tmp_path):
-        """NOTE: deviates from the brief by adding `use_physics_residual=True` to
-        `_make_trained_model()` (Phase 2 mode). Confirmed via debug run that in
-        Phase 1 mode (brief's exact fixture, `use_physics_residual` defaulting to
-        False) `physics_kwh` is fed to the ML model as just one of ~30 features
-        trained against fully random/uncorrelated data — it ends up with ~zero
-        learned importance, so a single-hour DHW override changes the
-        `physics_kwh` feature value but never moves `predicted_kwh` at all,
-        making `delta_kwh` deterministically zero and this assertion fail
-        regardless of whether predict_scenario()'s DHW-delta plumbing is
-        correct. This is the same class of fixture flaw already documented on
-        `TestPhase1Validation` above. Phase 2 mode feeds physics_kwh additively
-        into predicted_kwh (model.py `preds = physics_baseline + preds`),
-        guaranteeing the override is observable regardless of ML feature
-        importance, matching the pattern used in
-        `TestPhase2ResidualTarget.test_phase2_target_is_residual_log_transform_disabled`.
-        """
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-
-        override = {
-            "legionella": (str(forecast_df["timestamp"].iloc[10].date()), forecast_df["timestamp"].iloc[10].hour)
-        }
-        result = model.predict_scenario(
-            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
-        )
-        assert "delta_kwh" in result.columns
-        assert result["delta_kwh"].abs().sum() > 0  # dhw shift produced a nonzero delta somewhere
-
     def test_no_dhw_schedule_delta_unchanged_from_pre_plan_d_behaviour(self, tmp_path):
         model, forecast_df = _make_trained_model(tmp_path / "model")
         result = model.predict_scenario(forecast_df, live_temp=5.0, schedule={})
         assert (result["delta_kwh"] == 0.0).all()  # no appliance schedule, no dhw override -> no delta
-
-    def test_appliance_and_dhw_deltas_both_present_are_additive(self, tmp_path):
-        """Proves delta_kwh is genuinely additive: combined(appliance+dhw) ==
-        appliance_only_delta + dhw_only_delta, computed from three separate
-        predict_scenario() calls with a real (nonzero) appliance schedule AND a
-        real (nonzero) dhw override in the combined case.
-
-        Uses `use_physics_residual=True` (Phase 2 mode) for the same reason
-        documented on `test_delta_kwh_reflects_dhw_shift_vs_natural_baseline`
-        above: in Phase 1 mode, physics_kwh has ~zero learned SHAP importance
-        against random training data, so the dhw override never moves
-        predicted_kwh and its delta component would be deterministically zero
-        -- which would make this test pass trivially regardless of whether the
-        combined-delta plumbing in predict_scenario() is correct.
-        """
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-
-        # Give the model a real, non-empty appliance signature (same pattern as
-        # TestScenarioComposite.test_predict_scenario_returns_delta_column above)
-        # so the schedule below actually produces a nonzero appliance-side delta.
-        model._appliance_signatures = {
-            "sub_dw": {"hourly_profile": [0.6, 0.9, 0.4], "total_kwh": 1.9, "peak_hour": 1, "n_cycles": 5}
-        }
-        schedule = {"sub_dw": "12:00"}
-        override = {
-            "legionella": (str(forecast_df["timestamp"].iloc[10].date()), forecast_df["timestamp"].iloc[10].hour)
-        }
-
-        dhw_only = model.predict_scenario(
-            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override
-        )
-        appliance_only = model.predict_scenario(forecast_df, live_temp=5.0, schedule=schedule, physics_model=pm)
-        combined = model.predict_scenario(
-            forecast_df, live_temp=5.0, schedule=schedule, physics_model=pm, dhw_schedule_override=override
-        )
-
-        # Sanity: both component deltas must actually be nonzero, otherwise
-        # additivity would hold trivially (0 + 0 == 0) and prove nothing.
-        assert dhw_only["delta_kwh"].abs().sum() > 0
-        assert appliance_only["delta_kwh"].abs().sum() > 0
-
-        expected_combined = appliance_only["delta_kwh"] + dhw_only["delta_kwh"]
-        pd.testing.assert_series_equal(combined["delta_kwh"], expected_combined, check_exact=False, rtol=1e-6)
-
-    def test_set_dhw_schedule_then_get_scenario_with_different_override(self, tmp_path):
-        """Plan D Task 7 integration test: `set_dhw_schedule(A)` then
-        `get_scenario(dhw_schedule=B)` must compute `delta_kwh` vs. the
-        A-committed natural baseline, never vs. B and never vs. a
-        truly-uncommitted baseline.
-
-        Combines Task 1 (`ThermalPhysicsModel.commit_dhw_schedule()` persists
-        a committed override that becomes the new natural baseline), Task 3
-        (`predict_scenario()`'s natural-vs-scenario delta split), and Task 5
-        (`energy_forecast/set_dhw_schedule` calls `commit_dhw_schedule()` —
-        simulated here by calling `commit_dhw_schedule()` directly, which is
-        exactly what the service callback does).
-
-        Uses `use_physics_residual=True` (Phase 2 mode) for the same reason as
-        the other tests in this class: in Phase 1 mode `physics_kwh` has
-        ~zero learned SHAP importance against this fixture's random training
-        data, so a DHW override never moves `predicted_kwh` and every
-        assertion below would hold vacuously regardless of correctness.
-        """
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        calib_kwargs = dict(UA_eff=150.0, Q_base_el=0.35, UA_dhw=15.0, Q_dhw_daily=3.5)
-        physics_config = {
-            "cop_formula": {"a": 2.5, "b": 0.07},
-            "dhw_tank_volume_l": 200,
-            "dhw_power_w": 4000,
-            "internal_gains_fraction": 0.8,
-            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-            "room_thermostats": [],
-            "use_physics_residual": True,
-        }
-
-        # pm backs the trained model. Nothing is committed on it yet at train
-        # time -- commit_dhw_schedule() only affects predict_series(), not
-        # training.
-        pm = ThermalPhysicsModel(tmp_path / "physics_models", physics_config)
-        pm._calib.update(**calib_kwargs)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-
-        # Independent instance, identical calibration, but commit_dhw_schedule()
-        # is never called on it -- represents a genuinely uncommitted baseline
-        # so we can prove A is really baked into pm's "natural" state below,
-        # rather than merely asserting the scenario delta differs from B.
-        pm_never_committed = ThermalPhysicsModel(tmp_path / "physics_models_uncommitted", physics_config)
-        pm_never_committed._calib.update(**calib_kwargs)
-
-        hour_a = int(forecast_df["timestamp"].iloc[10].hour)
-        hour_b = (hour_a + 10) % 24  # deliberately a different hour than A
-        assert hour_a != hour_b
-        date_str = str(forecast_df["timestamp"].iloc[10].date())
-        override_a = {"legionella": (date_str, hour_a)}
-        override_b = {"legionella": (date_str, hour_b)}
-
-        # Task 5: simulate `set_dhw_schedule(A)` -- the service callback does
-        # exactly this: `physics_model.commit_dhw_schedule(override)`.
-        pm.commit_dhw_schedule(override_a)
-
-        # Task 1 proof: the natural baseline reflects committed A, not "no
-        # override at all". NOTE: as of Phase A Task 6, model.predict() itself
-        # no longer implicitly falls back to committed_override when
-        # dhw_schedule_override is omitted (physics_model.predict_series's
-        # silent fallback was removed, intentionally — the real forecast path
-        # energy_forecast.py:1980 must stay override-blind by default). The
-        # "natural baseline" guarantee this test exercises now lives
-        # specifically in predict_scenario()'s natural_baseline_df construction
-        # (model.py ~L1337), which asks for the committed override explicitly.
-        # Mirror that explicit ask here so this is a true proof of that
-        # invariant, not of a since-removed implicit default.
-        pred_natural_with_a = model.predict(
-            forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=pm._schedule.get("committed_override")
-        )
-        pred_truly_uncommitted = model.predict(forecast_df, live_temp=5.0, physics_model=pm_never_committed)
-        assert not np.allclose(
-            pred_natural_with_a["predicted_kwh"].to_numpy(),
-            pred_truly_uncommitted["predicted_kwh"].to_numpy(),
-        ), "committed override A must change the natural baseline vs. a truly-uncommitted physics model"
-
-        # Task 3: get_scenario(dhw_schedule=B) after set_dhw_schedule(A) was
-        # already committed -- delta_kwh must be vs. the A-committed natural
-        # baseline, not vs. B and not vs. zero.
-        scenario_b = model.predict_scenario(
-            forecast_df, live_temp=5.0, schedule={}, physics_model=pm, dhw_schedule_override=override_b
-        )
-        pred_scenario_b_only = model.predict(
-            forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=override_b
-        )
-
-        # Correct delta: scenario(B) - natural(A-committed).
-        expected_delta_vs_a = pred_scenario_b_only["predicted_kwh"] - pred_natural_with_a["predicted_kwh"]
-        pd.testing.assert_series_equal(
-            scenario_b["delta_kwh"], expected_delta_vs_a, check_names=False, check_exact=False, rtol=1e-9
-        )
-
-        # The regression this test exists to catch: if predict_scenario()'s
-        # natural-baseline computation ignored the committed override, the
-        # delta would instead equal scenario(B) - truly-uncommitted baseline.
-        # Prove that is NOT what happened.
-        wrong_delta_vs_uncommitted = pred_scenario_b_only["predicted_kwh"] - pred_truly_uncommitted["predicted_kwh"]
-        assert not np.allclose(scenario_b["delta_kwh"].to_numpy(), wrong_delta_vs_uncommitted.to_numpy()), (
-            "delta_kwh must be anchored to the A-committed baseline, not a truly-uncommitted baseline"
-        )
-
-        # Sanity: the real delta must actually be nonzero somewhere, else both
-        # assertions above would hold vacuously.
-        assert scenario_b["delta_kwh"].abs().sum() > 0
 
 
 # ── Program signatures in _learn_appliance_signatures ────────────────────────
@@ -7213,22 +6895,6 @@ class TestStripPartialLastDay:
 
 
 class TestPhysicsFeatureIntegration:
-    def test_physics_kwh_present_when_series_given(self):
-        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
-        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
-        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
-        physics_series = pd.Series([0.5] * 5, index=ts.floor("1h"))
-        result = _engineer_features(df, weather, outdoor_df=None, physics_kwh_series=physics_series)
-        assert "physics_kwh" in result.columns
-        assert result["physics_kwh"].iloc[0] == pytest.approx(0.5)
-
-    def test_physics_kwh_absent_not_zero_filled_when_none(self):
-        ts = pd.date_range("2026-01-15", periods=5, freq="1h")
-        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
-        weather = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 5, "wind_kmh": [10.0] * 5})
-        result = _engineer_features(df, weather, outdoor_df=None, physics_kwh_series=None)
-        assert "physics_kwh" not in result.columns
-
     def test_heating_buffer_temp_present_when_series_given(self):
         ts = pd.date_range("2026-01-15", periods=5, freq="1h")
         df = pd.DataFrame({"timestamp": ts, "gross_kwh": [1.0] * 5})
@@ -7245,495 +6911,8 @@ class TestPhysicsFeatureIntegration:
         assert "heating_buffer_temp" not in result.columns
 
 
-def _make_phase1_test_model(tmp_path) -> EnergyForecastModel:
-    """Model with `self.model`/`self.engine`/`feature_cols` fit on exactly
-    ["physics_kwh", "other_feat"] — two columns, matching the shape of the
-    fabricated holdout X used by TestPhase1Validation.
-
-    Needed because `_validate_physics_phase1()` calls
-    `self.model.predict(X, pred_contrib=True)` for the SHAP-rank codepath,
-    and LightGBM's `Booster.predict()` requires the predict-time column
-    count to exactly match the training column count (raises
-    `LightGBMError: number of features ... not the same as ... training
-    data` otherwise — see TestPhase1Validation docstring for how this was
-    discovered). `_make_trained_model()` trains on the full ~30-column
-    `_FEATURES_BASE` set, so it cannot be reused here.
-    """
-    from energy_forecast.model import _build_model, _try_import_lgbm, _try_import_sklearn_gbr
-
-    lgb = _try_import_lgbm()
-    GBR = _try_import_sklearn_gbr()
-    rng = np.random.default_rng(0)
-    n = 50
-    X_train = pd.DataFrame(
-        {
-            "physics_kwh": rng.uniform(0.5, 5.0, size=n),
-            "other_feat": rng.uniform(0.0, 1.0, size=n),
-        }
-    )
-    y_train = X_train["physics_kwh"].to_numpy() + rng.normal(0, 0.05, size=n)
-
-    m = EnergyForecastModel(tmp_path)
-    fitted = _build_model(lgb, GBR, n_estimators=50)
-    fitted.fit(X_train, y_train)
-    m.model = fitted
-    m.engine = "LightGBM" if lgb is not None else "GBR"
-    m.feature_cols = ["physics_kwh", "other_feat"]
-    return m
-
-
-class TestPhase1Validation:
-    """The brief's Step 1 test code trains via `_make_trained_model()` (no
-    `physics_model` arg), which fits a real model on the full ~30-column
-    `_FEATURES_BASE` feature set. Against that model, the brief's fabricated
-    2-column holdout X made `self.model.predict(X, pred_contrib=True)` raise
-    `lightgbm.basic.LightGBMError: The number of features in data (2) is not
-    the same as it was in training data (66)` — confirmed by running the
-    brief's test verbatim before this fix. `_make_phase1_test_model()` (above)
-    replaces `_make_trained_model()` for the two tests that exercise the
-    SHAP-rank codepath, fitting a real model on exactly the 2 columns the
-    fabricated X uses, so `pred_contrib=True` is shape-consistent and
-    meaningful.  `test_physics_kwh_not_in_features_returns_none_rank` doesn't
-    touch the SHAP codepath (physics_kwh absent -> early return), so it's
-    left using `_make_trained_model()` unchanged from the brief.
-    """
-
-    def test_calibration_good_when_top5_and_slope_in_range(self, tmp_path):
-        model = _make_phase1_test_model(tmp_path / "model")
-        X = pd.DataFrame({"physics_kwh": [1.0, 2.0, 3.0], "other_feat": [0.1, 0.2, 0.3]})
-        y_gross = np.array([1.05, 2.1, 2.9])  # slope ~1.0, physics_kwh tracks gross_kwh closely
-        physics_vals = np.array([1.0, 2.0, 3.0])
-        result = model._validate_physics_phase1(X, y_gross, physics_vals)
-        assert result["ols_slope"] == pytest.approx(1.0, rel=0.1)
-        assert result["calibration_good"] is True
-
-    def test_calibration_bad_when_slope_out_of_range(self, tmp_path):
-        model = _make_phase1_test_model(tmp_path / "model")
-        X = pd.DataFrame({"physics_kwh": [1.0, 2.0, 3.0], "other_feat": [0.1, 0.2, 0.3]})
-        y_gross = np.array([3.0, 6.0, 9.0])  # slope 3.0, badly miscalibrated
-        physics_vals = np.array([1.0, 2.0, 3.0])
-        result = model._validate_physics_phase1(X, y_gross, physics_vals)
-        assert result["calibration_good"] is False
-
-    def test_physics_kwh_not_in_features_returns_none_rank(self, tmp_path):
-        model, _ = _make_trained_model(tmp_path / "model")
-        X = pd.DataFrame({"other_feat": [0.1, 0.2, 0.3]})
-        result = model._validate_physics_phase1(X, np.array([1.0, 2.0, 3.0]), None)
-        assert result["shap_rank"] is None
-        assert result["calibration_good"] is False
-
-
-class TestPhase2ResidualTarget:
-    def test_phase1_target_is_gross_kwh_log_transform_active(self, tmp_path):
-        model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)
-        assert model._log_transform is True
-        assert model._use_physics_residual is False
-
-    def test_phase2_target_is_residual_log_transform_disabled(self, tmp_path):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        assert model._log_transform is False
-        assert model._use_physics_residual is True
-
-    def test_phase2_nan_physics_hours_filled_with_zero_and_warned(self, tmp_path, caplog):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        with caplog.at_level("WARNING"):
-            model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        # physics_kwh_series is always fully aligned in this fixture (predict_training_series covers
-        # every training timestamp), so no NaN-fill warning is expected here — this test documents
-        # the *absence* of the warning as the baseline; the NaN-path itself is covered directly below.
-
-    def test_phase2_target_computation_subtracts_physics_before_nan_fill_check(self, tmp_path):
-        # direct unit test of the target math, independent of full train() plumbing
-        ts = pd.date_range("2026-01-01", periods=5, freq="1h")
-        df = pd.DataFrame({"timestamp": ts, "gross_kwh": [2.0, 3.0, 4.0, 5.0, 6.0]})
-        physics_series = pd.Series([1.0, 1.0, np.nan, 2.0, 2.0], index=ts)  # one gap
-        physics_aligned = physics_series.reindex(df["timestamp"])
-        physics_vals = physics_aligned.fillna(0).values
-        target = df["gross_kwh"].to_numpy(dtype=float) - physics_vals
-        assert target[2] == pytest.approx(4.0)  # NaN -> 0, so residual = gross_kwh unmodified for that hour
-        assert target[0] == pytest.approx(1.0)
-
-    def test_phase2_warns_end_to_end_when_physics_series_has_real_gap(self, tmp_path, caplog):
-        # Unlike test_phase2_nan_physics_hours_filled_with_zero_and_warned above (whose fixture is
-        # fully aligned and documents the *absence* of the warning), this test forces a genuine gap
-        # in physics_kwh_series so train()'s internal reindex(df["timestamp"]) — see model.py around
-        # `self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)`
-        # — produces real NaNs, and asserts the resulting WARNING is actually logged.
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-
-        orig_predict_training_series = pm.predict_training_series
-        n_missing_hours = 3
-
-        def _predict_training_series_with_gap(*args, **kwargs):
-            series = orig_predict_training_series(*args, **kwargs)
-            # Drop the last few timestamps entirely so the physics_kwh_series index no
-            # longer covers every training hour — a genuine gap, not just a NaN value.
-            return series.iloc[:-n_missing_hours]
-
-        with (
-            patch.object(pm, "predict_training_series", side_effect=_predict_training_series_with_gap),
-            caplog.at_level("WARNING"),
-        ):
-            model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-
-        assert model._use_physics_residual is True
-        warning_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
-        matching = [m for m in warning_messages if "physics" in m.lower() and str(n_missing_hours) in m]
-        assert matching, (
-            f"expected a WARNING mentioning {n_missing_hours} missing physics hours, got: {warning_messages}"
-        )
-
-
-class TestPhase2Predict:
-    def test_phase2_predict_adds_physics_baseline(self, tmp_path):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
-        assert (result["predicted_kwh"] >= 0).all()  # clip enforced even though residual can go negative
-
-    def test_phase1_to_phase2_regression_identical_when_flag_false(self, tmp_path):
-        # use_physics_residual=False must reproduce pre-Phase-2 behaviour exactly
-        model_a, forecast_df = _make_trained_model(tmp_path / "model_a", use_physics_residual=False)
-        model_b, _ = _make_trained_model(tmp_path / "model_b", use_physics_residual=False)
-        result_a = model_a.predict(forecast_df, live_temp=5.0)
-        result_b = model_b.predict(forecast_df, live_temp=5.0)
-        pd.testing.assert_series_equal(
-            result_a["predicted_kwh"].reset_index(drop=True), result_b["predicted_kwh"].reset_index(drop=True)
-        )
-
-    def test_phase2_exception_in_physics_falls_back_to_ml_only(self, tmp_path, monkeypatch):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-
-        def _broken_predict_series(*a, **kw):
-            raise RuntimeError("simulated physics failure")
-
-        monkeypatch.setattr(pm, "predict_series", _broken_predict_series)
-        result = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
-        assert not result.empty  # no exception propagates; falls back to ML-only reconstruction
-
-
-def _phase2_physics(tmp_path):
-    from energy_forecast.physics import ThermalPhysicsModel
-
-    pm = ThermalPhysicsModel(
-        tmp_path / "physics_models",
-        {
-            "cop_formula": {"a": 2.5, "b": 0.07},
-            "dhw_tank_volume_l": 200,
-            "dhw_power_w": 4000,
-            "internal_gains_fraction": 0.8,
-            "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-            "room_thermostats": [],
-            "use_physics_residual": True,
-        },
-    )
-    pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-    return pm
-
-
-def _with_past_tail(forecast_df: pd.DataFrame, hours: int = 122) -> pd.DataFrame:
-    """Live-shaped frame: *hours* past rows in front of the 48 future rows (same columns, same values)."""
-    first = forecast_df["timestamp"].iloc[0]
-    tail = pd.concat([forecast_df.iloc[[0]]] * hours, ignore_index=True)
-    tail["timestamp"] = pd.date_range(first - pd.Timedelta(hours=hours), periods=hours, freq="1h")
-    return pd.concat([tail, forecast_df], ignore_index=True)
-
-
-class TestPhase2LiveShapedFrame:
-    """ROADMAP #113: Phase 2 must work on a forecast frame that carries a past tail (170 rows live)."""
-
-    def test_predict_adds_baseline_on_170_row_frame(self, tmp_path, caplog):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        long_df = _with_past_tail(forecast_df)
-        assert len(long_df) == 170
-        with caplog.at_level("WARNING", logger="energy_forecast"):
-            result = model.predict(long_df, live_temp=5.0, physics_model=pm)
-        assert "Phase 2 physics reconstruction failed" not in caplog.text
-        assert len(result) == 48
-        baseline = model._last_physics_kwh_series.reindex(pd.DatetimeIndex(result["timestamp"])).fillna(0).to_numpy()
-        assert baseline.sum() > 0
-        # gross forecast is at least the clipped baseline-plus-residual, and clearly above the bare residual
-        raw = model.model.predict(model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)[1])
-        np.testing.assert_allclose(result["predicted_kwh"].to_numpy(), np.maximum(0, baseline + raw), rtol=1e-9)
-
-    def test_short_frame_fills_missing_baseline_hours_with_zero(self, tmp_path, caplog):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        with caplog.at_level("WARNING", logger="energy_forecast"):
-            result = model.predict(forecast_df.iloc[:40], live_temp=5.0, physics_model=pm)
-        assert len(result) == 48
-        assert "Phase 2 physics reconstruction failed" not in caplog.text
-
-    def test_intervals_add_the_baseline_in_phase2(self, tmp_path):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        long_df = _with_past_tail(forecast_df)
-        prepared = model._prepare_prediction_X(long_df, 5.0, None, physics_model=pm)
-        base = model._last_physics_kwh_series
-        a = model.predict_intervals(long_df, 5.0, _prepared=prepared)
-        model._last_physics_kwh_series = base + 2.0
-        b = model.predict_intervals(long_df, 5.0, _prepared=prepared)
-        assert a is not None and len(a) == 48
-        # hours the baseline covers (the fixture's last hour has no baseline row -> filled with 0)
-        covered = base.reindex(pd.DatetimeIndex(prepared[0])).notna().to_numpy()
-        unclipped = (a["high_kwh"].to_numpy() > 0) & covered
-        assert unclipped.any()
-        np.testing.assert_allclose((b["high_kwh"] - a["high_kwh"]).to_numpy()[unclipped], 2.0)
-        assert (a["low_kwh"] <= a["high_kwh"]).all() and (a["low_kwh"] >= 0).all()
-
-    def test_intervals_without_prepared_use_the_physics_model(self, tmp_path):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        point = model.predict(forecast_df, live_temp=5.0, physics_model=pm)
-        bands = model.predict_intervals(forecast_df, 5.0, physics_model=pm)
-        assert bands is not None
-        # gross scale: the upper band is not below the point forecast by a whole baseline
-        assert bands["high_kwh"].sum() > 0.5 * point["predicted_kwh"].sum()
-
-    def test_intervals_return_none_when_phase2_baseline_is_missing(self, tmp_path, caplog):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        with caplog.at_level("WARNING", logger="energy_forecast"):
-            assert model.predict_intervals(forecast_df, 5.0) is None  # no physics model, no _prepared
-        assert "Phase 2 intervals skipped" in caplog.text
-
-    def test_phase1_intervals_unchanged(self, tmp_path):
-        model, forecast_df = _make_trained_model(tmp_path / "model")
-        prepared = model._prepare_prediction_X(forecast_df, 5.0, None)
-        a = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
-        model._last_physics_kwh_series = pd.Series(9.0, index=pd.DatetimeIndex(prepared[0]))
-        b = model.predict_intervals(forecast_df, 5.0, _prepared=prepared)
-        pd.testing.assert_frame_equal(a, b)  # Phase 1 never adds a baseline
-
-    def test_physics_series_is_simulated_from_the_first_predicted_hour(self, tmp_path, monkeypatch):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-        seen = {}
-        real = pm.predict_series
-
-        def spy(frame, **kw):
-            seen["first"] = pd.Timestamp(frame["timestamp"].iloc[0])
-            seen["rows"] = len(frame)
-            return real(frame, **kw)
-
-        monkeypatch.setattr(pm, "predict_series", spy)
-        future_hours, _ = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
-        assert seen["first"] == future_hours[0]
-        # the fixture frame is built from naive container time, the model's horizon from its own timezone,
-        # so derive the expected row count from future_hours instead of assuming 48
-        expected = int((pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]).sum())
-        assert seen["rows"] == expected
-        assert seen["rows"] <= 48
-
-    def test_past_tail_does_not_change_the_physics_feature(self, tmp_path):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-        _, x_short = model._prepare_prediction_X(forecast_df, 5.0, None, physics_model=pm)
-        _, x_long = model._prepare_prediction_X(_with_past_tail(forecast_df), 5.0, None, physics_model=pm)
-        np.testing.assert_allclose(x_long["physics_kwh"].to_numpy(), x_short["physics_kwh"].to_numpy())
-
-    def test_frame_without_future_rows_skips_physics(self, tmp_path, caplog):
-        pm = _phase2_physics(tmp_path)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-        past_only = forecast_df.copy()
-        past_only["timestamp"] = past_only["timestamp"] - pd.Timedelta(days=5)
-        with caplog.at_level("WARNING", logger="energy_forecast"):
-            result = model.predict(past_only, live_temp=5.0, physics_model=pm)
-        assert len(result) == 48
-        assert "no forecast rows at or after the first predicted hour" in caplog.text
-
-
-class TestGrossMAEReporting:
-    def test_phase1_last_mae_is_gross_kwh_mae_unchanged(self, tmp_path):
-        model, _ = _make_trained_model(tmp_path / "model", use_physics_residual=False)
-        assert model.last_mae is not None
-        assert model.last_residual_mae is None
-
-    def test_phase2_last_mae_still_reported_on_gross_kwh(self, tmp_path):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, _ = _make_trained_model(tmp_path / "model", physics_model=pm, use_physics_residual=True)
-        assert model.last_mae is not None
-        assert model.last_residual_mae is not None
-        # Regression guard for the exact bug this task fixes: the old code applied
-        # np.expm1() unconditionally to the raw prediction, which in Phase 2 is a residual
-        # (never log-transformed, can be negative) — not a log-transformed gross-kWh value.
-        # That produced a nonsensical MAE far outside the fixture's gross_kwh range
-        # (0.5-5.0): empirically ~7.56 for this fixture/seed vs. a correct ~0.9. A correctly
-        # reconstructed gross-kWh MAE must stay well inside the target's actual range.
-        assert model.last_mae < 3.0
-        # Note: last_mae and last_residual_mae are mathematically identical here by
-        # construction — MAE is translation-invariant per row (physics_kwh is subtracted
-        # from the target and added back to the prediction identically), so
-        # MAE(y, physics+pred) == MAE(y-physics, pred) exactly, *unless* the np.maximum(0, ...)
-        # floor-clip changes at least one holdout row. That only happens when the
-        # reconstructed prediction would go negative, which this fixture's holdout split
-        # doesn't trigger. last_residual_mae is still a distinct, separately-computed value
-        # (on the residual scale, unclipped) — it just happens to coincide numerically here.
-
-    def test_phase2_cv_mae_is_gross_kwh_mae_not_residual_garbage(self, tmp_path):
-        """Regression guard for the CV-fold-path twin of the bug fixed above.
-
-        `test_phase2_last_mae_still_reported_on_gross_kwh` above uses the default
-        n=600, which after the lag_336h dropna leaves ~264 clean rows — under
-        MIN_CV_ROWS=500, so CV is skipped and last_mae falls back to holdout_mae.
-        That means the previous test never exercised the CV path at all, even
-        though CV is what actually runs (and what feeds last_mae) for any
-        real-sized training set. Need n>=836 so that >=500 clean rows remain
-        for TimeSeriesSplit (see TestFeatureImportanceLogging for the same
-        n=900 pattern).
-
-        Before the fix, both the num_leaves sweep and the fold-MAE loop applied
-        np.expm1() unconditionally to the raw (residual, never log-transformed)
-        prediction, producing an MAE far outside the fixture's gross_kwh range
-        (0.5-5.0) — e.g. ~6.44 empirically. After the fix, both call sites
-        reconstruct gross-kWh as physics_kwh + residual (clipped at 0) before
-        scoring, matching the already-fixed holdout block.
-        """
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": True,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, _ = _make_trained_model(tmp_path / "model", n=900, physics_model=pm, use_physics_residual=True)
-        # Proves CV actually ran (not skipped, not silently falling back to holdout).
-        assert model.last_cv_mae is not None
-        assert model.last_mae == model.last_cv_mae
-        # Fixture's gross_kwh is uniform(0.5, 5.0) — a correctly reconstructed MAE
-        # must stay well inside that range, not the ~6x-larger garbage the
-        # unconditional np.expm1()-on-residual bug produced.
-        assert model.last_mae < 3.0
-
-
 class TestPredictDhwScheduleOverride:
     """Plan D Task 2: dhw_schedule_override parameter threading."""
-
-    def test_dhw_schedule_override_forwarded_to_physics_model(self, tmp_path, monkeypatch):
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        pm = ThermalPhysicsModel(
-            tmp_path / "physics_models",
-            {
-                "cop_formula": {"a": 2.5, "b": 0.07},
-                "dhw_tank_volume_l": 200,
-                "dhw_power_w": 4000,
-                "internal_gains_fraction": 0.8,
-                "heating_curve_points": [[-20, 55.5], [20, 25.0]],
-                "room_thermostats": [],
-                "use_physics_residual": False,
-            },
-        )
-        pm._calib.update(UA_eff=150.0, Q_base_el=0.35)
-        model, forecast_df = _make_trained_model(tmp_path / "model", physics_model=pm)
-
-        received = {}
-        original = pm.predict_series
-
-        def _spy(*args, **kwargs):
-            received.update(kwargs)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(pm, "predict_series", _spy)
-
-        override = {"legionella": ("2026-06-25", 10)}
-        model.predict(forecast_df, live_temp=5.0, physics_model=pm, dhw_schedule_override=override)
-        assert received.get("dhw_schedule_override") == override
 
     def test_dhw_schedule_override_none_by_default(self, tmp_path):
         model, forecast_df = _make_trained_model(tmp_path / "model")

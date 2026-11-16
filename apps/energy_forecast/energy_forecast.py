@@ -1295,9 +1295,7 @@ class EnergyForecast(hass.Hass):
                 heating_active_series=self._cached_heating_active_series,
                 setpoint_on=self._cached_heating_setpoints[0],
                 setpoint_off=self._cached_heating_setpoints[1],
-                physics_model=self._physics_model,
                 heating_buffer_temp_recent=self._physics_heating_buffer_df,
-                dhw_schedule_override=dhw_schedule,
             )
 
             if kwargs.get("publish", False):
@@ -1620,28 +1618,6 @@ class EnergyForecast(hass.Hass):
             _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(f"set_dhw_schedule failed: {exc}")
-
-    def _effective_use_physics_residual(self) -> bool:
-        """Config intent AND-ed with the cold-start gate.
-
-        Passed to `EnergyForecastModel.train()` as `use_physics_residual=` to decide Phase 1
-        (physics as a feature) vs Phase 2 (residual learning).
-        """
-        requested = bool(self._physics_config.get("use_physics_residual", False)) if self._physics_model else False
-        if requested and self._physics_model.is_cold_start_gated:
-            _LOGGER.warning(
-                "use_physics_residual=true but cold-start gate not satisfied "
-                f"({self._physics_model._calib.get('n_calibration_windows_ua_eff', 0)}/30 UA_eff windows) — "
-                "holding at Phase 1"
-            )
-            return False
-        if requested:
-            _LOGGER.warning(
-                "use_physics_residual=true: Phase 2 (residual training) is ACTIVE. This is an "
-                "experimental, unvalidated code path — not recommended for production use until "
-                "the post-activation 30-day interval-coverage check has passed."
-            )
-        return requested
 
     def _model_phase_attr(self) -> str | None:
         """Which physics phase last trained the model, for display as a sensor attribute.
@@ -1995,14 +1971,12 @@ class EnergyForecast(hass.Hass):
             climate_dfs=climate_dfs or None,
             dhw_df=dhw_df if not dhw_df.empty else None,
             heating_active_df=heating_active_df if not heating_active_df.empty else None,
-            heating_sub_meter_df=self._cached_heating_sub_meter_df,
             program_histories=program_histories or None,
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
             regime_count=self._regime_count,
             physics_model=self._physics_model,
             heating_buffer_temp_df=self._physics_heating_buffer_df,
-            use_physics_residual=self._effective_use_physics_residual(),
             heating_feature_df=heating_feature_df,
             drop_features=self._drop_features,
         )
@@ -2243,13 +2217,11 @@ class EnergyForecast(hass.Hass):
         _capture_snapshot = _snapshot_predict_inputs(self, predict_kwargs, now_ts)
         _prepared = self._ml_model._prepare_prediction_X(
             **predict_kwargs,
-            physics_model=self._physics_model,
         )
         _regime_info = dict(getattr(self._ml_model, "_last_regime_info", None) or {})
 
         predictions = self._ml_model.predict(
             **predict_kwargs,
-            physics_model=self._physics_model,
             _prepared=_prepared,
         )
         _model_predictions = predictions.copy() if _capture_snapshot is not None else None
@@ -2439,7 +2411,6 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
-                    physics_model=self._physics_model,
                     heating_buffer_temp_recent=self._physics_heating_buffer_df,
                     _prepared=_prepared,
                 )

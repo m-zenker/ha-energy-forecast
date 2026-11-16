@@ -279,14 +279,11 @@ class EnergyForecastModel:
         self.feature_cols: list[str] = _FEATURES_BASE
         self.last_trained: datetime = datetime.min
         self.last_mae: float | None = None
-        self.last_residual_mae: float | None = None  # Phase 2 only — internal diagnostic (residual scale)
         self.last_cv_mae: float | None = None  # cross-validated MAE
         self.engine: str = "not trained"
         self._feature_medians: dict = {}  # global medians — used to fill NaN at predict time
         self._feature_medians_by_how: dict = {}  # {how: {col: median}} — finer HOW-specific fill
         self._log_transform: bool = False  # log1p target; False = backward compat
-        self._use_physics_residual: bool = False  # Phase 2: train on gross_kwh - physics_kwh
-        self._last_physics_kwh_series: pd.Series | None = None  # set by _prepare_prediction_X(), read by predict()
         self._canton: str | None = None  # cantonal holiday subdivision
         self._country: str = "CH"  # ISO 3166-1 alpha-2 country for holidays
         self._timezone: str = timezone  # local timezone for wall-clock "now"
@@ -362,8 +359,6 @@ class EnergyForecastModel:
         regime_count: int = 5,
         physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
-        heating_sub_meter_df: pd.DataFrame | None = None,  # cols: timestamp, kwh — space-heating sub-meter (#92)
-        use_physics_residual: bool = False,
         heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
         regime_mode: str = "soft_oof",  # "soft_oof": out-of-fold probabilities (#110); "hard": true daily labels
         regime_oof_cv: str = "blocked",  # soft_oof folds: "blocked" (contiguous, default) | "shuffled" (backtest only)
@@ -488,16 +483,12 @@ class EnergyForecastModel:
             elif heating_active_df is None or heating_active_df.empty:
                 _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
 
-        # ── Physics-ML hybrid: calibration trigger + physics baseline series ──
-        # (Plan B Task 4). Runs before the hourly_weights computation below so
-        # open_window_flags is available to fold into it, and before the
-        # _engineer_features() call further down so physics_kwh_series /
-        # heating_buffer_temp_series can be threaded through.
-        physics_kwh_series = None
+        # ── Physics calibration trigger + open-window flags ──────────────────
+        # Runs before the hourly_weights computation below so open_window_flags
+        # is available to fold into it.
         heating_buffer_temp_series = None
         open_window_flags = None
         if physics_model is not None:
-            physics_model.check_zone_boundary(list(climate_dfs.keys()) if climate_dfs else [])
             if physics_model.calibration_stale:
                 # Calendar-day span, not row count: a multi-day excluded date range
                 # (or any other real gap) leaves len(energy_df)/24 undercounting the
@@ -510,14 +501,10 @@ class EnergyForecastModel:
                     dhw_df,
                     holdout_cutoff=energy_df["timestamp"].max() - pd.Timedelta(days=int(_span_days * 0.1) or 1),
                     heating_active_df=heating_active_df,
-                    heating_sub_meter_df=heating_sub_meter_df,
                     ev_df=ev_df,
                     away_df=away_df,
                 )
             physics_model._tau_hours = self._tau_hours
-            physics_kwh_series = physics_model.predict_training_series(
-                energy_df, weather_df, climate_dfs=climate_dfs, dhw_df=dhw_df, room_areas=room_areas
-            )
             if climate_dfs:
                 open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
 
@@ -718,7 +705,6 @@ class EnergyForecastModel:
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
             heating_active_df=heating_feature_df if heating_feature_df is not None else heating_active_df,
-            physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
 
@@ -742,8 +728,6 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
-        if physics_kwh_series is not None:
-            base_features = [*base_features, "physics_kwh"]
         if heating_buffer_temp_series is not None:
             base_features = [*base_features, "heating_buffer_temp"]
         if drop_features:
@@ -798,23 +782,7 @@ class EnergyForecastModel:
 
         X = df[feature_cols].astype(float)  # coerce int32/extension types → float64 (sklearn/lgb compat)
         y = df["gross_kwh"].to_numpy(dtype=float)
-        self._use_physics_residual = bool(use_physics_residual and physics_kwh_series is not None)
-        if use_physics_residual and not self._use_physics_residual:
-            _LOGGER.warning(
-                "use_physics_residual requested but no physics_kwh_series available — falling back to Phase 1."
-            )
-
-        if self._use_physics_residual:
-            physics_aligned = physics_kwh_series.reindex(df["timestamp"])
-            n_nans = int(physics_aligned.isna().sum())
-            if n_nans > 0:
-                _LOGGER.warning(
-                    f"{n_nans} hours have no physics prediction — set to 0 in residual target (check weather data gaps)"
-                )
-            physics_vals = physics_aligned.fillna(0).values
-            y_fit = y - physics_vals  # residual target — can be negative, no log transform
-        else:
-            y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
+        y_fit = np.log1p(y)  # log-transform reduces influence of rare high peaks
 
         # ── Sample weighting for main model ─────────────────────────────────
         sample_weight = None
@@ -863,14 +831,7 @@ class EnergyForecastModel:
                             except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                             nl_raw = m_nl.predict(X.iloc[val_idx])
-                            if self._use_physics_residual:
-                                X_val_nl = X.iloc[val_idx]
-                                physics_val_nl = (
-                                    X_val_nl["physics_kwh"].values if "physics_kwh" in X_val_nl.columns else 0.0
-                                )
-                                nl_pred = np.maximum(0, physics_val_nl + nl_raw)
-                            else:
-                                nl_pred = np.expm1(nl_raw)
+                            nl_pred = np.expm1(nl_raw)
                             sweep_maes[nl] = float(mae_fn(y[val_idx], nl_pred))
                         best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
                         _LOGGER.info(
@@ -921,15 +882,8 @@ class EnergyForecastModel:
                                 m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         else:
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                        # MAE reported in original kWh space (expm1 undoes log1p, or
-                        # reconstructed from physics + residual in Phase 2)
-                        fold_raw = m.predict(X.iloc[val_idx])
-                        if self._use_physics_residual:
-                            X_val = X.iloc[val_idx]
-                            physics_val = X_val["physics_kwh"].values if "physics_kwh" in X_val.columns else 0.0
-                            fold_pred = np.maximum(0, physics_val + fold_raw)
-                        else:
-                            fold_pred = np.expm1(fold_raw)
+                        # MAE reported in original kWh space (expm1 undoes log1p)
+                        fold_pred = np.expm1(m.predict(X.iloc[val_idx]))
                         fold_maes.append(float(mae_fn(y[val_idx], fold_pred)))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
@@ -968,7 +922,6 @@ class EnergyForecastModel:
         # The final `model` is still trained on all rows for best accuracy; this
         # temporary holdout model is only for the MAE fallback used when CV is skipped.
         holdout_mae = None
-        self.last_residual_mae = None
         if mae_fn is not None:
             split = max(int(len(X) * HOLDOUT_FRACTION), len(X) - MIN_CV_ROWS)
             try:
@@ -980,13 +933,7 @@ class EnergyForecastModel:
 
                 X_ho = X.iloc[split:]
                 ho_raw = ho_model.predict(X_ho)
-                if self._use_physics_residual:
-                    physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else 0.0
-                    gross_pred = np.maximum(0, physics_ho + ho_raw)
-                    holdout_mae = round(float(mae_fn(y[split:], gross_pred)), 4)
-                    self.last_residual_mae = round(float(mae_fn(y_fit[split:], ho_raw)), 4)
-                else:
-                    holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_raw))), 4)
+                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_raw))), 4)
             except (ValueError, IndexError):
                 pass
 
@@ -998,7 +945,7 @@ class EnergyForecastModel:
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
         self.engine = engine_name
-        self._log_transform = not self._use_physics_residual
+        self._log_transform = True
         self._canton = canton
         self._country = country
         self._sub_sensor_prefixes = list(sub_sensors_dict.keys()) if sub_sensors_dict else []
@@ -1012,24 +959,6 @@ class EnergyForecastModel:
             len(feature_cols),
             mae_str,
         )
-        if self._use_physics_residual and self.last_residual_mae is not None:
-            _LOGGER.info(
-                f"Holdout MAE (gross kWh)={holdout_mae}, residual MAE (internal diagnostic)={self.last_residual_mae}"
-            )
-
-        # ── Phase 1 physics validation diagnostic (Plan B Task 6) ────────────
-        # Read-only: reports whether physics_kwh is a top-5 SHAP feature and
-        # well-calibrated (OLS slope ~1.0) against gross_kwh on the same
-        # holdout split used for holdout_mae above. Never flips config —
-        # `self.model`/`self.engine` are already assigned above so the SHAP
-        # codepath in _validate_physics_phase1 sees the freshly trained model.
-        self.physics_phase1_diagnostic: dict | None = None
-        if physics_model is not None and "physics_kwh" in feature_cols and holdout_mae is not None:
-            X_ho = X.iloc[split:]
-            y_ho_gross = y[split:]  # gross_kwh, not log-transformed
-            physics_ho = X_ho["physics_kwh"].values if "physics_kwh" in X_ho.columns else None
-            self.physics_phase1_diagnostic = self._validate_physics_phase1(X_ho, y_ho_gross, physics_ho)
-
         # ── Quantile models for prediction intervals (CQR) ───────────────────
         # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
         # split-conformal calibration. Random split (not tail) is required so
@@ -1080,10 +1009,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
-        physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame
         | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
-        dhw_schedule_override: dict | None = None,
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -1153,40 +1080,6 @@ class EnergyForecastModel:
         else:
             _extended = forecast_df
 
-        # ── Physics-ML hybrid: physics baseline series at prediction time ────
-        # (Plan B Task 5). Uses the raw climate_recent (not climate_dfs_for_features,
-        # which is the RC-ODE-projected version built for _engineer_features()'s own
-        # climate feature) — predict_series() does its own internal projection.
-        physics_kwh_series = None
-        # The frame carries a past tail (past_days=3); simulating over it would seed the tank days
-        # ago (same reasoning as the override-delta fix in energy_forecast.py, alpha-34).
-        _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= future_hours[0]]
-        if physics_model is not None and _serving_df.empty:
-            _LOGGER.warning("Physics baseline skipped: no forecast rows at or after the first predicted hour")
-        elif physics_model is not None:
-            try:
-                physics_kwh_series = physics_model.predict_series(
-                    _serving_df,
-                    climate_recent=climate_recent,
-                    dhw_recent=dhw_recent,
-                    room_areas=room_areas,
-                    heating_active_series=heating_active_series,
-                    setpoint_on=setpoint_on,
-                    setpoint_off=setpoint_off,
-                    dhw_schedule_override=dhw_schedule_override,
-                )
-            except Exception as e:
-                _LOGGER.warning(f"Physics baseline prediction failed at predict time: {e} — falling back to ML-only")
-                physics_kwh_series = None
-
-        # Stashed for predict()'s Phase 2 reconstruction step. predict() may consume
-        # a pre-built (future_hours, X) tuple via its `_prepared` param rather than
-        # calling this method directly (see energy_forecast.py's threading of
-        # _prepare_prediction_X()'s output into predict()/predict_intervals()/
-        # shap_summary()); this attribute lets it recover physics_kwh_series without
-        # widening that shared 2-tuple contract.
-        self._last_physics_kwh_series = physics_kwh_series
-
         heating_buffer_temp_series = None
         if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
             if self._heating_buffer_smooth_h > 0:
@@ -1217,20 +1110,16 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
-            physics_kwh_series=physics_kwh_series,
             heating_buffer_temp_series=heating_buffer_temp_series,
         )
 
         # ── Model-artifact portability fallback ──────────────────────────────
-        # A saved model may have physics_kwh in feature_cols (trained with physics
-        # enabled) while physics_model is None at predict time (sensor outage,
-        # config change disabling physics). Fill with 0.0 rather than raising
-        # KeyError when feat_df[self.feature_cols] is sliced below.
+        # A model trained before physics_kwh was removed still lists it in feature_cols.
+        # Fill with 0.0 (the live model never split on it) rather than raising KeyError
+        # when feat_df[self.feature_cols] is sliced below.
         if "physics_kwh" in self.feature_cols and "physics_kwh" not in feat_df.columns:
             feat_df["physics_kwh"] = 0.0
-            _LOGGER.warning(
-                "physics_kwh in trained feature list but physics_model disabled at predict time — filling with 0.0"
-            )
+            _LOGGER.debug("physics_kwh in trained feature list but no longer computed — filling with 0.0")
 
         # Same portability guarantee for heating_buffer_temp: a saved model may have
         # heating_buffer_temp in feature_cols (trained with a buffer-temp sensor available)
@@ -1399,9 +1288,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
-        physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
-        dhw_schedule_override: dict | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame:
         """Return 48-hour DataFrame [timestamp (naive), predicted_kwh]."""
@@ -1427,9 +1314,7 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
-                physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
-                dhw_schedule_override=dhw_schedule_override,
             )
         if "thermal_pressure_net" in X.attrs:
             self._latest_thermal_pressure_net = float(X.attrs["thermal_pressure_net"])
@@ -1440,16 +1325,6 @@ class EnergyForecastModel:
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
-
-        if self._use_physics_residual and physics_model is not None:
-            try:
-                physics_kwh_series = self._last_physics_kwh_series
-                if physics_kwh_series is None:
-                    raise ValueError("physics baseline unavailable")
-                physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
-                preds = physics_baseline + preds
-            except Exception as e:
-                _LOGGER.warning(f"Phase 2 physics reconstruction failed: {e} — falling back to ML-only output")
 
         preds = np.maximum(0, preds)
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
@@ -1469,16 +1344,13 @@ class EnergyForecastModel:
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
         *,
-        physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
 
-        Returns None when quantile models are not yet trained, or in Phase 2
-        (physics residual) when the physics baseline is unavailable.  low_kwh and
-        high_kwh are guaranteed non-negative and ordered (low ≤ high).  In Phase 2
-        the bands are gross kWh (physics baseline + residual quantiles).
+        Returns None when quantile models are not yet trained.  low_kwh and
+        high_kwh are guaranteed non-negative and ordered (low ≤ high).
         """
         import numpy as np
         import pandas as pd
@@ -1502,7 +1374,6 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
-                physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         low = self._model_q10.predict(X)
@@ -1513,14 +1384,6 @@ class EnergyForecastModel:
             high += correction
             low = np.expm1(low)
             high = np.expm1(high)
-        if self._use_physics_residual:
-            physics_kwh_series = self._last_physics_kwh_series
-            if physics_kwh_series is None:
-                _LOGGER.warning("Phase 2 intervals skipped: physics baseline unavailable")
-                return None
-            physics_baseline = physics_kwh_series.reindex(pd.DatetimeIndex(future_hours)).fillna(0).values
-            low = low + physics_baseline
-            high = high + physics_baseline
         low = np.maximum(0, low)
         high = np.maximum(0, high)
         # Enforce ordering in case of quantile crossing
@@ -1542,17 +1405,12 @@ class EnergyForecastModel:
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
         room_areas: dict[str, float] | None = None,
-        physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
-        dhw_schedule_override: dict | None = None,
     ) -> pd.DataFrame:
         """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh, delta_kwh_hi].
 
         Runs the baseline predict() then overlays the appliance profiles from
-        *schedule* using the learned appliance signatures. If *dhw_schedule_override*
-        and *physics_model* are both given, also folds in the DHW-schedule delta
-        (scenario vs. the natural/no-override baseline) so `delta_kwh` reflects
-        the combined signed difference of both overlays vs. the natural baseline.
+        *schedule* using the learned appliance signatures.
 
         Raises:
             RuntimeError: if the model has not been trained yet.
@@ -1560,7 +1418,7 @@ class EnergyForecastModel:
         if self.model is None:
             raise RuntimeError("Model not yet trained.")
 
-        natural_baseline_df = self.predict(
+        baseline_df = self.predict(
             forecast_df,
             live_temp,
             recent_actuals,
@@ -1573,98 +1431,9 @@ class EnergyForecastModel:
             setpoint_on=setpoint_on,
             setpoint_off=setpoint_off,
             room_areas=room_areas,
-            physics_model=physics_model,
             heating_buffer_temp_recent=heating_buffer_temp_recent,
-            # predict_series's silent committed_override fallback was removed (Phase A Task 6) —
-            # this call site must ask for the live committed override explicitly so the "natural
-            # baseline" still reflects whatever's actually committed right now (e.g. an already-
-            # armed legionella boost) when scoring a *different* candidate dhw_schedule_override.
-            dhw_schedule_override=(
-                physics_model.schedule.get("committed_override") if physics_model is not None else None
-            ),
         )
-
-        if dhw_schedule_override is not None and physics_model is not None:
-            scenario_baseline_df = self.predict(
-                forecast_df,
-                live_temp,
-                recent_actuals,
-                sub_sensors_recent=sub_sensors_recent,
-                away_series=away_series,
-                people_home_series=people_home_series,
-                climate_recent=climate_recent,
-                dhw_recent=dhw_recent,
-                heating_active_series=heating_active_series,
-                setpoint_on=setpoint_on,
-                setpoint_off=setpoint_off,
-                room_areas=room_areas,
-                physics_model=physics_model,
-                heating_buffer_temp_recent=heating_buffer_temp_recent,
-                dhw_schedule_override=dhw_schedule_override,
-            )
-        else:
-            scenario_baseline_df = natural_baseline_df
-
-        result = _composite_forecast(scenario_baseline_df, schedule, self._appliance_signatures)
-
-        if dhw_schedule_override is not None and physics_model is not None:
-            dhw_delta = (scenario_baseline_df["predicted_kwh"] - natural_baseline_df["predicted_kwh"]).to_numpy()
-            result["delta_kwh"] = result["delta_kwh"] + dhw_delta
-            # delta_kwh_hi stays appliance-only: it sizes a booking's power, not the DHW shift.
-
-        return result
-
-    def _validate_physics_phase1(
-        self, X_holdout: pd.DataFrame, y_holdout_gross: np.ndarray, physics_kwh_holdout: np.ndarray | None
-    ) -> dict:
-        """Phase 1 read-only diagnostic: is `physics_kwh` a top-5 SHAP feature, well-calibrated (slope ~1.0)?
-
-        Reports whether the physics baseline is (a) among the model's top-5 most
-        important features by mean absolute SHAP contribution, and (b) linearly
-        calibrated against gross_kwh (OLS slope through the origin in [0.8, 1.2]).
-        Purely diagnostic — never flips ``use_physics_residual``. That remains a
-        manual operator decision (spec §2.1) once Phase 2 is planned.
-
-        Never raises: any missing precondition (no physics_kwh column, no
-        physics values, untrained model) yields the safe all-``None``/``False``
-        default dict.
-        """
-        import numpy as np
-        import pandas as pd
-
-        result = {"shap_rank": None, "shap_top5": False, "ols_slope": None, "calibration_good": False}
-        if "physics_kwh" not in X_holdout.columns or physics_kwh_holdout is None or self.model is None:
-            return result
-
-        if self.engine == "LightGBM":
-            contrib = self.model.predict(X_holdout, pred_contrib=True)
-            mean_abs = np.abs(contrib[:, :-1]).mean(axis=0)
-            ranked = pd.Series(mean_abs, index=X_holdout.columns).sort_values(ascending=False)
-            rank = int(ranked.index.get_loc("physics_kwh")) + 1  # 1-indexed
-            result["shap_rank"] = rank
-            result["shap_top5"] = rank <= 5
-
-        x = np.asarray(physics_kwh_holdout, dtype=float)
-        y = np.asarray(y_holdout_gross, dtype=float)
-        if np.sum(x**2) > 1e-9:
-            slope = float(np.sum(x * y) / np.sum(x**2))
-            result["ols_slope"] = slope
-            result["calibration_good"] = result["shap_top5"] and (0.8 <= slope <= 1.2)
-
-        if result["calibration_good"]:
-            _LOGGER.info(
-                "Phase 1 physics validation: PASS (shap_rank=%s, ols_slope=%.2f) — "
-                "physics signal is well-calibrated and predictive",
-                result["shap_rank"],
-                result["ols_slope"],
-            )
-        else:
-            _LOGGER.info(
-                "Phase 1 physics validation: not yet ready for Phase 2 (shap_rank=%s, ols_slope=%s)",
-                result["shap_rank"],
-                result["ols_slope"],
-            )
-        return result
+        return _composite_forecast(baseline_df, schedule, self._appliance_signatures)
 
     def shap_summary(
         self,
@@ -1681,7 +1450,6 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
-        physics_model: ThermalPhysicsModel | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
     ) -> dict[str, float]:
@@ -1717,7 +1485,6 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
-                physics_model=physics_model,
                 heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
 
@@ -1835,7 +1602,6 @@ class EnergyForecastModel:
             "feature_medians": self._feature_medians,
             "feature_medians_by_how": self._feature_medians_by_how,
             "log_transform": self._log_transform,
-            "use_physics_residual": self._use_physics_residual,
             "canton": self._canton,
             "country": self._country,
             "likely_ev_hours": self._likely_ev_hours,
@@ -2285,7 +2051,6 @@ class EnergyForecastModel:
                     self._feature_medians = meta.get("feature_medians", {})
                     self._feature_medians_by_how = meta.get("feature_medians_by_how", {})
                     self._log_transform = meta.get("log_transform", False)
-                    self._use_physics_residual = meta.get("use_physics_residual", False)
                     self._canton = meta.get("canton", None)
                     self._country = meta.get("country", "CH")
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())
@@ -3256,7 +3021,6 @@ def _engineer_features(
     room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
-    physics_kwh_series: pd.Series | None = None,  # hourly physics baseline, absent when physics disabled
     heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
     import numpy as np
@@ -3607,13 +3371,6 @@ def _engineer_features(
     if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
         delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
         df["regime_kwh"] *= 1.0 - (delta_168h / 8.0).clip(upper=1.0)
-
-    # ── Physics baseline (optional) ──────────────────────────────────────────
-    if physics_kwh_series is not None:
-        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
-        df = df.merge(physics_kwh_series.to_frame("physics_kwh"), left_on="_ts_floor", right_index=True, how="left")
-        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
-        df["physics_kwh"] = df["physics_kwh"].fillna(0.0)
 
     # ── Heating buffer temp (optional direct sensor feature) ──────────────────
     if heating_buffer_temp_series is not None:
