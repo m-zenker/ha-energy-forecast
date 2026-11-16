@@ -497,7 +497,6 @@ class EnergyForecastModel:
                 physics_model.calibrate(
                     energy_df,
                     weather_df,
-                    climate_dfs,
                     dhw_df,
                     holdout_cutoff=energy_df["timestamp"].max() - pd.Timedelta(days=int(_span_days * 0.1) or 1),
                     heating_active_df=heating_active_df,

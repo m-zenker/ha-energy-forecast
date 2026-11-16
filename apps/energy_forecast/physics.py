@@ -1,4 +1,4 @@
-"""Physics-based hourly electricity predictor (space heating, DHW, base load).
+"""Physics DHW / base-load model: calibration, override deltas and open-window detection.
 
 See docs/superpowers/specs/2026-06-22-physics-ml-hybrid-design.md for the design.
 """
@@ -16,14 +16,6 @@ from typing import Any, NamedTuple
 import numpy as np
 import pandas as pd
 
-from .const import (
-    HEATING_SUB_METER_MIN_KWH,
-    UA_EFF_FALLBACK_MAX_OUTDOOR_C,
-    UA_EFF_FALLBACK_MIN_LOAD_KWH,
-    UA_EFF_SANITY_MAX_W_PER_K,
-    UA_EFF_SANITY_MIN_W_PER_K,
-)
-
 _LOGGER = logging.getLogger("energy_forecast.physics")
 
 _VALID_OVERRIDE_KINDS = ("legionella", "comfort_boost")
@@ -33,7 +25,6 @@ ETA_CARNOT = 0.45
 WATER_SPECIFIC_HEAT_WH_PER_L_K = 1.163
 DEFAULT_T_FLOW_C = 45.0
 DEFAULT_AMBIENT_C = 20.0
-COLD_START_MIN_WINDOWS = 30
 STALE_AFTER_DAYS = 30
 
 # Fixed 24h draw-timing shape (sums to 1.0) — see Plan A "Assumptions" section.
@@ -72,11 +63,7 @@ _DEFAULT_DRAW_PROFILE = _DEFAULT_DRAW_PROFILE / _DEFAULT_DRAW_PROFILE.sum()
 def _default_calibration() -> dict[str, Any]:
     return {
         "calibrated_at": None,
-        "n_calibration_windows_ua_eff": 0,
-        "UA_eff": None,
-        "solar_gain_area": 0.0,
         "Q_base_el": 0.35,
-        "q_base_el_calibrated": False,  # new (#92) -- see _resolve_heating_eligibility's tier 3
         "Q_dhw_daily": 3.5,
         "UA_dhw": 15.0,
         "cop_formula": None,  # None → caller falls back to config cop_formula
@@ -274,10 +261,6 @@ class ThermalPhysicsModel:
         age_days = (pd.Timestamp.now() - calibrated_at.tz_localize(None)).total_seconds() / 86400
         return age_days > STALE_AFTER_DAYS
 
-    @property
-    def is_cold_start_gated(self) -> bool:
-        return self._calib.get("n_calibration_windows_ua_eff", 0) < COLD_START_MIN_WINDOWS
-
     def _t_flow_c(self, t_outdoor_c: float, live_shift_k: float | None) -> float:
         points = self._config.get("heating_curve_points") or []
         if not points:
@@ -296,55 +279,6 @@ class ThermalPhysicsModel:
         carnot = ETA_CARNOT * t_flow_k / denom if denom > 0 else COP_MIN
         linear = a + b * t_outdoor_c
         return max(COP_MIN, min(carnot, linear))
-
-    def _cop_series(
-        self,
-        timestamps: pd.DatetimeIndex,
-        t_outdoor: pd.Series,
-        cop_sensor_series: pd.Series | None,
-        live_shift_series: pd.Series | None = None,
-    ) -> pd.Series:
-        formula_vals = np.array(
-            [
-                self._cop_formula_value(
-                    t_o, None if live_shift_series is None else live_shift_series.reindex(timestamps).iloc[i]
-                )
-                for i, t_o in enumerate(t_outdoor.reindex(timestamps).values)
-            ]
-        )
-        result = pd.Series(formula_vals, index=timestamps)
-        if cop_sensor_series is not None:
-            aligned = cop_sensor_series.reindex(timestamps)
-            result = aligned.combine_first(result)
-        return result.clip(lower=COP_MIN)
-
-    def _space_heating_kwh(
-        self,
-        t_indoor: pd.Series,
-        t_outdoor: pd.Series,
-        ghi: pd.Series,
-        cop: pd.Series,
-    ) -> pd.Series:
-        ua = self._calib.get("UA_eff")
-        if ua is None:
-            return pd.Series(0.0, index=t_indoor.index)
-
-        solar_area = self._calib.get("solar_gain_area") or 0.0
-        q_base_el = self._calib.get("Q_base_el") or 0.0
-        gains_fraction = self._config["internal_gains_fraction"]
-
-        q_loss = ua * (t_indoor - t_outdoor).clip(lower=0.0)
-        q_solar = solar_area * ghi.fillna(0.0)
-        q_gain_int = q_base_el * gains_fraction * 1000.0
-
-        tau = self._tau_hours or 8.0
-        c_building = self._config.get("c_building_wh_k") or (ua * tau)
-        t_indoor_next = t_indoor.shift(-1).fillna(t_indoor)
-        q_mass = c_building * (t_indoor_next - t_indoor)
-
-        q_heat = (q_loss - q_solar - q_gain_int + q_mass).clip(lower=0.0)
-        q_heat_el = q_heat / cop.clip(lower=COP_MIN) / 1000.0
-        return q_heat_el
 
     def _dhw_override_for_hour(self, ts: pd.Timestamp, override: dict | None) -> float | None:
         """Return an override target temp for *ts* if a committed override (legionella
@@ -611,9 +545,8 @@ class ThermalPhysicsModel:
         setpoint_off: float | None = None,
     ) -> pd.Series:
         """Shared serving-side indoor-temperature derivation for a forecast window —
-        extracted verbatim from predict_series so the deterministic override correction
-        in energy_forecast.py drives _dhw_kwh_series with exactly the same ambient series
-        the real physics_kwh feature uses (final-review #2).
+        used by the deterministic override correction in energy_forecast.py to drive
+        _dhw_kwh_series with the indoor ambient series (final-review #2).
 
         Before this extraction, the correction fed raw OUTDOOR temperature into a DHW
         ODE whose t_ambient argument means "the air surrounding the tank" — i.e. it
@@ -638,96 +571,6 @@ class ThermalPhysicsModel:
         if t_indoor is None:
             t_indoor = pd.Series(setpoint_on or DEFAULT_AMBIENT_C, index=timestamps)
         return t_indoor
-
-    def predict_series(
-        self,
-        forecast_df: pd.DataFrame,
-        climate_recent: dict[str, pd.DataFrame] | None = None,
-        dhw_recent: pd.DataFrame | None = None,
-        room_areas: dict[str, float] | None = None,
-        heating_active_series: pd.Series | None = None,
-        setpoint_on: float | None = None,
-        setpoint_off: float | None = None,
-        dhw_schedule_override: dict | None = None,
-    ) -> pd.Series:
-        timestamps = pd.DatetimeIndex(forecast_df["timestamp"])
-        t_outdoor = pd.Series(forecast_df["temp_c"].values, index=timestamps)
-        ghi = (
-            pd.Series(forecast_df["direct_radiation_wm2"].values, index=timestamps)
-            if "direct_radiation_wm2" in forecast_df.columns
-            else pd.Series(0.0, index=timestamps)
-        )
-
-        try:
-            t_indoor = self._t_indoor_for_window(
-                climate_recent,
-                timestamps,
-                t_outdoor,
-                room_areas=room_areas,
-                heating_active_series=heating_active_series,
-                setpoint_on=setpoint_on,
-                setpoint_off=setpoint_off,
-            )
-
-            cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
-            q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
-
-            if dhw_recent is not None and not dhw_recent.empty:
-                latest = dhw_recent.sort_values("timestamp").iloc[-1]
-                age = timestamps[0] - pd.Timestamp(latest["timestamp"])
-                initial_t_tank = (
-                    float(latest["buffer_temp"])
-                    if age <= pd.Timedelta(hours=2)
-                    else (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
-                )
-            else:
-                initial_t_tank = (self._schedule["T_dhw_upper"] + self._schedule["T_dhw_lower"]) / 2
-
-            override_lookup = (
-                (lambda ts: self._dhw_override_for_hour(ts, dhw_schedule_override)) if dhw_schedule_override else None
-            )
-            q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
-                timestamps, t_indoor, initial_t_tank, override_lookup
-            )
-
-            q_base_el = self._calib.get("Q_base_el") or 0.35
-            physics_kwh = q_heat_el + q_dhw_el + q_base_el
-            return physics_kwh.clip(lower=0.0)
-        except Exception as e:
-            _LOGGER.warning(f"physics predict_series failed: {e} — returning zeros")
-            return pd.Series(0.0, index=timestamps)
-
-    def predict_training_series(
-        self,
-        energy_df: pd.DataFrame,
-        weather_df: pd.DataFrame,
-        climate_dfs: dict[str, pd.DataFrame] | None = None,
-        dhw_df: pd.DataFrame | None = None,
-        room_areas: dict[str, float] | None = None,
-    ) -> pd.Series:
-        timestamps = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
-        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
-        t_outdoor = w["temp_c"].reindex(timestamps, method="nearest")
-        ghi = (
-            w["direct_radiation_wm2"].reindex(timestamps, method="nearest")
-            if "direct_radiation_wm2" in w.columns
-            else pd.Series(0.0, index=timestamps)
-        )
-
-        t_indoor = self._area_weighted_t_indoor(climate_dfs or {}, timestamps, room_areas)
-        if t_indoor is None:
-            t_indoor = pd.Series(DEFAULT_AMBIENT_C, index=timestamps)
-
-        cop = self._cop_series(timestamps, t_outdoor, cop_sensor_series=None)
-        q_heat_el = self._space_heating_kwh(t_indoor, t_outdoor, ghi, cop)
-
-        initial_t_tank = self._initial_t_tank_for_window(dhw_df, timestamps)
-
-        q_dhw_el, _dhw_t_tank_series, _ = self._dhw_kwh_series(
-            timestamps, t_indoor, initial_t_tank, override_lookup=None
-        )
-        q_base_el = self._calib.get("Q_base_el") or 0.35
-        return (q_heat_el + q_dhw_el + q_base_el).clip(lower=0.0)
 
     def _calibrate_base_load(
         self,
@@ -780,240 +623,6 @@ class ThermalPhysicsModel:
 
         result = float(daily.mean()) - 24 * q_base_el
         return max(0.0, result)
-
-    def _resolve_heating_eligibility(
-        self,
-        e: pd.DataFrame,
-        heating_sub_meter_df: pd.DataFrame | None,
-        heating_active_df: pd.DataFrame | None,
-        weather_df: pd.DataFrame,
-    ) -> tuple[np.ndarray, str, pd.Series | None]:
-        """Returns (eligible_mask, tier_label, y_override).
-
-        y_override is the sub-meter kwh series aligned to `e["timestamp"]` when tier 1
-        fires (the regression should use it directly instead of gross_kwh - Q_base_el),
-        else None. Called after `_calibrate_ua_eff`'s own empty-frame guards, so an
-        empty weather_df/energy_df never reaches this method's weather_df["temp_c"]
-        access — preserving the never-raise contract.
-        """
-        ts = e["timestamp"]
-
-        if heating_sub_meter_df is not None and not heating_sub_meter_df.empty:
-            hs = heating_sub_meter_df.copy()
-            hs["timestamp"] = pd.to_datetime(hs["timestamp"])
-            kwh = hs.set_index("timestamp")["kwh"].reindex(ts, method="nearest", tolerance=pd.Timedelta("1h"))
-            kwh_filled = kwh.fillna(0)
-            return (kwh_filled.values > HEATING_SUB_METER_MIN_KWH), "sub_meter", kwh_filled
-
-        if heating_active_df is not None and not heating_active_df.empty:
-            ha = heating_active_df.copy()
-            ha["timestamp"] = pd.to_datetime(ha["timestamp"])
-            on = ha.set_index("timestamp")["heating_active"].reindex(ts, method="nearest", tolerance=pd.Timedelta("1h"))
-            return (on.fillna(0).values > 0.5), "heating_active", None
-
-        # Last resort: no sub-meter, no heating_active_entity configured.
-        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
-        t_out = w["temp_c"].reindex(ts, method="nearest", tolerance=pd.Timedelta("1h"))
-        if not self._calib.get("q_base_el_calibrated", False):
-            _LOGGER.info("UA_eff fallback tier: Q_base_el not yet calibrated — temperature-only eligibility (weaker)")
-            eligible = t_out.values < UA_EFF_FALLBACK_MAX_OUTDOOR_C
-        else:
-            load = e["gross_kwh"].values - self._calib["Q_base_el"]
-            eligible = (t_out.values < UA_EFF_FALLBACK_MAX_OUTDOOR_C) & (load > UA_EFF_FALLBACK_MIN_LOAD_KWH)
-        return eligible, "temperature_fallback", None
-
-    def _calibrate_ua_eff(
-        self,
-        energy_df: pd.DataFrame,
-        weather_df: pd.DataFrame,
-        climate_dfs: dict[str, pd.DataFrame] | None,
-        dhw_df: pd.DataFrame | None,
-        holdout_cutoff: pd.Timestamp,
-        heating_active_df: pd.DataFrame | None = None,
-        heating_sub_meter_df: pd.DataFrame | None = None,
-        ev_df: pd.DataFrame | None = None,
-        away_df: pd.DataFrame | None = None,
-    ) -> tuple[float | None, int]:
-        from .model import _find_passive_windows
-
-        if not climate_dfs:
-            return None, 0
-
-        e = energy_df.copy()
-        e["timestamp"] = pd.to_datetime(e["timestamp"])
-        e = e[e["timestamp"] < holdout_cutoff]
-        e = e[(e["timestamp"].dt.hour >= 22) | (e["timestamp"].dt.hour < 6)]
-
-        if e.empty:
-            return None, 0
-
-        has_dhw_sensor = dhw_df is not None and not dhw_df.empty
-        if has_dhw_sensor:
-            dhw_tank_temp_full = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
-                e["timestamp"], method="nearest", tolerance=pd.Timedelta("1h")
-            )
-            min_delta_t = 8.0
-        else:
-            dhw_tank_temp_full = pd.Series(np.nan, index=e["timestamp"].values)
-            min_delta_t = 12.0
-            _LOGGER.warning("DHW tank sensor absent — UA_eff calibration may be inflated")
-        # Computed on e right after the nighttime-hour filter — BEFORE the
-        # EV/away exclusion below — so .diff() compares real temporally-adjacent
-        # hours (e is still gapped only by night boundaries at this point). If
-        # this were computed after EV/away exclusion, an excluded hour in the
-        # middle of a night would leave a 2+ hour gap in the index, and .diff()
-        # would compare non-adjacent real hours — exactly the "gapped .diff()"
-        # bug that _find_passive_windows's dhw_rising_precomputed parameter
-        # (Task 1) was built to eliminate, reintroduced one level up here.
-        # _find_passive_windows reindexes dhw_rising_precomputed by timestamp
-        # value against its own (possibly EV/away-filtered) frame, so it
-        # tolerates timestamps present here but later excluded below.
-        dhw_rising_full = dhw_tank_temp_full.diff() > 0
-
-        if away_df is not None and not away_df.empty:
-            away_ts = set(pd.to_datetime(away_df.loc[away_df["is_away"] > 0, "timestamp"]).dt.floor("1h"))
-            e = e[~e["timestamp"].dt.floor("1h").isin(away_ts)]
-        if ev_df is not None and not ev_df.empty:
-            ev_ts = set(pd.to_datetime(ev_df["timestamp"]).dt.floor("1h"))
-            e = e[~e["timestamp"].dt.floor("1h").isin(ev_ts)]
-
-        if e.empty:
-            return None, 0
-
-        eligible, tier, y_override = self._resolve_heating_eligibility(
-            e, heating_sub_meter_df, heating_active_df, weather_df
-        )
-        e = e[eligible]
-        if e.empty:
-            return None, 0
-        if y_override is not None:
-            y_override = y_override[eligible]
-
-        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas=None)
-        if t_indoor is None:
-            return None, 0
-        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
-        t_outdoor = w["temp_c"].reindex(e["timestamp"], method="nearest", tolerance=pd.Timedelta("1h")).values
-
-        passive_df = pd.DataFrame(
-            {
-                "timestamp": e["timestamp"].values,
-                "T_outdoor": t_outdoor,
-                "T_indoor": t_indoor.values if t_indoor is not None else np.nan,
-                "hp_running": False,  # nighttime window, not HP-off; see min_hp_off_hours=0 below
-                "dhw_tank_temp": np.full(len(e), np.nan),  # unused: dhw_rising_precomputed always supplied
-            }
-        )
-        passive_idx = _find_passive_windows(
-            passive_df, min_delta_t=min_delta_t, min_hp_off_hours=0, dhw_rising_precomputed=dhw_rising_full
-        )
-        n_windows = len(passive_idx)
-
-        sub = e.iloc[passive_idx]
-        night_label = (sub["timestamp"] - pd.Timedelta(hours=6)).dt.date
-        n_nights = night_label.nunique()
-        if n_windows < 30 or n_nights < 10:
-            return None, n_windows
-
-        sub_t_indoor = t_indoor.iloc[passive_idx].values
-        sub_t_outdoor = t_outdoor[passive_idx]
-        delta_t = sub_t_indoor - sub_t_outdoor
-        cop = np.array([self._cop_formula_value(t, None) for t in sub_t_outdoor])
-
-        if y_override is not None:
-            q_heat_obs = y_override.iloc[passive_idx].values
-        else:
-            q_base_el = self._calib.get("Q_base_el") or 0.0
-            q_heat_obs = sub["gross_kwh"].values - q_base_el
-
-        x = (delta_t / cop).reshape(-1, 1)
-        y = q_heat_obs
-        slope = float(np.sum(x.flatten() * y) / np.sum(x.flatten() ** 2))
-        y_hat = slope * x.flatten()
-        ss_res = float(np.sum((y - y_hat) ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
-        ua_eff = slope * 1000.0
-
-        _LOGGER.info(
-            "UA_eff calibration (%s tier): %d rows, %d nights, x-range [%.1f, %.1f], UA_eff=%.1f W/K, R²=%.2f",
-            tier,
-            n_windows,
-            n_nights,
-            x.min(),
-            x.max(),
-            ua_eff,
-            r2,
-        )
-        if r2 < 0.5:
-            _LOGGER.warning(f"UA_eff calibration: R²={r2:.2f} < 0.5 — discarding result, using config default")
-            return None, n_windows
-        if not (UA_EFF_SANITY_MIN_W_PER_K <= ua_eff <= UA_EFF_SANITY_MAX_W_PER_K):
-            _LOGGER.warning(f"UA_eff={ua_eff:.1f} W/K outside plausible range — discarding, using config default")
-            return None, n_windows
-
-        return ua_eff, n_windows
-
-    def _calibrate_solar_gain_area(
-        self,
-        energy_df: pd.DataFrame,
-        weather_df: pd.DataFrame,
-        climate_dfs: dict[str, pd.DataFrame] | None,
-        ua_eff: float | None,
-        holdout_cutoff: pd.Timestamp,
-    ) -> float | None:
-        if ua_eff is None or not climate_dfs:
-            return None
-
-        e = energy_df.copy()
-        e["timestamp"] = pd.to_datetime(e["timestamp"])
-        e = e[e["timestamp"] < holdout_cutoff]
-        e = e[e["timestamp"].dt.month.isin([11, 12, 1, 2])]
-
-        w = weather_df.set_index(pd.to_datetime(weather_df["timestamp"]))
-        ghi = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest")
-        e = e[ghi.values > 50]
-        if e.empty:
-            return None
-
-        n_days = e["timestamp"].dt.date.nunique()
-        if n_days < 14:
-            _LOGGER.warning(f"solar_gain_area calibration: only {n_days} sunny winter days (need 14) — skipping")
-            return None
-
-        t_indoor = self._area_weighted_t_indoor(climate_dfs, pd.DatetimeIndex(e["timestamp"]), room_areas=None)
-        t_outdoor = w["temp_c"].reindex(e["timestamp"], method="nearest").values
-        ghi_sub = w["direct_radiation_wm2"].reindex(e["timestamp"], method="nearest").values
-        cop = np.array([self._cop_formula_value(t, None) for t in t_outdoor])
-
-        q_loss_w = ua_eff * np.clip((t_indoor.values if t_indoor is not None else 20.0) - t_outdoor, 0, None)
-        # gross_kwh includes standing base load (Q_base_el) — subtract it so q_heat_el_observed*cop*1000
-        # isolates space-heating-delivered watts only, mirroring the identical subtraction in
-        # _calibrate_ua_eff() and _calibrate_dhw_daily(). Verified numerically against this method's own
-        # test fixture (test_recovers_known_ghi_offset, true_area=8.0, Q_base_el=0.35): the regression
-        # slope comes out to 4.63 (42% low, outside the test's rel=0.3 tolerance) when gross_kwh is used
-        # directly, vs 8.05 (0.6% error) once Q_base_el is subtracted — the same class of bias Task 8
-        # found in _calibrate_ua_eff.
-        q_base_el = self._calib.get("Q_base_el") or 0.0
-        q_heat_el_observed = e["gross_kwh"].values - q_base_el
-        # residual = predicted UA-loss minus the heat actually delivered (reconstructed from observed
-        # electrical draw x COP). Physically, delivered heat = q_loss - q_solar (before any demand floor
-        # clipping), so residual = q_loss_w - (q_loss - q_solar) = q_solar = solar_gain_area * ghi — i.e.
-        # residual is POSITIVE and directly proportional to ghi with slope = solar_gain_area.
-        #
-        # NOTE: the brief's literal code set `y = -residual_w`, inverting this sign. That silently
-        # flipped every recovered slope negative, which the trailing `max(0.0, slope)` then clamped to
-        # 0.0 on every call — i.e. solar_gain_area calibration always returned exactly 0 regardless of
-        # any real solar effect. Confirmed numerically: literal code (with the Q_base_el fix applied)
-        # gives slope=-8.05 -> clamped to 0.0 (test asserts ~8.0, fails); removing the negation
-        # (y = residual_w, as below) gives slope=+8.05, matching the fixture's true_area=8.0.
-        residual_w = q_loss_w - q_heat_el_observed * cop * 1000.0
-        x = ghi_sub
-        y = residual_w
-        if np.sum(x**2) < 1e-9:
-            return None
-        slope = float(np.sum(x * y) / np.sum(x**2))
-        return max(0.0, slope)
 
     def _calibrate_ua_dhw(
         self,
@@ -1132,18 +741,6 @@ class ThermalPhysicsModel:
             return False
         return True
 
-    def check_zone_boundary(self, current_thermostat_entities: list[str]) -> None:
-        recorded = self._calib.get("room_thermostats_at_calibration")
-        if not recorded:
-            return
-        if sorted(recorded) != sorted(current_thermostat_entities):
-            _LOGGER.warning(
-                "Zone boundary changed: room_thermostats at calibration time %s differs from current %s — "
-                "UA_eff may no longer be consistent with Q_loss until recalibration",
-                recorded,
-                current_thermostat_entities,
-            )
-
     def detect_open_windows(
         self,
         climate_dfs: dict[str, pd.DataFrame],
@@ -1246,11 +843,9 @@ class ThermalPhysicsModel:
         self,
         energy_df: pd.DataFrame,
         weather_df: pd.DataFrame,
-        climate_dfs: dict[str, pd.DataFrame] | None,
         dhw_df: pd.DataFrame | None,
         holdout_cutoff: pd.Timestamp,
         heating_active_df: pd.DataFrame | None = None,
-        heating_sub_meter_df: pd.DataFrame | None = None,
         ev_df: pd.DataFrame | None = None,
         away_df: pd.DataFrame | None = None,
     ) -> None:
@@ -1258,41 +853,14 @@ class ThermalPhysicsModel:
             q_base_el = self._calibrate_base_load(energy_df, away_df, ev_df, holdout_cutoff)
             if q_base_el is not None:
                 self._calib["Q_base_el"] = q_base_el
-                self._calib["q_base_el_calibrated"] = True  # distinguishes real calibration from the 0.35 default
 
             q_dhw_daily = self._calibrate_dhw_daily(energy_df, self._calib["Q_base_el"], holdout_cutoff)
             if q_dhw_daily is not None:
                 self._calib["Q_dhw_daily"] = q_dhw_daily
 
-            ua_eff, n_windows = self._calibrate_ua_eff(
-                energy_df,
-                weather_df,
-                climate_dfs,
-                dhw_df,
-                holdout_cutoff,
-                heating_active_df=heating_active_df,
-                heating_sub_meter_df=heating_sub_meter_df,
-                ev_df=ev_df,
-                away_df=away_df,
-            )
-            self._calib["n_calibration_windows_ua_eff"] = n_windows
-            if ua_eff is not None:
-                self._calib["UA_eff"] = ua_eff
-            else:
-                _LOGGER.warning("UA_eff calibration unavailable — heating component will be skipped")
-
-            solar_area = self._calibrate_solar_gain_area(
-                energy_df, weather_df, climate_dfs, self._calib["UA_eff"], holdout_cutoff
-            )
-            if solar_area is not None:
-                self._calib["solar_gain_area"] = solar_area
-
             ua_dhw = self._calibrate_ua_dhw(dhw_df, weather_df, heating_active_df, holdout_cutoff)
             if ua_dhw is not None:
                 self._calib["UA_dhw"] = ua_dhw
-
-            if climate_dfs:
-                self._calib["room_thermostats_at_calibration"] = sorted(climate_dfs.keys())
 
             self._calib["calibrated_at"] = pd.Timestamp.now().isoformat()
             _atomic_write_json(self._calibration_path, self._calib)

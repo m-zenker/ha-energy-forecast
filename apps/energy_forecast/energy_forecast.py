@@ -501,7 +501,7 @@ class EnergyForecast(hass.Hass):
             self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
 
         # Populated by _fetch_physics_sensor_histories() (once per training cycle). Initialized
-        # here too so _update_sensors()/_publish_physics_sensors() can safely read them if either
+        # here too so _update_sensors() can safely read them if it
         # ever fires before the first _retrain() completes.
         self._physics_heating_buffer_df: Any = None
         self._physics_dhw_tank_df: Any = None
@@ -1103,32 +1103,6 @@ class EnergyForecast(hass.Hass):
             "measurement",
             json_attributes_topic=_tp_attrs_topic,
         )
-        # Physics baseline / ML adjustment sensors (only when a physics model is configured)
-        if self._physics_model is not None:
-            _physics_base_attrs_topic = (
-                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_physics_base_today/attributes"
-            )
-            self._mqtt_publish_discovery(
-                "energy_forecast_physics_base_today",
-                "Energy Forecast Physics Base Today",
-                "kWh",
-                "mdi:lightning-bolt-outline",
-                None,
-                "measurement",
-                json_attributes_topic=_physics_base_attrs_topic,
-            )
-            _ml_adjustment_attrs_topic = (
-                f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/energy_forecast_ml_adjustment_today/attributes"
-            )
-            self._mqtt_publish_discovery(
-                "energy_forecast_ml_adjustment_today",
-                "Energy Forecast ML Adjustment Today",
-                "kWh",
-                "mdi:tune-vertical",
-                None,
-                "measurement",
-                json_attributes_topic=_ml_adjustment_attrs_topic,
-            )
 
     def terminate(self) -> None:
         """AppDaemon lifecycle hook — publish offline availability on shutdown."""
@@ -1589,11 +1563,9 @@ class EnergyForecast(hass.Hass):
             self._physics_model.calibrate(
                 energy_df,
                 weather_df,
-                climate_dfs=self._physics_climate_dfs,
                 dhw_df=self._physics_dhw_tank_df,
                 holdout_cutoff=holdout_cutoff,
                 heating_active_df=self._cached_heating_active_df,
-                heating_sub_meter_df=self._cached_heating_sub_meter_df,
                 ev_df=self._cached_ev_df,
                 away_df=self._cached_away_df,
             )
@@ -2234,10 +2206,8 @@ class EnergyForecast(hass.Hass):
         # 2026-08-04 live bug: a committed override must move the published
         # forecast by its true expected kWh amount, independent of whatever
         # weight the trained model happens to give the override features.
-        # _override_delta stays None (not, say, an all-zero Series) when there's
-        # no physics model or no forecast row at or after the first predicted hour,
-        # so _publish_physics_sensors below can tell "nothing to fold in" apart from
-        # "a real, all-zero delta" without a redundant check.
+        # _override_delta stays None when there's no physics model or no forecast row
+        # at or after the first predicted hour.
         _override_delta = None
         if self._physics_model is not None:
             # forecast_df carries a past tail (fetch_open_meteo past_days=3). Simulating over it
@@ -2248,8 +2218,8 @@ class EnergyForecast(hass.Hass):
             if not _serving_df.empty:
                 _override_timestamps = pd.DatetimeIndex(_serving_df["timestamp"])
                 # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
-                # derived through the exact same climate-projection path predict_series
-                # uses for the real physics_kwh feature — not raw outdoor temperature
+                # derived through the same climate-projection path as the forecast
+                # features — not raw outdoor temperature
                 # (final-review #2). Feeding outdoor temp here modelled a tank standing
                 # outside, inflating standing losses and therefore the correction itself.
                 _t_ambient = self._physics_model._t_indoor_for_window(
@@ -2278,7 +2248,6 @@ class EnergyForecast(hass.Hass):
                 )
 
         self._publish_thermal_pressure()
-        self._publish_physics_sensors(predictions, override_delta=_override_delta)
 
         intervals = self._ml_model.predict_intervals(
             forecast_df,
@@ -2772,100 +2741,6 @@ class EnergyForecast(hass.Hass):
                 state=str(round(float(value), 3)),
                 attributes=attrs,
             )
-
-    def _publish_physics_sensors(self, forecast_df: pd.DataFrame, override_delta: pd.Series | None = None) -> None:
-        """Publish the physics-only baseline and the ML adjustment on top of it.
-
-        Published whenever a physics model is configured, independent of phase:
-        the physics baseline is computable (and diagnostically useful) in Phase 1
-        too, when it's only a model *feature* rather than the residual target.
-
-        `forecast_df` is the 48h `[timestamp, predicted_kwh]` frame returned by
-        `self._ml_model.predict(...)` — the main forecast, already carrying the
-        Task 11 DHW override correction (if any) added to `predicted_kwh`. The
-        physics baseline itself is recomputed from `self._cached_forecast_df`
-        (the raw weather forecast, which carries `temp_c`/`direct_radiation_wm2`
-        that `predict_series()` needs and that `forecast_df` does not have) via
-        `predict_series()`, which is override-blind by design.
-
-        `override_delta`: the same per-hour override correction the caller
-        already added to `forecast_df["predicted_kwh"]` (Task 11) — folded into
-        `physics_vals` here too, before the ML-adjustment subtraction. Without
-        this, `physics_vals` stays override-blind while `predicted_kwh` isn't,
-        so `ml_adjustment_vals = predicted_kwh - physics_vals` would silently
-        misattribute the entire override delta to "ML Adjustment" instead of
-        "Physics Base" on the published diagnostic sensors.
-
-        The weather frame is cut to rows at or after the first forecast hour, so
-        the simulation starts there (not on the ~3 days of past rows the live
-        frame carries, which would seed the DHW tank days ago). The published
-        physics base is floored at 0 after the override delta is added;
-        `ml_adjustment_vals` is computed after the floor, so the two sensors
-        still sum to `predicted_kwh`.
-        """
-        if self._physics_model is None or forecast_df.empty:
-            return
-        try:
-            import numpy as np
-            import pandas as pd
-
-            weather_df = self._cached_forecast_df if self._cached_forecast_df is not None else forecast_df
-            _cut = weather_df[weather_df["timestamp"] >= forecast_df["timestamp"].iloc[0]]
-            if not _cut.empty:
-                weather_df = _cut
-            physics_series = self._physics_model.predict_series(
-                weather_df,
-                climate_recent=self._physics_climate_dfs,
-                dhw_recent=self._physics_dhw_tank_df,
-                room_areas=self._climate_room_areas or None,
-            )
-            physics_vals = physics_series.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
-            if override_delta is not None:
-                physics_vals = (
-                    physics_vals + override_delta.reindex(pd.DatetimeIndex(forecast_df["timestamp"])).fillna(0.0).values
-                )
-            physics_vals = np.maximum(0.0, physics_vals)
-            ml_adjustment_vals = forecast_df["predicted_kwh"].values - physics_vals
-
-            physics_attrs = {
-                "hourly_kwh": [round(float(v), 3) for v in physics_vals],
-                "unit_of_measurement": "kWh",
-                "friendly_name": "Energy Forecast Physics Base Today",
-            }
-            ml_attrs = {
-                "hourly_kwh": [round(float(v), 3) for v in ml_adjustment_vals],
-                "unit_of_measurement": "kWh",
-                "friendly_name": "Energy Forecast ML Adjustment Today",
-            }
-
-            if self._mqtt_discovery:
-                self._mqtt_set_sensor("energy_forecast_physics_base_today", physics_vals[0])
-                self._mqtt_publish_sensor_attributes("energy_forecast_physics_base_today", physics_attrs)
-                self._mqtt_set_sensor("energy_forecast_ml_adjustment_today", ml_adjustment_vals[0])
-                self._mqtt_publish_sensor_attributes("energy_forecast_ml_adjustment_today", ml_attrs)
-            else:
-                self.set_state(
-                    "sensor.energy_forecast_physics_base_today",
-                    state=str(round(float(physics_vals[0]), 3)),
-                    attributes={
-                        **physics_attrs,
-                        "unique_id": "energy_forecast_physics_base_today",
-                        "attribution": ATTRIBUTION,
-                    },
-                    replace=True,
-                )
-                self.set_state(
-                    "sensor.energy_forecast_ml_adjustment_today",
-                    state=str(round(float(ml_adjustment_vals[0]), 3)),
-                    attributes={
-                        **ml_attrs,
-                        "unique_id": "energy_forecast_ml_adjustment_today",
-                        "attribution": ATTRIBUTION,
-                    },
-                    replace=True,
-                )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning(f"Failed to publish physics sensors: {exc}")
 
     def _publish_unavailable(self) -> None:
         if self._mqtt_discovery:
