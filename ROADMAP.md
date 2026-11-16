@@ -22,7 +22,7 @@ Start here. Everything below this section is detail and history.
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
 | 10 | #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
-| 11 | #124 verify override history against the tank before training replay | plan to be written (small, hef only) | investigated 2026-11-14 | none; after the batch |
+| 11 | #124 verify override history against the tank before training replay | plan written 2026-11-16, awaiting owner approval; branch `fix/override-history-tank-verify` 6fbddde | investigated 2026-11-14 | none; after the batch |
 | 12 | #121, #122, #123 | — | as capacity allows | #122 needs ≥ 5 overrides in the captures |
 
 **Rules that apply to all of it.**
@@ -636,7 +636,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
-| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — investigated 2026-11-14; plan to be written |
+| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — investigated 2026-11-14; plan written 2026-11-16, awaiting owner approval |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
