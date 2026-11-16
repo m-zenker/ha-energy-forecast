@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **dev v0.12.0-alpha-41** (2026-11-15, deployed, 1565 tests) · **main v0.11.18** (2026-10-26).
+Current: **dev v0.12.0-alpha-42** (2026-11-16, deployed, 1573 tests) · **main v0.11.18** (2026-10-26).
 
 ---
 
@@ -22,7 +22,7 @@ Start here. Everything below this section is detail and history.
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
 | 10 | #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
-| 11 | #124 verify override history against the tank before training replay | fixed on `train/next` 2026-11-16; forecast-changing, ships in its own `/pm evening` window (not with the #120 flip or #105) | live check 2026-11-16: 48 → 34 replayed | none |
+| 11 | #124 verify override history against the tank before training replay | shipped alpha-42 2026-11-16 (own window, without the #120 flip or #105); deployed, awaiting first retrain | live check 2026-11-16: 48 → 34 replayed | none |
 | 12 | #121, #122, #123 | — | as capacity allows | #122 needs ≥ 5 overrides in the captures |
 
 **Rules that apply to all of it.**
@@ -38,7 +38,7 @@ Start here. Everything below this section is detail and history.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-41 (2026-11-15): #116 retrain-age time zone, #113 Phase 2 reconstruction (dormant), #120 `drop_feature_groups` flag (off), #118 live cold-day gate tooling; alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
+**dev:** v0.12.0-alpha-42 (2026-11-16): #124 tank-verified override replay, daily-bias sensors on complete calendar days; alpha-41 (2026-11-15): #116 retrain-age time zone, #113 Phase 2 reconstruction (dormant), #120 `drop_feature_groups` flag (off), #118 live cold-day gate tooling; alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
 
 **Cold-onset over-forecast (2026-10-15): C verdict PASSED 2026-10-27 (pooled); A+B re-baseline FAILED the bias criterion 2026-11-03 — see the re-baseline paragraph below.** `mae_7d` jumped 0.196 → 0.477 after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term and compared every room to one shared setpoint. **C Task 1** (alpha-26, 2026-10-16): thermostat floor + per-room setpoint; replay 2026-10-08..14 MAE 24–47 h 0.485 → 0.255. **D Task 1** (alpha-25, 2026-10-16): `heating_power_request` valve demand cached in `climate_*.csv`; the ≥ 14 valve-closed-night data gate was met 2026-10-21.
 - **C check 2026-10-21: NOT MET.** 10-17 −2.2 (pass), 10-18 +6.2 and 10-19 +4.7 kWh/day (fail); pooled ≈ +3.5 vs +5.9 before C; point-in-band 87.5 % (< 90 %). Night hours (22–03 h) over-forecast ≈ 0.3–0.5 kWh/h.
@@ -218,7 +218,7 @@ With an override pending, each update adds about +1 kWh at the override hour, a 
 
 ### #124 — Verify Override History Against the Tank Before Training Replay
 
-**Priority:** Low-medium. **Status:** fixed on `train/next` 2026-11-16 (`fix/override-history-tank-verify`, plan `docs/superpowers/plans/2026-11-16-override-history-tank-verify.md`). **Forecast-changing** (training target, takes effect at the first retrain after deploy): ship it in its own `/pm evening` window, **not together with the #120 flip or #105**. hef only. Replaces the "phantom overrides need a cross-repo plan" note under #93.
+**Priority:** Low-medium. **Status:** shipped alpha-42 2026-11-16 (`fix/override-history-tank-verify`, plan `docs/superpowers/plans/2026-11-16-override-history-tank-verify.md`). **Forecast-changing** (training target, takes effect at the first retrain after deploy): ship it in its own `/pm evening` window, **not together with the #120 flip or #105**. hef only. Replaces the "phantom overrides need a cross-repo plan" note under #93.
 
 **Live check 2026-11-16** (`verify_override_history` on the entries committed before 11-12): 48 → 34 replayed; 6 duplicates and 8 not-run dropped, 8 capped, 0 unverified. These are the same 8 not-run entries as in the 11-14 investigation. On the full history (52 entries): 7 duplicates, 11 not run, 8 capped, 0 unverified. Three more overrides have not run since 11-12, so the em side is now an em ROADMAP investigation item ("DHW overrides committed to hef that never run").
 
@@ -638,7 +638,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
-| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — fixed on `train/next` 2026-11-16; forecast-changing, own ship window |
+| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed, awaiting first retrain |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
