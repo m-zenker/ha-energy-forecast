@@ -14,8 +14,8 @@ Limits:
   Near a capture this is at most the last hour; that one hour can still move a 48 h total by several percent,
   which is ordinary retrain jitter (see the jitter arm in ``walkforward``).
 - Weather is the captured archive weather, i.e. perfect. Measured cost of real forecast weather: 1-2 % MAE.
-- The physics model's state is the capture's state at every cutoff. With ``physics_kwh`` at zero gain this does not
-  change forecasts; it would matter for Phase 2.
+- The physics model's state is the capture's state at every cutoff; it only feeds calibration, open-window
+  detection and the DHW override delta at train time.
 - ``away_df`` is limited to the 10 days before the cutoff, as live's recorder window does.
 
 Loading real captures needs the env that matches the HA host (``/home/jovyan/my_envs/ha-energy-forecast-live``).
@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 from . import env  # noqa: F401  (hassapi stub + apps/ on sys.path before the app imports)
-from .env import TZ, frozen_now
+from .env import TZ, frozen_now, strip_legacy_train_kwargs
 
 HEATING_SUB_METER = "sub_em_kermi_bridge_kermi_electricity_heating"
 RECENT_ROWS = 401  # rows of recent_actuals live passes to predict()
@@ -59,7 +59,7 @@ class CaptureFrame:
     """Training and serve inputs for any cutoff or origin inside one retrain capture's history."""
 
     def __init__(self, payload: dict, heating_thresholds: Any | None = None) -> None:
-        self.tk: dict = payload["train_kwargs"]
+        self.tk: dict = strip_legacy_train_kwargs(payload["train_kwargs"])
         self.physics = payload.get("physics_model")
         self.model_init: dict = dict(payload.get("model_init") or {"timezone": TZ})
         self.weather = (
@@ -260,19 +260,13 @@ def predict(
     work: Path,
     origin: pd.Timestamp,
     kwargs: dict | None = None,
-    physics: bool = False,
 ) -> pd.DataFrame:
-    """48 h forecast as of *origin*: columns ``ts, lead, p50`` and, when quantile models exist, ``lo, hi``.
-
-    *physics* False skips the physics baseline at serve time. That is exact while ``physics_kwh`` has no splits
-    in the model and several times faster; pass True for Phase 2 models.
-    """
+    """48 h forecast as of *origin*: columns ``ts, lead, p50`` and, when quantile models exist, ``lo, hi``."""
     origin = pd.Timestamp(origin)
     kwargs = copy.deepcopy(kwargs) if kwargs is not None else frame.predict_kwargs(origin)
-    physics_model = frame.physics_for(work) if physics else None
     with frozen_now(origin, frame.model_init.get("timezone", TZ)):
-        prepared = model._prepare_prediction_X(**kwargs, physics_model=physics_model)
-        point = model.predict(**kwargs, physics_model=physics_model, _prepared=prepared)
+        prepared = model._prepare_prediction_X(**kwargs)
+        point = model.predict(**kwargs, _prepared=prepared)
         interval_kwargs = {k: v for k, v in kwargs.items() if k != "heating_buffer_temp_recent"}
         intervals = model.predict_intervals(**interval_kwargs, _prepared=prepared)
     out = pd.DataFrame(

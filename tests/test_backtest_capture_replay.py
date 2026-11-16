@@ -94,8 +94,8 @@ def _make_captures(
         "now_local": NOW,
     }
     with frozen_now(NOW, TZ):
-        prepared = model._prepare_prediction_X(**predict_kwargs, physics_model=physics)
-        preds = model.predict(**predict_kwargs, physics_model=physics, _prepared=prepared)
+        prepared = model._prepare_prediction_X(**predict_kwargs)
+        preds = model.predict(**predict_kwargs, _prepared=prepared)
     capture.write_capture(
         root,
         "predict",
@@ -236,8 +236,8 @@ def test_app_written_predict_capture_replays(tmp_path, monkeypatch):
     # Produce the "live" model output with the real model from the retrain reference.
     with frozen_now(NOW, TZ):
         model = EnergyForecastModel(ref, **rpayload["model_init"])
-        prepared = model._prepare_prediction_X(**predict_kwargs, physics_model=None)
-        preds = model.predict(**predict_kwargs, physics_model=None, _prepared=prepared)
+        prepared = model._prepare_prediction_X(**predict_kwargs)
+        preds = model.predict(**predict_kwargs, _prepared=prepared)
     app._ml_model.last_trained = model.last_trained
     snap = ef_mod._snapshot_predict_inputs(app, predict_kwargs, NOW)
     assert snap is not None

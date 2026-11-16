@@ -26,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import env  # noqa: F401  (hassapi stub + apps/ on sys.path before the app imports)
-from .env import TZ, frozen_now
+from .env import TZ, frozen_now, strip_legacy_train_kwargs
 
 PREDICT_TOL_KWH = 1e-6
 TRAIN_TOL_PCT = 0.1
@@ -109,10 +109,9 @@ def replay_predict(
                 shutil.copy2(p, work / p.name)
         with frozen_now(payload["now_local"], init.get("timezone", TZ)):
             model = EnergyForecastModel(work, **init)
-            physics = _retarget_physics(payload["physics_model"], work)
             kwargs = copy.deepcopy(payload["predict_kwargs"])
-            prepared = model._prepare_prediction_X(**kwargs, physics_model=physics)
-            preds = model.predict(**kwargs, physics_model=physics, _prepared=prepared)
+            prepared = model._prepare_prediction_X(**kwargs)
+            preds = model.predict(**kwargs, _prepared=prepared)
     preds = preds.copy()
     preds["timestamp"] = pd.to_datetime(preds["timestamp"]).dt.tz_localize(None)
     return preds
@@ -161,7 +160,7 @@ def replay_train(root: Path, retrain_id: str, scratch: Path, *, allow_unseeded: 
     init = dict(payload.get("model_init") or {})
     with frozen_now(payload["now_local"], init.get("timezone", TZ)):
         model = EnergyForecastModel(scratch, **init)
-        kwargs = dict(payload["train_kwargs"])
+        kwargs = strip_legacy_train_kwargs(payload["train_kwargs"])
         kwargs["physics_model"] = _retarget_physics(payload["physics_model"], scratch)
         model.train(**kwargs)
     return scratch

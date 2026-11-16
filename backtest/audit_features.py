@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from .capture_frame import CaptureFrame, load_model, train
-from .capture_replay import _retarget_physics, reference_dir_for
+from .capture_replay import reference_dir_for
 from .env import TZ, frozen_now
 
 LEADS = ((1, 5), (24, 47))
@@ -79,9 +79,8 @@ def served_features(root: Path, work_root: Path) -> pd.DataFrame:
         if ref not in models:
             models[ref] = load_model(ref, work_root)
         model, work = models[ref]
-        physics = _retarget_physics(payload["physics_model"], work)  # never the live paths
         with frozen_now(payload["now_local"], TZ):
-            hours, X = model._prepare_prediction_X(**copy.deepcopy(payload["predict_kwargs"]), physics_model=physics)
+            hours, X = model._prepare_prediction_X(**copy.deepcopy(payload["predict_kwargs"]))
         X = X.copy()
         X["ts"], X["lead"] = pd.DatetimeIndex(hours), np.arange(len(X))
         blocks.append(X)

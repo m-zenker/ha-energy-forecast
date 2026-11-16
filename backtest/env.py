@@ -27,6 +27,14 @@ if "hassapi" not in sys.modules:  # AppDaemon only exists inside HA; the app onl
     sys.modules["hassapi"] = _stub
 
 
+LEGACY_TRAIN_KWARGS = ("use_physics_residual", "heating_sub_meter_df")
+
+
+def strip_legacy_train_kwargs(kwargs: dict) -> dict:
+    """Copy of *kwargs* without train() arguments that no longer exist (older captures still carry them)."""
+    return {k: v for k, v in kwargs.items() if k not in LEGACY_TRAIN_KWARGS}
+
+
 @contextlib.contextmanager
 def frozen_now(ts: pd.Timestamp, tz: str = TZ) -> Iterator[None]:
     """Pin ``pd.Timestamp.now`` to naive-local *ts* (aware when called with ``tz=``); restore on exit.
