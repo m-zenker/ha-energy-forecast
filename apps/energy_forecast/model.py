@@ -427,11 +427,11 @@ class EnergyForecastModel:
             _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
             if _override_history:
                 # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
-                # derived as the (removed) predict_training_series did for the real
-                # physics_kwh feature — not raw outdoor temperature (final-review #2).
+                # derived as the former training-series predictor did
+                # — not raw outdoor temperature (final-review #2).
                 # Deliberately the simple _area_weighted_t_indoor form, without
                 # _project_indoor_temps: this is a historical training window with real
-                # readings, so there is nothing to project, and the old predict_training_series
+                # readings, so there is nothing to project, and the former predictor
                 # didn't project here either.
                 from .physics import DEFAULT_AMBIENT_C
 
@@ -2770,13 +2770,13 @@ def _find_passive_windows(
     min_hp_off_hours: int = 2,
     dhw_rising_precomputed: pd.Series | None = None,
 ) -> pd.Index:
-    """Return the index of rows suitable for passive-cooling calibration (τ, UA_eff).
+    """Return the index of rows suitable for passive-cooling calibration (τ).
 
     A row qualifies when: the heat pump has been off for at least
     ``min_hp_off_hours`` consecutive hours ending at that row, ΔT = T_indoor −
     T_outdoor ≥ ``min_delta_t``, and ``dhw_tank_temp`` is not rising into that
     row (rising tank temp indicates an active DHW cycle, which would inflate
-    UA_eff / shorten apparent τ if included).
+    / shorten apparent τ if included).
 
     ``dhw_rising_precomputed``: optional, keyword-only. A boolean Series indexed
     by timestamp, precomputed by the caller over a temporally-complete series

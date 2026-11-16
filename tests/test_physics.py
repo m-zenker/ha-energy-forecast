@@ -1255,9 +1255,9 @@ class TestZeroOverrideDegradation:
         assert (training_delta == 0.0).all()
         assert (serving_delta == 0.0).all()
 
-    def test_physics_kwh_identical_to_pre_phase_a_when_no_override_ever_committed(self, tmp_path):
+    def test_override_blind_series_identical_to_pre_phase_a_when_no_override_ever_committed(self, tmp_path):
         """No regression risk for installs that never use DHW overrides — the
-        override-blind physics_kwh feature must be bit-identical to calling
+        override-blind DHW series must be bit-identical to calling
         _dhw_kwh_series with override_lookup=None (today's only behavior)."""
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")

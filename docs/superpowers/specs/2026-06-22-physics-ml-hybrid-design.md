@@ -1,3 +1,5 @@
+> Superseded in part (heating, Phase 2) by 2026-11-16-physics-heating-removal-design.md.
+
 # Physics-ML Hybrid Energy Forecast Model — Design Spec
 
 **Date:** 2026-06-22

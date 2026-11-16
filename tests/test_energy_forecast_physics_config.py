@@ -1036,7 +1036,7 @@ class TestServingOverrideCorrection:
 
     def test_serving_delta_uses_indoor_temperature_not_outdoor(self, tmp_path, monkeypatch):
         """Final-review #2: the DHW ODE's `t_ambient` is the air around the TANK, i.e.
-        indoor temperature — exactly what predict_series feeds physics_kwh. The serving
+        indoor temperature — exactly what the training override-delta uses. The serving
         correction used to pass raw outdoor `forecast_df["temp_c"]` instead, so on a cold
         day it modelled a tank standing outside: inflated standing losses, wrong delta.
 

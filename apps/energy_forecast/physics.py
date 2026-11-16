@@ -240,7 +240,7 @@ class ThermalPhysicsModel:
 
     def _initial_t_tank_for_window(self, dhw_df: pd.DataFrame | None, timestamps: pd.DatetimeIndex) -> float:
         """Shared initial-tank-state estimate for a training/forecast window — extracted
-        from the removed predict_training_series to avoid duplicating this logic at the new
+        from the former training-series predictor to avoid duplicating this logic at the new
         override-delta call site in model.py."""
         if dhw_df is not None and not dhw_df.empty:
             d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(
@@ -338,7 +338,7 @@ class ThermalPhysicsModel:
     ) -> tuple[pd.Series, pd.Series, float]:
         """Returns (el_kwh_series, t_tank_series, final_t_tank). override_lookup is a
         per-hour callable returning an override target temp or None; None means
-        override-blind (the mandatory mode for physics_kwh as an ML feature — Goal 1).
+        override-blind (the mandatory mode for the training override-delta — Goal 1).
         Same ODE math as before Phase A — only the override-source abstraction changed,
         from a dict to a callable, so one loop can serve live-dict, history-based, and
         blind lookup modes without duplicating it (R2-#3's "one shared function")."""
@@ -501,7 +501,7 @@ class ThermalPhysicsModel:
     ) -> pd.Series:
         """Serving-side entry point (Goal 1): the deterministic post-model forecast
         correction. Callers add this UNCONDITIONALLY to the model's already-final
-        published forecast — never fed back into physics_kwh or the trained model."""
+        published forecast — never fed back into the trained model."""
         baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
             timestamps, t_ambient, initial_t_tank, override_lookup=None
         )

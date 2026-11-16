@@ -144,7 +144,7 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "weighted_solar_gain": "passive solar heat gain",
     "dhw_buffer_temp": "hot water buffer temperature",
     "dhw_pressure": "DHW heat demand",
-    # Physics-ML hybrid (only present when a physics model is configured)
+    # Legacy: only present in models trained before the physics heating removal
     "physics_kwh": "physics-model baseline forecast",
     "heating_buffer_temp": "heating buffer tank temperature (sensor)",
     # Optional sensor features
@@ -2181,7 +2181,7 @@ class EnergyForecast(hass.Hass):
 
         # ── Goal 1: deterministic post-model DHW override correction ──────────
         # Added unconditionally to the model's already-final output — never fed
-        # back into physics_kwh or the trained model, so double-counting is
+        # back into the trained model, so double-counting is
         # structurally impossible (spec's Design section). Direct fix for the
         # 2026-08-04 live bug: a committed override must move the published
         # forecast by its true expected kWh amount, independent of whatever

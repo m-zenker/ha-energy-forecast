@@ -1782,7 +1782,7 @@ class TestTrainWithPhysics:
 
         timestamps_for_delta = pd.DatetimeIndex(ts)
         # Final-review #2: the DHW ODE's t_ambient is INDOOR air, derived exactly the way
-        # predict_training_series derives it for the real physics_kwh feature — no
+        # the former training-series predictor derived it — no
         # climate_dfs in this fixture, so that derivation is the DEFAULT_AMBIENT_C
         # fallback, NOT weather_df["temp_c"]. Building the expected delta from outdoor
         # temperature (as this test originally did) no longer reproduces what train()
@@ -1851,8 +1851,7 @@ class TestPredictWithPhysics:
         assert "physics_kwh" not in model.feature_cols
 
     def test_heating_buffer_temp_filled_with_zero_when_sensor_unavailable_at_predict_time(self, tmp_path, caplog):
-        """Mirrors test_physics_kwh_filled_with_zero_when_model_disabled_at_predict_time:
-        a model trained WITH heating_buffer_temp_df (so heating_buffer_temp lands in
+        """A model trained WITH heating_buffer_temp_df (so heating_buffer_temp lands in
         feature_cols) must not raise KeyError when predicting WITHOUT
         heating_buffer_temp_recent (sensor outage or config change)."""
         n = 600
