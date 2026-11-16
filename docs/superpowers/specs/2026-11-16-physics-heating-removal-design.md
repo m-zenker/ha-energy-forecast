@@ -65,7 +65,7 @@ Remove the symbols in §3 and the heating-only branches of `calibrate()`. `calib
 
 ## 5. Design — EM (ha-energy-manager)
 
-- `loads/legionella_coverage.py` (`v2_coverage`, `:77`) and the duplicate denominator in `loads/heat_pump.py:4207`: drop the `physics` parameter; v2 always adds `cycle_kwh` to the denominator. Delete `_legionella_physics_present` (`:4220`). Drop the `physics_present` detail key and update its consumers (`:4032`, `:5606`) and tests (`test_heat_pump.py` `test_physics_present_*`, `test_legionella_coverage.py`). v1 and comfort-boost coverage are unchanged (`delta_kwh` stays 0). v2's logged values change from deploy on, so restart the v1/v2 review count.
+- `loads/legionella_coverage.py` (`v2_coverage`, `:77`) and the duplicate denominator in `loads/heat_pump.py:4207`: drop the `physics` parameter; v2 always adds `cycle_kwh` to the denominator. Delete `_legionella_physics_present` (`:4220`). Drop the `physics_present` detail key and update its consumers (`:4032`, `:5606`) and tests (`test_heat_pump.py` `test_physics_present_*`, `test_legionella_coverage.py`). v1 and comfort-boost coverage are unchanged (`delta_kwh` stays 0). **v2 gates the boost hand-off live** (`heat_pump.py:5583`, `:5612`), so the hand-off becomes stricter from the hef deploy on. That is a correction, owner-accepted 2026-11-16. A replay of the 3 past hand-offs: 10-15 5.54→1.39 and 10-31 3.34→0.72 still pass; 11-09 0.94→0.20 flips to below_min. Restart the v1/v2 review count and watch the first hand-offs with `legionella_report.py`.
 - `forecast/consumption_forecast_app.py`: remove the two sensor mirrors and the `model_phase` read, log and pass-through. Add the current-format ids that the publish at `:356-357` creates to the existing `_mqtt_clear_discovery_topics` call (`:272`; its list already holds the legacy ids).
 - `dashboard/ha-energy-manager.yaml`: remove the two sensor cards and the "hef Modellphase" row (`:1128`); deploy with `scripts/deploy_dashboard.py`. Delete the now-dead `hef_forecast_today` key (`config.example.yaml:564-566`). EM CLAUDE.md hef-physics section: the compatibility signal becomes the `set_dhw_schedule` / `get_scenario` services, not `model_phase`.
 - Deploy order does not matter. Without `model_phase`, the current EM already adds the cycle, which is now correct. The EM change is cleanup.
@@ -109,5 +109,6 @@ Remove the symbols in §3 and the heating-only branches of `calibrate()`. `calib
 
 - The per-hour override correction is no longer visible in HA (it was visible through `physics_base_today`'s `hourly_kwh`); logs only.
 - Leftover heating keys stay in `physics_calibration.json`.
+- Stricter legionella hand-offs (§5): some boosts move to a later candidate or attempt.
 - After the hef deploy, EM may read a stale retained `model_phase` for minutes (until hef's first attribute publish).
 - The post-retrain feature-set change (88 → 87 columns) re-draws `colsample_bytree` subsets; this counts as normal retrain jitter.
