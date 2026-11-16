@@ -427,12 +427,12 @@ class EnergyForecastModel:
             _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
             if _override_history:
                 # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
-                # derived exactly the way predict_training_series derives it for the real
+                # derived as the (removed) predict_training_series did for the real
                 # physics_kwh feature — not raw outdoor temperature (final-review #2).
                 # Deliberately the simple _area_weighted_t_indoor form, without
                 # _project_indoor_temps: this is a historical training window with real
-                # readings, so there is nothing to project, and predict_training_series
-                # doesn't project here either — the two must agree.
+                # readings, so there is nothing to project, and the old predict_training_series
+                # didn't project here either.
                 from .physics import DEFAULT_AMBIENT_C
 
                 _t_indoor_for_delta = physics_model._area_weighted_t_indoor(

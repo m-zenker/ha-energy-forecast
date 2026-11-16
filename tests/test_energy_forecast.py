@@ -1290,11 +1290,6 @@ class _FakeMqttSelf:
         if level == "WARNING":
             self._warnings.append(msg)
 
-    def _model_phase_attr(self) -> str | None:
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._model_phase_attr(self)
-
     def _heating_season_attr(self) -> dict | None:
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -4699,20 +4694,6 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._fetch_physics_sensor_histories(self, *args, **kwargs)
 
-    def _publish_physics_sensors(self, forecast_df, override_delta=None):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._publish_physics_sensors(self, forecast_df, override_delta=override_delta)
-
-    # _model_phase_attr() is called unconditionally by _publish() (used to tag
-    # the forecast sensor's "model_phase" attribute). It returns None
-    # immediately when self._physics_model is None (energy_forecast.py:1447-1448),
-    # so it's a safe no-op here too — same delegate pattern as above.
-    def _model_phase_attr(self):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._model_phase_attr(self)
-
     def _heating_season_attr(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -4785,11 +4766,8 @@ class TestUpdateSensorsExcludedRanges:
             is "meter".
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
             (energy_forecast.py:2058).
-          - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
-            / self._model_phase_attr(): all three early-return immediately when
-            self._physics_model is None (energy_forecast.py:1295-1296,
-            2389-2390, 1447-1448 respectively) — see _FakeUpdateSensors'
-            docstring above.
+          - self._fetch_physics_sensor_histories(): early-returns immediately when
+            self._physics_model is None — see _FakeUpdateSensors' docstring above.
         """
         import energy_forecast.energy_forecast as ef_mod
         import energy_forecast.ha_data as ha_data_mod

@@ -63,7 +63,6 @@ def _make_app(args: dict):
     # Bind the real initialize method to the mock
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
     app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
-    app._model_phase_attr = EnergyForecast._model_phase_attr.__get__(app, type(app))
     app._sub_sensor_prefix = EnergyForecast._sub_sensor_prefix.__get__(app, type(app))
     return app
 
@@ -81,7 +80,6 @@ class TestPhysicsConfigIngest:
         app = _make_app(
             {
                 "physics": {
-                    "cop_sensor": "sensor.kermi_cop",
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "room_thermostats": [
                         {
@@ -90,7 +88,6 @@ class TestPhysicsConfigIngest:
                             "area_m2": 35,
                         }
                     ],
-                    "use_physics_residual": False,
                 },
             }
         )
@@ -114,8 +111,9 @@ class TestPhysicsConfigIngest:
         app.initialize()
         assert app._physics_model is not None
         assert app._physics_config["dhw_tank_volume_l"] == 200
-        assert app._physics_config["internal_gains_fraction"] == 0.8
-        assert app._physics_config["use_physics_residual"] is False
+        assert "internal_gains_fraction" not in app._physics_config
+        assert "use_physics_residual" not in app._physics_config
+        assert "cop_sensor" not in app._physics_config
 
 
 class TestPhysicsSensorFetch:
@@ -149,7 +147,6 @@ class TestPhysicsSensorFetch:
                 "physics": {
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
-                    "cop_sensor": "sensor.kermi_cop",
                     "room_thermostats": [
                         {
                             "climate_entity": "climate.living_room",
@@ -162,7 +159,7 @@ class TestPhysicsSensorFetch:
         )
         app.initialize()
         app._fetch_physics_sensor_histories()
-        assert fetch_generic.call_count == 3  # dhw_tank, heating_buffer, cop
+        assert fetch_generic.call_count == 2  # dhw_tank, heating_buffer
         fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection
 
         # Regression guard: physics.py's ThermalPhysicsModel hard-codes "buffer_temp"
@@ -198,7 +195,6 @@ class TestPhysicsSensorRecentFetch:
                 "physics": {
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
-                    "cop_sensor": "sensor.kermi_cop",
                     "room_thermostats": [
                         {
                             "climate_entity": "climate.living_room",
@@ -219,7 +215,7 @@ class TestPhysicsSensorRecentFetch:
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
-        assert fetch_recent_generic.call_count == 3  # dhw_tank, heating_buffer, cop
+        assert fetch_recent_generic.call_count == 2  # dhw_tank, heating_buffer
         fetch_recent_climate.assert_called_once()
         fetch_generic.assert_not_called()
         fetch_climate.assert_not_called()
@@ -239,13 +235,11 @@ class TestPhysicsSensorRecentFetch:
 
         assert app._physics_heating_buffer_df is None
         assert app._physics_dhw_tank_df is None
-        assert app._physics_cop_df is None
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
         assert app._physics_heating_buffer_df is not None and not app._physics_heating_buffer_df.empty
         assert app._physics_dhw_tank_df is not None and not app._physics_dhw_tank_df.empty
-        assert app._physics_cop_df is not None and not app._physics_cop_df.empty
 
     def test_recent_only_empty_fetch_preserves_existing_value(self, monkeypatch):
         """A transient failure (empty result) during the hourly refresh must not
@@ -274,32 +268,6 @@ class TestPhysicsSensorRecentFetch:
         app._fetch_physics_sensor_histories()  # recent_only defaults to False
 
         assert app._physics_heating_buffer_df.empty
-
-    def test_recent_only_quiets_only_cop_sensor_no_data_warning(self, monkeypatch):
-        """A heat pump's live COP sensor only reports while actively heating — an empty
-        hourly recent-fetch is expected (not an error) for long idle stretches (e.g. all
-        summer), so only its recent_only fetch should pass quiet_if_empty=True. The other
-        two physics sensors (heating_buffer_temp, dhw_tank) have no such seasonal excuse
-        and must keep the default (noisy-on-empty) behaviour."""
-        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
-
-        app._fetch_physics_sensor_histories(recent_only=True)
-
-        calls_by_entity = {call.args[1]: call for call in fetch_recent_generic.call_args_list}
-        assert calls_by_entity["sensor.kermi_cop"].kwargs.get("quiet_if_empty") is True
-        assert calls_by_entity["sensor.kermi_dhw_buffer_temp"].kwargs.get("quiet_if_empty") is not True
-        assert calls_by_entity["sensor.kermi_heating_buffer"].kwargs.get("quiet_if_empty") is not True
-
-    def test_full_history_fetch_never_quiets_cop_sensor(self, monkeypatch):
-        """recent_only=False (retrain path): cop_sensor's weekly full-history fetch keeps
-        its normal WARNING — only the hourly recent fetch is quieted, since the weekly
-        fetch isn't the one that got noisy from this fix."""
-        app, _, _, fetch_generic, _ = self._configured_app(monkeypatch)
-
-        app._fetch_physics_sensor_histories()  # recent_only defaults to False
-
-        cop_call = next(call for call in fetch_generic.call_args_list if call.args[1] == "sensor.kermi_cop")
-        assert "quiet_if_empty" not in cop_call.kwargs
 
     def test_room_thermostat_temp_sensor_is_not_independently_fetched(self, monkeypatch, tmp_path):
         """#89: room_thermostats[].temp_sensor duplicates data already available from
@@ -508,7 +476,6 @@ class TestRetrainCallsPhysicsFetch:
 
         assert app._physics_dhw_tank_df is None
         assert app._physics_heating_buffer_df is None
-        assert app._physics_cop_df is None
 
     def test_retrain_passes_its_climate_dfs_and_dhw_df_to_physics_fetch(self, monkeypatch):
         """#89: _retrain() already fetches climate_dfs/dhw_df for the ML pipeline
@@ -657,25 +624,6 @@ class TestPhysicsMqttDiscoveryRegistration:
         # runs its body (it stays a plain auto-mocked attribute otherwise, like _mqtt_publish_discovery).
         app._mqtt_publish_all_discovery = EnergyForecast._mqtt_publish_all_discovery.__get__(app, type(app))
         return app
-
-
-class TestModelPhaseAttribute:
-    def test_model_phase_absent_when_physics_disabled(self):
-        app = _make_app({"energy_sensor": "sensor.grid_import"})
-        app.initialize()
-        assert app._model_phase_attr() is None
-
-    def test_model_phase_is_phase1_by_default(self, tmp_path):
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._ml_model._use_physics_residual = False
-        assert app._model_phase_attr() == "phase1"
-
-    def test_model_phase_is_phase2_when_flag_set_on_model(self, tmp_path):
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._ml_model._use_physics_residual = True
-        assert app._model_phase_attr() == "phase2"
 
 
 class TestGetScenarioDhwSchedule:
@@ -946,17 +894,13 @@ class TestServingOverrideCorrection:
 
     def _physics_config(self):
         return {
-            "cop_sensor": None,
             "dhw_tank_temp_sensor": None,
             "heating_buffer_temp_sensor": None,
-            "heating_curve_sensor": None,
             "cop_formula": {"a": 2.5, "b": 0.07},
             "dhw_tank_volume_l": 200,
             "dhw_power_w": 4000,
-            "internal_gains_fraction": 0.8,
             "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
             "room_thermostats": [],
-            "use_physics_residual": False,
         }
 
     def _run_update_sensors(
@@ -1022,7 +966,6 @@ class TestServingOverrideCorrection:
         stub._room_thermostats = []
         stub._physics_climate_dfs = {}
         stub._physics_dhw_tank_df = None
-        stub._physics_cop_df = None
         # Real predict() always returns 48 h from now, even when forecast_df carries a past tail.
         predicted_ts = forecast_timestamps if prediction_timestamps is None else prediction_timestamps
         stub._ml_model.predict = lambda *a, **kw: pd.DataFrame(

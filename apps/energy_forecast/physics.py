@@ -240,7 +240,7 @@ class ThermalPhysicsModel:
 
     def _initial_t_tank_for_window(self, dhw_df: pd.DataFrame | None, timestamps: pd.DatetimeIndex) -> float:
         """Shared initial-tank-state estimate for a training/forecast window — extracted
-        from predict_training_series to avoid duplicating this logic at the new
+        from the removed predict_training_series to avoid duplicating this logic at the new
         override-delta call site in model.py."""
         if dhw_df is not None and not dhw_df.empty:
             d = dhw_df.set_index(pd.to_datetime(dhw_df["timestamp"]))["buffer_temp"].reindex(

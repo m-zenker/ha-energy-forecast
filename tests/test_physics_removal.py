@@ -218,3 +218,134 @@ def test_legacy_calibration_file_loads_and_dhw_delta_works(tmp_path):
     delta = pm.compute_serving_override_delta(ts, t_amb, 45.0)
     assert isinstance(delta, pd.Series)
     assert delta.loc[target] > 0
+
+
+# ── Task 3: app surface ──────────────────────────────────────────────────────
+
+
+def _scenario_app(monkeypatch=None):
+    from unittest.mock import MagicMock
+
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    from tests.test_energy_forecast_physics_config import _make_app
+
+    app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+    app.initialize()
+    app._get_scenario_cb = EnergyForecast._get_scenario_cb.__get__(app, type(app))
+    app._cached_forecast_df = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-15", periods=48, freq="1h"), "temp_c": [5.0] * 48}
+    )
+    app._cached_live_temp = 5.0
+    app.fire_event = MagicMock()
+    app._ml_model.predict_scenario = lambda *a, **kw: pd.DataFrame(
+        {
+            "timestamp": app._cached_forecast_df["timestamp"],
+            "predicted_kwh": [1.0] * 48,
+            "delta_kwh": [0.0] * 48,
+        }
+    )
+    return app
+
+
+@pytest.mark.usefixtures("_restore_module_loggers")
+def test_get_scenario_ignores_dhw_schedule():
+    app = _scenario_app()
+    today = pd.Timestamp("2026-01-16").date().isoformat()
+    app._get_scenario_cb("default", "energy_forecast", "get_scenario", {"schedule": {}})
+    first = app.fire_event.call_args_list[-1]
+    app.fire_event.reset_mock()
+    app._get_scenario_cb(
+        "default", "energy_forecast", "get_scenario", {"schedule": {}, "dhw_schedule": {"legionella": [today, 12]}}
+    )
+    second = app.fire_event.call_args_list[-1]
+    assert first == second
+
+
+@pytest.mark.usefixtures("_restore_module_loggers")
+def test_retired_physics_sensors_cleared_at_startup():
+    from unittest.mock import MagicMock
+
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    from tests.test_energy_forecast_physics_config import TestPhysicsMqttDiscoveryRegistration
+
+    app = TestPhysicsMqttDiscoveryRegistration()._make_mqtt_app({})
+    app._retire_physics_sensors = EnergyForecast._retire_physics_sensors.__get__(app, type(app))
+    app.call_service = MagicMock()
+    app.initialize()
+    pubs = [c.kwargs for c in app.call_service.call_args_list if c.args and c.args[0] == "mqtt/publish"]
+    for uid in ("energy_forecast_physics_base_today", "energy_forecast_ml_adjustment_today"):
+        topic = f"homeassistant/sensor/{uid}/config"
+        assert any(p["topic"] == topic and p["payload"] == "" and p["retain"] is True for p in pubs), uid
+    for p in pubs:
+        if "physics_base_today" in p["topic"] or "ml_adjustment_today" in p["topic"]:
+            assert p["payload"] == ""
+    for p in app._mqtt_publish_discovery.call_args_list:
+        assert not any(x in str(p) for x in _PHYSICS_SENSOR_IDS)
+
+
+@pytest.mark.usefixtures("_restore_module_loggers")
+def test_retire_physics_sensors_failure_only_warns():
+    from unittest.mock import MagicMock
+
+    from energy_forecast.energy_forecast import EnergyForecast
+
+    app = MagicMock()
+    app._mqtt_discovery_prefix = "homeassistant"
+    app._mqtt_namespace = "mqtt"
+    app.call_service.side_effect = RuntimeError("broker down")
+    EnergyForecast._retire_physics_sensors(app)  # must not raise
+    assert app.call_service.call_count == 2
+
+
+@pytest.mark.usefixtures("_restore_module_loggers")
+def test_today_attributes_have_no_model_phase(tmp_path, monkeypatch):
+    from energy_forecast.physics import ThermalPhysicsModel
+
+    from tests.test_energy_forecast_physics_config import TestServingOverrideCorrection
+
+    helper = TestServingOverrideCorrection()
+    pm = ThermalPhysicsModel(tmp_path / "pm", helper._physics_config())
+    now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
+    ts = pd.date_range(start=now, periods=48, freq="1h")
+    _, stub = helper._run_update_sensors(tmp_path, monkeypatch, pm, ts)
+    assert stub.set_state_calls
+    assert "model_phase" not in str(stub.set_state_calls)
+    assert not hasattr(type(stub), "_model_phase_attr")
+
+
+@pytest.mark.usefixtures("_restore_module_loggers")
+def test_removed_physics_keys_are_ignored(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from energy_forecast import ha_data as hd
+
+    from tests.test_energy_forecast_physics_config import _make_app
+
+    fetch_recent = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "value"]))
+    fetch_hist = MagicMock(return_value=pd.DataFrame(columns=["timestamp", "value"]))
+    monkeypatch.setattr(hd, "fetch_recent_generic_sensor", fetch_recent)
+    monkeypatch.setattr(hd, "fetch_generic_sensor_history", fetch_hist)
+    monkeypatch.setattr(hd, "fetch_recent_climate", MagicMock())
+    monkeypatch.setattr(hd, "fetch_climate_history", MagicMock())
+    app = _make_app(
+        {
+            "energy_sensor": "sensor.grid_import",
+            "physics": {
+                "use_physics_residual": True,
+                "cop_sensor": "sensor.cop",
+                "internal_gains_fraction": 0.8,
+                "dhw_tank_temp_sensor": "sensor.tank",
+            },
+        }
+    )
+    app.initialize()
+    app._cache_path = None
+    app._generic_sensor_cache_path = lambda eid, prefix="x": f"{prefix}.csv"
+    app._fetch_physics_sensor_histories(recent_only=True)
+    app._fetch_physics_sensor_histories()
+    fetched = {c.args[1] for c in [*fetch_recent.call_args_list, *fetch_hist.call_args_list]}
+    assert "sensor.tank" in fetched
+    assert "sensor.cop" not in fetched
+    assert not hasattr(app, "_physics_cop_df") or isinstance(app._physics_cop_df, MagicMock)
