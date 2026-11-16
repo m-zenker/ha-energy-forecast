@@ -22,7 +22,7 @@ Start here. Everything below this section is detail and history.
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
 | 10 | #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
-| 11 | #124 verify override history against the tank before training replay | plan to be written (small, hef only) | investigated 2026-11-14 | none; after the batch |
+| 11 | #124 verify override history against the tank before training replay | fixed on `train/next` 2026-11-16; forecast-changing, ships in its own `/pm evening` window (not with the #120 flip or #105) | live check 2026-11-16: 48 → 34 replayed | none |
 | 12 | #121, #122, #123 | — | as capacity allows | #122 needs ≥ 5 overrides in the captures |
 
 **Rules that apply to all of it.**
@@ -218,7 +218,9 @@ With an override pending, each update adds about +1 kWh at the override hour, a 
 
 ### #124 — Verify Override History Against the Tank Before Training Replay
 
-**Priority:** Low-medium. **Status:** investigated 2026-11-14; no plan yet. hef only. Replaces the "phantom overrides need a cross-repo plan" note under #93.
+**Priority:** Low-medium. **Status:** fixed on `train/next` 2026-11-16 (`fix/override-history-tank-verify`, plan `docs/superpowers/plans/2026-11-16-override-history-tank-verify.md`). **Forecast-changing** (training target, takes effect at the first retrain after deploy): ship it in its own `/pm evening` window, **not together with the #120 flip or #105**. hef only. Replaces the "phantom overrides need a cross-repo plan" note under #93.
+
+**Live check 2026-11-16** (`verify_override_history` on the entries committed before 11-12): 48 → 34 replayed; 6 duplicates and 8 not-run dropped, 8 capped, 0 unverified. These are the same 8 not-run entries as in the 11-14 investigation. On the full history (52 entries): 7 duplicates, 11 not run, 8 capped, 0 unverified. Three more overrides have not run since 11-12, so the em side is now an em ROADMAP investigation item ("DHW overrides committed to hef that never run").
 
 Training subtracts a DHW override delta for every non-cancelled entry in `override_history`. Of 48 past entries (2026-09-02..11-11), none is marked cancelled, and checked against the hourly tank temperature: 8 never ran (tank rise under 2 °C), 6 are same-day duplicates, 8 ran but stopped short of the committed target, 26 ran as committed.
 
@@ -636,7 +638,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
-| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — investigated 2026-11-14; plan to be written |
+| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — fixed on `train/next` 2026-11-16; forecast-changing, own ship window |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.
