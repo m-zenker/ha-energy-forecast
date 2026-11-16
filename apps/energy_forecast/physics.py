@@ -11,7 +11,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -115,6 +115,117 @@ def _read_json_or_default(path: Path, default: dict) -> dict:
     except (OSError, json.JSONDecodeError, ValueError) as e:
         _LOGGER.warning(f"Failed to read {path.name}: {e} — using defaults")
         return dict(default)
+
+
+class OverrideVerification(NamedTuple):
+    """Result of verify_override_history (#124)."""
+
+    entries: list[dict]  # entries to replay, in input order; capped ones are copies
+    dropped_duplicate: int  # superseded by a later commit for the same (kind, date)
+    dropped_not_run: int  # tank rise < min_rise_c
+    capped: int  # target_c lowered to the observed peak
+    unverified: int  # kept unchanged: no usable tank data for the window
+
+
+def _parse_committed_at(entry: dict) -> pd.Timestamp | None:
+    """committed_at as a UTC Timestamp (naive values read as UTC), or None when it is
+    missing or unparseable."""
+    try:
+        ts = pd.Timestamp(entry["committed_at"])
+    except Exception:  # noqa: BLE001 — read-time validation contract, R1-#20
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _is_well_formed_override(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if any(k not in entry for k in ("kind", "date", "hour", "target_c", "committed_at")):
+        return False
+    if entry["kind"] not in _VALID_OVERRIDE_KINDS or entry["target_c"] is None:
+        return False
+    return _parse_committed_at(entry) is not None
+
+
+def verify_override_history(
+    history: list[dict],
+    tank_df: pd.DataFrame | None,
+    *,
+    min_rise_c: float = 2.0,
+    window_h: int = 3,
+    min_shortfall_c: float = 2.0,
+) -> OverrideVerification:
+    """Filter override_history for the training replay (#124).
+
+    Keeps the last-committed entry per (kind, date); drops it when the hourly tank series
+    (cols timestamp, buffer_temp; naive local, labelled at the hour start, last reading of
+    the hour) shows a rise of less than ``min_rise_c`` from the reading labelled T-1 h to the
+    peak over T..T+window_h h; caps target_c at that peak when it fell short by at least
+    ``min_shortfall_c``. Entries without usable tank data are kept unchanged. Cancelled
+    entries are left out; malformed ones pass through for the replay to warn about. Never
+    raises and never mutates the input.
+    """
+    tank: pd.Series | None = None
+    try:
+        if tank_df is not None and not tank_df.empty:
+            t = tank_df.drop_duplicates("timestamp", keep="last")
+            tank = pd.Series(
+                pd.to_numeric(t["buffer_temp"], errors="coerce").to_numpy(),
+                index=pd.DatetimeIndex(pd.to_datetime(t["timestamp"])),
+            ).sort_index()
+    except Exception as e:  # noqa: BLE001 — never stop a retrain over the tank frame
+        _LOGGER.warning(f"override_history verification: unusable tank frame ignored ({e})")
+        tank = None
+
+    # Pass 1: cancelled out; malformed through; last commit per (kind, date) wins.
+    winners: dict[tuple, int] = {}
+    keep_pos: list[int] = []
+    dropped_duplicate = 0
+    for i, entry in enumerate(history):
+        if isinstance(entry, dict) and entry.get("cancelled_at") is not None:
+            continue
+        if not _is_well_formed_override(entry):
+            keep_pos.append(i)
+            continue
+        key = (entry["kind"], str(entry["date"]))
+        prev = winners.get(key)
+        if prev is not None:
+            dropped_duplicate += 1
+            if _parse_committed_at(entry) < _parse_committed_at(history[prev]):
+                continue
+        winners[key] = i
+    keep_pos.extend(winners.values())
+
+    # Pass 2: tank check on the survivors, output in input order.
+    entries: list[dict] = []
+    dropped_not_run = capped = unverified = 0
+    for i in sorted(keep_pos):
+        entry = history[i]
+        if i not in winners.values():  # malformed: pass through
+            entries.append(entry)
+            continue
+        try:
+            t0 = pd.Timestamp(f"{entry['date']} {int(entry['hour']):02d}:00")
+            pre = tank.get(t0 - pd.Timedelta(hours=1)) if tank is not None else None
+            window = tank.loc[t0 : t0 + pd.Timedelta(hours=window_h)].dropna() if tank is not None else None
+        except Exception:  # noqa: BLE001 — never raise; treat as no tank data
+            pre = window = None
+        if pre is None or pd.isna(pre) or window is None or len(window) < window_h + 1:
+            unverified += 1
+            entries.append(entry)
+            continue
+        peak = float(window.max())
+        if peak - float(pre) < min_rise_c:
+            dropped_not_run += 1
+            continue
+        if float(entry["target_c"]) - peak >= min_shortfall_c:
+            capped += 1
+            entries.append({**entry, "target_c": peak})
+            continue
+        entries.append(entry)
+    return OverrideVerification(entries, dropped_duplicate, dropped_not_run, capped, unverified)
 
 
 class ThermalPhysicsModel:
