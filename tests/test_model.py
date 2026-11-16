@@ -6910,12 +6910,12 @@ class TestPhysicsFeatureIntegration:
         assert "heating_buffer_temp" not in result.columns
 
 
-class TestPredictDhwScheduleOverride:
-    """Plan D Task 2: dhw_schedule_override parameter threading."""
+class TestPredictReturnsRows:
+    """Plain predict() smoke test (the dhw_schedule_override parameter no longer exists)."""
 
-    def test_dhw_schedule_override_none_by_default(self, tmp_path):
+    def test_plain_predict_returns_rows(self, tmp_path):
         model, forecast_df = _make_trained_model(tmp_path / "model")
-        result = model.predict(forecast_df, live_temp=5.0)  # no exception with default None
+        result = model.predict(forecast_df, live_temp=5.0)  # no extra arguments needed
         assert not result.empty
 
 

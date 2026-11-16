@@ -155,7 +155,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
 - **Automatic physics recalibration** — `train()` recalibrates the DHW/tank parameters when the stored calibration is stale; holdout cutoff matches the existing MAE holdout so training and calibration windows are consistent
 - **Open-window anomaly down-weighting** — training hours flagged as single-hour open-window temperature shocks (detected from climate sensor data) are down-weighted to 0.5× their normal sample weight
 - **On-demand recalibration service** — `energy_forecast/recalibrate_physics` AppDaemon service lets you trigger physics recalibration from **Developer Tools → Services** without a full AppDaemon restart
-- **Model-artifact portability** — if a model was trained with `heating_buffer_temp` but the sensor later goes offline, `predict()` fills the missing column with `0.0` and logs a WARNING; no crashes, no stale data. Models trained before 0.12.0 that still list `physics_kwh` get it filled with `0.0` silently until the next retrain
+- **Model-artifact portability** — if a model was trained with `heating_buffer_temp` but the sensor later goes offline, `predict()` fills the missing column with `0.0` and logs a WARNING; no crashes, no stale data. Models trained before the physics heating removal that still list `physics_kwh` get it filled with `0.0` silently until the next retrain
 - **Persisted DHW schedule commits** — `energy_forecast/set_dhw_schedule` AppDaemon service (registered only when `physics:` is configured), e.g.:
   ```yaml
   service: appdaemon/energy_forecast_set_dhw_schedule
@@ -189,7 +189,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 
 `dhw_schedule` is accepted for call-shape compatibility but **ignored** (DEBUG log): `get_scenario` returns the same frame with or without it, and `delta_kwh` covers the appliance schedule only. A consuming app such as `ha-energy-manager` must add its own DHW/legionella cycle energy. To persist a DHW schedule change instead, use `energy_forecast/set_dhw_schedule` (see [Physics model](#physics-model--dhw-and-override-modelling-optional)).
 
-> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), do not cache a result that was computed with a non-`None` `dhw_schedule` unless `dhw_schedule` itself is part of the cache key — the safest default is to never cache those results. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app does not touch any cache kept by the caller.
+> **Caller cache contract:** if you cache `get_scenario` results (e.g. in `ha-energy-manager`), `dhw_schedule` is ignored, so it need not be part of your cache key. After a successful `energy_forecast/set_dhw_schedule` call, flush your own scenario cache; this app does not touch any cache kept by the caller.
 
 **Event payload** (`energy_forecast_scenario_result`):
 ```json
@@ -203,7 +203,7 @@ Schedule dict keys are the suffix of the `sub_energy_sensors` entity ID after th
 }
 ```
 
-`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances (and, if `dhw_schedule` was supplied, the DHW override) relative to the baseline forecast — positive values mean higher consumption than baseline. `delta_kwh_hi` is the appliance-only delta built from the upper-quartile-cycle profiles (same sign and units as `delta_kwh`, no DHW delta); absent on older versions.
+`timestamp` is in your configured timezone (ISO 8601 with UTC offset). `delta_kwh` is the net addition from scheduled appliances relative to the baseline forecast — positive values mean higher consumption than baseline. `delta_kwh_hi` is the appliance-only delta built from the upper-quartile-cycle profiles (same sign and units as `delta_kwh`, no DHW delta); absent on older versions.
 
 > **Correlating requests with responses:** pass `request_id` (any string, e.g. a UUID) in the service call and it is echoed back verbatim in the result event's `request_id` field — `null` if you didn't send one. This exists so a caller with more than one `get_scenario` request potentially in flight at once (e.g. two independent AppDaemon apps both calling this service around the same time) can tell which event answers which request, rather than assuming the next fired event is theirs.
 
@@ -472,7 +472,7 @@ energy_forecast:
   #     - [-5, 46.0]
   #     - [5, 39.5]
   #     - [20, 25.0]
-  #   room_thermostats:                                        # dedicated room sensors for training-time accuracy
+  #   room_thermostats:                                        # accepted for config compatibility; only unit-validated
   #     - climate_entity: climate.living_room
   #       temp_sensor: sensor.netatmo_living_room_temp
   #       area_m2: 35
@@ -537,7 +537,7 @@ energy_forecast:
 | `physics.dhw_tank_volume_l` | No | `200` | DHW tank volume in litres. Used by the physics model to compute heat-loss and re-heat energy. |
 | `physics.dhw_power_w` | No | `4000` | DHW heater rated power in watts. |
 | `physics.heating_curve_points` | No | `[[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]]` | List of `[outdoor_temp_°C, flow_temp_°C]` pairs defining the heating curve (used for the DHW flow temperature). |
-| `physics.room_thermostats` | No | `[]` | List of `{climate_entity, temp_sensor, area_m2}` dicts — a dedicated, more accurate sensor per room used for open-window detection and indoor-temperature accuracy (separate from, and complementary to, the existing `climate_entities`/`climate_room_areas`). Entries missing `climate_entity` or `temp_sensor` are skipped with a WARNING; `area_m2` defaults to `20.0`. |
+| `physics.room_thermostats` | No | `[]` | List of `{climate_entity, temp_sensor, area_m2}` dicts — kept for config compatibility. After the physics heating removal the entries are only validated (temperature unit check) and have no forecast consumer. Open-window detection uses the `climate_entities` / `climate_room_areas` config instead. Entries missing `climate_entity` or `temp_sensor` are skipped with a WARNING; `area_m2` defaults to `20.0`. |
 
 **`sub_energy_sensors` — dict form with `program_sensor`:**
 
@@ -1062,7 +1062,7 @@ The following features activate when the corresponding sensors are configured an
 
 The thermal physics model (`apps/energy_forecast/physics.py`) models the DHW tank (schedule
 inference, legionella cycles, standing losses, committed overrides), detects open-window
-anomalies, and checks zone-boundary consistency. Its one numeric output into the forecast is the
+anomalies. Its one numeric output into the forecast is the
 deterministic DHW **override delta**, added to the published forecast after the model has run
 (and subtracted from the training target for hours with a committed override). It no longer
 models space heating, and no longer feeds a `physics_kwh` feature to LightGBM.
@@ -1070,7 +1070,7 @@ models space heating, and no longer feeds a `physics_kwh` feature to LightGBM.
 **Enabling vs disabling:** Omitting the `physics:` block leaves behaviour unchanged. Adding even
 an empty `physics: {}` activates the feature.
 
-### Removed in 0.12.0
+### Removed with the physics heating removal
 
 The physics space-heating model, the `physics_kwh` feature, Phase 2 residual training and the
 `UA_eff` heating calibration were removed. Delete these from `apps.yaml` (they are ignored if
@@ -1089,7 +1089,7 @@ and `energy_forecast/recalibrate_physics`, and all other sensor names.
   physics:
     dhw_tank_temp_sensor: sensor.dhw_tank_temperature        # optional: DHW tank °C
     heating_buffer_temp_sensor: sensor.heating_buffer_temp  # optional: buffer °C
-    room_thermostats:                                        # optional: for open-window detection + training accuracy
+    room_thermostats:                                        # optional: accepted for config compatibility; only unit-validated, no forecast consumer
       - climate_entity: climate.living_room
         temp_sensor: sensor.netatmo_living_room_temp
         area_m2: 35
@@ -1145,7 +1145,7 @@ contract above) — flush that separately after a successful call. Logs a WARNIN
 
 ### Open-window down-weighting
 
-When `room_thermostats` are configured, the physics model's open-window detector flags training
+When `climate_entities` are configured, the physics model's open-window detector flags training
 hours that show a single-hour temperature shock (a sharp drop followed by recovery in a single
 hour). These hours are down-weighted to **0.5×** their normal exponential sample weight — they are
 not excluded, but their influence on the model is halved so genuine open-window events do not
@@ -1161,7 +1161,7 @@ distort lag-feature learning.
 
 If a model was trained with `heating_buffer_temp` in its feature set but the sensor goes
 offline, prediction does not crash. The missing column is filled with `0.0` and a WARNING is
-logged. A model trained before 0.12.0 that still lists `physics_kwh` gets it filled with `0.0`
+logged. A model trained before the physics heating removal that still lists `physics_kwh` gets it filled with `0.0`
 silently until the next retrain. This applies to `predict()`,
 `predict_intervals()`, and `shap_summary()`.
 

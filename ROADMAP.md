@@ -650,6 +650,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 127 | Open-window down-weighting on/off backtest | verifies the 0.5x weight pays off | S | follow-up of physics heating removal (2026-11-16); low |
 | 128 | DHW draw calibration (`Q_dhw_daily` 2.79 vs sub-meter about 0.83 kWh/day) | DHW tank model accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
 | 129 | Move open-window detection into `model.py` and decouple `model.py` from `physics.py` | structure only | M | follow-up of physics heating removal (2026-11-16); low |
+| 130 | Drop write-only room-thermostat/climate history fetch in `_fetch_physics_sensor_histories` (`_physics_climate_dfs` is write-only after the physics removal; `recalibrate_physics` fetches ~10 unused climate histories) | behaviour-neutral cleanup | S | follow-up of physics heating removal (2026-11-16); deferred from the removal change; low |
 
 **Cold-onset sequencing (agreed 2026-10-17).** Every forecast-changing step waits for the one before it, so each effect stays attributable:
 0. ✅ v0.11.16 on main (weather dtype fix, Rule 3) — released 2026-10-19 (cf28443), independent of everything below.

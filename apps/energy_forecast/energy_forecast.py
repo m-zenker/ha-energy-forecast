@@ -1851,8 +1851,9 @@ class EnergyForecast(hass.Hass):
         self._cached_weather_df = weather_df
         # (#92) Cache the additional calibrate() inputs so an on-demand
         # recalibrate_physics call doesn't need to re-derive ev_df (which needs the
-        # full EV-detection pipeline) or re-fetch heating_active/away/sub-meter
-        # history independently — same rationale as the two lines above.
+        # full EV-detection pipeline) or re-fetch heating_active/away history
+        # independently — same rationale as the two lines above. The sub-meter cache
+        # now serves only `heating_season` (calibrate() no longer takes the sub-meter).
         self._cached_heating_active_df = heating_active_df if not heating_active_df.empty else None
         self._cached_away_df = away_df if not away_df.empty else None
         self._cached_ev_df = ev_df

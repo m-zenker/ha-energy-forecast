@@ -216,7 +216,11 @@ def verify_override_history(
 
 
 class ThermalPhysicsModel:
-    """Calibrated physics baseline for hourly household electricity consumption."""
+    """DHW tank / override / open-window model (no space-heating model).
+
+    Infers the DHW schedule, models legionella cycles and standing losses, computes committed-override
+    deltas, and flags single-hour open-window shocks.
+    """
 
     _OVERRIDE_TAIL_THRESHOLD_C = 0.1  # R2-#3: shared cutoff, both call sites use it identically
 
