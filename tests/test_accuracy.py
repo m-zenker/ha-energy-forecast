@@ -104,3 +104,29 @@ def test_empty_and_young_history_give_nan_not_errors():
     young = _hist([1.0] * 30)
     s2 = accuracy.summarize(accuracy.paired_errors({ts: 1.2 for ts in young}, young))
     assert s2["mae"] == pytest.approx(0.2) and math.isnan(s2["naive_mae"]) and math.isnan(s2["skill_pct"])
+
+
+def test_summarize_windows_scores_only_complete_calendar_days():
+    # Day d (Nov 1 = 0) has a constant per-hour error of 0.1 * (d + 1) -> daily error sum 2.4 * (d + 1).
+    now = pd.Timestamp("2026-11-10 22:00")  # today has 22 paired hours -> would pass MIN_DAY_HOURS
+    hours = pd.date_range(START, now - pd.Timedelta(hours=1), freq="1h")
+    actual = {ts: 2.0 for ts in hours}
+    pred = {ts: 2.0 + 0.1 * ((ts.normalize() - START).days + 1) for ts in hours}
+    today = now.normalize()
+    s = accuracy.summarize_windows(
+        pred, actual, since=now - pd.Timedelta(days=7), day_start=today - pd.Timedelta(days=7), day_end=today
+    )
+    assert s["n_days"] == 7  # Nov 3..9 in full: oldest day not truncated by the rolling cutoff, today excluded
+    assert s["daily_bias"] == pytest.approx(2.4 * np.mean(range(3, 10)))
+    assert s["daily_abs_error"] == pytest.approx(s["daily_bias"])
+    assert s["daily_bias_pct"] == pytest.approx(100 * sum(2.4 * d for d in range(3, 10)) / (7 * 48.0))
+    assert s["n_hours"] == 7 * 24  # hourly / block metrics keep the rolling window
+
+
+def test_summarize_windows_without_day_bounds_matches_summarize():
+    actual = _hist([2.0] * 240)
+    pred = {ts: 2.5 for ts in list(actual)[-48:]}
+    got = accuracy.summarize_windows(pred, actual)
+    want = accuracy.summarize(accuracy.paired_errors(pred, actual))
+    assert got.keys() == want.keys()
+    assert all(got[k] == want[k] or (math.isnan(got[k]) and math.isnan(want[k])) for k in want)

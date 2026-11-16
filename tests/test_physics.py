@@ -2114,3 +2114,137 @@ class TestZeroOverrideDegradation:
         el_kwh_b, _, final_b = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
         pd.testing.assert_series_equal(el_kwh_a, el_kwh_b)
         assert final_a == final_b
+
+
+# ── #124: verify override_history against the DHW tank before the training replay ──
+
+
+def _tank(start: str, temps: list[float]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"timestamp": pd.date_range(start, periods=len(temps), freq="h"), "buffer_temp": [float(t) for t in temps]}
+    )
+
+
+def _entry(kind: str, date: str, hour: int, target: float, committed_at: str) -> dict:
+    return {
+        "kind": kind,
+        "date": date,
+        "hour": hour,
+        "target_c": target,
+        "committed_at": committed_at,
+        "cancelled_at": None,
+    }
+
+
+def _verify(history, tank_df):
+    from energy_forecast.physics import verify_override_history
+
+    return verify_override_history(history, tank_df)
+
+
+class TestVerifyOverrideHistory:
+    # Override at 2026-10-01 12:00 -> pre reading labelled 11:00, window 12:00..15:00.
+    RAN = [50.0, 52.0, 60.0, 59.0, 57.0]
+
+    def _leg(self, target=60.0, date="2026-10-01", hour=12, committed="2026-10-01T05:00:00+00:00"):
+        return _entry("legionella", date, hour, target, committed)
+
+    def test_ran_as_committed_is_kept_unchanged(self):
+        e = self._leg()
+        r = _verify([e], _tank("2026-10-01 11:00", self.RAN))
+        assert r.entries == [e] and r.entries[0] is e
+        assert (r.dropped_duplicate, r.dropped_not_run, r.capped, r.unverified) == (0, 0, 0, 0)
+
+    def test_no_rise_is_dropped(self):
+        r = _verify([self._leg()], _tank("2026-10-01 11:00", [50.0, 50.0, 50.4, 50.2, 50.0]))
+        assert r.entries == []
+        assert r.dropped_not_run == 1
+
+    def test_rise_just_below_threshold_is_dropped_and_at_threshold_kept(self):
+        below = _verify([self._leg()], _tank("2026-10-01 11:00", [50.0, 51.0, 51.9, 51.5, 51.0]))
+        assert below.entries == [] and below.dropped_not_run == 1
+        at = _verify([self._leg(target=52.0)], _tank("2026-10-01 11:00", [50.0, 51.0, 52.0, 51.5, 51.0]))
+        assert len(at.entries) == 1 and at.dropped_not_run == 0
+
+    def test_short_cycle_is_capped(self):
+        e = self._leg()
+        r = _verify([e], _tank("2026-10-01 11:00", [50.0, 53.0, 55.5, 55.0, 54.0]))
+        assert r.entries[0]["target_c"] == 55.5
+        assert r.capped == 1
+        assert e["target_c"] == 60.0
+
+    def test_small_shortfall_not_capped(self):
+        r = _verify([self._leg()], _tank("2026-10-01 11:00", [50.0, 55.0, 58.1, 57.0, 56.0]))
+        assert r.entries[0]["target_c"] == 60.0
+        assert r.capped == 0
+
+    def test_same_day_retries_keep_last_commit(self):
+        h = [
+            self._leg(date="2026-11-08", hour=12, committed="2026-11-08T05:00:00+00:00"),
+            self._leg(date="2026-11-08", hour=13, committed="2026-11-08T11:00:00+00:00"),
+            self._leg(date="2026-11-08", hour=14, committed="2026-11-08T12:00:00+00:00"),
+        ]
+        # flat until 13:00, rises at 14:00
+        tank = _tank("2026-11-08 10:00", [48.0, 48.0, 48.0, 48.0, 55.0, 60.0, 58.0, 56.0])
+        r = _verify(h, tank)
+        assert [e["hour"] for e in r.entries] == [14]
+        assert r.dropped_duplicate == 2
+
+    def test_dedup_is_per_kind(self):
+        leg = self._leg()
+        cb = _entry("comfort_boost", "2026-10-01", 12, 55.0, "2026-10-01T04:00:00+00:00")
+        r = _verify([leg, cb], _tank("2026-10-01 11:00", self.RAN))
+        assert len(r.entries) == 2 and r.dropped_duplicate == 0
+
+    def test_cancelled_entries_excluded(self):
+        e = self._leg()
+        e["cancelled_at"] = "2026-10-01T06:00:00+00:00"
+        r = _verify([e], _tank("2026-10-01 11:00", self.RAN))
+        assert r.entries == []
+        assert (r.dropped_duplicate, r.dropped_not_run, r.capped, r.unverified) == (0, 0, 0, 0)
+
+    def test_incomplete_window_keeps_entry(self):
+        e = self._leg()
+        r = _verify([e], _tank("2026-10-01 11:00", [50.0, 50.0, 50.0]))  # ends at 13:00
+        assert r.entries == [e] and r.unverified == 1
+
+    def test_no_tank_data_only_dedups(self):
+        h = [
+            self._leg(hour=12, committed="2026-10-01T05:00:00+00:00"),
+            self._leg(hour=13, committed="2026-10-01T11:00:00+00:00"),
+        ]
+        for tank in (None, pd.DataFrame(columns=["timestamp", "buffer_temp"])):
+            r = _verify(h, tank)
+            assert [e["hour"] for e in r.entries] == [13]
+            assert r.dropped_duplicate == 1 and r.unverified == 1
+
+    def test_malformed_entries_pass_through(self):
+        no_hour = self._leg()
+        del no_hour["hour"]
+        bad_ts = self._leg(committed="garbage")
+        bad_kind = _entry("bogus", "2026-10-01", 12, 60.0, "2026-10-01T05:00:00+00:00")
+        h = [no_hour, bad_ts, bad_kind]
+        r = _verify(h, _tank("2026-10-01 11:00", [50.0] * 5))
+        assert len(r.entries) == 3 and all(a is b for a, b in zip(r.entries, h, strict=True))
+
+    def test_missing_pre_reading_is_unverified(self):
+        e = self._leg()
+        r = _verify([e], _tank("2026-10-01 12:00", [50.0, 50.0, 50.0, 50.0]))  # no 11:00 row
+        assert r.entries == [e] and r.unverified == 1
+
+    def test_nan_in_window_is_unverified(self):
+        e = self._leg()
+        r = _verify([e], _tank("2026-10-01 11:00", [50.0, 50.0, float("nan"), 50.0, 50.0]))
+        assert r.entries == [e] and r.unverified == 1
+
+    def test_output_preserves_input_order(self):
+        h = [
+            self._leg(date="2026-10-03", committed="2026-10-03T05:00:00+00:00"),
+            self._leg(date="2026-10-01", committed="2026-10-01T05:00:00+00:00"),
+            self._leg(date="2026-10-02", committed="2026-10-02T05:00:00+00:00"),
+        ]
+        temps = []
+        for _ in range(3):  # each day: 00..10 flat, 11 pre, 12..15 cycle, 16..23 flat
+            temps += [50.0] * 11 + self.RAN + [50.0] * 8
+        r = _verify(h, _tank("2026-10-01 00:00", temps))
+        assert [e["date"] for e in r.entries] == ["2026-10-03", "2026-10-01", "2026-10-02"]

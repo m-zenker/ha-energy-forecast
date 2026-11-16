@@ -29,6 +29,7 @@ _NAN_KEYS = (
     "daily_bias",
     "daily_bias_pct",
 )
+DAILY_KEYS = ("n_days", "daily_abs_error", "daily_bias", "daily_bias_pct")
 
 
 def naive_same_hour_mean(actual: pd.Series) -> pd.Series:
@@ -115,4 +116,28 @@ def summarize(pairs: pd.DataFrame) -> dict[str, float]:
         total_actual = float(days["actual"].sum()[scored].sum())
         if total_actual != 0 and not np.isnan(total_actual):
             out["daily_bias_pct"] = float(100.0 * de.sum() / total_actual)
+    return out
+
+
+def summarize_windows(
+    pred_history: dict,
+    actuals_history: dict,
+    since: pd.Timestamp | None = None,
+    day_start: pd.Timestamp | None = None,
+    day_end: pd.Timestamp | None = None,
+) -> dict[str, float]:
+    """``summarize`` with hourly/block metrics over ``ts >= since`` and daily metrics over ``[day_start, day_end)``.
+
+    The daily keys (``DAILY_KEYS``) are scored on calendar days only. A rolling hourly cutoff would truncate the
+    oldest day and admit today once it reaches ``MIN_DAY_HOURS``, so the daily numbers would only move between
+    22:00 and 03:00 and ``n_days`` would flap. Pass midnight-aligned bounds so they roll over once a day.
+    """
+    out = summarize(paired_errors(pred_history, actuals_history, since=since))
+    if day_start is None and day_end is None:
+        return out
+    pairs = paired_errors(pred_history, actuals_history, since=day_start)
+    if day_end is not None:
+        pairs = pairs[pairs.index < pd.Timestamp(day_end)]
+    daily = summarize(pairs)
+    out.update({k: daily[k] for k in DAILY_KEYS})
     return out
