@@ -3586,12 +3586,20 @@ def _accuracy_windows(pred_history: dict, actuals_history: dict, now_ts: pd.Time
     import pandas as pd
 
     since_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
+    # Daily metrics (bias, abs error, n_days) use complete local calendar days ending at today's midnight, so they
+    # roll over once a day instead of drifting 22:00-03:00 as partial days cross MIN_DAY_HOURS. 7d = the last 7
+    # complete days; 30d = the last 29, because hourly pruning at floor(now) - 30d truncates the 30th day.
+    today = now_ts.normalize()
     # The 30-day window relies on _pred_history/_actuals_history being pruned to 30 days (same as mae_30d). The naive
     # baseline is thin at its start: actuals are pruned to 30 days too, so the first 2 days have no naive and days
     # 3-8 average fewer than 7 lookback days.
     return {
-        "accuracy_7d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=since_7d)),
-        "accuracy_30d": accuracy.summarize(accuracy.paired_errors(pred_history, actuals_history, since=None)),
+        "accuracy_7d": accuracy.summarize_windows(
+            pred_history, actuals_history, since=since_7d, day_start=today - pd.Timedelta(days=7), day_end=today
+        ),
+        "accuracy_30d": accuracy.summarize_windows(
+            pred_history, actuals_history, since=None, day_start=today - pd.Timedelta(days=29), day_end=today
+        ),
     }
 
 
