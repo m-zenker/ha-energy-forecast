@@ -5535,3 +5535,30 @@ def test_accuracy_windows_helper():
     assert out["accuracy_7d"]["n_hours"] == 7 * 24
     assert out["accuracy_30d"]["n_hours"] == len(hours)
     assert out["accuracy_7d"]["block_mae"] == pytest.approx(1.5)
+    # Daily metrics: complete calendar days only (Nov 7..13; Oct 25 starts at 10:00 so 30d has Oct 26..Nov 13).
+    assert out["accuracy_7d"]["n_days"] == 7 and out["accuracy_30d"]["n_days"] == 19
+    assert out["accuracy_7d"]["daily_bias"] == pytest.approx(12.0)
+
+
+def test_accuracy_windows_daily_metrics_change_only_at_midnight():
+    """Daily bias must not move at 22:00-03:00 as partial days enter/leave the window (rolling-cutoff bug)."""
+    from energy_forecast.energy_forecast import _accuracy_windows
+
+    start = pd.Timestamp("2026-10-01")
+    end = pd.Timestamp("2026-11-16 00:00")
+    hours = pd.date_range(start, end + pd.Timedelta(hours=23), freq="1h")
+    pred = {ts: 2.0 + 0.1 * ((ts.normalize() - start).days % 5) for ts in hours}
+    actual_all = {ts: 2.0 for ts in hours}
+
+    def run(now):
+        actual = {ts: v for ts, v in actual_all.items() if ts < now and ts >= now - pd.Timedelta(days=30)}
+        return _accuracy_windows(pred, actual, now)
+
+    for w, n in (("accuracy_7d", 7), ("accuracy_30d", 29)):
+        ref = run(pd.Timestamp("2026-11-15 00:00"))[w]
+        assert ref["n_days"] == n
+        for h in range(1, 24):
+            got = run(pd.Timestamp("2026-11-15") + pd.Timedelta(hours=h))[w]
+            assert got["n_days"] == n, (w, h)
+            assert got["daily_bias"] == pytest.approx(ref["daily_bias"]), (w, h)
+        assert run(end)[w]["daily_bias"] != pytest.approx(ref["daily_bias"])  # rolls over at midnight
