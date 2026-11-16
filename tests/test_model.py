@@ -1457,6 +1457,113 @@ class TestTrainWithPhysics:
             "UTC->local conversion regressed to a bare tz_localize(None)"
         )
 
+    # ── #124: the training replay uses the tank-verified history ─────────────
+    def _verify_fixture(self, tmp_path):
+        """600 h of data; two legionella commits on different days: a phantom at ts[200]
+        (tank flat) and a real one at ts[300] (tank +8 °C). Returns (energy, weather, pm,
+        dhw_df, ts)."""
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        n = 600
+        ts = pd.date_range("2024-01-01", periods=n, freq="1h")
+        rng = np.random.default_rng(0)
+        energy_df = pd.DataFrame({"timestamp": ts, "gross_kwh": rng.uniform(0.5, 5.0, size=n)})
+        weather_df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "temp_c": rng.uniform(-5, 25, size=n),
+                "precipitation_mm": [0.0] * n,
+                "sunshine_min": [30.0] * n,
+                "wind_kmh": [10.0] * n,
+                "cloud_cover_pct": [50.0] * n,
+                "direct_radiation_wm2": [100.0] * n,
+            }
+        )
+        pm = ThermalPhysicsModel(tmp_path / "physics_models", self._physics_config())
+        for pos in (200, 300):
+            pm.commit_dhw_schedule({"legionella": (ts[pos].strftime("%Y-%m-%d"), int(ts[pos].hour))})
+        temps = np.full(n, 50.0)
+        temps[300:304] = [55.0, 58.0, 57.0, 56.0]
+        dhw_df = pd.DataFrame({"timestamp": ts, "buffer_temp": temps})
+        return energy_df, weather_df, pm, dhw_df, ts
+
+    def test_training_replay_receives_verified_history(self, tmp_path):
+        import copy
+
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        energy_df, weather_df, pm, dhw_df, ts = self._verify_fixture(tmp_path)
+        stored_before = copy.deepcopy(pm.schedule["override_history"])
+        assert len(stored_before) == 2, "sanity: two history entries"
+
+        real = ThermalPhysicsModel.compute_training_override_delta
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch.object(
+            ThermalPhysicsModel, "compute_training_override_delta", autospec=True, side_effect=real
+        ) as spy:
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=pm, dhw_df=dhw_df)
+
+        assert spy.call_count == 1
+        replayed = spy.call_args.args[4]
+        assert [(e["date"], e["hour"]) for e in replayed] == [(ts[300].strftime("%Y-%m-%d"), int(ts[300].hour))]
+        assert pm.schedule["override_history"] == stored_before
+
+    def test_training_replay_logs_verification_summary(self, tmp_path, caplog):
+        import logging
+
+        energy_df, weather_df, pm, dhw_df, _ = self._verify_fixture(tmp_path)
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with caplog.at_level(logging.INFO, logger="energy_forecast"):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=0, physics_model=pm, dhw_df=dhw_df)
+        msgs = [
+            r.getMessage() for r in caplog.records if "override_history verified against the tank" in r.getMessage()
+        ]
+        assert len(msgs) == 1
+        assert "1 of 2 replayed" in msgs[0]
+        assert "dropped 0 duplicate, 1 not run" in msgs[0]
+
+    def test_pre_migration_cutoff_uses_raw_history(self, tmp_path):
+        """The replay drops the phantom-only history, but the R1-#13 pre-migration cutoff
+        still comes from the raw history (owner decision 2026-11-16)."""
+        from energy_forecast.model import _build_model as _real_build_model
+        from energy_forecast.physics import ThermalPhysicsModel
+
+        energy_df, weather_df, _, dhw_df, ts = self._verify_fixture(tmp_path)
+        pm = ThermalPhysicsModel(tmp_path / "physics_models_raw", self._physics_config())
+        pm.commit_dhw_schedule({"legionella": (ts[200].strftime("%Y-%m-%d"), int(ts[200].hour))})  # phantom
+        ship_cutoff_local = ts[450]
+        pm.schedule["override_history"][0]["committed_at"] = (
+            ship_cutoff_local.tz_localize("Europe/Zurich").tz_convert("UTC").isoformat()
+        )
+
+        captured: list[tuple[np.ndarray, np.ndarray | None]] = []
+
+        def spy_build_model(lgb, GBR, n_estimators=None, num_leaves=31):
+            built = _real_build_model(lgb, GBR, n_estimators=n_estimators, num_leaves=num_leaves)
+            real_fit = built.fit
+
+            def spy_fit(X_arg, y_arg, *a, **kw):
+                captured.append((X_arg.index.to_numpy(), kw.get("sample_weight")))
+                result = real_fit(X_arg, y_arg, *a, **kw)
+                del built.fit
+                return result
+
+            built.fit = spy_fit
+            return built
+
+        m = EnergyForecastModel(tmp_path / "model", timezone="Europe/Zurich")
+        with patch("energy_forecast.model._build_model", side_effect=spy_build_model):
+            m.train(energy_df, weather_df, outdoor_df=None, weight_halflife_days=30.0, physics_model=pm, dhw_df=dhw_df)
+
+        idx, sw = max(captured, key=lambda pair: len(pair[0]))
+        row_ts = ts[idx]
+        pre_mask = row_ts < ship_cutoff_local
+        days_ago = (energy_df["timestamp"].max() - row_ts).total_seconds() / 86400.0
+        base_weight = np.exp(-days_ago * np.log(2) / 30.0)
+        assert pre_mask.any() and (~pre_mask).any()
+        np.testing.assert_allclose(sw[pre_mask], base_weight[pre_mask] * 0.5, rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(sw[~pre_mask], base_weight[~pre_mask], rtol=1e-9, atol=1e-12)
+
     def _pre_migration_fixture(self, tmp_path, n=600):
         ts = pd.date_range("2024-01-01", periods=n, freq="1h")
         rng = np.random.default_rng(0)

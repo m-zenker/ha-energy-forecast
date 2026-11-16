@@ -446,8 +446,24 @@ class EnergyForecastModel:
                 if _t_indoor_for_delta is None:
                     _t_indoor_for_delta = pd.Series(DEFAULT_AMBIENT_C, index=_timestamps_for_delta)
                 _initial_t_tank = physics_model._initial_t_tank_for_window(dhw_df, _timestamps_for_delta)
+                # #124: replay only overrides the tank shows actually ran (last commit per
+                # (kind, date), capped at the observed peak). The stored history and the
+                # pre-migration down-weight below keep the raw list.
+                from .physics import verify_override_history
+
+                _verified = verify_override_history(_override_history, dhw_df)
+                _LOGGER.info(
+                    "override_history verified against the tank: %d of %d replayed "
+                    "(dropped %d duplicate, %d not run; %d capped, %d unverified)",
+                    len(_verified.entries),
+                    len(_override_history),
+                    _verified.dropped_duplicate,
+                    _verified.dropped_not_run,
+                    _verified.capped,
+                    _verified.unverified,
+                )
                 _override_delta = physics_model.compute_training_override_delta(
-                    _timestamps_for_delta, _t_indoor_for_delta, _initial_t_tank, _override_history
+                    _timestamps_for_delta, _t_indoor_for_delta, _initial_t_tank, _verified.entries
                 )
                 energy_df = energy_df.copy()
                 energy_df["gross_kwh"] = energy_df["gross_kwh"].to_numpy() - _override_delta.to_numpy()
