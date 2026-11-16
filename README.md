@@ -163,7 +163,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
     dhw_schedule:
       legionella: ["2026-06-25", 10]  # [date string, hour]
   ```
-  Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, one call only), this **persists** into the physics model, and the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
+  `get_scenario` ignores its `dhw_schedule` kwarg; this service is the only way to change the DHW schedule, and it **persists** into the physics model; the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
 
 ---
 
@@ -179,7 +179,7 @@ data:
     sub_dishwasher: "22:30"        # key = entity ID suffix from sub_energy_sensors
     sub_washing_machine: "off"     # "off" or null to exclude from scenario
     sub_dryer: {start: "23:00", program: "eco"}  # dict form: program = lowercased program_sensor state; unknown program falls back to the combined profile
-  dhw_schedule:                    # optional: transient physics DHW override (requires `physics:` block)
+  dhw_schedule:                    # optional: accepted but ignored (call-shape compatibility)
     legionella: ["2026-06-25", 10] # [date string, hour] — NOT persisted
   publish: true                    # optional: write result to HA sensors
   request_id: "any-string-you-choose"  # optional: echoed back verbatim in the result event
@@ -1135,8 +1135,8 @@ data:
     legionella: ["2026-06-25", 10]   # [date string, hour]
 ```
 
-Unlike `get_scenario`'s `dhw_schedule` kwarg (transient, see [Scenario / What-If API](#scenario--what-if-api)),
-this override is **committed** — it is written to `physics_schedule.json` as `committed_override`
+`get_scenario` ignores its `dhw_schedule` kwarg (see [Scenario / What-If API](#scenario--what-if-api)).
+This override is **committed** — it is written to `physics_schedule.json` as `committed_override`
 and persists across restarts until overwritten. `get_scenario` keeps answering after a commit and
 reads the override at prediction time; the next hourly cycle publishes the new schedule.
 It does **not** invalidate any scenario cache kept by a consuming app (see the caller cache
@@ -1167,9 +1167,9 @@ silently until the next retrain. This applies to `predict()`,
 
 ### Known limitations
 
-- `energy_forecast/get_scenario` applies a transient `dhw_schedule` override to the scenario's
-  physics inputs, but its returned forecast does **not** include a DHW energy delta for that
-  override — a consuming app (e.g. `ha-energy-manager`) must add its own cycle energy.
+- `energy_forecast/get_scenario` accepts `dhw_schedule` for call-shape compatibility but
+  **ignores** it (DEBUG log); the returned forecast carries no DHW energy delta. A consuming
+  app (e.g. `ha-energy-manager`) must add its own cycle energy.
 
 ---
 
