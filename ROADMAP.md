@@ -34,7 +34,7 @@ Start here. Everything below this section is detail and history.
 
 **Open decision, not scheduled:** physics release strategy (v0.12.0 opt-in on `main`, or more cherry-picks). `dev` is over 110 commits ahead of `main` and this batch adds six branches.
 
-**Parked or closed, so not on this list:** #111 (parked), #112 and #115 (closed), #96 cooling mode (parked 2026-11-09), #103 (closed 2026-11-16, physics heating removal), #104 and #106 (parked 2026-11-16), HACS items #46/#16/#18.
+**Parked or closed, so not on this list:** #111 (parked), #112 and #115 (closed), #96 cooling mode (parked 2026-11-09), #103 (closed 2026-11-16, physics heating removal), #104 and #106 (parked 2026-11-16), #105 (closed 2026-11-16; branch `feat/ua-eff-daily` and its worktree parked 2026-11-17, continues offline only, unpark if its PASS is to re-enter as an ML feature), HACS items #46/#16/#18.
 
 ---
 
