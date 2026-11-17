@@ -63,7 +63,6 @@ def _make_app(args: dict):
     # Bind the real initialize method to the mock
     app.initialize = EnergyForecast.initialize.__get__(app, type(app))
     app._fetch_physics_sensor_histories = EnergyForecast._fetch_physics_sensor_histories.__get__(app, type(app))
-    app._model_phase_attr = EnergyForecast._model_phase_attr.__get__(app, type(app))
     app._sub_sensor_prefix = EnergyForecast._sub_sensor_prefix.__get__(app, type(app))
     return app
 
@@ -81,7 +80,6 @@ class TestPhysicsConfigIngest:
         app = _make_app(
             {
                 "physics": {
-                    "cop_sensor": "sensor.kermi_cop",
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "room_thermostats": [
                         {
@@ -90,7 +88,6 @@ class TestPhysicsConfigIngest:
                             "area_m2": 35,
                         }
                     ],
-                    "use_physics_residual": False,
                 },
             }
         )
@@ -114,8 +111,9 @@ class TestPhysicsConfigIngest:
         app.initialize()
         assert app._physics_model is not None
         assert app._physics_config["dhw_tank_volume_l"] == 200
-        assert app._physics_config["internal_gains_fraction"] == 0.8
-        assert app._physics_config["use_physics_residual"] is False
+        assert "internal_gains_fraction" not in app._physics_config
+        assert "use_physics_residual" not in app._physics_config
+        assert "cop_sensor" not in app._physics_config
 
 
 class TestPhysicsSensorFetch:
@@ -149,7 +147,6 @@ class TestPhysicsSensorFetch:
                 "physics": {
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
-                    "cop_sensor": "sensor.kermi_cop",
                     "room_thermostats": [
                         {
                             "climate_entity": "climate.living_room",
@@ -162,7 +159,7 @@ class TestPhysicsSensorFetch:
         )
         app.initialize()
         app._fetch_physics_sensor_histories()
-        assert fetch_generic.call_count == 3  # dhw_tank, heating_buffer, cop
+        assert fetch_generic.call_count == 2  # dhw_tank, heating_buffer
         fetch_climate.assert_called_once()  # the room_thermostat's climate_entity, for setpoint projection
 
         # Regression guard: physics.py's ThermalPhysicsModel hard-codes "buffer_temp"
@@ -198,7 +195,6 @@ class TestPhysicsSensorRecentFetch:
                 "physics": {
                     "dhw_tank_temp_sensor": "sensor.kermi_dhw_buffer_temp",
                     "heating_buffer_temp_sensor": "sensor.kermi_heating_buffer",
-                    "cop_sensor": "sensor.kermi_cop",
                     "room_thermostats": [
                         {
                             "climate_entity": "climate.living_room",
@@ -219,7 +215,7 @@ class TestPhysicsSensorRecentFetch:
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
-        assert fetch_recent_generic.call_count == 3  # dhw_tank, heating_buffer, cop
+        assert fetch_recent_generic.call_count == 2  # dhw_tank, heating_buffer
         fetch_recent_climate.assert_called_once()
         fetch_generic.assert_not_called()
         fetch_climate.assert_not_called()
@@ -239,13 +235,11 @@ class TestPhysicsSensorRecentFetch:
 
         assert app._physics_heating_buffer_df is None
         assert app._physics_dhw_tank_df is None
-        assert app._physics_cop_df is None
 
         app._fetch_physics_sensor_histories(recent_only=True)
 
         assert app._physics_heating_buffer_df is not None and not app._physics_heating_buffer_df.empty
         assert app._physics_dhw_tank_df is not None and not app._physics_dhw_tank_df.empty
-        assert app._physics_cop_df is not None and not app._physics_cop_df.empty
 
     def test_recent_only_empty_fetch_preserves_existing_value(self, monkeypatch):
         """A transient failure (empty result) during the hourly refresh must not
@@ -274,32 +268,6 @@ class TestPhysicsSensorRecentFetch:
         app._fetch_physics_sensor_histories()  # recent_only defaults to False
 
         assert app._physics_heating_buffer_df.empty
-
-    def test_recent_only_quiets_only_cop_sensor_no_data_warning(self, monkeypatch):
-        """A heat pump's live COP sensor only reports while actively heating — an empty
-        hourly recent-fetch is expected (not an error) for long idle stretches (e.g. all
-        summer), so only its recent_only fetch should pass quiet_if_empty=True. The other
-        two physics sensors (heating_buffer_temp, dhw_tank) have no such seasonal excuse
-        and must keep the default (noisy-on-empty) behaviour."""
-        app, fetch_recent_generic, _, _, _ = self._configured_app(monkeypatch)
-
-        app._fetch_physics_sensor_histories(recent_only=True)
-
-        calls_by_entity = {call.args[1]: call for call in fetch_recent_generic.call_args_list}
-        assert calls_by_entity["sensor.kermi_cop"].kwargs.get("quiet_if_empty") is True
-        assert calls_by_entity["sensor.kermi_dhw_buffer_temp"].kwargs.get("quiet_if_empty") is not True
-        assert calls_by_entity["sensor.kermi_heating_buffer"].kwargs.get("quiet_if_empty") is not True
-
-    def test_full_history_fetch_never_quiets_cop_sensor(self, monkeypatch):
-        """recent_only=False (retrain path): cop_sensor's weekly full-history fetch keeps
-        its normal WARNING — only the hourly recent fetch is quieted, since the weekly
-        fetch isn't the one that got noisy from this fix."""
-        app, _, _, fetch_generic, _ = self._configured_app(monkeypatch)
-
-        app._fetch_physics_sensor_histories()  # recent_only defaults to False
-
-        cop_call = next(call for call in fetch_generic.call_args_list if call.args[1] == "sensor.kermi_cop")
-        assert "quiet_if_empty" not in cop_call.kwargs
 
     def test_room_thermostat_temp_sensor_is_not_independently_fetched(self, monkeypatch, tmp_path):
         """#89: room_thermostats[].temp_sensor duplicates data already available from
@@ -508,7 +476,6 @@ class TestRetrainCallsPhysicsFetch:
 
         assert app._physics_dhw_tank_df is None
         assert app._physics_heating_buffer_df is None
-        assert app._physics_cop_df is None
 
     def test_retrain_passes_its_climate_dfs_and_dhw_df_to_physics_fetch(self, monkeypatch):
         """#89: _retrain() already fetches climate_dfs/dhw_df for the ML pipeline
@@ -531,77 +498,6 @@ class TestRetrainCallsPhysicsFetch:
         call_kwargs = app._fetch_physics_sensor_histories.call_args.kwargs
         assert "climate_dfs" in call_kwargs
         assert "dhw_df" in call_kwargs
-
-
-class TestRetrainWiresUsePhysicsResidual:
-    """Final-review fix: `_retrain()` must pass `_effective_use_physics_residual()` through to
-    `EnergyForecastModel.train()` as `use_physics_residual=`. Without this wiring, the
-    cold-start-gate design (config intent AND-ed with calibration-window count) is computed but
-    never actually reaches training, so Phase 2 residual learning can never activate."""
-
-    def _patch_retrain_deps(self, monkeypatch):
-        import pandas as pd
-        from energy_forecast import ha_data as ha_data_mod
-        from energy_forecast import weather as weather_mod
-
-        energy_df = pd.DataFrame(
-            {
-                "timestamp": pd.date_range("2024-01-01", periods=2000, freq="1h"),
-                "gross_kwh": [1.0] * 2000,
-            }
-        )
-        empty_df = pd.DataFrame(columns=["timestamp"])
-
-        monkeypatch.setattr(ha_data_mod, "fetch_energy_history", lambda *a, **kw: energy_df)
-        monkeypatch.setattr(
-            ha_data_mod,
-            "split_ev_charging",
-            lambda df, *a, **kw: (df, pd.DataFrame(columns=["timestamp", "gross_kwh"])),
-        )
-        monkeypatch.setattr(weather_mod, "fetch_historical_weather", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(weather_mod, "fetch_open_meteo", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(ha_data_mod, "fetch_boolean_entity_history", lambda *a, **kw: empty_df)
-        monkeypatch.setattr(ha_data_mod, "fetch_presence_history", lambda *a, **kw: empty_df)
-
-    def _make_retrain_ready_app(self, monkeypatch, *, use_physics_residual: bool):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        self._patch_retrain_deps(monkeypatch)
-
-        app = _make_app(
-            {"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": use_physics_residual}}
-        )
-        app.initialize()
-        assert app._physics_model is not None
-
-        app._ml_model = MagicMock()  # avoid a real training cycle
-        app._fetch_physics_sensor_histories = MagicMock()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        app._retrain = EnergyForecast._retrain.__get__(app, type(app))
-        return app
-
-    def test_retrain_passes_use_physics_residual_true_when_gate_clear(self, monkeypatch):
-        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
-
-        # Clear the cold-start gate so _effective_use_physics_residual() resolves to True.
-        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
-        assert app._physics_model.is_cold_start_gated is False
-
-        app._retrain()
-
-        app._ml_model.train.assert_called_once()
-        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is True
-
-    def test_retrain_passes_use_physics_residual_false_when_gate_not_clear(self, monkeypatch):
-        app = self._make_retrain_ready_app(monkeypatch, use_physics_residual=True)
-
-        # Fresh model, no calibration windows accumulated yet — gate stays closed.
-        assert app._physics_model.is_cold_start_gated is True
-
-        app._retrain()
-
-        app._ml_model.train.assert_called_once()
-        assert app._ml_model.train.call_args.kwargs["use_physics_residual"] is False
 
 
 class TestRecalibratePhysicsService:
@@ -654,7 +550,7 @@ class TestRecalibratePhysicsService:
 
     def test_calibrate_via_recalibrate_physics_matches_scheduled_retrain(self, tmp_path):
         """The on-demand recalibrate_physics path must forward the same
-        heating_active/ev/away/heating-sub-meter data _retrain() cached for it —
+        heating_active/ev/away data _retrain() cached for it —
         not silently resolve a weaker tier than the scheduled path would."""
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -677,11 +573,9 @@ class TestRecalibratePhysicsService:
         heating_active_sentinel = pd.DataFrame({"timestamp": [], "heating_active": []})
         ev_sentinel = pd.DataFrame({"timestamp": []})
         away_sentinel = pd.DataFrame({"timestamp": [], "is_away": []})
-        sub_meter_sentinel = pd.DataFrame({"timestamp": [], "kwh": []})
         app._cached_heating_active_df = heating_active_sentinel
         app._cached_ev_df = ev_sentinel
         app._cached_away_df = away_sentinel
-        app._cached_heating_sub_meter_df = sub_meter_sentinel
 
         with patch.object(app._physics_model, "calibrate") as mock_calibrate:
             app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
@@ -690,7 +584,6 @@ class TestRecalibratePhysicsService:
             assert kwargs["heating_active_df"] is heating_active_sentinel
             assert kwargs["ev_df"] is ev_sentinel
             assert kwargs["away_df"] is away_sentinel
-            assert kwargs["heating_sub_meter_df"] is sub_meter_sentinel
 
     def test_recalibrate_service_before_first_retrain_logs_warning_and_does_not_crash(self, caplog):
         """No _cached_energy_df/_cached_weather_df yet (never retrained) — must not raise."""
@@ -710,250 +603,6 @@ class TestRecalibratePhysicsService:
                 app._recalibrate_physics_cb("default", "energy_forecast", "recalibrate_physics", {})
             mock_calibrate.assert_not_called()
         assert any("recalibrate_physics" in r.message.lower() for r in caplog.records)
-
-    def test_cold_start_gate_logs_warning_when_residual_requested_but_gated(self, caplog):
-        import logging
-
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
-        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
-        app.initialize()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        assert app._physics_model.is_cold_start_gated is True  # fresh model, no calibration windows yet
-        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            app._effective_use_physics_residual()
-        assert any("cold-start" in r.message.lower() or "cold start" in r.message.lower() for r in caplog.records)
-
-    def test_phase2_activation_logs_experimental_warning_when_gate_clear(self, caplog):
-        import logging
-
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {"use_physics_residual": True}})
-        app.logger = logging.getLogger("energy_forecast")  # real logger so caplog sees post-initialize() warnings
-        app.initialize()
-        app._effective_use_physics_residual = EnergyForecast._effective_use_physics_residual.__get__(app, type(app))
-        app._physics_model._calib["n_calibration_windows_ua_eff"] = 30
-        assert app._physics_model.is_cold_start_gated is False
-
-        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
-            result = app._effective_use_physics_residual()
-
-        assert result is True
-        assert any("experimental" in r.message.lower() and "phase 2" in r.message.lower() for r in caplog.records)
-
-
-class TestPhysicsSensors:
-    def test_physics_sensors_published_when_physics_configured(self, monkeypatch):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
-        app._publish_physics_sensors(forecast_df)
-        published_entities = [c.args[0] for c in app.set_state.call_args_list]
-        assert "sensor.energy_forecast_physics_base_today" in published_entities
-        assert "sensor.energy_forecast_ml_adjustment_today" in published_entities
-
-    def test_physics_sensors_not_published_when_physics_disabled(self):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import"})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        app._publish_physics_sensors(pd.DataFrame({"timestamp": [], "predicted_kwh": []}))
-        app.set_state.assert_not_called()
-
-    def test_ml_adjustment_can_be_negative(self, monkeypatch):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [0.5] * 48})  # physics baseline exceeds total
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.8] * 48, index=ts))
-        app._publish_physics_sensors(forecast_df)
-        adj_call = next(
-            c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_ml_adjustment_today"
-        )
-        assert float(adj_call.kwargs["state"]) < 0
-
-    def test_physics_base_is_floored_at_zero_with_a_negative_override_delta(self, monkeypatch):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        delta = pd.Series(0.0, index=ts)
-        delta.iloc[3] = -1.0
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.4] * 48, index=ts))
-        app._publish_physics_sensors(forecast_df, override_delta=delta)
-
-        def _hourly(entity):
-            call = next(c for c in app.set_state.call_args_list if c.args[0] == entity)
-            return call.kwargs["attributes"]["hourly_kwh"]
-
-        base = _hourly("sensor.energy_forecast_physics_base_today")
-        adj = _hourly("sensor.energy_forecast_ml_adjustment_today")
-        assert base[:5] == [0.4, 0.4, 0.4, 0.0, 0.4]
-        assert min(base) >= 0
-        assert adj[3] == 1.0  # predicted_kwh[3] - 0.0
-        assert all(abs(b + a - 1.0) < 1e-6 for b, a in zip(base, adj, strict=True))
-
-    def test_physics_sensor_weather_frame_is_cut_to_the_forecast_hours(self, monkeypatch):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        all_ts = pd.date_range("2026-01-12", periods=122 + 48, freq="1h")
-        future_ts = all_ts[122:]
-        app._cached_forecast_df = pd.DataFrame({"timestamp": all_ts, "temp_c": 5.0, "direct_radiation_wm2": 0.0})
-        forecast_df = pd.DataFrame({"timestamp": future_ts, "predicted_kwh": [1.0] * 48})
-        seen = []
-
-        def _spy(df, *a, **kw):
-            seen.append(df)
-            return pd.Series([0.4] * len(df), index=pd.DatetimeIndex(df["timestamp"]))
-
-        monkeypatch.setattr(app._physics_model, "predict_series", _spy)
-        app._publish_physics_sensors(forecast_df)
-        assert len(seen) == 1
-        assert seen[0]["timestamp"].iloc[0] == forecast_df["timestamp"].iloc[0]
-        assert len(seen[0]) == 48
-
-    def test_physics_sensors_use_mqtt_in_mqtt_mode(self, monkeypatch):
-        """In MQTT mode, both sensors must go through _mqtt_set_sensor, not set_state."""
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app._mqtt_discovery = True
-        app.set_state = MagicMock()
-        app._mqtt_set_sensor = MagicMock()
-        app._mqtt_publish_sensor_attributes = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
-        app._publish_physics_sensors(forecast_df)
-
-        mqtt_ids = [c.args[0] for c in app._mqtt_set_sensor.call_args_list]
-        assert "energy_forecast_physics_base_today" in mqtt_ids
-        assert "energy_forecast_ml_adjustment_today" in mqtt_ids
-        attr_ids = [c.args[0] for c in app._mqtt_publish_sensor_attributes.call_args_list]
-        assert "energy_forecast_physics_base_today" in attr_ids
-        assert "energy_forecast_ml_adjustment_today" in attr_ids
-        app.set_state.assert_not_called()
-
-    def test_physics_history_attrs_defensively_initialized_before_first_retrain(self):
-        """initialize() must set all _fetch_physics_sensor_histories() output attributes to
-        their safe defaults immediately — not just _physics_heating_buffer_df — so
-        _publish_physics_sensors() (called every hourly update cycle) never raises
-        AttributeError if it fires before the first _retrain() has ever completed (e.g. right
-        after physics: is newly enabled and the weekly retrain hasn't run yet)."""
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        # Real (non-mocked) attribute assignments from initialize() are distinguishable from
-        # MagicMock's auto-vivified attributes: an unset attribute would return a fresh MagicMock
-        # on access, not `{}`/`None`, so these assertions genuinely fail without the fix.
-        assert app._physics_climate_dfs == {}
-        assert app._physics_dhw_tank_df is None
-        assert app._physics_cop_df is None
-        assert app._physics_heating_buffer_df is None
-
-        # Real predict_series (not monkeypatched away) must run without raising even though
-        # _fetch_physics_sensor_histories() was never called.
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        app._cached_forecast_df = pd.DataFrame({"timestamp": ts, "temp_c": [5.0] * 48})
-        app._publish_physics_sensors(forecast_df)  # must not raise AttributeError
-        published_entities = [c.args[0] for c in app.set_state.call_args_list]
-        assert "sensor.energy_forecast_physics_base_today" in published_entities
-
-
-class TestPhysicsSensorsOverrideDeltaAttribution:
-    """Task 11 review fix: _publish_physics_sensors' `ml_adjustment_vals =
-    predicted_kwh - physics_vals` must not misattribute the Task 11 DHW override
-    correction (already folded into `predicted_kwh` by the caller) to "ML
-    Adjustment" — `physics_vals` must absorb the same `override_delta` first."""
-
-    def test_override_delta_folds_into_physics_base_not_ml_adjustment(self, monkeypatch):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        # predicted_kwh already carries the Task 11 correction, as _update_sensors
-        # leaves it: a flat 1.0 kWh/h ML forecast plus a +2.0 kWh override bump at
-        # hour 5. The override-blind physics baseline is a flat 0.6 kWh/h.
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        forecast_df.loc[5, "predicted_kwh"] = 3.0
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
-
-        override_delta = pd.Series(0.0, index=ts)
-        override_delta.iloc[5] = 2.0
-
-        app._publish_physics_sensors(forecast_df, override_delta=override_delta)
-
-        physics_call = next(
-            c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_physics_base_today"
-        )
-        adj_call = next(
-            c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_ml_adjustment_today"
-        )
-        physics_hourly = physics_call.kwargs["attributes"]["hourly_kwh"]
-        adj_hourly = adj_call.kwargs["attributes"]["hourly_kwh"]
-
-        # The override delta lands in the physics baseline...
-        assert physics_hourly[5] == pytest.approx(0.6 + 2.0)
-        assert physics_hourly[4] == pytest.approx(0.6)  # untouched hour unaffected
-        # ...not in ML adjustment: with the fix, hour 5's adjustment is
-        # predicted_kwh - (physics + delta) = 3.0 - 2.6 = 0.4, identical to every
-        # other hour's 1.0 - 0.6 = 0.4 — the override contributes nothing to "ML
-        # Adjustment". Pre-fix, hour 5 would read 3.0 - 0.6 = 2.4, wrongly
-        # attributing the whole override bump to "ML".
-        assert adj_hourly[5] == pytest.approx(0.4)
-        assert adj_hourly[4] == pytest.approx(0.4)
-
-    def test_no_override_delta_argument_matches_pre_fix_behavior(self, monkeypatch):
-        """Backward compatibility: callers that omit override_delta (or pass None —
-        e.g. no physics model committed override this cycle) must see identical
-        behavior to before this fix."""
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._publish_physics_sensors = EnergyForecast._publish_physics_sensors.__get__(app, type(app))
-        app.set_state = MagicMock()
-        ts = pd.date_range("2026-01-15", periods=48, freq="1h")
-        forecast_df = pd.DataFrame({"timestamp": ts, "predicted_kwh": [1.0] * 48})
-        monkeypatch.setattr(app._physics_model, "predict_series", lambda *a, **kw: pd.Series([0.6] * 48, index=ts))
-
-        app._publish_physics_sensors(forecast_df)  # no override_delta kwarg at all
-
-        adj_call = next(
-            c for c in app.set_state.call_args_list if c.args[0] == "sensor.energy_forecast_ml_adjustment_today"
-        )
-        assert adj_call.kwargs["attributes"]["hourly_kwh"][0] == pytest.approx(1.0 - 0.6)
 
 
 class TestPhysicsMqttDiscoveryRegistration:
@@ -976,42 +625,9 @@ class TestPhysicsMqttDiscoveryRegistration:
         app._mqtt_publish_all_discovery = EnergyForecast._mqtt_publish_all_discovery.__get__(app, type(app))
         return app
 
-    def test_physics_sensors_registered_when_physics_configured(self):
-        app = self._make_mqtt_app({})
-        app.initialize()
-        registered_ids = [c.args[0] for c in app._mqtt_publish_discovery.call_args_list]
-        assert "energy_forecast_physics_base_today" in registered_ids
-        assert "energy_forecast_ml_adjustment_today" in registered_ids
-
-    def test_physics_sensors_not_registered_when_physics_disabled(self):
-        app = self._make_mqtt_app(None)
-        app.initialize()
-        registered_ids = [c.args[0] for c in app._mqtt_publish_discovery.call_args_list]
-        assert "energy_forecast_physics_base_today" not in registered_ids
-        assert "energy_forecast_ml_adjustment_today" not in registered_ids
-
-
-class TestModelPhaseAttribute:
-    def test_model_phase_absent_when_physics_disabled(self):
-        app = _make_app({"energy_sensor": "sensor.grid_import"})
-        app.initialize()
-        assert app._model_phase_attr() is None
-
-    def test_model_phase_is_phase1_by_default(self, tmp_path):
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._ml_model._use_physics_residual = False
-        assert app._model_phase_attr() == "phase1"
-
-    def test_model_phase_is_phase2_when_flag_set_on_model(self, tmp_path):
-        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
-        app.initialize()
-        app._ml_model._use_physics_residual = True
-        assert app._model_phase_attr() == "phase2"
-
 
 class TestGetScenarioDhwSchedule:
-    def test_dhw_schedule_forwarded_as_override(self, monkeypatch):
+    def test_dhw_schedule_no_longer_forwarded_to_the_model(self, monkeypatch):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
@@ -1043,10 +659,10 @@ class TestGetScenarioDhwSchedule:
             "get_scenario",
             {"schedule": {}, "dhw_schedule": {"legionella": ["2026-01-16", 10]}},
         )
-        assert received.get("dhw_schedule_override") == {"legionella": ["2026-01-16", 10]}
-        assert received.get("physics_model") is app._physics_model
+        assert "dhw_schedule_override" not in received
+        assert "physics_model" not in received
 
-    def test_no_dhw_schedule_key_forwards_none(self):
+    def test_no_dhw_schedule_key_adds_no_override_kwarg(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
         app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
@@ -1073,7 +689,7 @@ class TestGetScenarioDhwSchedule:
         app._ml_model.predict_scenario = _fake_predict_scenario
 
         app._get_scenario_cb("default", "energy_forecast", "get_scenario", {"schedule": {}})
-        assert received.get("dhw_schedule_override") is None
+        assert "dhw_schedule_override" not in received
 
 
 class TestSetDhwScheduleService:
@@ -1278,17 +894,13 @@ class TestServingOverrideCorrection:
 
     def _physics_config(self):
         return {
-            "cop_sensor": None,
             "dhw_tank_temp_sensor": None,
             "heating_buffer_temp_sensor": None,
-            "heating_curve_sensor": None,
             "cop_formula": {"a": 2.5, "b": 0.07},
             "dhw_tank_volume_l": 200,
             "dhw_power_w": 4000,
-            "internal_gains_fraction": 0.8,
             "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
             "room_thermostats": [],
-            "use_physics_residual": False,
         }
 
     def _run_update_sensors(
@@ -1354,7 +966,6 @@ class TestServingOverrideCorrection:
         stub._room_thermostats = []
         stub._physics_climate_dfs = {}
         stub._physics_dhw_tank_df = None
-        stub._physics_cop_df = None
         # Real predict() always returns 48 h from now, even when forecast_df carries a past tail.
         predicted_ts = forecast_timestamps if prediction_timestamps is None else prediction_timestamps
         stub._ml_model.predict = lambda *a, **kw: pd.DataFrame(
@@ -1425,7 +1036,7 @@ class TestServingOverrideCorrection:
 
     def test_serving_delta_uses_indoor_temperature_not_outdoor(self, tmp_path, monkeypatch):
         """Final-review #2: the DHW ODE's `t_ambient` is the air around the TANK, i.e.
-        indoor temperature — exactly what predict_series feeds physics_kwh. The serving
+        indoor temperature — exactly what the training override-delta uses. The serving
         correction used to pass raw outdoor `forecast_df["temp_c"]` instead, so on a cold
         day it modelled a tank standing outside: inflated standing losses, wrong delta.
 
@@ -1714,56 +1325,3 @@ class TestServingOverrideCorrection:
         predictions, _ = self._run_update_sensors(tmp_path, monkeypatch, physics_model, forecast_timestamps)
 
         assert (predictions.set_index("timestamp")["predicted_kwh"] == 1.0).all()
-
-    def test_committed_override_not_misattributed_to_ml_adjustment_sensor(self, tmp_path, monkeypatch):
-        """Review-fix regression, end-to-end through _update_sensors(): the
-        published sensor.energy_forecast_ml_adjustment_today diagnostic must not
-        silently absorb the DHW override delta and attribute it to "ML
-        Adjustment" instead of "Physics Base". Companion to the direct unit tests
-        in TestPhysicsSensorsOverrideDeltaAttribution — this one instead proves
-        _update_sensors() actually threads _override_delta through to
-        _publish_physics_sensors(), not just that the method behaves correctly
-        in isolation."""
-        from energy_forecast.physics import ThermalPhysicsModel
-
-        now = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None).floor("1h")
-        forecast_timestamps = pd.date_range(start=now, periods=48, freq="1h")
-        override_ts = forecast_timestamps[5]
-
-        physics_with_override = ThermalPhysicsModel(tmp_path / "physics_models_attr_override", self._physics_config())
-        physics_with_override.commit_dhw_schedule({"legionella": [override_ts.strftime("%Y-%m-%d"), override_ts.hour]})
-        physics_no_override = ThermalPhysicsModel(tmp_path / "physics_models_attr_baseline", self._physics_config())
-
-        # base_kwh=5.0 for the same reason as
-        # test_committed_override_moves_published_forecast_by_full_delta: keep the
-        # zero-floor (final-review #4) from clipping a negative correction hour, which
-        # would otherwise shift ml_adjustment between the two runs for a reason that has
-        # nothing to do with the misattribution this test is about.
-        _, stub_with_override = self._run_update_sensors(
-            tmp_path, monkeypatch, physics_with_override, forecast_timestamps, base_kwh=5.0
-        )
-        _, stub_baseline = self._run_update_sensors(
-            tmp_path, monkeypatch, physics_no_override, forecast_timestamps, base_kwh=5.0
-        )
-
-        def _hourly_kwh(stub, entity_id):
-            call = next(c for c in stub.set_state_calls if c["entity_id"] == entity_id)
-            return call["attributes"]["hourly_kwh"]
-
-        physics_with = _hourly_kwh(stub_with_override, "sensor.energy_forecast_physics_base_today")
-        physics_base = _hourly_kwh(stub_baseline, "sensor.energy_forecast_physics_base_today")
-        ml_adj_with = _hourly_kwh(stub_with_override, "sensor.energy_forecast_ml_adjustment_today")
-        ml_adj_base = _hourly_kwh(stub_baseline, "sensor.energy_forecast_ml_adjustment_today")
-
-        # Sanity: the two physics_model instances (same fresh config, no
-        # calibration difference) must actually differ at the override hour —
-        # otherwise this test can't distinguish "fixed" from "coincidentally
-        # equal".
-        assert physics_with[5] != pytest.approx(physics_base[5])
-
-        # The fake ML model always predicts a flat 1.0 kWh/h regardless of the
-        # committed override (Task 11 adds the correction after predict()
-        # returns) — so "ML Adjustment" must read identically whether or not an
-        # override is committed. Before this fix, ml_adj_with[5] would be
-        # inflated by the override delta relative to ml_adj_base[5].
-        assert ml_adj_with == pytest.approx(ml_adj_base, abs=1e-9)

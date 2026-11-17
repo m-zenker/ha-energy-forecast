@@ -1290,11 +1290,6 @@ class _FakeMqttSelf:
         if level == "WARNING":
             self._warnings.append(msg)
 
-    def _model_phase_attr(self) -> str | None:
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._model_phase_attr(self)
-
     def _heating_season_attr(self) -> dict | None:
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -1622,15 +1617,6 @@ class TestMqttDiscoveryEnergyStateClassMismatch:
             payload = self._payload_for(fake, unique_id)
             assert "device_class" not in payload
             assert payload.get("state_class") == "measurement"
-
-    @pytest.mark.parametrize("unique_id", ["energy_forecast_physics_base_today", "energy_forecast_ml_adjustment_today"])
-    def test_physics_sensors_have_no_device_class(self, unique_id):
-        fake = _FakeMqttSelf()
-        fake._physics_model = MagicMock()
-        fake._mqtt_publish_all_discovery()
-        payload = self._payload_for(fake, unique_id)
-        assert "device_class" not in payload
-        assert payload.get("state_class") == "measurement"
 
     def test_scenario_sensors_have_no_device_class(self):
         fake = _FakeMqttSelf()
@@ -3530,13 +3516,13 @@ class TestShapFeatureLabelCoverage:
             assert tgated in _SHAP_FEATURE_LABELS
 
     def test_physics_dynamic_features_have_labels(self):
-        """physics_kwh/heating_buffer_temp are appended to feature_cols dynamically in
-        model.py's train() (not part of the static _FEATURES_BASE list) when a physics
-        model / heating_buffer_temp_sensor is configured, so the static-list coverage
+        """heating_buffer_temp is appended to feature_cols dynamically in
+        model.py's train() (not part of the static _FEATURES_BASE list) when a
+        heating_buffer_temp_sensor is configured, so the static-list coverage
         test above can't catch them — check them explicitly."""
         from energy_forecast.energy_forecast import _SHAP_FEATURE_LABELS
 
-        for feat in ("physics_kwh", "heating_buffer_temp"):
+        for feat in ("physics_kwh", "heating_buffer_temp"):  # physics_kwh: legacy trained models
             assert feat in _SHAP_FEATURE_LABELS
 
 
@@ -4301,13 +4287,6 @@ class _FakeRetrain:
 
         return EnergyForecast._last_trained_local(self)
 
-    def _effective_use_physics_residual(self):
-        # _retrain() passes this through to self._ml_model.train(). Delegate to the real
-        # implementation; with self._physics_model = None it short-circuits to False.
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._effective_use_physics_residual(self)
-
     def _ev_charging_cache_path(self):
         # _retrain() calls this when self._ev_charging_sensor is set. Delegate to the
         # real implementation for the same reason as _last_trained_local above.
@@ -4715,20 +4694,6 @@ class _FakeUpdateSensors:
 
         return EnergyForecast._fetch_physics_sensor_histories(self, *args, **kwargs)
 
-    def _publish_physics_sensors(self, forecast_df, override_delta=None):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._publish_physics_sensors(self, forecast_df, override_delta=override_delta)
-
-    # _model_phase_attr() is called unconditionally by _publish() (used to tag
-    # the forecast sensor's "model_phase" attribute). It returns None
-    # immediately when self._physics_model is None (energy_forecast.py:1447-1448),
-    # so it's a safe no-op here too — same delegate pattern as above.
-    def _model_phase_attr(self):
-        from energy_forecast.energy_forecast import EnergyForecast
-
-        return EnergyForecast._model_phase_attr(self)
-
     def _heating_season_attr(self):
         from energy_forecast.energy_forecast import EnergyForecast
 
@@ -4801,11 +4766,8 @@ class TestUpdateSensorsExcludedRanges:
             is "meter".
           - self._ml_model.shap_summary(): only called if self._shap_top_n > 0
             (energy_forecast.py:2058).
-          - self._fetch_physics_sensor_histories() / self._publish_physics_sensors()
-            / self._model_phase_attr(): all three early-return immediately when
-            self._physics_model is None (energy_forecast.py:1295-1296,
-            2389-2390, 1447-1448 respectively) — see _FakeUpdateSensors'
-            docstring above.
+          - self._fetch_physics_sensor_histories(): early-returns immediately when
+            self._physics_model is None — see _FakeUpdateSensors' docstring above.
         """
         import energy_forecast.energy_forecast as ef_mod
         import energy_forecast.ha_data as ha_data_mod

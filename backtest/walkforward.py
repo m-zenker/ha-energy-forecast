@@ -44,7 +44,6 @@ class WfArm:
     cutoff_shift_h: int = 0  # retrain this many hours off the nominal cutoff (jitter control: -1)
     every_days: int = 1  # retrain cadence
     live_frame: bool = False  # serve with live's 3-day weather tail instead of a contiguous one
-    physics: bool = False  # run the physics baseline at serve time (needed for Phase 2 models)
 
 
 ARMS: dict[str, WfArm] = {
@@ -123,7 +122,7 @@ def run_arm(
             if arm.live_frame:
                 kwargs["forecast_df"] = frame.forecast_frame(origin, SERVE_PAST)
             with patch() if patch else contextlib.nullcontext():
-                out = predict(frame, model, work, origin, kwargs=kwargs, physics=arm.physics)
+                out = predict(frame, model, work, origin, kwargs=kwargs)
             out["arm"], out["origin"], out["cutoff"] = arm.name, origin, cutoff
             rows.append(out)
         day += pd.Timedelta(days=1)

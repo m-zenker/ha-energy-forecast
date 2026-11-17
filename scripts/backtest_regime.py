@@ -390,8 +390,7 @@ def run_backtest(
                 for o in origins:
                     totals = {}
                     for name, factor in (("base", 1.0), ("lo", SUN_FACTORS[0]), ("hi", SUN_FACTORS[1])):
-                        # Predict with the arm's own trained physics model, as the live app does.
-                        inp = {**inputs_cache[o], "physics_model": cap["physics_model"]}
+                        inp = inputs_cache[o]
                         inp = inp if factor == 1.0 else scale_sunshine(inp, o, factor)
                         with rh.frozen_clock(o):
                             pred = model.predict(**inp, _prepared=model._prepare_prediction_X(**inp))
