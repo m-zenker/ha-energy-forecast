@@ -24,7 +24,7 @@ Start here. Everything below this section is detail and history.
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
 | 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
 | 10 | **Closed 2026-11-16** (continues offline only; a PASS re-enters as an ML feature). #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
-| 11 | #124 verify override history against the tank before training replay | shipped alpha-42 2026-11-16 (own window, without the #120 flip or #105); deployed, awaiting first retrain | live check 2026-11-16: 48 → 34 replayed | none |
+| 11 | #124 verify override history against the tank before training replay | shipped alpha-42 2026-11-16 (own window, without the #120 flip or #105); deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) | live check 2026-11-16: 48 → 34 replayed | none |
 | 12 | #121, #122, #123 | — | as capacity allows | #122 needs ≥ 5 overrides in the captures |
 
 **Rules that apply to all of it.**
@@ -646,7 +646,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
-| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed, awaiting first retrain |
+| 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) |
 | 125 | NaN-robust indoor averaging (would switch the training override subtraction on for 34 overrides and move the target) | forecast-changing | S | follow-up of physics heating removal (2026-11-16); low, own ship window |
 | 126 | Measured vs simulated override correction (hef models about 1 kWh for a legionella hour, EM measures 5 kWh) | override delta accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
 | 127 | Open-window down-weighting on/off backtest | verifies the 0.5x weight pays off | S | follow-up of physics heating removal (2026-11-16); low |
