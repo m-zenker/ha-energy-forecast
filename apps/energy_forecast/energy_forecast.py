@@ -50,7 +50,7 @@ from .const import (
 )
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
-from .physics import ThermalPhysicsModel
+from .physics import _VALID_OVERRIDE_KINDS, ThermalPhysicsModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
 # Using logging.getLogger() here would produce an "AppDaemon" category in HA logs
@@ -1572,13 +1572,30 @@ class EnergyForecast(hass.Hass):
         if self._physics_model is None:
             _LOGGER.warning("set_dhw_schedule called but physics is not configured — ignoring")
             return
+        # `clear` carries kind names to cancel. EM cannot send `{kind: None}` in dhw_schedule: AppDaemon's
+        # call_service strips None values (hassapi.py remove_literals), so hef would receive `{}`.
+        clear = kwargs.get("clear")
         dhw_schedule = kwargs.get("dhw_schedule")
-        if not isinstance(dhw_schedule, dict):
+        clear_kinds: list[str] = []
+        if clear is not None:
+            if isinstance(clear, list):
+                clear_kinds = [k for k in clear if k in _VALID_OVERRIDE_KINDS]
+                if len(clear_kinds) != len(clear):
+                    _LOGGER.warning(f"set_dhw_schedule: ignoring unknown clear kinds in {clear!r}")
+            else:
+                _LOGGER.warning("set_dhw_schedule: clear must be a list of kinds — ignoring")
+        if dhw_schedule is None and clear is not None:
+            pass  # a clear-only call is valid (an invalid or empty `clear` was already handled above)
+        elif not isinstance(dhw_schedule, dict):
             _LOGGER.warning("set_dhw_schedule: dhw_schedule must be a dict — ignoring")
             return
         try:
-            self._physics_model.commit_dhw_schedule(dhw_schedule)
-            _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
+            if clear_kinds:
+                self._physics_model.commit_dhw_schedule({k: None for k in clear_kinds})
+                _LOGGER.info(f"DHW schedule cleared: {clear_kinds}")
+            if dhw_schedule is not None:
+                self._physics_model.commit_dhw_schedule(dhw_schedule)
+                _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error(f"set_dhw_schedule failed: {exc}")
 
