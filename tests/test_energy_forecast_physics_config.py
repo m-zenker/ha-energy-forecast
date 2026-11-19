@@ -1325,3 +1325,100 @@ class TestServingOverrideCorrection:
         predictions, _ = self._run_update_sensors(tmp_path, monkeypatch, physics_model, forecast_timestamps)
 
         assert (predictions.set_index("timestamp")["predicted_kwh"] == 1.0).all()
+
+
+class TestSetDhwScheduleClearKwarg:
+    """`clear: list[str]` on energy_forecast/set_dhw_schedule. EM cannot send `{kind: None}` because
+    AppDaemon's call_service strips None values (hassapi.py remove_literals), so hef receives `{}`."""
+
+    @staticmethod
+    def _app(tmp_path):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = _make_app({"energy_sensor": "sensor.grid_import", "physics": {}})
+        app.logger = logging.getLogger("energy_forecast")  # must precede initialize(): it rebinds the module _LOGGER
+        app.initialize()
+        TestSetDhwScheduleService._isolate_physics_model_dir(app, tmp_path)
+        app._set_dhw_schedule_cb = EnergyForecast._set_dhw_schedule_cb.__get__(app, type(app))
+        return app
+
+    @staticmethod
+    def _call(app, kwargs):
+        app._set_dhw_schedule_cb("default", "energy_forecast", "set_dhw_schedule", kwargs)
+
+    @staticmethod
+    def _history(app, kind):
+        return [e for e in app._physics_model._schedule["override_history"] if e["kind"] == kind]
+
+    def test_clear_kwarg_removes_commit_and_marks_history_cancelled(self, tmp_path):
+        app = self._app(tmp_path)
+        self._call(app, {"dhw_schedule": {"legionella": ["2026-11-15", 13]}})
+
+        self._call(app, {"clear": ["legionella"]})
+
+        assert app._physics_model._schedule["committed_override"] is None
+        (entry,) = self._history(app, "legionella")
+        assert entry["cancelled_at"] is not None
+
+    def test_clear_kwarg_only_named_kind(self, tmp_path):
+        app = self._app(tmp_path)
+        self._call(
+            app,
+            {"dhw_schedule": {"legionella": ["2026-11-15", 13], "comfort_boost": ["2026-11-15", 12, 52.0]}},
+        )
+
+        self._call(app, {"clear": ["legionella"]})
+
+        assert list(app._physics_model._schedule["committed_override"]) == ["comfort_boost"]
+        assert self._history(app, "legionella")[0]["cancelled_at"] is not None
+        assert self._history(app, "comfort_boost")[0]["cancelled_at"] is None
+
+    def test_clear_kwarg_without_commit_is_noop(self, tmp_path):
+        app = self._app(tmp_path)
+
+        self._call(app, {"clear": ["comfort_boost"]})
+
+        assert app._physics_model._schedule["committed_override"] is None
+        assert app._physics_model._schedule.get("override_history", []) == []
+
+    def test_clear_then_dhw_schedule_same_kind_ends_committed(self, tmp_path):
+        app = self._app(tmp_path)
+        self._call(app, {"dhw_schedule": {"comfort_boost": ["2026-11-19", 12, 50.0]}})
+
+        self._call(
+            app,
+            {"clear": ["comfort_boost"], "dhw_schedule": {"comfort_boost": ["2026-11-19", 14, 52.0]}},
+        )
+
+        assert app._physics_model._schedule["committed_override"] == {"comfort_boost": ["2026-11-19", 14, 52.0]}
+        old, new = sorted(self._history(app, "comfort_boost"), key=lambda e: e["hour"])
+        assert old["cancelled_at"] is not None  # the clear ran first and cancelled the superseded entry
+        assert new["cancelled_at"] is None
+
+    @pytest.mark.parametrize(
+        ("clear", "expected_warnings"),
+        [(["bogus"], 1), ("legionella", 1), ([], 0)],
+    )
+    def test_clear_kwarg_invalid_input_is_ignored(self, tmp_path, caplog, clear, expected_warnings):
+        import logging
+
+        app = self._app(tmp_path)
+        self._call(app, {"dhw_schedule": {"legionella": ["2026-11-15", 13]}})
+        before = app._physics_model._schedule["committed_override"].copy()
+
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            self._call(app, {"clear": clear})
+
+        assert app._physics_model._schedule["committed_override"] == before
+        assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == expected_warnings
+
+    def test_legacy_none_dhw_schedule_still_clears(self, tmp_path):
+        app = self._app(tmp_path)
+        self._call(app, {"dhw_schedule": {"legionella": ["2026-11-15", 13]}})
+
+        self._call(app, {"dhw_schedule": {"legionella": None}})
+
+        assert app._physics_model._schedule["committed_override"] is None
