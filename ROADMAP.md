@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **dev v0.12.0-alpha-43** (2026-11-17, deployed, 1475 tests) · **main v0.11.18** (2026-10-26).
+Current: **dev v0.12.0-alpha-44** (2026-11-19, deployed, 1495 tests; `set_dhw_schedule` accepts a `clear` list, EM alpha-164 uses it) · **main v0.11.18** (2026-10-26).
 
 ---
 
