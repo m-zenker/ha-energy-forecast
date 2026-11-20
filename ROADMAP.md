@@ -378,7 +378,9 @@ Both columns added to `_FEATURES_BASE`. At prediction time, `trend_deviation` an
 
 ### #88 — Temperature-Similarity Sample Weighting
 
-**Priority:** Low-Medium — re-scoped 2026-11-13: test on the capture frame (#119) with the cold-onset stability metric.
+**Priority:** Low — **tested and not adopted 2026-11-20** (result below). Re-scoped 2026-11-13: test on the capture frame (#119) with the cold-onset stability metric.
+
+**2026-11-20 result (`backtest/experiments/halflife.py`, lean frame, archive weather, 4 folds / 61 days, seed noise floor ±1.6 %):** neither a longer `weight_halflife_days` (live 60) nor temperature-similarity weighting beats the live setting. Cold days (48): hl90 +2.5 % hourly / +1.5 % 3 h, hl120 +0.1 % / −2.0 %, hl180 +2.3 % / +1.2 %, hl30 +2.5 % / +3.8 %; the order is not monotone, so it is noise. Longer half-lives push cold-day bias from +0.01 to +0.5…+0.9 kWh/day (wrong way: live already over-forecasts cold days by about +2.9). No recency weighting (`hl0`) is best on cold days (−1.6 % / −5.0 %, |bias| −13 %) but inside the noise floor overall and it would break the migration down-weight that relies on the half-life. Gaussian temperature kernel (centred on the 7 days before the fold): `ts5` +6.3 % on 3 h blocks on cold days, `ts8` neutral; both gain 4–9 % on warm days, where the forecast is not failing, and pull bias negative. Limits: the lean frame shows no cold over-forecast (base cold bias 0.0 vs +2.9 live), so it cannot say whether a longer half-life would fix the live bias. Keep `weight_halflife_days: 60`. Re-open only if the #120 shadow or the 14-cold-day gate (step 8) points at training weight; the right test then is a capture-frame walk-forward of `hl120` / `hl0`.
 
 **2026-11-13:** the full-year prerequisite is met. For: rows at ≤ 3 °C hold 2.3 % of training weight (about 56 effective rows), and one more day of data moved the 2 °C forecast by 45 %. Against: this autumn runs lower than last winter at the same temperature (18.9 against 24.5 kWh/day at 3–6 °C, 5 days), so up-weighting old cold rows may over-forecast.
 
@@ -610,7 +612,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
 | 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | done — Phase A deployed 2026-08-27 (hef `v0.12.0-alpha-13`), exit gate passed 2026-09-18, Phase B live (EM). Open follow-up moved to #124 (override entries that never ran are replayed in training) |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | low — inputs degenerate at day-ahead lead; retest first |
-| 88 | Temperature-similarity sample weighting | low-medium | 3 h | low-medium — re-scoped: test on #119 with the cold-onset stability metric |
+| 88 | Temperature-similarity sample weighting | low | 3 h | low — tested 2026-11-20, not adopted (no gain on cold days; half-life 60 kept); see #88 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
