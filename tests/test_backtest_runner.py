@@ -172,3 +172,22 @@ def test_run_arm_rows_carry_naive_columns(base_rows):
     assert all({"mae3", "naive_mae", "naive_mae3"} <= set(r) for r in base_rows)
     assert any(np.isfinite(r["naive_mae"]) for r in base_rows)
     assert any(np.isfinite(r["naive_mae3"]) for r in base_rows)
+
+
+def test_arm_patch_wraps_train_and_gets_fold_and_weather(synth):
+    seen = []
+
+    class _Ctx:
+        def __enter__(self):
+            seen.append("enter")
+
+        def __exit__(self, *exc):
+            seen.append("exit")
+
+    def patch(fold, weather):
+        seen.append((fold.name, len(weather)))
+        return _Ctx()
+
+    rows = run_arm(Arm("p", patch=patch), synth.fold, synth.inputs, synth.weather, DEFAULTS, origins=(6,))
+    assert seen[0] == ("f", len(synth.weather)) and seen[1:] == ["enter", "exit"]
+    assert len(rows) > 0
