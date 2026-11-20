@@ -19,9 +19,13 @@ ARMS = [
     Arm("-temp_c", drop=("temp_c",)),               # drop static _FEATURES_BASE names
     Arm("clim", weather=climatology),               # transform the weather frame (train + predict)
     Arm("hl30", train_kwargs={"weight_halflife_days": 30.0}),  # override train() kwargs
+    Arm("custom", patch=my_ctx),                    # my_ctx(fold, weather) -> context manager around train()
 ]
 # optional: FOLDS = [...]  (default backtest.data.DEFAULT_FOLDS), ORIGINS = (6, 18)
 ```
+
+`patch` is for changes `train_kwargs` cannot express; see `experiments/halflife.py` (`ts*` arms scale the LightGBM
+`sample_weight`). `run_arm` trains once at `fold.start` and predicts the whole fold, so keep folds to about 10 days.
 
 Train kwargs default to what live `_retrain()` passes, read from `data/apps.yaml`. Only static `_FEATURES_BASE`
 names can be dropped. A drop that `train()` re-adds (`lag_*h`, sub-sensor lags) raises an error
