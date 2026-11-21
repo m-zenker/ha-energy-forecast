@@ -573,7 +573,7 @@ All sensors have `unit_of_measurement: kWh` and carry `attribution`, `model_engi
 |-----------|-------------|
 | `sensor.energy_forecast_next_1h` | Predicted consumption for the next hour |
 | `sensor.energy_forecast_next_3h` | Predicted consumption for the next 3 hours |
-| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features), `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"). |
+| `sensor.energy_forecast_today` | Total for today (midnight to midnight): actuals for elapsed hours + forecast for remaining hours. Attributes: `shap_top_features` (top driving features), `shap_narrative` (human-readable explanation, e.g. "Mainly driven by: current outdoor temperature; yesterday's same-hour consumption"; per-appliance sub-sensor features read like "last week's dishwasher consumption"). `shap_top_features` keeps the raw column names. |
 | `sensor.energy_forecast_tomorrow` | Predicted total for tomorrow |
 
 ### Prediction intervals (calibrated 80% coverage)
