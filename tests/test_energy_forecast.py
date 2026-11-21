@@ -3526,6 +3526,72 @@ class TestShapFeatureLabelCoverage:
             assert feat in _SHAP_FEATURE_LABELS
 
 
+class TestShapSubSensorLabels:
+    """Dynamic per-sub-sensor columns resolve by pattern instead of showing the raw column name."""
+
+    PREFIX = "sub_em_kermi_bridge_kermi_electricity_heating"
+
+    def test_reported_feature_resolves(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        assert _shap_label(f"{self.PREFIX}_lag_168h") == "last week's kermi electricity heating consumption"
+
+    def test_all_suffixes_resolve(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        assert _shap_label("sub_dishwasher_lag_24h") == "yesterday's dishwasher consumption"
+        assert _shap_label("sub_dishwasher_lag_168h") == "last week's dishwasher consumption"
+        assert _shap_label("sub_dishwasher_active_24h") == "dishwasher active in past 24h"
+        assert _shap_label("sub_dishwasher_runs_7d") == "dishwasher starts in past 7d"
+
+    def test_suffix_like_token_in_slug_parses_final_suffix(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        assert _shap_label("sub_heat_runs_7d_lag_24h") == "yesterday's heat runs 7d consumption"
+
+    def test_non_matching_names_fall_back_to_raw(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        for raw in ("sub_foo", "lag_999h", "sub__lag_24h", "unknown_feature"):
+            assert _shap_label(raw) == raw
+
+    def test_static_label_wins(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        assert _shap_label("lag_24h_tgated") == "yesterday's same-hour consumption"
+
+    def test_prefix_only_slug_keeps_name(self):
+        from energy_forecast.energy_forecast import _shap_label
+
+        assert _shap_label("sub_em_lag_24h") == "yesterday's em consumption"
+
+    def test_every_generated_sub_sensor_column_has_label(self):
+        """Fails when model.py adds a sub-sensor column suffix without a label."""
+        import pandas as pd
+        from energy_forecast.energy_forecast import _shap_label
+        from energy_forecast.model import _add_sub_sensor_lags_training
+
+        ts = pd.date_range("2024-01-01", periods=400, freq="1h")
+        energy = pd.DataFrame({"timestamp": ts, "gross_kwh": 1.0})
+        sub_df = pd.DataFrame({"timestamp": ts, "kwh": [0.0, 1.0] * 200})
+        out = _add_sub_sensor_lags_training(energy, {self.PREFIX: sub_df})
+        added = [c for c in out.columns if c not in energy.columns]
+        assert len(added) == 4
+        for col in added:
+            assert _shap_label(col) != col, f"{col} has no narrative label"
+
+    def test_narrative_uses_labels_and_keeps_numbers(self):
+        from energy_forecast.energy_forecast import _build_shap_narrative
+
+        feats = {f"{self.PREFIX}_lag_168h": 0.5, "hour": -0.25}
+        text = _build_shap_narrative(feats)
+        assert text == (
+            "Mainly driven by: last week's kermi electricity heating consumption (+0.50 kWh); hour of day (-0.25 kWh)."
+        )
+        assert "sub_" not in text
+        assert list(feats) == [f"{self.PREFIX}_lag_168h", "hour"]  # input keys stay raw
+
+
 # ── Relative MAE (#54) ───────────────────────────────────────────────────────────
 
 
