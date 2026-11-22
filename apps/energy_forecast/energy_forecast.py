@@ -18,6 +18,8 @@ EV charging handling:
 
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import logging
 import math
@@ -32,19 +34,23 @@ import hassapi as hass
 if TYPE_CHECKING:
     import pandas as pd
 
-from . import __version__, ha_data, weather
+from . import __version__, accuracy, capture, ha_data, heating_season, weather
 from .const import (
     CACHE_PATH,
+    CAPTURE_DIR,
     EV_CHARGING_THRESHOLD_KWH,
     GITHUB_RELEASES_URL,
     PRED_HISTORY_PATH,
     PRESENCE_STATE_HOME,
+    REGIME_LOG_PATH,
     UNIT_TO_KWH,
     drop_dst_duplicates,
+    resolve_feature_groups,
     resolve_timezone,
 )
 from .const import strip_tz as _strip_tz_util
 from .model import EnergyForecastModel
+from .physics import _VALID_OVERRIDE_KINDS, ThermalPhysicsModel
 
 # Placeholder replaced in initialize() with AppDaemon's per-app logger.
 # Using logging.getLogger() here would produce an "AppDaemon" category in HA logs
@@ -53,6 +59,8 @@ _LOGGER = logging.getLogger("energy_forecast")
 
 # ── Operational constants l ─────────────────────────────────────────────────────
 RETRAIN_INTERVAL_S = 168 * 3600  # weekly
+STARTUP_RETRAIN_MIN_GAP_HOURS = 6  # skip the unconditional startup retrain if one already
+# happened this recently (e.g. a crash-loop restart)
 MIN_HISTORY_HOURS = 48
 BLOCK_SLOTS = [f"{h:02d}_{h + 3:02d}" for h in range(0, 24, 3)]
 ATTRIBUTION = "HA Energy Forecast — LightGBM + MeteoSwiss/Open-Meteo"
@@ -136,6 +144,9 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
     "weighted_solar_gain": "passive solar heat gain",
     "dhw_buffer_temp": "hot water buffer temperature",
     "dhw_pressure": "DHW heat demand",
+    # Legacy: only present in models trained before the physics heating removal
+    "physics_kwh": "physics-model baseline forecast",
+    "heating_buffer_temp": "heating buffer tank temperature (sensor)",
     # Optional sensor features
     "outdoor_temp_live": "live outdoor temperature (sensor)",
     "temp_bias": "temperature sensor bias",
@@ -186,6 +197,123 @@ def _describe_temperature_mismatch(unit: str | None, state_class: str | None = N
     return None
 
 
+def _tracks_retrain(fn):
+    """Maintain self._retrain_running for the duration of a retrain (reset even on error)."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        self._retrain_running = True
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._retrain_running = False
+
+    return wrapper
+
+
+def _capture_retrain_inputs(app, train_kwargs: dict) -> str | None:
+    """Snapshot the exact train() inputs (flag-gated; never raises)."""
+    if not app._capture_inputs:
+        return None
+    try:
+        import pandas as pd
+
+        physics = train_kwargs.get("physics_model")
+        payload = {
+            "train_kwargs": {**train_kwargs, "physics_model": None},
+            "physics_model": copy.deepcopy(physics) if physics is not None else None,
+            "now_local": pd.Timestamp.now(tz=app._timezone).tz_localize(None),
+            "model_init": {"model_archive_count": app._model_archive_count, "timezone": app._timezone},
+            "args": {
+                k: v
+                for k, v in dict(app.args).items()
+                if not any(w in str(k).lower() for w in ("secret", "token", "password"))
+            },
+        }
+        meta = {
+            "last_trained_before": str(app._ml_model.last_trained) if app._ml_model.last_trained else None,
+            "physics": physics is not None,
+        }
+        capture_id = capture.write_capture(CAPTURE_DIR, "retrain", payload, meta, pd.Timestamp.now(tz="UTC"))
+        if capture_id is not None:
+            # train() has not run yet, so this is the exact state the retrain starts from (replay seed).
+            capture.attach_pre_state(CAPTURE_DIR, capture_id, app._ml_model._model_dir)
+        return capture_id
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain snapshot failed: %s", exc)
+        return None
+
+
+def _snapshot_predict_inputs(app, predict_kwargs: dict, now_local) -> dict | None:
+    """Deep-copy the raw predict inputs before the model touches them (flag-gated; never raises)."""
+    if not app._capture_inputs:
+        return None
+    try:
+        physics = app._physics_model
+        return {
+            "predict_kwargs": copy.deepcopy(predict_kwargs),
+            "physics_model": copy.deepcopy(physics) if physics is not None else None,
+            "now_local": now_local,
+            # Bookkeeping only: stripped in _write_predict_capture, never part of the pickled payload.
+            "_served_last_trained": str(app._ml_model.last_trained),
+            "_retrain_running_at_snapshot": bool(app._retrain_running),
+        }
+    except Exception as exc:
+        _LOGGER.warning("capture: predict snapshot failed: %s", exc)
+        return None
+
+
+def _write_predict_capture(
+    app,
+    snapshot: dict | None,
+    model_predictions,
+    published_predictions,
+    aggregated: dict,
+    *,
+    weather_source: str | None,
+    after_retrain: bool,
+) -> None:
+    """Persist the predict snapshot plus the model output and published vector (never raises)."""
+    if snapshot is None:
+        return
+    try:
+        import pandas as pd
+
+        snapshot = dict(snapshot)
+        served_last_trained = snapshot.pop("_served_last_trained", None)
+        running_at_snapshot = bool(snapshot.pop("_retrain_running_at_snapshot", False))
+        current_last_trained = str(app._ml_model.last_trained)
+        if served_last_trained is None:
+            served_last_trained = current_last_trained
+        payload = {
+            **snapshot,
+            "model_predictions": model_predictions,
+            "published_predictions": published_predictions.copy(),
+            "tomorrow_kwh": aggregated["tomorrow"],
+        }
+        meta = {
+            # The model that served model_predictions (a retrain may have completed since the snapshot).
+            "last_trained": served_last_trained,
+            "retrained_during_update": current_last_trained != served_last_trained,
+            "weather_source": weather_source,
+            "retrain_in_progress": (running_at_snapshot or bool(app._retrain_running)) and not after_retrain,
+            "after_retrain": after_retrain,
+            "physics": snapshot["physics_model"] is not None,
+        }
+        capture.write_capture(CAPTURE_DIR, "predict", payload, meta, pd.Timestamp.now(tz="UTC"))
+    except Exception as exc:
+        _LOGGER.warning("capture: predict snapshot failed: %s", exc)
+
+
+def _finish_retrain_capture(app, capture_id: str) -> None:
+    """Attach the freshly written model files and final train timestamp (never raises)."""
+    try:
+        capture.attach_reference(CAPTURE_DIR, capture_id, app._ml_model._model_dir)
+        capture.update_sidecar(CAPTURE_DIR, "retrain", capture_id, last_trained_after=str(app._ml_model.last_trained))
+    except Exception as exc:
+        _LOGGER.warning("capture: retrain reference failed: %s", exc)
+
+
 class EnergyForecast(hass.Hass):
     """AppDaemon app that forecasts household energy consumption."""
 
@@ -201,6 +329,7 @@ class EnergyForecast(hass.Hass):
         _hd._LOGGER = self.logger
         _mdl._LOGGER = self.logger
         _wth._LOGGER = self.logger
+        capture._LOGGER = self.logger
 
         _LOGGER.info("HA Energy Forecast initialising…")
 
@@ -216,6 +345,9 @@ class EnergyForecast(hass.Hass):
         self._ev_charger_kw: float = float(self.args.get("ev_charger_kw", 9.0))
         self._ev_charging_sensor: str | None = self.args.get("ev_charging_sensor") or None
         self._baseline_mode: bool = bool(self.args.get("baseline_mode", False))
+        # Feature groups left out of training (#120). An unknown group name raises, stopping startup.
+        self._drop_feature_groups: list[str] = list(self.args.get("drop_feature_groups") or [])
+        self._drop_features: tuple[str, ...] = resolve_feature_groups(self._drop_feature_groups)
         self._cache_path: Path = Path(self.args.get("cache_path", str(CACHE_PATH)))
         self._cache_path_15m: Path = self._cache_path.parent / "energy_history_15m.csv"
         _energy_unit: str = str(self.args.get("energy_unit", "kWh"))
@@ -284,6 +416,10 @@ class EnergyForecast(hass.Hass):
         # Daily GitHub-release update check (main-track users only; see _check_for_update_cb)
         self._update_check_enabled: bool = bool(self.args.get("update_check_enabled", True))
 
+        # Live input capture: record exact model inputs for offline replay (off by default)
+        self._capture_inputs: bool = bool(self.args.get("capture_inputs", False))
+        self._retrain_running: bool = False
+
         # Daily Regime Clustering (Stage 4)
         self._enable_regimes: bool = bool(self.args.get("enable_regimes", False))
         self._regime_count: int = int(self.args.get("regime_count", 5))
@@ -297,15 +433,82 @@ class EnergyForecast(hass.Hass):
         self._dhw_buffer_sensor: str | None = self.args.get("dhw_buffer_sensor") or None
         self._heating_active_entity: str | None = self.args.get("heating_system_active_entity") or None
         self._climate_room_areas: dict[str, float] = self._parse_room_areas(self.args.get("climate_room_areas") or {})
-        self._heating_temp_on: float = float(self.args.get("heating_temp_on", 14.0))
-        self._heating_temp_off: float = float(self.args.get("heating_temp_off", 18.0))
+        # Optional manual override of the learned DAILY-MEAN thresholds (heating_season.py).
+        # Both must be set; one alone is ignored so a stale single key can't pin half the rule.
+        _temp_on = self.args.get("heating_temp_on")
+        _temp_off = self.args.get("heating_temp_off")
+        if (_temp_on is None) != (_temp_off is None):
+            _LOGGER.warning(
+                "heating_temp_on/heating_temp_off must be set together (daily-mean °C) — ignoring %s, "
+                "thresholds will be learned from history",
+                "heating_temp_on" if _temp_on is not None else "heating_temp_off",
+            )
+            _temp_on = _temp_off = None
+        self._heating_temp_on_cfg: float | None = float(_temp_on) if _temp_on is not None else None
+        self._heating_temp_off_cfg: float | None = float(_temp_off) if _temp_off is not None else None
+        self._heating_thresholds_path = Path(__file__).parent / "models" / "heating_thresholds.json"
+        self._heating_thresholds = heating_season.resolve_thresholds(
+            self._heating_temp_on_cfg,
+            self._heating_temp_off_cfg,
+            heating_season.load_thresholds(self._heating_thresholds_path) or heating_season.default_thresholds(),
+        )
         self._heating_setpoint_on: float = float(self.args.get("heating_setpoint_on", 20.0))
         self._heating_setpoint_off: float = float(self.args.get("heating_setpoint_off", 12.0))
+
+        # ── Physics model config (physics-ml-hybrid) ──────────────────────────
+        physics_raw = self.args.get("physics") or {}
+        if not isinstance(physics_raw, dict):
+            _LOGGER.warning("physics: config block must be a dict — ignoring")
+            physics_raw = {}
+
+        default_physics_config = {
+            "dhw_tank_temp_sensor": None,
+            "heating_buffer_temp_sensor": None,
+            "heating_sub_meter_sensor": None,  # entity_id of the space-heating-only kWh sub-meter (#92)
+            "cop_formula": {"a": 2.5, "b": 0.07},
+            "dhw_tank_volume_l": 200,
+            "dhw_power_w": 4000,
+            "heating_curve_points": [[-20, 55.5], [-5, 46.0], [5, 39.5], [20, 25.0]],
+            "room_thermostats": [],
+        }
+        self._physics_config: dict = {**default_physics_config, **physics_raw}
+
+        room_therm_raw = self._physics_config.get("room_thermostats") or []
+        self._room_thermostats: list[dict] = []
+        for item in room_therm_raw:
+            if not isinstance(item, dict) or "climate_entity" not in item or "temp_sensor" not in item:
+                _LOGGER.warning(
+                    f"room_thermostats: skipping invalid entry {item!r} — needs climate_entity and temp_sensor"
+                )
+                continue
+            self._room_thermostats.append(
+                {
+                    "climate_entity": str(item["climate_entity"]),
+                    "temp_sensor": str(item["temp_sensor"]),
+                    "area_m2": float(item.get("area_m2", 20.0)),
+                }
+            )
+        self._physics_config["room_thermostats"] = self._room_thermostats
+
+        physics_enabled = "physics" in self.args  # any physics: block present, even empty dict, enables the model
+        self._physics_model: ThermalPhysicsModel | None = None
+        if physics_enabled:
+            physics_model_dir = Path(__file__).parent / "models"
+            self._physics_model = ThermalPhysicsModel(physics_model_dir, self._physics_config)
+
+        # Populated by _fetch_physics_sensor_histories() (once per training cycle). Initialized
+        # here too so _update_sensors() can safely read them if it
+        # ever fires before the first _retrain() completes.
+        self._physics_heating_buffer_df: Any = None
+        self._physics_dhw_tank_df: Any = None
+        self._physics_climate_dfs: dict[str, Any] = {}
 
         # Prediction history for adaptive retrain: {target_timestamp: predicted_kwh}.
         # Keep-first semantics so we track h≈24+ ahead predictions, not h=1.
         self._pred_history: dict[Any, float] = {}
         self._actuals_history: dict[Any, float] = {}  # key: pd.Timestamp (floored 1h), rolling 30d actuals
+        self._actuals_on_target_basis: bool = True  # False until legacy gross actuals are migrated (#117)
+        self._actuals_migration_warned: frozenset = frozenset()  # dedupe: missing-prefix set already warned about
         self._last_adaptive_retrain: datetime = datetime.min
 
         # Dedup key set for excluded_ranges.csv WARNING escalation (ROADMAP #95) —
@@ -320,8 +523,20 @@ class EnergyForecast(hass.Hass):
         self._cached_sub_sensors: Any = None
         self._cached_away_series: Any = None
         self._cached_people_home: Any = None
+        self._cached_heating_active_series: Any = None
+        self._cached_heating_setpoints: tuple[float | None, float | None] = (None, None)
         self._cached_climate_recent: Any = None
         self._cached_dhw_recent: Any = None
+
+        # Physics recalibrate_physics service: the fully-processed energy/weather data from the
+        # most recent training cycle, cached so an operator-triggered recalibration doesn't need
+        # to refetch history. None until the first _retrain() completes.
+        self._cached_energy_df: Any = None
+        self._cached_weather_df: Any = None
+        self._cached_heating_active_df: Any = None  # (#92) cached alongside energy/weather for recalibrate_physics
+        self._cached_ev_df: Any = None
+        self._cached_away_df: Any = None
+        self._cached_heating_sub_meter_df: Any = None
 
         # MQTT Discovery (opt-in)
         self._mqtt_discovery: bool = bool(self.args.get("mqtt_discovery", False))
@@ -336,21 +551,26 @@ class EnergyForecast(hass.Hass):
         if self._mqtt_discovery:
             self._cleanup_legacy_states()  # remove ghost set_state entities
             self._mqtt_publish_all_discovery()
+            self._retire_physics_sensors()
             self._mqtt_publish_availability("online")
 
         model_dir = Path(__file__).parent / "models"
         self._ml_model = EnergyForecastModel(
             model_dir, model_archive_count=self._model_archive_count, timezone=self._timezone
         )
+        self._seed_adaptive_cooldown()
         self._lock = threading.Lock()
 
         self.listen_event(self._retrain_cb, "RELOAD_ENERGY_MODEL")
         self.listen_event(self._rollback_model_cb, "energy_forecast_rollback_model")
         self.register_service("energy_forecast/get_scenario", self._get_scenario_cb)
+        if self._physics_model is not None:
+            self.register_service("energy_forecast/recalibrate_physics", self._recalibrate_physics_cb)
+            self.register_service("energy_forecast/set_dhw_schedule", self._set_dhw_schedule_cb)
 
         self._check_setup()
         self._publish_unavailable()
-        self.run_in(self._retrain_cb, 10)
+        self.run_in(self._maybe_startup_retrain, 10)
         self.run_every(self._retrain_cb, f"now+{RETRAIN_INTERVAL_S + 10}", RETRAIN_INTERVAL_S)
         self.run_in(self._update_cb, 130)
         self.run_hourly(self._update_cb, time(0, 1, 0))
@@ -409,7 +629,7 @@ class EnergyForecast(hass.Hass):
         _LOGGER.info(
             "Config validated — lat=%s, lon=%s, plz=%s, timezone=%s, "
             "holiday_country=%s, weight_halflife=%sd, baseline_mode=%s, "
-            "ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
+            "drop_feature_groups=%s, ev_threshold=%s kWh/h, ev_charger=%s kW, sub_energy_sensors=%s, "
             "anomaly_sigma_threshold=%s, shap_top_n=%s, mqtt_discovery=%s",
             self._lat,
             self._lon,
@@ -418,6 +638,7 @@ class EnergyForecast(hass.Hass):
             self._holiday_country,
             self._weight_halflife,
             self._baseline_mode,
+            self._drop_feature_groups,
             self._ev_threshold,
             self._ev_charger_kw,
             len(self._sub_energy_sensors),
@@ -451,16 +672,19 @@ class EnergyForecast(hass.Hass):
         if self._battery_discharge_sensor:
             energy_roles.append((self._battery_discharge_sensor, "battery_discharge_sensor"))
 
-        # NOTE: physics.dhw_tank_temp_sensor, physics.heating_buffer_temp_sensor, and
-        # room_thermostats[].temp_sensor are intentionally not registered here — those
-        # config keys don't exist on this branch (they belong to the unmerged
-        # feat/physics-core-engine branch's physics config ingest). Add them here,
-        # following the exact pattern below, once that branch merges.
         temperature_roles: list[tuple[str, str]] = []
         if self._outdoor_sensor:
             temperature_roles.append((self._outdoor_sensor, "outdoor_temp_sensor"))
         if self._dhw_buffer_sensor:
             temperature_roles.append((self._dhw_buffer_sensor, "dhw_buffer_sensor"))
+        if self._physics_config.get("dhw_tank_temp_sensor"):
+            temperature_roles.append((self._physics_config["dhw_tank_temp_sensor"], "physics.dhw_tank_temp_sensor"))
+        if self._physics_config.get("heating_buffer_temp_sensor"):
+            temperature_roles.append(
+                (self._physics_config["heating_buffer_temp_sensor"], "physics.heating_buffer_temp_sensor")
+            )
+        for rt in self._room_thermostats:
+            temperature_roles.append((rt["temp_sensor"], "room_thermostats[].temp_sensor"))
 
         for entity_id, role in energy_roles:
             EnergyForecast._warn_on_sensor_mismatch(self, entity_id, role, _describe_energy_mismatch)
@@ -700,6 +924,24 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("MQTT discovery publish failed for %s: %s", unique_id, exc)
 
+    def _retire_physics_sensors(self) -> None:
+        """Clear retained discovery configs of the retired physics diagnostic sensors.
+
+        An empty retained payload on a discovery config topic makes HA remove the entity.
+        Failures are logged, never raised.
+        """
+        for unique_id in ("energy_forecast_physics_base_today", "energy_forecast_ml_adjustment_today"):
+            try:
+                self.call_service(
+                    "mqtt/publish",
+                    topic=f"{self._mqtt_discovery_prefix}/sensor/{unique_id}/config",
+                    payload="",
+                    retain=True,
+                    namespace=self._mqtt_namespace,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("MQTT retire publish failed for %s: %s", unique_id, exc)
+
     def _mqtt_set_sensor(self, unique_id: str, value: Any) -> None:
         """Publish a numeric sensor state (NaN/Inf → 0.0) to the MQTT state topic."""
         try:
@@ -835,6 +1077,21 @@ class EnergyForecast(hass.Hass):
             ("energy_forecast_relative_mae_30d", "Energy Forecast Relative MAE 30d"),
         ]:
             self._mqtt_publish_discovery(uid, name, "%", "mdi:percent", None, "measurement")
+        # Block / daily accuracy sensors (#114)
+        for _w in ("7d", "30d"):
+            for uid, name, icon in [
+                (f"energy_forecast_block_mae_{_w}", f"Energy Forecast Block MAE {_w}", "mdi:chart-timeline-variant"),
+                (f"energy_forecast_daily_bias_{_w}", f"Energy Forecast Daily Bias {_w}", "mdi:scale-unbalanced"),
+            ]:
+                self._mqtt_publish_discovery(
+                    uid,
+                    name,
+                    "kWh",
+                    icon,
+                    None,
+                    "measurement",
+                    json_attributes_topic=f"{self._mqtt_discovery_prefix}/energy_forecast/sensor/{uid}/attributes",
+                )
         # Anomaly detection sensor (#39)
         _anomaly_attrs_topic = (
             f"{self._mqtt_discovery_prefix}/energy_forecast"
@@ -877,7 +1134,7 @@ class EnergyForecast(hass.Hass):
         try:
             self._retrain()
             if self._ml_model.model is not None:
-                self._update_sensors()
+                self._update_sensors(after_retrain=True)
         except Exception as exc:  # noqa: BLE001
             import traceback
 
@@ -899,12 +1156,71 @@ class EnergyForecast(hass.Hass):
         finally:
             self._lock.release()
 
+    def _last_trained_local(self) -> datetime:
+        """self._ml_model.last_trained as naive wall-clock time in the app's time zone.
+
+        last_trained is stamped by datetime.now() in model.py's train(), i.e. the container's
+        system-local time (local time in the HA add-on, UTC in a plain Docker container). This
+        converts it to self._timezone so it is comparable with
+        pd.Timestamp.now(self._timezone).tz_localize(None), which every retrain-cadence gate uses.
+        The old code assumed the stamp was UTC, which made the age read 1-2h short on HA (#116).
+        """
+        import pandas as pd
+
+        last_trained = self._ml_model.last_trained
+        if last_trained == datetime.min:
+            return last_trained
+        # astimezone() with no argument attaches the system zone to a naive datetime.
+        # Go through a plain datetime: pd.Timestamp.astimezone() requires an argument.
+        ts = pd.Timestamp(last_trained)
+        aware = ts.to_pydatetime().astimezone() if ts.tzinfo is None else ts
+        return pd.Timestamp(aware).tz_convert(self._timezone).tz_localize(None)
+
+    def _seed_adaptive_cooldown(self) -> None:
+        """Seed the adaptive-retrain cooldown from the persisted last-trained timestamp.
+
+        Without this, self._last_adaptive_retrain starts at datetime.min on every AppDaemon
+        restart, immediately re-arming the 24h adaptive-retrain cooldown. Re-synced at the end of
+        every _retrain() too (not just here at startup) — otherwise this seed is a one-shot and
+        _last_adaptive_retrain silently drifts apart from last_trained again after the very next
+        retrain, which would only mask the bug for a single restart cycle.
+        """
+        self._last_adaptive_retrain = self._last_trained_local()
+
+    def _maybe_startup_retrain(self, event_name=None, data=None, kwargs=None) -> None:
+        """Startup retrain (run_in(..., 10)), skipped if a retrain already completed recently.
+
+        Closes the other half of defect (A): previously *every* restart forced a full retrain
+        regardless of how recently one had already happened, so a crash-loop or repeated manual
+        restart could touch τ far more often than the intended weekly cadence. A restart shortly
+        after a genuine code deploy will run on the previous model until the next
+        scheduled/adaptive retrain — an acceptable trade-off given the model changes slowly
+        week to week, and RELOAD_ENERGY_MODEL remains available for an explicit forced reload.
+        """
+        import pandas as pd
+
+        last_local = self._last_trained_local()
+        if last_local != datetime.min:
+            hours_since = (pd.Timestamp.now(self._timezone).tz_localize(None) - last_local).total_seconds() / 3600
+            if hours_since < STARTUP_RETRAIN_MIN_GAP_HOURS:
+                _LOGGER.info(
+                    "Startup retrain skipped — last retrain was %.1fh ago (< %dh gap); the "
+                    "weekly/adaptive schedule will pick up the next real update.",
+                    hours_since,
+                    STARTUP_RETRAIN_MIN_GAP_HOURS,
+                )
+                return
+        self._retrain_cb(event_name, data, kwargs)
+
     def _get_scenario_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
         """AppDaemon service callback: energy_forecast/get_scenario.
 
         Accepts kwargs:
-          schedule (dict[str, str]): {prefix: "HH:MM" | "off" | None}
+          schedule (dict): {prefix: "HH:MM" | "off" | None | {"start": "HH:MM", "program": str}}
+          dhw_schedule (dict | None): accepted for call-shape compatibility; ignored
+              (there is no physics scenario delta any more).
           publish  (bool):           if True, publish scenario sensors to HA
+
         Fires event "energy_forecast_scenario_result" with the forecast payload.
         """
         try:
@@ -928,12 +1244,22 @@ class EnergyForecast(hass.Hass):
                     continue
                 if val is not None and val != "off":
                     try:
-                        datetime.strptime(str(val), "%H:%M")
+                        if isinstance(val, dict):
+                            # {"start": "HH:MM", "program": str} — program optional
+                            datetime.strptime(str(val.get("start")), "%H:%M")
+                            if "program" in val and not isinstance(val["program"], str):
+                                raise ValueError("program must be a str")
+                        else:
+                            datetime.strptime(str(val), "%H:%M")
                     except ValueError:
                         _LOGGER.warning("get_scenario: invalid time '%s' for prefix '%s' — ignored", val, key)
                         continue
                 cleaned[key] = val
             schedule = cleaned
+
+            dhw_schedule = kwargs.get("dhw_schedule")
+            if dhw_schedule is not None:
+                _LOGGER.debug("get_scenario: dhw_schedule ignored (no physics scenario delta)")
 
             result_df = self._ml_model.predict_scenario(
                 self._cached_forecast_df,
@@ -946,6 +1272,10 @@ class EnergyForecast(hass.Hass):
                 climate_recent=self._cached_climate_recent,
                 dhw_recent=self._cached_dhw_recent,
                 room_areas=self._climate_room_areas or None,
+                heating_active_series=self._cached_heating_active_series,
+                setpoint_on=self._cached_heating_setpoints[0],
+                setpoint_off=self._cached_heating_setpoints[1],
+                heating_buffer_temp_recent=self._physics_heating_buffer_df,
             )
 
             if kwargs.get("publish", False):
@@ -954,6 +1284,7 @@ class EnergyForecast(hass.Hass):
             self.fire_event(
                 "energy_forecast_scenario_result",
                 forecast=result_df.to_dict("records"),
+                request_id=kwargs.get("request_id"),
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("get_scenario failed: %s", exc)
@@ -1094,8 +1425,183 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("Sensor update failed: %s", exc, exc_info=True)
 
+    # ── Physics sensor history fetch (physics-ml-hybrid) ─────────────────────
+
+    def _fetch_physics_sensor_histories(
+        self, recent_only: bool = False, climate_dfs: dict[str, Any] | None = None, dhw_df: Any = None
+    ) -> None:
+        """Fetch (or, hourly, lightly refresh) the additional sensor histories the
+        physics model needs.
+
+        `recent_only=False` (the default, called once per cycle from `_retrain()`)
+        does a full 30-day fetch and resets every attribute first — this is the
+        authoritative refresh after a training cycle; a no-op when
+        `self._physics_model` is None, so absent `physics:` config behaves
+        identically to v0.11.7.
+
+        `recent_only=True` is called every hourly `_update_sensors()` cycle, mirroring
+        the existing `dhw_buffer_sensor`/`climate_entities` hourly-refresh pattern.
+        Without it, these attributes are populated only inside a training cycle
+        (weekly, or gated behind adaptive-retrain's 24h cooldown + MAE threshold);
+        an AppDaemon restart resets them all to None/empty in initialize(), and they
+        stay that way until the next retrain completes — which can be up to a week
+        away. Every hourly predict cycle during that gap hits the model-artifact
+        portability fallback and silently fills the corresponding feature with a
+        constant 0.0, drifting the model off the feature distribution it was trained
+        on. A failed or empty recent fetch never regresses an already-good value —
+        it just leaves the attribute unchanged for this cycle.
+
+        `climate_dfs`: the caller's already-fetched climate data for this cycle
+        (`_retrain()`'s `climate_dfs` local, or `_update_sensors()`'s
+        `climate_recent`). When a room_thermostats[].climate_entity is a key in
+        this dict, reuse it instead of a second independent HA history fetch +
+        on-disk cache file (#89). Omit (or pass a dict missing the entity) to
+        fall back to the original independent-fetch behavior — used by
+        `_recalibrate_physics_cb`'s on-demand service call, which has no such
+        already-fetched data available.
+
+        `dhw_df`: the caller's already-fetched DHW DataFrame (`_retrain()`'s `dhw_df`
+        local, or `_update_sensors()`'s `dhw_recent`). When `physics.dhw_tank_temp_sensor`
+        equals `self._dhw_buffer_sensor` (the same entity), reuse it instead of a second
+        independent HA history fetch + on-disk cache file (#89). Falls back to independent
+        fetch otherwise, or when omitted (e.g. `_recalibrate_physics_cb`'s on-demand call).
+        """
+        if not recent_only:
+            self._physics_dhw_tank_df: Any = None
+            self._physics_heating_buffer_df: Any = None
+            self._physics_climate_dfs: dict[str, Any] = {}
+
+        if self._physics_model is None:
+            return
+
+        cfg = self._physics_config
+        generic_fetch = ha_data.fetch_recent_generic_sensor if recent_only else ha_data.fetch_generic_sensor_history
+        climate_fetch = ha_data.fetch_recent_climate if recent_only else ha_data.fetch_climate_history
+        verb = "recent" if recent_only else "history"
+
+        def _keep_or_replace(current: Any, df: Any) -> Any:
+            if df.empty:
+                return current if recent_only else df
+            return _strip_tz(df, self._timezone)
+
+        if cfg.get("dhw_tank_temp_sensor"):
+            entity_id = cfg["dhw_tank_temp_sensor"]
+            if dhw_df is not None and entity_id == self._dhw_buffer_sensor:
+                try:
+                    self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, dhw_df)
+                # Broader except than the fetch path below: reused data is arbitrary
+                # caller-supplied input (could be None/malformed), not a guaranteed DataFrame.
+                except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
+                    _LOGGER.warning("Physics DHW tank %s reuse failed: %s", entity_id, exc)
+            else:
+                path = self._generic_sensor_cache_path(entity_id, prefix="physics_dhw_tank")
+                try:
+                    df = generic_fetch(self, entity_id, path, column_name="buffer_temp", timezone=self._timezone)
+                    self._physics_dhw_tank_df = _keep_or_replace(self._physics_dhw_tank_df, df)
+                except (OSError, KeyError, ValueError) as exc:
+                    _LOGGER.warning("Physics DHW tank %s %s fetch failed: %s", entity_id, verb, exc)
+
+        if cfg.get("heating_buffer_temp_sensor"):
+            entity_id = cfg["heating_buffer_temp_sensor"]
+            path = self._generic_sensor_cache_path(entity_id, prefix="physics_heating_buffer")
+            try:
+                df = generic_fetch(self, entity_id, path, column_name="heating_buffer_temp", timezone=self._timezone)
+                self._physics_heating_buffer_df = _keep_or_replace(self._physics_heating_buffer_df, df)
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics heating buffer %s %s fetch failed: %s", entity_id, verb, exc)
+
+        for rt in self._room_thermostats:
+            climate_entity = rt["climate_entity"]
+            if climate_dfs is not None and climate_entity in climate_dfs:
+                try:
+                    self._physics_climate_dfs[climate_entity] = _keep_or_replace(
+                        self._physics_climate_dfs.get(climate_entity), climate_dfs[climate_entity]
+                    )
+                # Broader except than the fetch path below: reused data is arbitrary
+                # caller-supplied input (could be None/malformed), not a guaranteed DataFrame.
+                except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
+                    _LOGGER.warning("Physics room climate %s reuse failed: %s", climate_entity, exc)
+                continue
+            climate_path = self._climate_cache_path(climate_entity)
+            try:
+                climate_df = climate_fetch(self, climate_entity, climate_path, timezone=self._timezone)
+                self._physics_climate_dfs[climate_entity] = _keep_or_replace(
+                    self._physics_climate_dfs.get(climate_entity), climate_df
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                _LOGGER.warning("Physics room climate %s %s fetch failed: %s", climate_entity, verb, exc)
+
+    def _recalibrate_physics_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/recalibrate_physics`: manually trigger a physics
+        recalibration on demand, using the energy/weather data cached by the most recent
+        training cycle (see `_retrain()`)."""
+        import pandas as pd
+
+        if self._physics_model is None:
+            _LOGGER.warning("recalibrate_physics called but physics is not configured — ignoring")
+            return
+        if self._cached_energy_df is None or self._cached_weather_df is None:
+            _LOGGER.warning(
+                "recalibrate_physics called before the first training cycle has completed — "
+                "no cached energy/weather data available yet. Ignoring."
+            )
+            return
+        try:
+            self._fetch_physics_sensor_histories()
+            energy_df = self._cached_energy_df
+            weather_df = self._cached_weather_df
+            holdout_cutoff = energy_df["timestamp"].max() - pd.Timedelta(days=max(int(len(energy_df) / 24 * 0.1), 1))
+            self._physics_model.calibrate(
+                energy_df,
+                weather_df,
+                dhw_df=self._physics_dhw_tank_df,
+                holdout_cutoff=holdout_cutoff,
+                heating_active_df=self._cached_heating_active_df,
+                ev_df=self._cached_ev_df,
+                away_df=self._cached_away_df,
+            )
+            _LOGGER.info("Physics recalibration complete")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"recalibrate_physics failed: {exc}")
+
+    def _set_dhw_schedule_cb(self, namespace: str, domain: str, service: str, kwargs: dict) -> None:
+        """AppDaemon service `energy_forecast/set_dhw_schedule`: commit a DHW schedule override
+        to the physics model. Keeps _cached_forecast_df (raw weather, schedule-independent) so
+        get_scenario keeps answering between cycles; the override is read at prediction time and
+        the next hourly cycle publishes the new schedule."""
+        if self._physics_model is None:
+            _LOGGER.warning("set_dhw_schedule called but physics is not configured — ignoring")
+            return
+        # `clear` carries kind names to cancel. EM cannot send `{kind: None}` in dhw_schedule: AppDaemon's
+        # call_service strips None values (hassapi.py remove_literals), so hef would receive `{}`.
+        clear = kwargs.get("clear")
+        dhw_schedule = kwargs.get("dhw_schedule")
+        clear_kinds: list[str] = []
+        if clear is not None:
+            if isinstance(clear, list):
+                clear_kinds = [k for k in clear if k in _VALID_OVERRIDE_KINDS]
+                if len(clear_kinds) != len(clear):
+                    _LOGGER.warning(f"set_dhw_schedule: ignoring unknown clear kinds in {clear!r}")
+            else:
+                _LOGGER.warning("set_dhw_schedule: clear must be a list of kinds — ignoring")
+        if dhw_schedule is None and clear is not None:
+            pass  # a clear-only call is valid (an invalid or empty `clear` was already handled above)
+        elif not isinstance(dhw_schedule, dict):
+            _LOGGER.warning("set_dhw_schedule: dhw_schedule must be a dict — ignoring")
+            return
+        try:
+            if clear_kinds:
+                self._physics_model.commit_dhw_schedule({k: None for k in clear_kinds})
+                _LOGGER.info(f"DHW schedule cleared: {clear_kinds}")
+            if dhw_schedule is not None:
+                self._physics_model.commit_dhw_schedule(dhw_schedule)
+                _LOGGER.info(f"DHW schedule committed: {dhw_schedule}")
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error(f"set_dhw_schedule failed: {exc}")
+
     # ── Core logic ────────────────────────────────────────────────────────────
 
+    @_tracks_retrain
     def _retrain(self) -> None:
         import pandas as pd
 
@@ -1355,9 +1861,75 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s fetch failed: %s", self._heating_active_entity, exc)
 
-        self._ml_model.train(
-            baseline_df,
-            weather_df,
+        # Physics recalibrate_physics service: cache the fully-processed training data (post
+        # EV-subtraction/target-correction for baseline_df, post-stitch for weather_df) so an
+        # on-demand recalibration doesn't need to refetch history.
+        self._cached_energy_df = baseline_df
+        self._cached_weather_df = weather_df
+        # (#92) Cache the additional calibrate() inputs so an on-demand
+        # recalibrate_physics call doesn't need to re-derive ev_df (which needs the
+        # full EV-detection pipeline) or re-fetch heating_active/away history
+        # independently — same rationale as the two lines above. The sub-meter cache
+        # now serves only `heating_season` (calibrate() no longer takes the sub-meter).
+        self._cached_heating_active_df = heating_active_df if not heating_active_df.empty else None
+        self._cached_away_df = away_df if not away_df.empty else None
+        self._cached_ev_df = ev_df
+        heating_sub_meter_entity = self._physics_config.get("heating_sub_meter_sensor")
+        self._cached_heating_sub_meter_df = (
+            sub_sensors_dict.get(self._sub_sensor_prefix(heating_sub_meter_entity))
+            if heating_sub_meter_entity
+            else None
+        )
+        if heating_sub_meter_entity and self._cached_heating_sub_meter_df is None:
+            # physics.heating_sub_meter_sensor and sub_energy_sensors are two independent
+            # config lists with no cross-check -- if the entity isn't also listed under
+            # sub_energy_sensors, sub_sensors_dict.get() above silently returns None and
+            # the heating-season meter label never fires (falls back to the switch / none, no diagnostic).
+            _LOGGER.warning(
+                "physics.heating_sub_meter_sensor=%s configured but not found in sub_energy_sensors "
+                "— the heating-season meter label will never fire; add it to sub_energy_sensors too",
+                heating_sub_meter_entity,
+            )
+
+        # ── Heating season: daily label (meter > switch > none) + learned daily-mean thresholds ──
+        # The label also becomes the heating_active training feature when it comes from the meter,
+        # so training and the daily-rule projection in _build_heating_active_projection agree.
+        heating_label, heating_label_source = heating_season.daily_heating_label(
+            self._cached_heating_sub_meter_df,
+            heating_active_df if not heating_active_df.empty else None,
+        )
+        learned_thresholds = heating_season.learn_thresholds(
+            heating_label, heating_season.daily_mean_temp(weather_df), heating_label_source
+        )
+        self._heating_thresholds = heating_season.resolve_thresholds(
+            self._heating_temp_on_cfg, self._heating_temp_off_cfg, learned_thresholds
+        )
+        heating_season.save_thresholds(self._heating_thresholds, self._heating_thresholds_path)
+        _LOGGER.info(
+            "Heating season: on < %.1f °C, off > %.1f °C daily mean (%s, label=%s, %d days, mismatch=%s)",
+            self._heating_thresholds.on_below,
+            self._heating_thresholds.off_above,
+            self._heating_thresholds.source,
+            self._heating_thresholds.label_source,
+            self._heating_thresholds.n_days,
+            self._heating_thresholds.mismatch_rate,
+        )
+        heating_feature_df = (
+            heating_season.heating_feature_df(
+                heating_label,
+                heating_active_df if not heating_active_df.empty else None,
+                until=pd.Timestamp.now(tz=self._timezone).tz_localize(None),
+            )
+            if heating_label_source == "meter"
+            else None
+        )
+
+        # ── Physics: fetch DHW tank / heating buffer / COP / room-thermostat histories ──
+        self._fetch_physics_sensor_histories(climate_dfs=climate_dfs, dhw_df=dhw_df)
+
+        train_kwargs = dict(
+            energy_df=baseline_df,
+            weather_df=weather_df,
             outdoor_df=None,
             weight_halflife_days=self._weight_halflife,
             canton=self._holiday_canton,
@@ -1373,8 +1945,17 @@ class EnergyForecast(hass.Hass):
             room_areas=self._climate_room_areas or None,
             enable_regimes=self._enable_regimes,
             regime_count=self._regime_count,
+            physics_model=self._physics_model,
+            heating_buffer_temp_df=self._physics_heating_buffer_df,
+            heating_feature_df=heating_feature_df,
+            drop_features=self._drop_features,
         )
+        capture_id = _capture_retrain_inputs(self, train_kwargs)
+        self._ml_model.train(**train_kwargs)
+        if capture_id is not None:
+            _finish_retrain_capture(self, capture_id)
         _LOGGER.info("Retrained. MAE: %s", self._ml_model.last_mae)
+        self._last_adaptive_retrain = self._last_trained_local()
 
         try:
             ha_data.fetch_energy_history_15m(
@@ -1387,7 +1968,7 @@ class EnergyForecast(hass.Hass):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("15m cache update failed (non-fatal): %s", exc)
 
-    def _update_sensors(self) -> None:
+    def _update_sensors(self, *, after_retrain: bool = False) -> None:
         import numpy as np
         import pandas as pd
 
@@ -1400,6 +1981,8 @@ class EnergyForecast(hass.Hass):
             self.args.get("srg_client_secret"),
             timezone=self._timezone,
         )
+        # Read before _strip_tz/drop_dst_duplicates, which may drop DataFrame.attrs.
+        _weather_source = forecast_df.attrs.get("weather_source")
         forecast_df = drop_dst_duplicates(_strip_tz(forecast_df, self._timezone))
 
         # ── Fetch recent actuals ──────────────────────────────────────────────
@@ -1474,13 +2057,8 @@ class EnergyForecast(hass.Hass):
             full_actuals = None
             ev_detected = None
 
-        ev_hour_set: set = set()
-        if ev_detected is not None and not ev_detected.empty:
-            ev_hour_set = set(pd.to_datetime(ev_detected["timestamp"]).dt.floor("1h"))
-        # Hours immediately before/after EV charging are also contaminated (ramp-up/down).
-        # Excluded from _actuals_history so 7d/30d MAE sensors stay clean.
-        _ev_adjacent: set = {ts + pd.Timedelta(hours=d) for ts in ev_hour_set for d in (-1, 1)}
-        ev_mae_excluded: set = ev_hour_set | _ev_adjacent
+        ev_mae_excluded: set = _ev_mae_excluded_hours(ev_detected)
+        ev_sensor_kwh: dict = _ev_sensor_kwh_by_hour(ev_detected)
 
         sub_sensors_recent: dict = {}
         for entity_id in self._sub_energy_sensors:
@@ -1545,14 +2123,18 @@ class EnergyForecast(hass.Hass):
             except (OSError, KeyError, ValueError) as exc:
                 _LOGGER.warning("Heating active %s recent fetch failed: %s", self._heating_active_entity, exc)
 
+        # ── Physics: keep DHW tank / heating buffer / COP / room-thermostat data
+        # fresh every hourly cycle, independent of the weekly/adaptive retrain ──
+        self._fetch_physics_sensor_histories(recent_only=True, climate_dfs=climate_recent, dhw_df=dhw_recent)
+
         # ── Heating active projection (setpoint hysteresis) ──────────────────
         heating_active_series = None
         heating_setpoint_on = None
         heating_setpoint_off = None
-        if self._heating_active_entity and climate_recent:
+        if self._heating_active_entity or self._heating_thresholds.label_source == "meter":
             try:
                 heating_active_series, heating_setpoint_on, heating_setpoint_off = (
-                    self._build_heating_active_projection(forecast_df, climate_recent)
+                    self._build_heating_active_projection(forecast_df, climate_recent, sub_sensors_recent)
                 )
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Heating active projection failed: %s", exc)
@@ -1582,40 +2164,87 @@ class EnergyForecast(hass.Hass):
         self._cached_people_home = people_home_series
         self._cached_climate_recent = climate_recent or None
         self._cached_dhw_recent = dhw_recent if not dhw_recent.empty else None
+        self._cached_heating_active_series = heating_active_series
+        self._cached_heating_setpoints = (heating_setpoint_on, heating_setpoint_off)
 
         # Build the 48h feature matrix once; predict/predict_intervals/shap_summary
         # all receive the pre-computed result to avoid triple feature engineering.
+        predict_kwargs = {
+            "forecast_df": forecast_df,
+            "live_temp": live_temp,
+            "recent_actuals": recent_actuals,
+            "sub_sensors_recent": sub_sensors_recent or None,
+            "away_series": away_series,
+            "people_home_series": people_home_series,
+            "climate_recent": climate_recent or None,
+            "dhw_recent": dhw_recent if not dhw_recent.empty else None,
+            "room_areas": self._climate_room_areas or None,
+            "heating_active_series": heating_active_series,
+            "setpoint_on": heating_setpoint_on,
+            "setpoint_off": heating_setpoint_off,
+            "heating_buffer_temp_recent": self._physics_heating_buffer_df,
+        }
+        _capture_snapshot = _snapshot_predict_inputs(self, predict_kwargs, now_ts)
         _prepared = self._ml_model._prepare_prediction_X(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent=sub_sensors_recent or None,
-            away_series=away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent or None,
-            dhw_recent=dhw_recent if not dhw_recent.empty else None,
-            room_areas=self._climate_room_areas or None,
-            heating_active_series=heating_active_series,
-            setpoint_on=heating_setpoint_on,
-            setpoint_off=heating_setpoint_off,
+            **predict_kwargs,
         )
+        _regime_info = dict(getattr(self._ml_model, "_last_regime_info", None) or {})
 
         predictions = self._ml_model.predict(
-            forecast_df,
-            live_temp,
-            recent_actuals,
-            sub_sensors_recent=sub_sensors_recent or None,
-            away_series=away_series,
-            people_home_series=people_home_series,
-            climate_recent=climate_recent or None,
-            dhw_recent=dhw_recent if not dhw_recent.empty else None,
-            room_areas=self._climate_room_areas or None,
-            heating_active_series=heating_active_series,
-            setpoint_on=heating_setpoint_on,
-            setpoint_off=heating_setpoint_off,
+            **predict_kwargs,
             _prepared=_prepared,
         )
+        _model_predictions = predictions.copy() if _capture_snapshot is not None else None
         predictions["timestamp"] = pd.to_datetime(predictions["timestamp"]).dt.tz_localize(None)
+
+        # ── Goal 1: deterministic post-model DHW override correction ──────────
+        # Added unconditionally to the model's already-final output — never fed
+        # back into the trained model, so double-counting is
+        # structurally impossible (spec's Design section). Direct fix for the
+        # 2026-08-04 live bug: a committed override must move the published
+        # forecast by its true expected kWh amount, independent of whatever
+        # weight the trained model happens to give the override features.
+        # _override_delta stays None when there's no physics model or no forecast row
+        # at or after the first predicted hour.
+        _override_delta = None
+        if self._physics_model is not None:
+            # forecast_df carries a past tail (fetch_open_meteo past_days=3). Simulating over it
+            # seeds the tank from days ago and lets a finished override, which committed_override
+            # keeps, shift future reheats by ±1 kWh. The correction only applies to overrides still
+            # ahead: once an override's hour has passed, its modelled tail is deliberately dropped.
+            _serving_df = forecast_df[pd.to_datetime(forecast_df["timestamp"]) >= predictions["timestamp"].iloc[0]]
+            if not _serving_df.empty:
+                _override_timestamps = pd.DatetimeIndex(_serving_df["timestamp"])
+                # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
+                # derived through the same climate-projection path as the forecast
+                # features — not raw outdoor temperature
+                # (final-review #2). Feeding outdoor temp here modelled a tank standing
+                # outside, inflating standing losses and therefore the correction itself.
+                _t_ambient = self._physics_model._t_indoor_for_window(
+                    climate_recent or None,
+                    _override_timestamps,
+                    pd.Series(_serving_df["temp_c"].values, index=_override_timestamps),
+                    room_areas=self._climate_room_areas or None,
+                    heating_active_series=heating_active_series,
+                    setpoint_on=heating_setpoint_on,
+                    setpoint_off=heating_setpoint_off,
+                )
+                _initial_t_tank = self._physics_model._initial_t_tank_for_window(
+                    dhw_recent if not dhw_recent.empty else None, _override_timestamps
+                )
+                _override_delta = self._physics_model.compute_serving_override_delta(
+                    _override_timestamps, _t_ambient, _initial_t_tank
+                )
+                # Floored at zero, same as model.py's own `np.maximum(0, preds)`: this is a
+                # SIGNED delta applied to an already-final forecast with nothing downstream of
+                # it, so without the floor a large negative correction publishes a visibly
+                # negative hourly forecast (final-review #4).
+                predictions["predicted_kwh"] = np.maximum(
+                    0.0,
+                    predictions["predicted_kwh"].to_numpy()
+                    + _override_delta.reindex(pd.DatetimeIndex(predictions["timestamp"])).fillna(0.0).to_numpy(),
+                )
+
         self._publish_thermal_pressure()
 
         intervals = self._ml_model.predict_intervals(
@@ -1639,25 +2268,60 @@ class EnergyForecast(hass.Hass):
         # ── Store predictions for adaptive retrain tracking ───────────────────
         self._pred_history = _accumulate_pred_history(self._pred_history, predictions, now_ts)
 
-        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41) ─
+        # ── Populate rolling actuals history for mae_7d / mae_30d sensors (#41, #117) ─
         # keep-last semantics: fresher actuals overwrite older ones for the same hour.
-        # Use full_actuals (pre-split, pre-sub-sensor-subtraction) so stored kWh
-        # matches the training target (raw gross_kwh on non-EV hours).
+        # Stored kWh = target-corrected consumption minus the baseline_mode sub-meters
+        # (same set as the training target) minus wallbox EV kWh.
+        # Wallbox-sensor EV hours are stored net of the exact wallbox kWh; threshold-inferred
+        # EV hours (+-1 h) are excluded. Keep-last means a late wallbox reading self-corrects.
+        # While the one-time migration is pending, history stays GROSS (no sub-meter
+        # subtraction) so the migration converts every stored hour exactly once.
+        _score_subs = (
+            self._subtract_only_dict(sub_sensors_recent) if (self._baseline_mode and sub_sensors_recent) else None
+        )
+        if not self._actuals_on_target_basis:
+            if self._baseline_mode:
+                _expected = {self._sub_sensor_prefix(e) for e in self._sub_energy_sensors} - {
+                    self._sub_sensor_prefix(e) for e in self._baseline_included_sensors
+                }
+            else:
+                _expected = set()
+            _migrated, _done = _migrate_actuals_to_target(self._actuals_history, _score_subs, _expected)
+            if not _done:
+                _missing = frozenset(_missing_sub_prefixes(_score_subs, _expected))
+                if _missing != self._actuals_migration_warned:
+                    self._actuals_migration_warned = _missing
+                    _LOGGER.warning(
+                        "Actuals migration to the training-target basis is waiting for sub-meter history: %s; "
+                        "scoring stays on the old basis until it loads",
+                        ", ".join(sorted(_missing)),
+                    )
+            else:
+                self._actuals_migration_warned = frozenset()
+                _removed = sum(self._actuals_history.get(k, 0.0) - v for k, v in _migrated.items())
+                self._actuals_history = _migrated
+                self._actuals_on_target_basis = True
+                _LOGGER.info(
+                    "Stored actuals migrated to the training-target basis "
+                    "(%d hours, %.2f kWh appliance energy removed)",
+                    len(_migrated),
+                    _removed,
+                )
         if full_actuals is not None and not full_actuals.empty:
-            completed_cutoff = now_ts.floor("1h")  # skip the current (incomplete) hour
             # Retroactively evict EV hours + neighbors already in actuals_history.
             # Handles stale partials stored before the session was fully detected and
             # ramp-down hours stored before adjacent exclusion kicked in.
             for _ts in ev_mae_excluded:
                 self._actuals_history.pop(_ts, None)
-            for _ts, _kwh in zip(
-                pd.to_datetime(full_actuals["timestamp"]).dt.floor("1h"),
-                full_actuals["gross_kwh"].astype(float),
-            ):
-                if _ts >= completed_cutoff:  # skip current (partial) hour
-                    continue
-                if _ts not in ev_mae_excluded:
-                    self._actuals_history[_ts] = _kwh
+            self._actuals_history.update(
+                _scoring_actuals(
+                    full_actuals,
+                    _score_subs if self._actuals_on_target_basis else None,
+                    ev_mae_excluded,
+                    ev_sensor_kwh,
+                    now_ts.floor("1h"),
+                )
+            )
         actuals_cutoff = now_ts.floor("1h") - pd.Timedelta(days=30)
         self._actuals_history = {
             ts: kwh for ts, kwh in self._actuals_history.items() if pd.Timestamp(ts) >= actuals_cutoff
@@ -1714,6 +2378,7 @@ class EnergyForecast(hass.Hass):
                     dhw_recent=dhw_recent if not dhw_recent.empty else None,
                     room_areas=self._climate_room_areas or None,
                     n=self._shap_top_n,
+                    heating_buffer_temp_recent=self._physics_heating_buffer_df,
                     _prepared=_prepared,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1728,6 +2393,29 @@ class EnergyForecast(hass.Hass):
             sub_sensors_recent=sub_sensors_recent or None,
             ev_actuals_df=_ev_actuals_df,
         )
+        try:
+            _now_local = pd.Timestamp.now(self._timezone).tz_localize(None)
+            _append_regime_log(
+                REGIME_LOG_PATH,
+                _build_regime_log_record(
+                    pd.Timestamp.now(self._timezone).isoformat(),  # tz-aware: DST fall-back safe
+                    self._ml_model.last_trained,
+                    _tomorrow_local_date(_now_local),
+                    round(float(aggregated["tomorrow"]), 3),
+                    _regime_info,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("regime_log record failed: %s", exc)
+        _write_predict_capture(
+            self,
+            _capture_snapshot,
+            _model_predictions,
+            predictions,
+            aggregated,
+            weather_source=_weather_source,
+            after_retrain=after_retrain,
+        )
         aggregated["shap_top_features"] = shap_data
         aggregated["shap_narrative"] = _build_shap_narrative(shap_data)
         aggregated["mae_7d"] = mae_7d
@@ -1736,6 +2424,10 @@ class EnergyForecast(hass.Hass):
         aggregated["mae_30d_pct"] = mae_30d_pct
         aggregated["mae_7d_n_pairs"] = n_7d
         aggregated["mae_30d_n_pairs"] = n_30d
+        try:
+            aggregated.update(_accuracy_windows(self._pred_history, self._actuals_history, now_ts))
+        except Exception as exc:  # never let the new metrics stop the forecast publish
+            _LOGGER.warning("Accuracy metrics failed: %s", exc)
         aggregated["is_anomaly"] = is_anomaly
         aggregated["anomaly_residual"] = anomaly_residual
         aggregated["anomaly_std"] = anomaly_std
@@ -1844,31 +2536,72 @@ class EnergyForecast(hass.Hass):
 
         return pd.Series(n_home, index=future_hours, dtype=int)
 
+    def _heating_prior_and_today(self, sub_sensors_recent: dict | None) -> tuple[int, int | None]:
+        """(prior_state, today_state) for heating_season.project_heating_active.
+
+        Meter tier: prior = yesterday's meter heating-day label, today = 1 once today's heating
+        energy passes METER_DAY_KWH. Entity tier: the live switch state is both. An unknown /
+        unavailable entity yields prior 0 and lets the daily rule decide today.
+        """
+        import pandas as pd
+
+        entity_state: int | None = None
+        if self._heating_active_entity:
+            raw = self.get_state(self._heating_active_entity)
+            if raw in ("on", "1", "true", "True"):
+                entity_state = 1
+            elif raw in ("off", "0", "false", "False"):
+                entity_state = 0
+        if self._heating_thresholds.label_source == "meter":
+            meter_entity = self._physics_config.get("heating_sub_meter_sensor")
+            meter_df = (sub_sensors_recent or {}).get(self._sub_sensor_prefix(meter_entity)) if meter_entity else None
+            now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
+            prior, today = heating_season.meter_prior_and_today(meter_df, now)
+            if prior is None:
+                prior = entity_state if entity_state is not None else 0
+            return prior, today
+        return (entity_state if entity_state is not None else 0), entity_state
+
+    def _heating_season_attr(self) -> dict | None:
+        """Learned/config heating thresholds for the energy_forecast_today attributes (None when unused)."""
+        from dataclasses import asdict
+
+        t = self._heating_thresholds
+        if not self._heating_active_entity and t.label_source != "meter":
+            return None
+        return asdict(t)
+
     def _build_heating_active_projection(
         self,
         forecast_df: Any,
         climate_recent: dict[str, Any],
+        sub_sensors_recent: dict | None = None,
     ) -> tuple[Any, float, float]:
         """Return (heating_active_series, setpoint_on, setpoint_off) for 48-hour window.
 
         heating_active_series: pd.Series[int] indexed by naive hourly timestamps (1=heating on).
         setpoint_on/off: live values derived from climate entities when available, else config defaults.
-        Uses outdoor temp hysteresis to project future heating state.
-        Only call when _heating_active_entity is configured.
+        Projects future heating state with the daily-mean rule in heating_season.py
+        (learned or configured thresholds in self._heating_thresholds).
         """
         import numpy as np
         import pandas as pd
 
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
-        future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
-        active = self.get_state(self._heating_active_entity) in ("on", "1", "true", "True")
+        prior_state, today_state = self._heating_prior_and_today(sub_sensors_recent)
+        active = bool(today_state if today_state is not None else prior_state)
 
         # Derive setpoint_on / setpoint_off from live climate entity data when available
         live_setpoints = []
         for eid, cdf in (climate_recent or {}).items():
             if cdf is not None and not cdf.empty and "setpoint" in cdf.columns:
-                latest_sp = cdf.sort_values("timestamp").iloc[-1]["setpoint"]
+                # Skip entity-unavailable (NaN) rows: float(nan) doesn't raise, and one NaN would make the
+                # mean — and so setpoint_on/off for the indoor projection — NaN (same rule as _project_indoor_temps).
+                valid = cdf.dropna(subset=["setpoint"])
+                if valid.empty:
+                    continue
+                latest_sp = valid.sort_values("timestamp").iloc[-1]["setpoint"]
                 try:
                     live_setpoints.append(float(latest_sp))
                 except (TypeError, ValueError):
@@ -1883,24 +2616,9 @@ class EnergyForecast(hass.Hass):
             s_off = live_setpoint if live_setpoint is not None else self._heating_setpoint_off
             s_on = self._heating_setpoint_on
 
-        temp_on = self._heating_temp_on
-        temp_off = self._heating_temp_off
-
-        # Align outdoor forecast temps to future hours
-        forecast_indexed = forecast_df.set_index(pd.to_datetime(forecast_df["timestamp"]))["temp_c"]
-        outdoor_temps = forecast_indexed.reindex(future_hours, method="nearest").ffill().bfill().values
-
-        # Hysteresis projection
-        state = int(active)
-        states: list[int] = []
-        for temp in outdoor_temps:
-            if temp < temp_on:
-                state = 1
-            elif temp > temp_off:
-                state = 0
-            states.append(state)
-
-        heating_active_series = pd.Series(states, index=future_hours, dtype=int)
+        heating_active_series = heating_season.project_heating_active(
+            now_naive, forecast_df, prior_state, self._heating_thresholds, today_state=today_state
+        )
         return heating_active_series, float(s_on), float(s_off)
 
     def _maybe_adaptive_retrain(self, actuals_df: Any) -> None:
@@ -1964,6 +2682,11 @@ class EnergyForecast(hass.Hass):
             # Relative MAE sensors (#54)
             "sensor.energy_forecast_relative_mae_7d",
             "sensor.energy_forecast_relative_mae_30d",
+            # Block / daily accuracy sensors (#114)
+            "sensor.energy_forecast_block_mae_7d",
+            "sensor.energy_forecast_block_mae_30d",
+            "sensor.energy_forecast_daily_bias_7d",
+            "sensor.energy_forecast_daily_bias_30d",
             # Anomaly detection sensor (#39)
             "binary_sensor.energy_forecast_unusual_consumption",
             # Interval sensors
@@ -1975,6 +2698,9 @@ class EnergyForecast(hass.Hass):
             "sensor.energy_forecast_tomorrow_high",
             # Thermal pressure sensor (now served via MQTT)
             "sensor.energy_forecast_thermal_pressure_net",
+            # Physics baseline / ML adjustment sensors (now served via MQTT)
+            "sensor.energy_forecast_physics_base_today",
+            "sensor.energy_forecast_ml_adjustment_today",
             # Scenario sensors (now served via MQTT when mqtt_discovery=True)
             "sensor.energy_forecast_scenario_today",
             "sensor.energy_forecast_scenario_tomorrow",
@@ -2083,6 +2809,7 @@ class EnergyForecast(hass.Hass):
         # ── Forecast totals ───────────────────────────────────────────────────
         shap_features = data.get("shap_top_features") or {}
         shap_narrative = data.get("shap_narrative") or ""
+        heating_season_attr = self._heating_season_attr()
         for key, label in [
             ("next_1h", "Next 1h"),
             ("next_3h", "Next 3h"),
@@ -2096,6 +2823,8 @@ class EnergyForecast(hass.Hass):
                     extra["shap_top_features"] = shap_features
                 if shap_narrative:
                     extra["shap_narrative"] = shap_narrative
+                if heating_season_attr is not None:
+                    extra["heating_season"] = heating_season_attr
                 if not extra:  # if no attributes, set to None
                     extra = None
             safe_set(
@@ -2105,13 +2834,16 @@ class EnergyForecast(hass.Hass):
                 extra_attrs=extra,
                 icon="mdi:lightning-bolt",
             )
-        # In MQTT mode, publish shap_top_features and shap_narrative as json_attributes for energy_forecast_today
-        if self._mqtt_discovery and (shap_features or shap_narrative):
+        # In MQTT mode, publish shap_top_features and shap_narrative as
+        # json_attributes for energy_forecast_today
+        if self._mqtt_discovery and (shap_features or shap_narrative or heating_season_attr is not None):
             attrs = {}
             if shap_features:
                 attrs["shap_top_features"] = shap_features
             if shap_narrative:
                 attrs["shap_narrative"] = shap_narrative
+            if heating_season_attr is not None:
+                attrs["heating_season"] = heating_season_attr
             if attrs:
                 self._mqtt_publish_sensor_attributes(
                     "energy_forecast_today",
@@ -2295,6 +3027,73 @@ class EnergyForecast(hass.Hass):
                     replace=True,
                 )
 
+        # ── Block / daily accuracy sensors (#114) ───────────────────────────────
+        def _acc_num(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        def _acc_attr(v: Any) -> Any:
+            f = _acc_num(v)
+            return round(f, 3) if math.isfinite(f) else None
+
+        for _w in ("7d", "30d"):
+            acc = data.get(f"accuracy_{_w}") or {}
+            block_attrs = {
+                "n_blocks": int(acc.get("n_blocks") or 0),
+                "naive_block_mae": _acc_attr(acc.get("naive_block_mae")),
+                "skill_vs_naive_pct": _acc_attr(acc.get("block_skill_pct")),
+                "hourly_mae": _acc_attr(acc.get("mae")),
+                "hourly_naive_mae": _acc_attr(acc.get("naive_mae")),
+                "hourly_skill_vs_naive_pct": _acc_attr(acc.get("skill_pct")),
+                "block_hours": 3,
+            }
+            bias_attrs = {
+                "bias_pct": _acc_attr(acc.get("daily_bias_pct")),
+                "daily_abs_error": _acc_attr(acc.get("daily_abs_error")),
+                "n_days": int(acc.get("n_days") or 0),
+            }
+            for uid, label, icon, val, decimals, attrs in [
+                (
+                    f"energy_forecast_block_mae_{_w}",
+                    f"Block MAE {_w}",
+                    "mdi:chart-timeline-variant",
+                    _acc_num(acc.get("block_mae")),
+                    4,
+                    block_attrs,
+                ),
+                (
+                    f"energy_forecast_daily_bias_{_w}",
+                    f"Daily Bias {_w}",
+                    "mdi:scale-unbalanced",
+                    _acc_num(acc.get("daily_bias")),
+                    3,
+                    bias_attrs,
+                ),
+            ]:
+                invalid = math.isnan(val) or math.isinf(val)
+                if self._mqtt_discovery:
+                    if invalid:
+                        self._mqtt_set_sensor_raw(uid, "unavailable")
+                    else:
+                        self._mqtt_set_sensor(uid, round(val, decimals))
+                    self._mqtt_publish_sensor_attributes(uid, attrs)
+                else:
+                    self.set_state(
+                        f"sensor.{uid}",
+                        state="unavailable" if invalid else f"{val:.{decimals}f}",
+                        attributes={
+                            "unit_of_measurement": "kWh",
+                            "friendly_name": f"Energy Forecast {label}",
+                            "unique_id": uid,
+                            "icon": icon,
+                            "attribution": ATTRIBUTION,
+                            **attrs,
+                        },
+                        replace=True,
+                    )
+
         # ── Anomaly detection sensor (#39) ────────────────────────────────────
         is_anomaly = data.get("is_anomaly", False)
         anomaly_attrs = {
@@ -2418,8 +3217,12 @@ class EnergyForecast(hass.Hass):
             def _isum(vals, s, e):
                 return round(float(np.sum(vals[(iv_times >= s) & (iv_times < e)])), 3)
 
-            today_low, _ = _blend_today_totals(iv_times, iv_low, blended_actuals, today_np, tomorrow_np, now_np)
-            today_high, _ = _blend_today_totals(iv_times, iv_high, blended_actuals, today_np, tomorrow_np, now_np)
+            today_low, blocks_low = _blend_today_totals(
+                iv_times, iv_low, blended_actuals, today_np, tomorrow_np, now_np
+            )
+            today_high, blocks_high = _blend_today_totals(
+                iv_times, iv_high, blended_actuals, today_np, tomorrow_np, now_np
+            )
 
             result.update(
                 {
@@ -2431,22 +3234,8 @@ class EnergyForecast(hass.Hass):
                     "tomorrow_high": _isum(iv_high, tomorrow_np, tomorrow_np + np.timedelta64(1, "D")),
                 }
             )
-            result["blocks_today_low"] = {
-                f"{h:02d}_{h + 3:02d}": _isum(
-                    iv_low,
-                    today_np + np.timedelta64(h, "h"),
-                    today_np + np.timedelta64(h + 3, "h"),
-                )
-                for h in range(0, 24, 3)
-            }
-            result["blocks_today_high"] = {
-                f"{h:02d}_{h + 3:02d}": _isum(
-                    iv_high,
-                    today_np + np.timedelta64(h, "h"),
-                    today_np + np.timedelta64(h + 3, "h"),
-                )
-                for h in range(0, 24, 3)
-            }
+            result["blocks_today_low"] = blocks_low
+            result["blocks_today_high"] = blocks_high
             result["blocks_tomorrow_low"] = {
                 f"{h:02d}_{h + 3:02d}": _isum(
                     iv_low,
@@ -2547,6 +3336,8 @@ class EnergyForecast(hass.Hass):
             _LOGGER.warning("Failed to load pred_history: %s", exc)
             return
 
+        self._actuals_on_target_basis = data.get("actuals_basis") == "target"
+
         try:
             now = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
             cutoff = now.floor("1h") - pd.Timedelta(days=30)
@@ -2580,6 +3371,7 @@ class EnergyForecast(hass.Hass):
             data = {
                 "pred": {ts.isoformat(): float(kwh) for ts, kwh in self._pred_history.items()},
                 "actuals": {ts.isoformat(): float(kwh) for ts, kwh in self._actuals_history.items()},
+                "actuals_basis": "target" if self._actuals_on_target_basis else "gross",
             }
             tmp_path = PRED_HISTORY_PATH.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:
@@ -2624,6 +3416,68 @@ class EnergyForecast(hass.Hass):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _accuracy_windows(pred_history: dict, actuals_history: dict, now_ts: pd.Timestamp) -> dict[str, dict]:
+    """Block/daily/naive accuracy summaries over the trailing 7 days and the full history (#114)."""
+    import pandas as pd
+
+    since_7d = now_ts.floor("1h") - pd.Timedelta(days=7)
+    # Daily metrics (bias, abs error, n_days) use complete local calendar days ending at today's midnight, so they
+    # roll over once a day instead of drifting 22:00-03:00 as partial days cross MIN_DAY_HOURS. 7d = the last 7
+    # complete days; 30d = the last 29, because hourly pruning at floor(now) - 30d truncates the 30th day.
+    today = now_ts.normalize()
+    # The 30-day window relies on _pred_history/_actuals_history being pruned to 30 days (same as mae_30d). The naive
+    # baseline is thin at its start: actuals are pruned to 30 days too, so the first 2 days have no naive and days
+    # 3-8 average fewer than 7 lookback days.
+    return {
+        "accuracy_7d": accuracy.summarize_windows(
+            pred_history, actuals_history, since=since_7d, day_start=today - pd.Timedelta(days=7), day_end=today
+        ),
+        "accuracy_30d": accuracy.summarize_windows(
+            pred_history, actuals_history, since=None, day_start=today - pd.Timedelta(days=29), day_end=today
+        ),
+    }
+
+
+def _tomorrow_local_date(now_local: Any) -> date:
+    """Tomorrow's calendar date in local time — same rule as ``_aggregate`` (normalize() + 1 day)."""
+    return (now_local.normalize() + timedelta(days=1)).date()
+
+
+def _build_regime_log_record(
+    ts: str,
+    last_trained: datetime | None,
+    tomorrow_date: date,
+    tomorrow_kwh: float,
+    regime_info: dict,
+) -> dict:
+    """Pure builder for one regime_log.jsonl line (JSON-native values only).
+
+    ``last_trained`` is logged raw (``isoformat()``, no conversion) as a retrain identifier.
+    """
+    lt: str | None = None
+    if last_trained is not None and last_trained != datetime.min:
+        lt = last_trained.isoformat()
+    info = regime_info.get(tomorrow_date)
+    return {
+        "ts": ts,
+        "last_trained": lt,
+        "target_date": tomorrow_date.isoformat(),
+        "tomorrow_kwh": tomorrow_kwh,
+        "label": info["label"] if info else None,
+        "proba": info["proba"] if info else None,
+    }
+
+
+def _append_regime_log(path: Path, record: dict) -> None:
+    """Append one JSON line to the regime log. Never raises."""
+    try:
+        line = json.dumps(record) + "\n"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Could not write regime log %s: %s", path, exc)
 
 
 def _strip_tz(df: Any, timezone: str = "Europe/Zurich") -> Any:
@@ -2713,6 +3567,31 @@ def _apply_target_correction(
     return df
 
 
+def _ev_mae_excluded_hours(ev_detected: pd.DataFrame | None) -> set:
+    """Hours dropped from the MAE/actuals history because their EV subtraction may leave residue.
+
+    Only threshold-inferred EV hours (plus +-1h ramp) qualify; wallbox-sensor hours are
+    subtracted exactly and are scored like any other hour.
+    """
+    import pandas as pd
+
+    resid = ha_data.residual_ev_rows(ev_detected)
+    if resid is None or resid.empty:
+        return set()
+    hours = set(pd.to_datetime(resid["timestamp"]).dt.floor("1h"))
+    return hours | {ts + pd.Timedelta(hours=d) for ts in hours for d in (-1, 1)}
+
+
+def _ev_sensor_kwh_by_hour(ev_detected: pd.DataFrame | None) -> dict:
+    """Wallbox kWh per hour for sensor-tagged EV rows — used to store MAE actuals net of EV."""
+    import pandas as pd
+
+    if ev_detected is None or ev_detected.empty or "ev_source" not in ev_detected.columns:
+        return {}
+    s = ev_detected[ev_detected["ev_source"] == "sensor"]
+    return dict(zip(pd.to_datetime(s["timestamp"]).dt.floor("1h"), s["gross_kwh"].astype(float)))
+
+
 def _fetch_correction_dfs(
     app: Any,
     solar_sensor: str | None,
@@ -2785,6 +3664,66 @@ def _subtract_sub_sensors(
     removed_kwh = float(sub_total.sum())
     df[column] = (df[column] - sub_total.values).clip(lower=0.0)
     return df, removed_kwh
+
+
+def _scoring_actuals(
+    full_actuals: Any,
+    sub_sensors_dict: dict[str, Any] | None,
+    ev_excluded: set,
+    ev_sensor_kwh: dict,
+    completed_cutoff: Any,
+) -> dict:
+    """Per-hour actuals for MAE/bias scoring, using the training-target definition (#117).
+
+    Appliance sub-meter energy is subtracted (floored at 0), then wallbox EV kWh is
+    subtracted (floored at 0).  EV-excluded hours and hours at/after ``completed_cutoff``
+    are skipped.  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    corrected, _ = _subtract_sub_sensors(full_actuals, sub_sensors_dict)
+    out: dict = {}
+    for ts, kwh in zip(
+        pd.to_datetime(corrected["timestamp"]).dt.floor("1h"),
+        corrected["gross_kwh"].astype(float),
+    ):
+        if ts >= completed_cutoff or ts in ev_excluded:
+            continue
+        out[ts] = max(0.0, kwh - ev_sensor_kwh.get(ts, 0.0))
+    return out
+
+
+def _missing_sub_prefixes(sub_sensors_dict: dict[str, Any] | None, expected_prefixes: set[str]) -> set[str]:
+    """Expected sub-sensor prefixes whose frame is missing or empty (history not loaded yet)."""
+    subs = sub_sensors_dict or {}
+    return {p for p in expected_prefixes if subs.get(p) is None or subs[p].empty}
+
+
+def _migrate_actuals_to_target(
+    actuals_history: dict,
+    sub_sensors_dict: dict[str, Any] | None,
+    expected_prefixes: set[str],
+) -> tuple[dict, bool]:
+    """One-time conversion of stored gross actuals to the training-target basis (#117).
+
+    Returns ``(new_history, done)``.  ``done`` is False and the history is returned
+    unchanged while any expected sub-sensor prefix is missing or has an empty frame
+    (sub-sensor history not loaded yet).  Pure: inputs are not mutated.
+    """
+    import pandas as pd
+
+    if not expected_prefixes:
+        return dict(actuals_history), True
+    subs = sub_sensors_dict or {}
+    if _missing_sub_prefixes(subs, expected_prefixes):
+        return dict(actuals_history), False
+    if not actuals_history:
+        return {}, True
+
+    stamps = list(actuals_history)
+    df = pd.DataFrame({"timestamp": stamps, "gross_kwh": [float(actuals_history[t]) for t in stamps]})
+    corrected, _ = _subtract_sub_sensors(df, {p: subs[p] for p in expected_prefixes})
+    return dict(zip(stamps, corrected["gross_kwh"].astype(float))), True
 
 
 def _blend_today_totals(

@@ -29,6 +29,8 @@ def _make_app(cached_df=None):
     app._cached_people_home = None
     app._cached_climate_recent = None
     app._cached_dhw_recent = None
+    app._cached_heating_active_series = None
+    app._cached_heating_setpoints = (None, None)
     app._climate_room_areas = {}
     app._timezone = "Europe/Zurich"
     app._mqtt_discovery = False
@@ -85,6 +87,77 @@ class TestGetScenarioCb:
         assert isinstance(records, list)
         assert len(records) == 48
 
+    def test_scenario_event_records_include_delta_kwh_hi(self):
+        """Every record of the result event carries delta_kwh_hi (real _composite_forecast output)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+        from energy_forecast.model import _composite_forecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        sigs = {"sub_dw": {"hourly_profile": [1.0, 2.0], "hourly_profile_hi": [1.5, 3.0]}}
+        app._ml_model.predict_scenario.return_value = _composite_forecast(cached_df, {"sub_dw": "12:00"}, sigs)
+
+        EnergyForecast._get_scenario_cb(
+            app, "homeassistant", "energy_forecast", "get_scenario", {"schedule": {}, "publish": False}
+        )
+
+        records = app.fire_event.call_args[1]["forecast"]
+        assert all("delta_kwh_hi" in r for r in records)
+        assert max(r["delta_kwh_hi"] for r in records) == 3.0
+
+    def test_echoes_request_id_when_caller_supplies_one(self):
+        """A caller-supplied request_id must be echoed back verbatim in the
+        result event, so concurrent callers can correlate their own request
+        with the right response (ha-energy-manager's ScenarioScorer rejects
+        any response it can't correlate — see this plan's docstring)."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False, "request_id": "abc-123"},
+        )
+
+        app.fire_event.assert_called_once()
+        _event_name, kwargs = app.fire_event.call_args[0][0], app.fire_event.call_args[1]
+        assert kwargs["request_id"] == "abc-123"
+
+    def test_request_id_is_none_when_caller_omits_it(self):
+        """Backward compatibility: a caller that never sends request_id (e.g.
+        an older integration, or a manual service call from HA's UI) must
+        keep working exactly as before — no request_id key required in the
+        call, and the response carries request_id=None rather than raising
+        or omitting the key inconsistently."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False},
+        )
+
+        app.fire_event.assert_called_once()
+        _event_name, kwargs = app.fire_event.call_args[0][0], app.fire_event.call_args[1]
+        assert kwargs["request_id"] is None
+
     def test_room_areas_forwarded_to_predict_scenario(self):
         """_get_scenario_cb must pass _climate_room_areas to predict_scenario."""
         from energy_forecast.energy_forecast import EnergyForecast
@@ -107,6 +180,34 @@ class TestGetScenarioCb:
 
         call_kwargs = app._ml_model.predict_scenario.call_args[1]
         assert call_kwargs.get("room_areas") == {"climate.living": 40.0}
+
+    def test_heating_buffer_temp_forwarded_to_predict_scenario(self):
+        """_get_scenario_cb must pass self._physics_heating_buffer_df to predict_scenario
+        as heating_buffer_temp_recent — regression test for the 2026-08-19 bug where every
+        get_scenario call silently predicted with a phantom heating_buffer_temp=0.0."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        buffer_df = pd.DataFrame(
+            {"timestamp": pd.date_range("2024-01-01", periods=3, freq="1h"), "heating_buffer_temp": [45.0, 46.0, 47.0]}
+        )
+        app._physics_heating_buffer_df = buffer_df
+
+        scenario_result = cached_df.copy()
+        scenario_result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = scenario_result
+
+        EnergyForecast._get_scenario_cb(
+            app,
+            "homeassistant",
+            "energy_forecast",
+            "get_scenario",
+            {"schedule": {}, "publish": False},
+        )
+
+        call_kwargs = app._ml_model.predict_scenario.call_args[1]
+        assert call_kwargs.get("heating_buffer_temp_recent") is buffer_df
 
     def test_publish_flag_calls_publish_method(self):
         """publish=True should call _publish_scenario_forecast."""
@@ -392,6 +493,32 @@ class TestGetScenarioValidation:
 
         assert not any("invalid time" in r.message for r in caplog.records)
 
+    def _run(self, value, caplog):
+        import logging
+
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        app = self._make_app_with_signatures("wm")
+        app._ml_model.predict_scenario.return_value = _make_baseline_df()
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            EnergyForecast._get_scenario_cb(app, "ha", "ef", "get_scenario", {"schedule": {"wm": value}})
+        return app._ml_model.predict_scenario.call_args[0][2]
+
+    def test_dict_schedule_value_is_kept(self, caplog):
+        value = {"start": "10:00", "program": "eco"}
+        assert self._run(value, caplog) == {"wm": value}
+
+    def test_dict_schedule_with_bad_start_is_dropped(self, caplog):
+        assert self._run({"start": "25:00"}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+
+    def test_dict_schedule_missing_start_or_nonstr_program_is_dropped(self, caplog):
+        assert self._run({"program": "eco"}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+        caplog.clear()
+        assert self._run({"start": "10:00", "program": 5}, caplog) == {}
+        assert any("invalid time" in r.message for r in caplog.records)
+
 
 class TestGetScenarioCbSubSensors:
     def test_list_typed_sub_energy_sensors_does_not_crash(self):
@@ -537,3 +664,24 @@ class TestPublishScenarioMqtt:
         EnergyForecast._publish_scenario_forecast(app, self._make_result_df())
         app._mqtt_publish_discovery.assert_not_called()
         assert app._mqtt_set_sensor.call_count == 11
+
+
+class TestGetScenarioHeatingProjection:
+    def test_scenario_receives_cached_heating_projection(self):
+        """Scenarios must use the same heating_active projection as the main forecast, not the default 1."""
+        from energy_forecast.energy_forecast import EnergyForecast
+
+        cached_df = _make_baseline_df()
+        app = _make_app(cached_df=cached_df)
+        series = pd.Series(0, index=pd.DatetimeIndex(cached_df["timestamp"]))
+        app._cached_heating_active_series = series
+        app._cached_heating_setpoints = (20.0, 12.0)
+        result = cached_df.copy()
+        result["delta_kwh"] = 0.0
+        app._ml_model.predict_scenario.return_value = result
+
+        EnergyForecast._get_scenario_cb(app, "homeassistant", "energy_forecast", "get_scenario", {"schedule": {}})
+
+        kwargs = app._ml_model.predict_scenario.call_args.kwargs
+        assert kwargs["heating_active_series"] is series
+        assert (kwargs["setpoint_on"], kwargs["setpoint_off"]) == (20.0, 12.0)

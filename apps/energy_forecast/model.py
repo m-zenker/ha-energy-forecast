@@ -39,25 +39,35 @@ import logging
 import pickle
 import shutil
 import statistics
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
     import pandas as pd
 
+    from .physics import ThermalPhysicsModel
+
 from . import clustering
 from .const import (
+    APPLIANCE_HI_PERCENTILE,
     APPLIANCE_MAX_WINDOW_HOURS,
     DEFAULT_ROOM_AREA_M2,
     DEFAULT_TAU,
+    DEFICIT_RECOVERY_TAU_H,
+    DEFICIT_STEADY_MIN_ROWS,
+    DEFICIT_STEADY_WINDOW_H,
+    HEATING_BUFFER_SMOOTH_H,
     HOLDOUT_FRACTION,
     MIN_CV_ROWS,
     MIN_TRAINING_ROWS,
     SENSOR_BLEND_HOURS,
     SENSOR_FULL_TRUST_HOURS,
 )
+from .ha_data import residual_ev_rows
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -158,6 +168,12 @@ _FEATURES_BASE = [
 _FEATURES_WITH_SENSOR = _FEATURES_BASE + ["outdoor_temp_live", "temp_bias"]
 
 
+def _droppable_features() -> set[str]:
+    """Names train(drop_features=...) accepts: base features except the autoregressive lags, plus the buffer sensor."""
+    lags = {f"lag_{lag}h" for lag in LAG_HOURS}
+    return {c for c in _FEATURES_BASE if c not in lags} | {"heating_buffer_temp"}
+
+
 def _write_hash(path: Path) -> None:
     """Write a SHA-256 sidecar file next to *path*."""
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -241,8 +257,17 @@ class EnergyForecastModel:
     """Encapsulates training data, model weights and prediction logic."""
 
     _TAU_SELECTIVITY_THRESHOLD: int = 32  # ≥ this many candidates → top-25%; below → top-50%
-    _SPRING_BIAS_NIGHT_FRAC: float = 0.15  # fraction of nighttime candidates below which guard fires
-    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median above which guard fires
+    _SPRING_BIAS_OUTDOOR_TEMP: float = 12.0  # °C outdoor median at/above which temp confidence is zero
+    _SPRING_BIAS_OUTDOOR_TEMP_FLOOR: float = 5.0  # °C outdoor median at/below which temp confidence is full
+    _SPRING_BIAS_NIGHT_FRAC_FULL: float = 0.40  # night_frac at/above which night confidence is full
+    _TAU_SAMPLE_CONF_REF: int = 3  # candidate count at/above which sample confidence is full
+    _TAU_EMA_MAX_NEW_WEIGHT: float = 0.2  # weight given to the fresh τ estimate at full confidence
+    _TAU_DRIFT_WINDOW_DAYS: int = 30  # short drift-cap window (days)
+    _TAU_MAX_DRIFT_FRAC: float = 0.35  # short drift-cap max fractional move
+    _TAU_LONG_DRIFT_WINDOW_DAYS: int = 180  # long drift-cap window (days)
+    _TAU_LONG_MAX_DRIFT_FRAC: float = 0.50  # long drift-cap max fractional move
+
+    assert _SPRING_BIAS_OUTDOOR_TEMP > _SPRING_BIAS_OUTDOOR_TEMP_FLOOR
 
     def __init__(self, model_dir: Path, model_archive_count: int = 3, timezone: str = "Europe/Zurich") -> None:
         self._model_dir = model_dir
@@ -278,14 +303,27 @@ class EnergyForecastModel:
         self._sub_sensor_prefixes: list[str] = []
         # Building thermal time constant (hours) — calibrated from passive-cooling windows
         self._tau_hours: float | None = None
+        # Rolling drift-cap anchors for _tau_hours (short: 30-day/35%, long: 180-day/50%)
+        self._tau_anchor_hours: float | None = None
+        self._tau_anchor_ts: pd.Timestamp | None = None
+        self._tau_long_anchor_hours: float | None = None
+        self._tau_long_anchor_ts: pd.Timestamp | None = None
         # Solar-compensated thermal pressure from last predict() call
         self._latest_thermal_pressure_net: float | None = None
+        # Features this model was trained without (#120); informational, serving slices by feature_cols
+        self._drop_features: tuple[str, ...] = ()
 
         # Daily Regime Clustering (optional)
         self._enable_regimes: bool = False
+        self._heating_buffer_smooth_h: int = 0  # trailing-mean window the loaded model was trained with (0 = raw)
         self._regime_count: int = 5
+        self._regime_mode: str = "hard"  # how regime_kwh was built in training: "hard" | "soft_oof" (#110)
+        self._regime_oof_acc: float | None = None  # diagnostic only, not persisted
+        self._regime_oof_majority: float | None = None  # share of the most common regime (the accuracy to beat)
         self._clusterer: clustering.DailyProfileClusterer | None = None
         self._regime_model: clustering.RegimePredictor | None = None
+        # Per-date regime label/probabilities from the last _prepare_prediction_X call (log only, never a feature)
+        self._last_regime_info: dict[date, dict] = {}
 
         # Recent weather tail — last 400h stored at training time so that
         # temp_lag_168h / temp_lag_336h are computable at prediction time
@@ -319,10 +357,25 @@ class EnergyForecastModel:
         room_areas: dict[str, float] | None = None,  # entity_id → m² for area-weighted thermal pressure
         enable_regimes: bool = False,
         regime_count: int = 5,
+        physics_model: ThermalPhysicsModel | None = None,
+        heating_buffer_temp_df: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        heating_feature_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active — daily label; feature only
+        regime_mode: str = "soft_oof",  # "soft_oof": out-of-fold probabilities (#110); "hard": true daily labels
+        regime_oof_cv: str = "blocked",  # soft_oof folds: "blocked" (contiguous, default) | "shuffled" (backtest only)
+        drop_features: Sequence[str] = (),  # feature names to leave out of the model (#120); default: none
     ) -> None:
         """Train/retrain the model on historical data."""
         import numpy as np
         import pandas as pd
+
+        if regime_mode not in ("hard", "soft_oof"):
+            raise ValueError(f"regime_mode must be 'hard' or 'soft_oof', got {regime_mode!r}")
+        if regime_oof_cv not in ("shuffled", "blocked"):
+            raise ValueError(f"regime_oof_cv must be 'shuffled' or 'blocked', got {regime_oof_cv!r}")
+        drop_features = tuple(drop_features)
+        _bad_drop = [f for f in drop_features if f not in _droppable_features()]
+        if _bad_drop:
+            raise ValueError(f"cannot drop {_bad_drop}: not a droppable feature")
 
         ok, engine_name = ensure_ml_packages()
         if not ok:
@@ -359,6 +412,57 @@ class EnergyForecastModel:
                 n_rows,
             )
 
+        # _override_history is hoisted here (rather than declared only inside the
+        # `if physics_model is not None:` block below) so it stays in scope for the
+        # R1-#13 pre-migration down-weight block further down in this function even
+        # when physics_model is None.
+        _override_history = physics_model.schedule.get("override_history", []) if physics_model is not None else []
+
+        # Goal 1/2 (R1-#11): correct gross_kwh for any committed DHW override ONCE, upstream
+        # of both calibration and the ML training target — single source of truth, not two
+        # independent subtraction points that could drift apart. Uses self._calib's current
+        # (pre-this-cycle) values as a bootstrap approximation — calibrate() below refines
+        # them further using the now-corrected series.
+        if physics_model is not None:
+            _timestamps_for_delta = pd.DatetimeIndex(pd.to_datetime(energy_df["timestamp"]))
+            if _override_history:
+                # t_ambient for the DHW ODE is INDOOR air (the room the tank stands in),
+                # derived as the former training-series predictor did
+                # — not raw outdoor temperature (final-review #2).
+                # Deliberately the simple _area_weighted_t_indoor form, without
+                # _project_indoor_temps: this is a historical training window with real
+                # readings, so there is nothing to project, and the former predictor
+                # didn't project here either.
+                from .physics import DEFAULT_AMBIENT_C
+
+                _t_indoor_for_delta = physics_model._area_weighted_t_indoor(
+                    climate_dfs or {}, _timestamps_for_delta, room_areas
+                )
+                if _t_indoor_for_delta is None:
+                    _t_indoor_for_delta = pd.Series(DEFAULT_AMBIENT_C, index=_timestamps_for_delta)
+                _initial_t_tank = physics_model._initial_t_tank_for_window(dhw_df, _timestamps_for_delta)
+                # #124: replay only overrides the tank shows actually ran (last commit per
+                # (kind, date), capped at the observed peak). The stored history and the
+                # pre-migration down-weight below keep the raw list.
+                from .physics import verify_override_history
+
+                _verified = verify_override_history(_override_history, dhw_df)
+                _LOGGER.info(
+                    "override_history verified against the tank: %d of %d replayed "
+                    "(dropped %d duplicate, %d not run; %d capped, %d unverified)",
+                    len(_verified.entries),
+                    len(_override_history),
+                    _verified.dropped_duplicate,
+                    _verified.dropped_not_run,
+                    _verified.capped,
+                    _verified.unverified,
+                )
+                _override_delta = physics_model.compute_training_override_delta(
+                    _timestamps_for_delta, _t_indoor_for_delta, _initial_t_tank, _verified.entries
+                )
+                energy_df = energy_df.copy()
+                energy_df["gross_kwh"] = energy_df["gross_kwh"].to_numpy() - _override_delta.to_numpy()
+
         # ── Lag & rolling features (must happen before _engineer_features) ──
         df = _add_lag_and_rolling_training(energy_df, active_lags)
         df = _add_sub_sensor_lags_training(df, sub_sensors_dict)
@@ -379,6 +483,40 @@ class EnergyForecastModel:
             elif heating_active_df is None or heating_active_df.empty:
                 _LOGGER.debug("τ calibration skipped: heating_system_active_entity not configured.")
 
+        # ── Physics calibration trigger + open-window flags ──────────────────
+        # Runs before the hourly_weights computation below so open_window_flags
+        # is available to fold into it.
+        heating_buffer_temp_series = None
+        open_window_flags = None
+        if physics_model is not None:
+            if physics_model.calibration_stale:
+                # Calendar-day span, not row count: a multi-day excluded date range
+                # (or any other real gap) leaves len(energy_df)/24 undercounting the
+                # true span, silently shrinking/misplacing the holdout window.
+                _span_days = (energy_df["timestamp"].max() - energy_df["timestamp"].min()).days
+                physics_model.calibrate(
+                    energy_df,
+                    weather_df,
+                    dhw_df,
+                    holdout_cutoff=energy_df["timestamp"].max() - pd.Timedelta(days=int(_span_days * 0.1) or 1),
+                    heating_active_df=heating_active_df,
+                    ev_df=ev_df,
+                    away_df=away_df,
+                )
+            physics_model._tau_hours = self._tau_hours
+            if climate_dfs:
+                open_window_flags = physics_model.detect_open_windows(climate_dfs, weather_df, room_areas)
+
+        smooth_h = 0  # committed to self only after a successful fit (see below)
+        if heating_buffer_temp_df is not None and not heating_buffer_temp_df.empty:
+            heating_buffer_temp_series = heating_buffer_temp_df.set_index(
+                pd.to_datetime(heating_buffer_temp_df["timestamp"])
+            )["heating_buffer_temp"]
+            if HEATING_BUFFER_SMOOTH_H > 0:
+                smoothed = smooth_heating_buffer(heating_buffer_temp_series, HEATING_BUFFER_SMOOTH_H)
+                if smoothed.notna().any():  # < 3 readings in total -> all NaN -> every row would be dropped
+                    heating_buffer_temp_series, smooth_h = smoothed, HEATING_BUFFER_SMOOTH_H
+
         for prefix, sig in self._appliance_signatures.items():
             _LOGGER.info(
                 "Appliance signature | %s | cycles=%d | total=%.2f kWh | peak_hour=%d",
@@ -391,7 +529,7 @@ class EnergyForecastModel:
             _LOGGER.info("Appliance signatures: no signatures learned (insufficient cycles in history)")
 
         # ── EV session probability: which hour_of_week slots charge regularly ─
-        likely_ev_hours = _compute_likely_ev_hours(energy_df, ev_df)
+        likely_ev_hours = _compute_likely_ev_hours(energy_df, residual_ev_rows(ev_df))
         self._likely_ev_hours = likely_ev_hours
 
         # ── Sample weighting for decay (Stage 1.5) ──────────────────────────
@@ -405,15 +543,84 @@ class EnergyForecastModel:
             hourly_weights = pd.Series(h_weights, index=energy_df["timestamp"])
             daily_weights = hourly_weights.groupby(energy_df["timestamp"].dt.date).mean()
 
+        # ── Down-weight open-window hours (Plan B Task 4) ───────────────────
+        if open_window_flags is not None and hourly_weights is not None:
+            ow = open_window_flags.reindex(df["timestamp"].values if "timestamp" in df else hourly_weights.index)
+            down_weight = pd.Series(np.where(ow.fillna(False), 0.5, 1.0), index=hourly_weights.index)
+            hourly_weights = hourly_weights * down_weight
+
+        # ── Down-weight pre-migration hours (R1-#13) ─────────────────────────
+        # Bounds how long training rows from before the DHW override-correction
+        # fix shipped (no override_history to reconstruct from, so any override-shaped
+        # spikes in gross_kwh are noise the model has to explain away some other way)
+        # stay at full training influence — roughly weight_halflife_days after ship,
+        # via the existing recency-halflife weighting above.
+        if _override_history and hourly_weights is not None:
+            # Read-time validation, never raise (final-review #5): a single malformed
+            # entry used to raise straight out of train(), where _retrain_cb's blanket
+            # handler logs an ERROR and the model then never retrains again until the
+            # file is hand-fixed. Every other read-time path this plan added
+            # skips-and-warns; this one now does too.
+            _committed_ats: list[Any] = []
+            for _entry in _override_history:
+                try:
+                    if _entry.get("cancelled_at") is not None:
+                        # A cancelled override never actually happened, so its commit
+                        # can't mark when migration to this feature began.
+                        continue
+                    _committed_at = pd.Timestamp(_entry["committed_at"])
+                    if pd.isna(_committed_at):
+                        raise ValueError("committed_at is not a timestamp")
+                    if _committed_at.tzinfo is not None:
+                        # committed_at is written as an ISO-8601 UTC-aware string
+                        # (dt.datetime.now(dt.UTC).isoformat() in commit_dhw_schedule), while
+                        # df["timestamp"] is naive LOCAL time throughout this module (stripped
+                        # via _strip_tz(df, self._timezone) before train() ever sees it). A bare
+                        # tz_localize(None) would strip the tz label without converting, leaving
+                        # UTC wall-clock numbers mislabeled as naive — silently misclassifying
+                        # every row within the local UTC offset of the true cutoff. Must convert
+                        # to local time first, same pattern as energy_forecast.py:1013
+                        # (`.tz_convert(self._timezone).tz_localize(None)`), not the bare
+                        # tz_localize(None) used elsewhere in this class for values that were
+                        # already local when constructed (e.g. model.py's own
+                        # `pd.Timestamp.now(tz=self._timezone).tz_localize(None)` calls).
+                        # Normalizing here (rather than after min()) also keeps min() from
+                        # comparing tz-aware against naive Timestamps, which itself raises.
+                        _committed_at = _committed_at.tz_convert(self._timezone).tz_localize(None)
+                    _committed_ats.append(_committed_at)
+                except Exception as _exc:  # noqa: BLE001 — read-time validation contract
+                    _LOGGER.warning(
+                        "override_history: entry with unusable committed_at skipped for the "
+                        "pre-migration down-weight: %s (%s)",
+                        _entry,
+                        _exc,
+                    )
+            if not _committed_ats:
+                _LOGGER.warning(
+                    "override_history: no entry has a usable committed_at (all malformed or "
+                    "cancelled) — skipping the pre-migration down-weight this cycle"
+                )
+            else:
+                _ship_cutoff = min(_committed_ats)
+                _pre_migration = pd.to_datetime(df["timestamp"]) < _ship_cutoff
+                _down_weight_migration = pd.Series(np.where(_pre_migration, 0.5, 1.0), index=hourly_weights.index)
+                hourly_weights = hourly_weights * _down_weight_migration
+
         # ── Daily Regime Clustering (Stage 4) ───────────────────────────────
         self._enable_regimes = enable_regimes
         self._regime_count = regime_count
+        self._regime_mode = "hard"
+        self._regime_oof_acc = None
+        self._regime_oof_majority = None
         regime_kwh_series = None
 
         if enable_regimes:
             _actual_k = regime_count
             _prebuilt_daily_features = None
-            ev_day_dates: set = set(ev_df["timestamp"].dt.date) if ev_df is not None and len(ev_df) > 0 else set()
+            _ev_resid = residual_ev_rows(ev_df)
+            ev_day_dates: set = (
+                set(_ev_resid["timestamp"].dt.date) if _ev_resid is not None and len(_ev_resid) > 0 else set()
+            )
             if regime_count == 0:
                 # Auto-K: build daily features once and reuse for both selection and predictor
                 _prebuilt_daily_features = _prepare_daily_regime_features(
@@ -447,24 +654,34 @@ class EnergyForecastModel:
                     )
                 )
 
+                n_clusters = self._clusterer.centroids.shape[0]
                 self._regime_model = clustering.RegimePredictor()
-                self._regime_model.fit(daily_features, labels, sample_weight=daily_weights)
+                oof = self._regime_model.fit(
+                    daily_features, labels, sample_weight=daily_weights, n_clusters=n_clusters, oof_cv=regime_oof_cv
+                )
 
                 # 3. Create hourly regime_kwh_series (vectorized)
-                # Map daily labels to hourly timestamps
+                # Map daily labels to hourly timestamps (gaps forward-filled, leading gaps give 0)
                 ts_idx = pd.to_datetime(df["timestamp"])
-                hourly_labels = ts_idx.dt.date
-                # Reindex labels to all dates in df, ffill any gaps
-                mapped_labels = labels.reindex(hourly_labels).ffill().fillna(-1).astype(int).values
-
-                # Use centroids matrix to lookup values for each hour
-                regime_rows = np.zeros(len(ts_idx))
-                valid_mask = mapped_labels >= 0
-                if valid_mask.any():
-                    hours = ts_idx.dt.hour.values
-                    n_clusters = self._clusterer.centroids.shape[0]
-                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_rows[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
+                if regime_mode == "soft_oof" and oof is not None:
+                    # Out-of-fold probabilities match what predict sees (a forest that never saw the day's label).
+                    regime_proba = oof.reindex(labels.index)
+                    n_missing = int(regime_proba.isna().all(axis=1).sum())
+                    if n_missing:
+                        _LOGGER.info("soft_oof regime_kwh: %d labelled days without weather features get 0", n_missing)
+                    regime_proba = regime_proba.fillna(0.0)
+                    self._regime_mode = "soft_oof"
+                    _y = labels.reindex(oof.index)
+                    self._regime_oof_acc = float((oof.to_numpy().argmax(axis=1) == _y.to_numpy()).mean())
+                    self._regime_oof_majority = float(_y.value_counts(normalize=True).max())
+                    _LOGGER.info(
+                        "Regime classifier out-of-fold accuracy %.2f (majority class %.2f)",
+                        self._regime_oof_acc,
+                        self._regime_oof_majority,
+                    )
+                else:
+                    regime_proba = clustering.one_hot(labels, n_clusters)
+                regime_rows = clustering.regime_kwh_from_proba(regime_proba, ts_idx, self._clusterer.centroids)
 
                 regime_kwh_series = pd.Series(regime_rows, index=ts_idx)
 
@@ -486,7 +703,8 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             regime_kwh_series=regime_kwh_series,
-            heating_active_df=heating_active_df,
+            heating_active_df=heating_feature_df if heating_feature_df is not None else heating_active_df,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
 
         # ── Build feature list from active lags ─────────────────────────────
@@ -509,6 +727,11 @@ class EnergyForecastModel:
                 sub_sensor_cols.append(f"{prefix}_runs_7d")
 
         base_features = [c for c in _FEATURES_BASE if c not in all_lag_cols] + active_lag_cols + sub_sensor_cols
+        if heating_buffer_temp_series is not None:
+            base_features = [*base_features, "heating_buffer_temp"]
+        if drop_features:
+            base_features = [c for c in base_features if c not in drop_features]
+            _LOGGER.info("Training without %d dropped feature(s): %s", len(drop_features), list(drop_features))
         sensor_features = base_features + ["outdoor_temp_live", "temp_bias"]
 
         use_sensor = outdoor_df is not None and not outdoor_df.empty and "outdoor_temp_live" in df.columns
@@ -606,7 +829,9 @@ class EnergyForecastModel:
                                 )
                             except (ValueError, RuntimeError):
                                 m_nl.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
-                            sweep_maes[nl] = float(mae_fn(y[val_idx], np.expm1(m_nl.predict(X.iloc[val_idx]))))
+                            nl_raw = m_nl.predict(X.iloc[val_idx])
+                            nl_pred = np.expm1(nl_raw)
+                            sweep_maes[nl] = float(mae_fn(y[val_idx], nl_pred))
                         best_num_leaves = min(sweep_maes, key=sweep_maes.__getitem__)
                         _LOGGER.info(
                             "num_leaves sweep on last fold: %s → best=%d (MAE=%.4f)",
@@ -657,7 +882,8 @@ class EnergyForecastModel:
                         else:
                             m.fit(X.iloc[tr_idx], y_fit[tr_idx], **fit_kwargs)
                         # MAE reported in original kWh space (expm1 undoes log1p)
-                        fold_maes.append(float(mae_fn(y[val_idx], np.expm1(m.predict(X.iloc[val_idx])))))
+                        fold_pred = np.expm1(m.predict(X.iloc[val_idx]))
+                        fold_maes.append(float(mae_fn(y[val_idx], fold_pred)))
                 cv_mae = round(float(np.mean(fold_maes)), 4)
                 cv_std = round(float(np.std(fold_maes)), 4)
                 _LOGGER.info(
@@ -703,12 +929,17 @@ class EnergyForecastModel:
                     ho_model.fit(X.iloc[:split], y_fit[:split], sample_weight=sample_weight[:split])
                 else:
                     ho_model.fit(X.iloc[:split], y_fit[:split])
-                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_model.predict(X.iloc[split:])))), 4)
+
+                X_ho = X.iloc[split:]
+                ho_raw = ho_model.predict(X_ho)
+                holdout_mae = round(float(mae_fn(y[split:], np.expm1(ho_raw))), 4)
             except (ValueError, IndexError):
                 pass
 
         self.model = model
         self.feature_cols = feature_cols
+        self._drop_features = drop_features
+        self._heating_buffer_smooth_h = smooth_h
         self.last_trained = datetime.now()
         self.last_mae = cv_mae if cv_mae is not None else holdout_mae
         self.last_cv_mae = cv_mae
@@ -727,7 +958,6 @@ class EnergyForecastModel:
             len(feature_cols),
             mae_str,
         )
-
         # ── Quantile models for prediction intervals (CQR) ───────────────────
         # q10/q90 trained on random 85% of rows; random 15% (≥20 rows) used for
         # split-conformal calibration. Random split (not tail) is required so
@@ -778,6 +1008,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        heating_buffer_temp_recent: pd.DataFrame
+        | None = None,  # cols: timestamp, heating_buffer_temp — most recent reading(s)
     ):
         """Build the 48-hour feature matrix shared by predict() and predict_intervals().
 
@@ -787,6 +1019,7 @@ class EnergyForecastModel:
         import numpy as np
         import pandas as pd
 
+        self._last_regime_info = {}
         now_naive = pd.Timestamp.now(tz=self._timezone).tz_localize(None)
         future_hours = pd.date_range(start=now_naive.floor("1h"), periods=48, freq="1h")
 
@@ -846,6 +1079,24 @@ class EnergyForecastModel:
         else:
             _extended = forecast_df
 
+        heating_buffer_temp_series = None
+        if heating_buffer_temp_recent is not None and not heating_buffer_temp_recent.empty:
+            if self._heating_buffer_smooth_h > 0:
+                # trained on the trailing mean: predict the same level, flat over the horizon, from the
+                # readings in [current hour - W, current hour); a dead sensor (empty window) -> NaN, which the
+                # existing training-median fill handles exactly as the raw path does today
+                level = heating_buffer_level(
+                    heating_buffer_temp_recent,
+                    self._heating_buffer_smooth_h,
+                    before=future_hours[0],
+                )
+                latest_val = float("nan") if level is None else level
+            else:
+                # hold the most recent reading flat across the forecast horizon — same "recent" pattern
+                # used for dhw_recent/climate_recent elsewhere in this method
+                latest_val = float(heating_buffer_temp_recent.sort_values("timestamp")["heating_buffer_temp"].iloc[-1])
+            heating_buffer_temp_series = pd.Series(latest_val, index=pd.DatetimeIndex(forecast_df["timestamp"]))
+
         feat_df = _engineer_features(
             future_df,
             _extended,
@@ -858,7 +1109,27 @@ class EnergyForecastModel:
             tau_hours=self._tau_hours,
             room_areas=room_areas,
             heating_active_df=ha_df_for_features,
+            heating_buffer_temp_series=heating_buffer_temp_series,
         )
+
+        # ── Model-artifact portability fallback ──────────────────────────────
+        # A model trained before physics_kwh was removed still lists it in feature_cols.
+        # Fill with 0.0 (the live model never split on it) rather than raising KeyError
+        # when feat_df[self.feature_cols] is sliced below.
+        if "physics_kwh" in self.feature_cols and "physics_kwh" not in feat_df.columns:
+            feat_df["physics_kwh"] = 0.0
+            _LOGGER.debug("physics_kwh in trained feature list but no longer computed — filling with 0.0")
+
+        # Same portability guarantee for heating_buffer_temp: a saved model may have
+        # heating_buffer_temp in feature_cols (trained with a buffer-temp sensor available)
+        # while heating_buffer_temp_recent is None/empty at predict time (sensor outage
+        # or config change). Fill with 0.0
+        # rather than raising KeyError when feat_df[self.feature_cols] is sliced below.
+        if "heating_buffer_temp" in self.feature_cols and "heating_buffer_temp" not in feat_df.columns:
+            feat_df["heating_buffer_temp"] = 0.0
+            _LOGGER.warning(
+                "heating_buffer_temp in trained feature list but sensor unavailable at predict time — filling with 0.0"
+            )
 
         # ── Daily Regime Profile Prediction ──────────────────────────────────
         if self._regime_model and self._clusterer and "regime_kwh" in self.feature_cols:
@@ -883,28 +1154,41 @@ class EnergyForecastModel:
 
                 # 2. Predict regime IDs
                 predicted_labels = self._regime_model.predict(daily_features)
-                regime_map = dict(zip(daily_features.index, predicted_labels))
+
+                # 2b. Class probabilities: feed the production regime log (prediction-neutral) and,
+                # in soft_oof mode, regime_kwh. A failure here never breaks the forecast.
+                _proba_df = None
+                if self._enable_regimes or self._regime_mode == "soft_oof":
+                    try:
+                        _proba_df = self._regime_model.predict_proba(daily_features, self._clusterer.centroids.shape[0])
+                        if self._enable_regimes and _proba_df is not None:
+                            for _i, _d in enumerate(daily_features.index):
+                                if int(predicted_labels[_i]) < 0:
+                                    continue
+                                self._last_regime_info[_d] = {
+                                    "label": int(predicted_labels[_i]),
+                                    "proba": [float(round(p, 3)) for p in _proba_df.iloc[_i].to_numpy()],
+                                }
+                    except Exception as _exc:  # noqa: BLE001
+                        _proba_df = None
+                        self._last_regime_info = {}
+                        _LOGGER.warning("Regime info capture failed (log only): %s", _exc)
 
                 # 3. Populate regime_kwh column (vectorized)
                 # Mirror training ffill so partial/gap days get a filled label
                 # rather than -1 (which would zero out regime_kwh).
                 ts_idx = pd.to_datetime(feat_df["timestamp"])
-                hourly_labels = ts_idx.dt.date
-                date_series = pd.Series(hourly_labels)
-                label_series = date_series.map(regime_map).ffill().fillna(-1).astype(int)
-                mapped_labels = label_series.values
-
-                regime_vals = np.zeros(len(ts_idx))
-                valid_mask = mapped_labels >= 0
-                if valid_mask.any():
-                    hours = ts_idx.dt.hour.values
-                    n_clusters = self._clusterer.centroids.shape[0]
-                    safe_labels = np.clip(mapped_labels[valid_mask], 0, n_clusters - 1)
-                    regime_vals[valid_mask] = self._clusterer.centroids[safe_labels, hours[valid_mask]]
+                n_clusters = self._clusterer.centroids.shape[0]
+                if self._regime_mode == "soft_oof" and _proba_df is not None:
+                    _regime_p = _proba_df
+                else:
+                    _regime_p = clustering.one_hot(pd.Series(predicted_labels, index=daily_features.index), n_clusters)
+                regime_vals = clustering.regime_kwh_from_proba(_regime_p, ts_idx, self._clusterer.centroids)
                 feat_df["regime_kwh"] = regime_vals
             except Exception as e:
                 _LOGGER.warning(f"Regime prediction failed during forecast: {e}")
                 feat_df["regime_kwh"] = 0.0
+                self._last_regime_info = {}
         else:
             feat_df["regime_kwh"] = 0.0
 
@@ -978,6 +1262,15 @@ class EnergyForecastModel:
                     feat_df[col] = feat_df[col].fillna(global_med)
 
         X = feat_df[self.feature_cols].fillna(0)
+        # thermal_pressure_net feeds a published sensor even when the model was trained without it (#120):
+        # carry the value on X so predict() can set it whether or not the column is a model feature.
+        if "thermal_pressure_net" in X.columns:
+            _tpn = float(X["thermal_pressure_net"].iloc[0])
+        elif "thermal_pressure_net" in feat_df.columns:
+            _tpn = float(feat_df["thermal_pressure_net"].fillna(0.0).iloc[0])
+        else:
+            _tpn = 0.0
+        X.attrs["thermal_pressure_net"] = _tpn
         return future_hours, X
 
     def predict(
@@ -1020,16 +1313,18 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
-        if "thermal_pressure_net" in X.columns:
+        if "thermal_pressure_net" in X.attrs:
+            self._latest_thermal_pressure_net = float(X.attrs["thermal_pressure_net"])
+        elif "thermal_pressure_net" in X.columns:
             self._latest_thermal_pressure_net = float(X["thermal_pressure_net"].iloc[0])
         else:
-            # Defensive fallback: thermal_pressure_net is always in _FEATURES_BASE,
-            # so this branch should never execute in practice.
             self._latest_thermal_pressure_net = 0.0
         preds = self.model.predict(X)
         if self._log_transform:
             preds = np.expm1(preds)
+
         preds = np.maximum(0, preds)
         return pd.DataFrame({"timestamp": future_hours, "predicted_kwh": preds})
 
@@ -1047,7 +1342,8 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
-        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
+        *,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,
         _prepared: tuple | None = None,
     ) -> pd.DataFrame | None:
         """Return 48-hour DataFrame [timestamp, low_kwh, high_kwh], or None.
@@ -1077,6 +1373,7 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
         low = self._model_q10.predict(X)
         high = self._model_q90.predict(X)
@@ -1096,7 +1393,7 @@ class EnergyForecastModel:
         self,
         forecast_df: pd.DataFrame,
         live_temp: float | None,
-        schedule: dict[str, str | None],
+        schedule: dict[str, str | dict | None],
         recent_actuals: pd.DataFrame | None = None,
         sub_sensors_recent: dict | None = None,
         away_series: pd.Series | None = None,
@@ -1109,7 +1406,7 @@ class EnergyForecastModel:
         room_areas: dict[str, float] | None = None,
         heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
     ) -> pd.DataFrame:
-        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh].
+        """Return composite 48h forecast [timestamp, predicted_kwh, delta_kwh, delta_kwh_hi].
 
         Runs the baseline predict() then overlays the appliance profiles from
         *schedule* using the learned appliance signatures.
@@ -1152,6 +1449,7 @@ class EnergyForecastModel:
         heating_active_series: pd.Series | None = None,
         setpoint_on: float | None = None,
         setpoint_off: float | None = None,
+        heating_buffer_temp_recent: pd.DataFrame | None = None,  # cols: timestamp, heating_buffer_temp
         _prepared: tuple | None = None,
     ) -> dict[str, float]:
         """Return the top-N driving features for today's prediction slice.
@@ -1186,6 +1484,7 @@ class EnergyForecastModel:
                 heating_active_series=heating_active_series,
                 setpoint_on=setpoint_on,
                 setpoint_off=setpoint_off,
+                heating_buffer_temp_recent=heating_buffer_temp_recent,
             )
 
         # Filter to today's local date; fall back to all rows if none match
@@ -1294,6 +1593,7 @@ class EnergyForecastModel:
 
         meta = {
             "feature_cols": self.feature_cols,
+            "drop_features": list(self._drop_features),
             "last_trained": self.last_trained,
             "last_mae": self.last_mae,
             "last_cv_mae": self.last_cv_mae,
@@ -1306,9 +1606,15 @@ class EnergyForecastModel:
             "likely_ev_hours": self._likely_ev_hours,
             "sub_sensor_prefixes": self._sub_sensor_prefixes,
             "tau_hours": self._tau_hours,
+            "tau_anchor_hours": self._tau_anchor_hours,
+            "tau_anchor_ts": self._tau_anchor_ts,
+            "tau_long_anchor_hours": self._tau_long_anchor_hours,
+            "tau_long_anchor_ts": self._tau_long_anchor_ts,
             "enable_regimes": self._enable_regimes,
             "regime_count": self._regime_count,
+            "regime_mode": self._regime_mode,
             "weather_tail": self._weather_tail,
+            "heating_buffer_smooth_h": self._heating_buffer_smooth_h,
         }
         with open(self._meta_path, "wb") as fh:
             pickle.dump(meta, fh)
@@ -1426,12 +1732,15 @@ class EnergyForecastModel:
         * ``solar``          — ``exp(−max_radiation / 400)``; continuous penalty, no hard cut-off
         * ``hour``           — 1.0 nighttime (22–06), 0.7 shoulder (06–09, 16–22), 0.1 daytime
 
-        A spring-bias guard is applied before selection: if fewer than 15 % of candidates
-        are nighttime AND the heating-off outdoor median exceeds 12 °C, the stored τ is
-        preserved (spring open-window data is not representative of building thermal mass).
+        The top 50 % of candidates by quality (minimum 1) are used to compute the median τ.
 
-        The top 50 % of candidates by quality (minimum 1) are used to compute the
-        median τ, which is then EMA-smoothed against the stored value.
+        A continuous confidence weight — requiring both a sufficient nighttime fraction *and*
+        a cold-enough outdoor median among the selected top-N candidates, plus enough total
+        candidates — scales how much a fresh estimate can move the stored τ in a single retrain
+        (0–20 %). A two-tier rolling cap independently bounds total movement to ±35 % over any
+        30 days and ±50 % over any 180 days, regardless of retrain frequency. See
+        `docs/superpowers/specs/2026-07-09-tau-calibration-drift-fix-design.md` §2.1–2.2 for the
+        full design rationale.
         """
         import numpy as np
         import pandas as pd
@@ -1480,6 +1789,24 @@ class EnergyForecastModel:
 
         combined["off"] = (combined["heating_active"] == 0).astype(int)
         combined["block"] = (combined["off"].diff().ne(0)).cumsum()
+
+        combined_reset = combined.reset_index().rename(columns={"index": "timestamp"})
+        passive_df = pd.DataFrame(
+            {
+                "timestamp": combined_reset["timestamp"],
+                "T_outdoor": combined_reset["T_outdoor"],
+                "T_indoor": combined_reset["T_indoor"],
+                "hp_running": combined_reset["heating_active"].astype(bool),
+                "dhw_tank_temp": np.nan,  # τ calibration has no DHW filter input today — unchanged behaviour
+            }
+        )
+        passive_idx = _find_passive_windows(passive_df, min_delta_t=0.0, min_hp_off_hours=1)
+        # block identity is computed above, on the full unfiltered timeline, so block boundaries
+        # reflect true temporal contiguity of on/off transitions. Filtering afterward only removes
+        # individual rows within already-correctly-bounded blocks (harmless with these loose
+        # min_delta_t=0.0/min_hp_off_hours=1 parameters, which add no filtering beyond off==1 given
+        # this input) — it does not merge distinct off-periods into one pseudo-block.
+        combined = combined.iloc[passive_idx].copy() if len(passive_idx) else combined.iloc[0:0]
 
         candidates: list[tuple[float, float, int]] = []  # (tau, quality, hour_start)
 
@@ -1565,28 +1892,13 @@ class EnergyForecastModel:
                 hour_start = int(group.index[s].hour)
 
                 quality = r2 * outdoor_temp_score * n_score * solar_score * hour_score
-                candidates.append((tau, quality, hour_start))
+                candidates.append((tau, quality, hour_start, sub_t_outdoor))
 
         if not candidates:
             _LOGGER.info("τ calibration: no valid passive-cooling windows found — skipping.")
             return None
 
-        # Spring-bias guard: if almost no nighttime candidates exist and outdoor temps
-        # are warm, the estimates are dominated by open-window ventilation rather than
-        # structural thermal mass.  Preserve the stored winter τ in that case.
         old_tau = self._tau_hours
-        if old_tau is not None and old_tau > 0 and len(candidates) >= 3:
-            night_frac = sum(1 for _, _, h in candidates if h >= 22 or h < 6) / len(candidates)
-            outdoor_median = float(combined[combined["off"] == 1]["T_outdoor"].median())
-            if night_frac < self._SPRING_BIAS_NIGHT_FRAC and outdoor_median > self._SPRING_BIAS_OUTDOOR_TEMP:
-                _LOGGER.info(
-                    "τ calibration skipped — spring/summer bias (%.0f%% nighttime candidates, "
-                    "T_out median=%.1f°C); preserving stored τ=%.1f h.",
-                    night_frac * 100,
-                    outdoor_median,
-                    old_tau,
-                )
-                return old_tau
 
         # With few candidates use top-50%; with many (≥ threshold) tighten to top-25%
         # to reduce bias from lower-quality windows in data-rich retrains.
@@ -1607,21 +1919,93 @@ class EnergyForecastModel:
             max(tau_estimates),
         )
 
+        # Confidence: requires BOTH a sufficient nighttime fraction AND a cold-enough outdoor
+        # median among the SELECTED (quality-filtered) candidates -- computed over the same
+        # population tau_median comes from, not the raw candidate pool. A single good signal
+        # must not be able to rescue full trust for a window where the other signal is bad
+        # (e.g. a warm, all-night window is a textbook summer ventilation case, not safe data).
+        night_frac = sum(1 for c in selected if c[2] >= 22 or c[2] < 6) / len(selected)
+        outdoor_median = float(np.median([c[3] for c in selected]))
+
+        night_conf = min(1.0, night_frac / self._SPRING_BIAS_NIGHT_FRAC_FULL)
+        temp_conf = min(
+            1.0,
+            max(
+                0.0,
+                (self._SPRING_BIAS_OUTDOOR_TEMP - outdoor_median)
+                / (self._SPRING_BIAS_OUTDOOR_TEMP - self._SPRING_BIAS_OUTDOOR_TEMP_FLOOR),
+            ),
+        )
+        # len(candidates) (pre-selection pool size) -- sparse retrains should be trusted less.
+        sample_conf = min(1.0, len(candidates) / self._TAU_SAMPLE_CONF_REF)
+
+        # Geometric mean, not a plain product: a plain 3-way product over-penalizes moderately
+        # -good conditions (three factors of 0.7 would multiply to 0.34); the geometric mean
+        # preserves the same AND-semantics at the boundaries (any single factor at exactly 0
+        # still forces confidence to exactly 0) while being much gentler in the interior.
+        confidence = (night_conf * temp_conf * sample_conf) ** (1.0 / 3.0)
+
         tau_median = float(np.median(tau_estimates))
 
         if old_tau is not None and old_tau > 0:
-            change_frac = abs(tau_median - old_tau) / old_tau
-            if change_frac > 0.5:
-                tau_result = 0.8 * old_tau + 0.2 * tau_median
+            new_weight = confidence * self._TAU_EMA_MAX_NEW_WEIGHT
+            tau_result = (1.0 - new_weight) * old_tau + new_weight * tau_median
+            if confidence < 0.05:
                 _LOGGER.info(
-                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, Δ=%.0f%%)",
+                    "τ calibration: ~0%% confidence (night_frac=%.0f%%, T_out median=%.1f°C, "
+                    "%d candidates) — preserving stored τ=%.1f h.",
+                    night_frac * 100,
+                    outdoor_median,
+                    len(candidates),
+                    old_tau,
+                )
+            else:
+                _LOGGER.info(
+                    "τ EMA blend: %.1f h → %.1f h (raw %.1f h, new_weight=%.0f%%, confidence=%.0f%% "
+                    "[night=%.0f%%, temp=%.0f%%, sample=%.0f%%])",
                     old_tau,
                     tau_result,
                     tau_median,
-                    change_frac * 100,
+                    new_weight * 100,
+                    confidence * 100,
+                    night_conf * 100,
+                    temp_conf * 100,
+                    sample_conf * 100,
                 )
-            else:
-                tau_result = tau_median
+
+            latest_ts = combined.index.max()
+
+            def _apply_drift_cap(anchor_h_attr, anchor_ts_attr, window_days, max_frac, result):
+                anchor_h = getattr(self, anchor_h_attr, None)
+                anchor_ts = getattr(self, anchor_ts_attr, None)
+                if anchor_h is None or anchor_ts is None or (latest_ts - anchor_ts).days >= window_days:
+                    anchor_h = old_tau
+                    setattr(self, anchor_h_attr, anchor_h)
+                    setattr(self, anchor_ts_attr, latest_ts)
+                max_drift = anchor_h * max_frac
+                lo, hi = anchor_h - max_drift, anchor_h + max_drift
+                if not (lo <= result <= hi):
+                    _LOGGER.warning(
+                        "τ drift cap (%d-day): %.1f h clamped to [%.1f, %.1f] h (anchor=%.1f h @ %s)",
+                        window_days,
+                        result,
+                        lo,
+                        hi,
+                        anchor_h,
+                        anchor_ts,
+                    )
+                return min(max(result, lo), hi)
+
+            tau_result = _apply_drift_cap(
+                "_tau_anchor_hours", "_tau_anchor_ts", self._TAU_DRIFT_WINDOW_DAYS, self._TAU_MAX_DRIFT_FRAC, tau_result
+            )
+            tau_result = _apply_drift_cap(
+                "_tau_long_anchor_hours",
+                "_tau_long_anchor_ts",
+                self._TAU_LONG_DRIFT_WINDOW_DAYS,
+                self._TAU_LONG_MAX_DRIFT_FRAC,
+                tau_result,
+            )
         else:
             tau_result = tau_median
 
@@ -1658,6 +2042,7 @@ class EnergyForecastModel:
                     with open(self._meta_path, "rb") as fh:
                         meta = pickle.load(fh)
                     self.feature_cols = meta.get("feature_cols", _FEATURES_BASE)
+                    self._drop_features = tuple(meta.get("drop_features", []))
                     self.last_trained = meta.get("last_trained", datetime.min)
                     self.last_mae = meta.get("last_mae")
                     self.last_cv_mae = meta.get("last_cv_mae")
@@ -1670,9 +2055,15 @@ class EnergyForecastModel:
                     self._likely_ev_hours = meta.get("likely_ev_hours", set())
                     self._sub_sensor_prefixes = meta.get("sub_sensor_prefixes", [])
                     self._tau_hours = meta.get("tau_hours", None)
+                    self._tau_anchor_hours = meta.get("tau_anchor_hours", None)
+                    self._tau_anchor_ts = meta.get("tau_anchor_ts", None)
+                    self._tau_long_anchor_hours = meta.get("tau_long_anchor_hours", None)
+                    self._tau_long_anchor_ts = meta.get("tau_long_anchor_ts", None)
                     self._enable_regimes = meta.get("enable_regimes", False)
                     self._regime_count = meta.get("regime_count", 5)
+                    self._regime_mode = meta.get("regime_mode", "hard")
                     self._weather_tail = meta.get("weather_tail", None)
+                    self._heating_buffer_smooth_h = meta.get("heating_buffer_smooth_h", 0)
                 except (pickle.UnpicklingError, EOFError, OSError) as exc:
                     _LOGGER.warning("Could not load model metadata: %s", exc)
 
@@ -1998,6 +2389,19 @@ def _learn_appliance_signatures(
         arr = np.array(padded)
         return np.mean(arr, axis=0).tolist(), np.std(arr, axis=0).tolist()
 
+    def _hi_profile(wins: list[list[float]]) -> list[float]:
+        """Column-wise mean of the cycles whose total is at/above the upper-quartile total.
+
+        Totals come from the windows passed in (post outlier rejection). With fewer than
+        4 windows the percentile is meaningless, so the mean of all windows is returned.
+        """
+        if len(wins) < 4:
+            return _avg_profile(wins)[0]
+        wtotals = np.array([sum(w) for w in wins])
+        thresh = float(np.percentile(wtotals, APPLIANCE_HI_PERCENTILE)) - 1e-9
+        top = [w for w, t in zip(wins, wtotals) if t >= thresh]
+        return _avg_profile(top)[0]
+
     def _resolve_program(cycle_ts: pd.Timestamp, prog_df: pd.DataFrame) -> str | None:
         """Last-value-carry-forward lookup of program at cycle start."""
         earlier = prog_df[prog_df["timestamp"] <= cycle_ts]
@@ -2097,6 +2501,7 @@ def _learn_appliance_signatures(
                 prof, std = _avg_profile(pwins)
                 programs[label] = {
                     "hourly_profile": prof,
+                    "hourly_profile_hi": _hi_profile(pwins),
                     "std_profile": std,
                     "total_kwh": float(sum(prof)),
                     "n_cycles": len(pwins),
@@ -2152,6 +2557,7 @@ def _learn_appliance_signatures(
         sig: dict = {
             "total_kwh": float(sum(hourly_profile)),
             "hourly_profile": hourly_profile,
+            "hourly_profile_hi": _hi_profile(windows),
             "std_profile": std_profile,
             "peak_hour": int(np.argmax(hourly_profile)),
             "n_cycles": len(windows),
@@ -2194,16 +2600,20 @@ def _composite_forecast(
         signatures:  appliance signatures dict from _learn_appliance_signatures().
 
     Returns:
-        DataFrame with columns [timestamp, predicted_kwh, delta_kwh].
+        DataFrame with columns [timestamp, predicted_kwh, delta_kwh, delta_kwh_hi].
         ``delta_kwh`` is the signed kWh difference vs. the baseline introduced by
         the scheduled appliances; it is 0 when schedule is empty or a prefix has no
-        matching signature.
+        matching signature. ``delta_kwh_hi`` is the same overlay built from the
+        upper-quartile profiles (``hourly_profile_hi``) for booking power sizing;
+        profile choice: program hi -> program mean -> combined hi -> combined mean.
+        It is appliance-only and does not feed ``predicted_kwh``.
     """
     import numpy as np
     import pandas as pd
 
     result = baseline_df.copy()
     result["delta_kwh"] = 0.0
+    result["delta_kwh_hi"] = 0.0
 
     if not schedule or not signatures:
         return result
@@ -2252,10 +2662,12 @@ def _composite_forecast(
         # Profile selection: prefer per-program profile; fall back to combined
         sig = signatures[prefix]
         profile: list | None = None
+        profile_hi: list | None = None
         if program is not None:
             prog_profiles = sig.get("programs", {})
             if program in prog_profiles:
                 profile = prog_profiles[program]["hourly_profile"]
+                profile_hi = prog_profiles[program].get("hourly_profile_hi") or profile
             else:
                 _LOGGER.debug(
                     "_composite_forecast: no profile for program '%s' on '%s' — using combined",
@@ -2264,13 +2676,17 @@ def _composite_forecast(
                 )
         if profile is None:
             profile = sig["hourly_profile"]
+            profile_hi = sig.get("hourly_profile_hi") or profile
         # Clip profile to available window
         profile = profile[: 48 - offset_h]
         if not profile:
             continue
+        profile_hi = profile_hi[: 48 - offset_h]
 
         n = len(profile)
         result.loc[result.index[offset_h : offset_h + n], "delta_kwh"] += profile
+        n_hi = len(profile_hi)
+        result.loc[result.index[offset_h : offset_h + n_hi], "delta_kwh_hi"] += profile_hi
 
     result["predicted_kwh"] = np.maximum(0.0, result["predicted_kwh"].values + result["delta_kwh"].values)
     return result
@@ -2347,6 +2763,56 @@ def _add_sub_sensor_lags_prediction(
     return future_df
 
 
+def _find_passive_windows(
+    df: pd.DataFrame,
+    *,
+    min_delta_t: float = 8.0,
+    min_hp_off_hours: int = 2,
+    dhw_rising_precomputed: pd.Series | None = None,
+) -> pd.Index:
+    """Return the index of rows suitable for passive-cooling calibration (τ).
+
+    A row qualifies when: the heat pump has been off for at least
+    ``min_hp_off_hours`` consecutive hours ending at that row, ΔT = T_indoor −
+    T_outdoor ≥ ``min_delta_t``, and ``dhw_tank_temp`` is not rising into that
+    row (rising tank temp indicates an active DHW cycle, which would inflate
+    / shorten apparent τ if included).
+
+    ``dhw_rising_precomputed``: optional, keyword-only. A boolean Series indexed
+    by timestamp, precomputed by the caller over a temporally-complete series
+    (real adjacent hours, not rows already thinned by an eligibility filter) —
+    used instead of recomputing ``.diff()`` on this function's own (possibly
+    gapped) ``dhw_tank_temp`` column, which would compare non-adjacent real
+    hours across the gaps and reintroduce false "DHW rising" positives/negatives.
+    Reindexed here against this function's internally re-sorted ``d``, not the
+    caller's ``df`` — by timestamp value, so the caller's row order or any
+    extra/missing timestamps can't misalign it. Default ``None`` preserves the
+    original per-call behavior for ``_calibrate_ua_dhw`` and the open-window
+    detector, which don't pass it.
+    """
+    import pandas as pd
+
+    d = df.sort_values("timestamp").reset_index(drop=True)
+
+    off = (~d["hp_running"].astype(bool)).astype(int)
+    off_run_length = off.groupby((off != off.shift()).cumsum()).cumcount() + 1
+    off_run_length = off_run_length.where(off == 1, 0)
+    enough_off = off_run_length >= min_hp_off_hours
+
+    delta_t = d["T_indoor"] - d["T_outdoor"]
+    enough_delta = delta_t >= min_delta_t
+
+    if dhw_rising_precomputed is not None:
+        reindexed = dhw_rising_precomputed.reindex(d["timestamp"], fill_value=False)
+        dhw_rising = pd.Series(reindexed.to_numpy(), index=d.index)
+    else:
+        dhw_rising = d["dhw_tank_temp"].diff() > 0
+    not_dhw_active = ~dhw_rising.fillna(False)
+
+    mask = enough_off & enough_delta & not_dhw_active
+    return d.index[mask]
+
+
 # ── Indoor temperature projection (RC-ODE forward simulation) ────────────────
 
 
@@ -2362,16 +2828,25 @@ def _project_indoor_temps(
     """Project indoor temperature for each climate entity over *future_timestamps*.
 
     Uses a first-order RC ODE (Euler forward):
-        T_in[t+1] = T_in[t] + (T_out[t] - T_in[t]) / tau
+        T_in[t+1] = max(T_in[t] + (T_out[t] - T_in[t]) / tau, setpoint[t] - d(t))
+
+    while heating is on (thermostat floor), else the free term alone. The floor deficit is
+    ``d(i) = d_ss + (d0 − d_ss)·exp(−i / DEFICIT_RECOVERY_TAU_H)``: ``d0`` is the deficit at hour 0,
+    ``d_ss`` the median deficit at the current setpoint over the last DEFICIT_STEADY_WINDOW_H (0 with
+    fewer than DEFICIT_STEADY_MIN_ROWS such rows); both are 0 when heating only switches on later or
+    the observation is stale. NaN (entity-unavailable) climate rows are skipped; a room with no valid row
+    yields an all-NaN frame.
 
     Starting T_in: most-recent ``current_temp`` if the observation is <2 h old;
     otherwise falls back to the most-recent ``setpoint``.
 
     Returns a dict ``{entity_id: pd.DataFrame}`` with ``timestamp``,
     ``current_temp``, ``setpoint`` and ``deficit`` columns indexed by
-    *future_timestamps*. ``setpoint`` is the pure hysteresis-projected
-    trajectory; ``deficit`` blends the live setpoint (near-term, full trust)
-    with that hysteresis-projected setpoint (far-term) — see the blend block
+    *future_timestamps*. ``setpoint`` is, for on-hours, the room's own live
+    setpoint when heating is already on at hour 0 (or when no heating series is
+    given) and the shared ``setpoint_on`` when heating only switches on later;
+    off-hours use ``setpoint_off``. ``deficit`` blends the live setpoint (near-term,
+    full trust) with that projected setpoint (far-term) — see the blend block
     below. These DataFrames can be passed as *climate_dfs* to
     ``_engineer_features()`` so that prediction-time thermal pressure reflects
     projected — rather than stale — indoor temperatures, using ``deficit``
@@ -2392,30 +2867,73 @@ def _project_indoor_temps(
 
         cdf = cdf.copy()
         cdf["timestamp"] = pd.to_datetime(cdf["timestamp"])
-        latest = cdf.sort_values("timestamp").iloc[-1]
+        # Entity-unavailable rows carry NaN temp + setpoint (~430 h across 9 rooms live, 2026-10-19). A
+        # trailing one used to make the whole room projection NaN — use the last valid row instead.
+        cdf = cdf.dropna(subset=["current_temp", "setpoint"]).sort_values("timestamp")
+        if cdf.empty:
+            # No valid reading at all: keep an all-NaN frame (pre-existing behaviour) so the room's area stays
+            # in thermal_pressure's denominator exactly as in training, where unavailable rooms count too.
+            nan_col = np.full(len(future_timestamps), np.nan)
+            result[eid] = pd.DataFrame(
+                {"timestamp": future_timestamps, "current_temp": nan_col, "setpoint": nan_col, "deficit": nan_col}
+            )
+            continue
+        latest = cdf.iloc[-1]
 
         age = now - latest["timestamp"]
+        steady_deficit = 0.0
         if age <= stale_threshold:
             t_in_start = float(latest["current_temp"])
+            # Typical deficit at the CURRENT setpoint over the last DEFICIT_STEADY_WINDOW_H: a room that
+            # persistently sits below target keeps that demand; rows at other setpoints (night setback,
+            # just-raised morning setpoint) don't count — they'd invent or hide deficit vs the new target.
+            window = cdf[cdf["timestamp"] > latest["timestamp"] - pd.Timedelta(hours=DEFICIT_STEADY_WINDOW_H)]
+            same_sp = window[(window["setpoint"] - float(latest["setpoint"])).abs() < 0.05]
+            if len(same_sp) >= DEFICIT_STEADY_MIN_ROWS:
+                steady_deficit = float(np.median(np.maximum(0.0, same_sp["setpoint"] - same_sp["current_temp"])))
         else:
             t_in_start = float(latest["setpoint"])
 
         # Align outdoor temps to future_timestamps
         t_out_arr = outdoor_temp_series.reindex(future_timestamps, method="nearest").values.astype(float)
 
-        # Vectorised Euler forward over 48 steps
-        t_in_arr = np.empty(len(future_timestamps))
-        t_in_arr[0] = t_in_start
-        for i in range(1, len(future_timestamps)):
-            t_in_arr[i] = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+        n = len(future_timestamps)
+        room_setpoint = float(latest["setpoint"])
 
-        # Build a projected climate DataFrame matching what _engineer_features expects
-        setpoint_val = float(latest["setpoint"])
+        # Heating state per step. No series → thermostat-controlled for the whole window.
         if heating_active_series is not None and setpoint_on is not None and setpoint_off is not None:
-            ha_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values
-            setpoint_arr = np.where(ha_arr.astype(bool), setpoint_on, setpoint_off)
+            on_arr = heating_active_series.reindex(future_timestamps, method="nearest").fillna(0).values.astype(bool)
+            # Heating already on at hour 0 → this room's thermostat setpoint is the truth for every
+            # on-hour. Comparing all rooms to the shared mean (setpoint_on) invented ~1.4 °C of
+            # deficit for 18 °C rooms (2026-10-15). Turning on later → shared setpoint_on, as before.
+            on_setpoint = room_setpoint if on_arr[0] else setpoint_on
+            setpoint_arr = np.where(on_arr, on_setpoint, setpoint_off)
         else:
-            setpoint_arr = np.full(len(future_timestamps), setpoint_val)
+            on_arr = np.ones(n, dtype=bool)
+            setpoint_arr = np.full(n, room_setpoint)
+
+        # RC cool-down with a thermostat floor: while heating is on the room is held at its
+        # current deficit below the active setpoint instead of decaying toward outdoor. A pure
+        # cool-down projected ~4.6 °C of pressure at 24–35 h lead vs 0.02 °C real (2026-10-15).
+        # d0 is measured against the same setpoint the floor uses: the room's own setpoint when heating
+        # is already on at hour 0; when heating only switches on later the floor is the shared
+        # setpoint_on with d0 = 0 (season onset; room assumed brought to target).
+        # The hour-0 deficit is often transient (setpoint just stepped up, e.g. ~04–05 h): holding it for
+        # 48 h swung the tomorrow forecast by +3–4 kWh for one hourly run (2026-10-19 replay). It now
+        # decays to the room's steady same-setpoint deficit with DEFICIT_RECOVERY_TAU_H; d(0) = d0 keeps
+        # hour 0 (what the published sensors read) unchanged. Read the module global at call time — the
+        # replay gate patches it to inf to reproduce the old constant-d0 floor.
+        if on_arr[0]:
+            initial_deficit = max(0.0, room_setpoint - t_in_start)
+            decay = np.exp(-np.arange(n, dtype=float) / DEFICIT_RECOVERY_TAU_H)
+            floor_deficit = steady_deficit + (initial_deficit - steady_deficit) * decay
+        else:
+            floor_deficit = np.zeros(n)
+        t_in_arr = np.empty(n)
+        t_in_arr[0] = t_in_start
+        for i in range(1, n):
+            free = t_in_arr[i - 1] + (t_out_arr[i - 1] - t_in_arr[i - 1]) / tau
+            t_in_arr[i] = max(free, setpoint_arr[i] - floor_deficit[i]) if on_arr[i] else free
 
         # ── Deficit blend: live setpoint (near-term) → hysteresis-projected
         # setpoint (far-term) ────────────────────────────────────────────
@@ -2425,9 +2943,9 @@ def _project_indoor_temps(
         # thinks it *should* be set to. Beyond SENSOR_BLEND_HOURS we trust the
         # hysteresis projection fully, same rationale as the outdoor-temp blend
         # in _build_prediction_temp_df.
-        live_deficit_arr = np.maximum(0.0, setpoint_val - t_in_arr)
+        live_deficit_arr = np.maximum(0.0, room_setpoint - t_in_arr)
         hyst_deficit_arr = np.maximum(0.0, setpoint_arr - t_in_arr)
-        hours_ahead = np.arange(len(future_timestamps), dtype=float)
+        hours_ahead = np.arange(n, dtype=float)
         blend_span = max(SENSOR_BLEND_HOURS - SENSOR_FULL_TRUST_HOURS, 1)
         alpha = np.clip((hours_ahead - SENSOR_FULL_TRUST_HOURS) / blend_span, 0.0, 1.0)
         deficit_arr = live_deficit_arr * (1.0 - alpha) + hyst_deficit_arr * alpha
@@ -2448,6 +2966,45 @@ def _project_indoor_temps(
 # ── Core feature engineering ──────────────────────────────────────────────────
 
 
+def smooth_heating_buffer(series: pd.Series, window_h: int) -> pd.Series:
+    """Causal trailing mean of the heating-buffer reading, excluding the reading at ``t`` itself.
+
+    Value at ``t`` = mean of readings with ``t - window_h <= ts < t``; NaN until 3 past readings exist (the
+    caller's ``ffill().fillna(median)`` covers the sensor's first hours). Excluding the same-hour reading keeps
+    "the heat pump is running right now" out of the feature, which is what made it a target proxy.
+    """
+
+    s = series.dropna().sort_index(kind="stable")  # stable: "keep last" among duplicates is then the last written
+    s = s[~s.index.duplicated(keep="last")]
+    return s.rolling(f"{int(window_h)}h", min_periods=min(3, int(window_h)), closed="left").mean()
+
+
+def heating_buffer_level(recent: pd.DataFrame, window_h: int, before: pd.Timestamp | None = None) -> float | None:
+    """Predict-time counterpart of :func:`smooth_heating_buffer`: mean of the valid readings in the window.
+
+    The window is ``before - window_h <= ts < before``, exactly what training used for the first forecast hour
+    (live frames carry the partial current hour as their last label; ``before`` = forecast start excludes it).
+    ``before=None`` → the last ``window_h`` hours up to and including the latest valid reading. Uses whatever
+    readings exist (>= 1), so a short history after a sensor restart still yields a level; ``None`` when the
+    window holds no valid reading (dead sensor), so the caller can fall back to the training-median fill.
+    """
+    import pandas as pd
+
+    d = recent.dropna(subset=["heating_buffer_temp"])
+    if d.empty:
+        return None
+    ts = pd.to_datetime(d["timestamp"])
+    if before is None:
+        end = ts.max() + pd.Timedelta(nanoseconds=1)
+    else:
+        end = pd.Timestamp(before)
+        if end.tzinfo is not None:
+            end = end.tz_localize(None)
+    in_window = ((ts >= end - pd.Timedelta(hours=window_h)) & (ts < end)).to_numpy()
+    vals = d.loc[in_window, "heating_buffer_temp"]
+    return float(vals.mean()) if len(vals) else None
+
+
 def _engineer_features(
     df: pd.DataFrame,  # naive timestamps
     weather_df: pd.DataFrame,  # naive timestamps
@@ -2463,6 +3020,7 @@ def _engineer_features(
     room_areas: dict[str, float] | None = None,  # entity_id → m² (defaults to DEFAULT_ROOM_AREA_M2)
     regime_kwh_series: pd.Series | None = None,  # hourly regime profile
     heating_active_df: pd.DataFrame | None = None,  # cols: timestamp, heating_active (0/1)
+    heating_buffer_temp_series: pd.Series | None = None,  # direct sensor feature, absent when sensor not configured
 ) -> pd.DataFrame:
     import numpy as np
     import pandas as pd
@@ -2812,6 +3370,18 @@ def _engineer_features(
     if "temp_c" in df.columns and "temp_lag_168h" in df.columns:
         delta_168h = (df["temp_c"] - df["temp_lag_168h"]).clip(lower=0)
         df["regime_kwh"] *= 1.0 - (delta_168h / 8.0).clip(upper=1.0)
+
+    # ── Heating buffer temp (optional direct sensor feature) ──────────────────
+    if heating_buffer_temp_series is not None:
+        df["_ts_floor"] = df["timestamp"].dt.floor("1h")
+        df = df.merge(
+            heating_buffer_temp_series.to_frame("heating_buffer_temp"),
+            left_on="_ts_floor",
+            right_index=True,
+            how="left",
+        )
+        df.drop(columns=["_ts_floor"], inplace=True, errors="ignore")
+        df["heating_buffer_temp"] = df["heating_buffer_temp"].ffill().fillna(df["heating_buffer_temp"].median())
 
     return df
 

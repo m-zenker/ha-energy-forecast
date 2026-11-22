@@ -1,11 +1,15 @@
 """Constants for the Energy Forecast app."""
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 # Data Validation
 MAX_HOURLY_KWH = 50.0  # Filters out meter resets or spikes
+# A drop to below this fraction of the previous reading is a counter restart
+# (SolarEdge b1 battery meters reset twice daily); smaller dips are jitter.
+COUNTER_RESET_FRACTION = 0.9
 
 # EV Charging Detection
 # Hours above this threshold are classified as EV charging and excluded from
@@ -24,6 +28,8 @@ CACHE_PATH = Path(__file__).parent / "energy_history.csv"
 CACHE_PATH_15M = Path(__file__).parent / "energy_history_15m.csv"
 MAX_15MIN_KWH = MAX_HOURLY_KWH / 4  # 12.5 kWh — per-slot cap for 15-min resolution
 PRED_HISTORY_PATH = Path(__file__).parent / "pred_history.json"
+REGIME_LOG_PATH = PRED_HISTORY_PATH.parent / "regime_log.jsonl"  # append-only, one line per sensor update
+CAPTURE_DIR = PRED_HISTORY_PATH.parent / "captures"  # live model-input captures (see capture.py)
 GITHUB_RELEASES_URL = "https://api.github.com/repos/m-zenker/ha-energy-forecast/releases/latest"
 
 # Occupancy Detection
@@ -31,6 +37,7 @@ PRESENCE_STATE_HOME = "home"
 
 # Appliance Signature Learning
 APPLIANCE_MAX_WINDOW_HOURS = 12  # Hard cap for adaptive cycle detection
+APPLIANCE_HI_PERCENTILE = 75  # Cycles at/above this total-kWh percentile form the upper-quartile profile
 
 # Sensor Blending Logic
 # How many hours to trust the local outdoor sensor before
@@ -40,6 +47,15 @@ SENSOR_BLEND_HOURS = 6
 
 # Thermal Projection (indoor temperature RC-ODE forward simulation)
 DEFAULT_TAU = 12.0  # hours — used when τ has not been calibrated yet
+# Thermostat recovery of a transient hour-0 deficit in the indoor projection (2026-10-19): the floor
+# deficit decays from d0 to the room's steady same-setpoint deficit with this e-folding time.
+DEFICIT_RECOVERY_TAU_H = 2.0  # hours — value from plan 2026-10-19-deficit-fade Task 1
+DEFICIT_STEADY_WINDOW_H = 24  # hours of climate history used for the steady deficit
+DEFICIT_STEADY_MIN_ROWS = 3  # fewer same-setpoint rows → steady deficit 0 (setpoint just changed)
+# Heating-buffer smoothing (2026-10-20): train and predict `heating_buffer_temp` as a causal trailing mean over
+# this many hours instead of a heat-pump-cycle snapshot. ON (24 h, option S24); 0 = off (raw same-hour reading,
+# latest broadcast). Models trained before the retrain keep the raw path (window persisted in meta.pkl).
+HEATING_BUFFER_SMOOTH_H = 24
 DEFAULT_ROOM_AREA_M2 = 15.0  # m² — default per-room area when not configured
 
 # Supported energy sensor units and their kWh conversion factors.
@@ -117,3 +133,35 @@ def resolve_timezone(configured: str | None, ha_timezone: Any, logger: logging.L
             )
         return configured
     return ha_timezone or "Europe/Zurich"
+
+
+# Named groups of model features that `drop_feature_groups` can leave out of training (ROADMAP #120).
+FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
+    "thermal_pressure": (
+        "thermal_pressure",
+        "thermal_pressure_max",
+        "thermal_pressure_std",
+        "thermal_pressure_cop",
+        "thermal_pressure_net",
+        "infiltration_pressure",
+    ),
+    "heating_buffer": ("heating_buffer_temp",),
+}
+
+
+def resolve_feature_groups(groups: Iterable[str]) -> tuple[str, ...]:
+    """Feature names for the given group names, in group order, without duplicates.
+
+    Raises ValueError for an unknown group so a config typo stops startup instead of silently
+    training the full model.
+    """
+    groups = list(groups)
+    bad = [g for g in groups if g not in FEATURE_GROUPS]
+    if bad:
+        raise ValueError(f"unknown feature group(s) {bad}; known: {sorted(FEATURE_GROUPS)}")
+    names: list[str] = []
+    for g in groups:
+        for name in FEATURE_GROUPS[g]:
+            if name not in names:
+                names.append(name)
+    return tuple(names)
