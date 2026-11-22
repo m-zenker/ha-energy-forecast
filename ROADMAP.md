@@ -32,7 +32,9 @@ Start here. Everything below this section is detail and history.
 - One forecast-changing step per deploy window. Steps 4–6 do not change the published forecast at default config; the #120 flip (step 9) and #105 (step 10) do, and each gets its own window.
 - Phase 2 (`use_physics_residual`) was removed on 2026-11-16 together with the physics space-heating model (physics heating removal); there is no activation path left.
 
-**Open decision, not scheduled:** physics release strategy (v0.12.0 opt-in on `main`, or more cherry-picks). `dev` is over 110 commits ahead of `main` and this batch adds six branches.
+**Resolved 2026-11-22:** physics release strategy. The physics heating model was removed, so no Rule 3 opt-in release was needed; `dev` shipped to `main` as v0.12.0 via `release/v0.12.0` and `main` was merged back into `dev` (dev now on the 0.12.1 alpha line).
+
+**v1.0 gate clock started 2026-11-22**; earliest v1.0.0 = 2026-12-20 (tag date + 28 days).
 
 **Parked or closed, so not on this list:** #111 (parked), #112 and #115 (closed), #96 cooling mode (parked 2026-11-09), #103 (closed 2026-11-16, physics heating removal), #104 and #106 (parked 2026-11-16), #105 (closed 2026-11-16; branch `feat/ua-eff-daily` and its worktree parked 2026-11-17, continues offline only, unpark if its PASS is to re-enter as an ML feature), HACS items #46/#16/#18.
 
@@ -676,6 +678,7 @@ Open decision at the C verdict: physics release strategy (v0.12.0 opt-in vs furt
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.12.0 | 2026-11-22 | First `main` release of the 0.12 line: block/daily accuracy sensors, steadier day-ahead forecast, DHW override handling, heating-season detection, update check, DST/cache/archive fixes. 1483 tests on the release branch. |
 | v0.11.4-alpha | 2026-06-13 | 15-minute energy history cache (#85); strip partial day from clustering input (#86). 643 tests. |
 | v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
 | v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
