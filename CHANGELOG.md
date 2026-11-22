@@ -8,6 +8,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.12.0] - 2026-11-22
+
+First release since 0.11.18 that brings the whole 0.12 line to `main`. It adds accuracy reporting you can read in HA, a more stable day-ahead forecast, and several fixes found on live installs. Details are per-feature below; the alpha-by-alpha history is in the git log.
+
+### Upgrading from 0.11.x
+
+- **Replace the whole `apps/energy_forecast/` folder**, do not copy single files. Four modules are new (`accuracy.py`, `capture.py`, `heating_season.py`, `physics.py`); an old install with only some files updated fails on import. No new Python packages are needed.
+- Your existing model, caches and `pred_history.json` keep working. The next scheduled retrain builds the new feature set (87 columns).
+- **Check `heating_temp_on` / `heating_temp_off` if you set them.** They are now thresholds on the *daily mean* outdoor temperature (before: hourly temperatures, defaults 14/18 °C). Set both or neither; one alone is ignored with a warning. Unset, they are learned per installation at each retrain.
+- With `baseline_mode: true`, the actuals used for MAE/bias now exclude the baseline sub-meters (same definition the model trains on). Expect `mae_*` values to shift once; it is a measurement change, not a forecast change.
+- Hourly forecast publishing and sub-sensor history re-derived from HA are unaffected by the upgrade.
+
+### Added
+
+- Accuracy sensors: `sensor.energy_forecast_block_mae_7d` / `_30d` (MAE of 3 h block totals) and `sensor.energy_forecast_daily_bias_7d` / `_30d` (mean forecast minus actual per calendar day, negative = under-forecast), plus a naive same-hour baseline for comparison.
+- `get_scenario`: schedule values may be `{"start": "HH:MM", "program": "<label>"}`; appliance bookings can be sized by their upper-quartile profile (`delta_kwh_hi`).
+- DHW override handling (`set_dhw_schedule`, `recalibrate_physics`): committed legionella and comfort-boost cycles now correct the published forecast and are replayed in training only if the tank data shows they ran.
+- Heating-season detection from daily-mean outdoor temperature with learned thresholds; `heating_season` attribute on `sensor.energy_forecast_today`; example automation in `docs/examples/heating_season_automation.yaml`.
+- Daily update check: a persistent notification when a newer release exists (skipped on alpha/beta builds; `update_check_enabled`).
+- Opt-in `capture_inputs` (default `false`) records exact retrain inputs for offline replay; opt-in `drop_feature_groups` (default `[]`).
+- Regime stability log (`regime_log.jsonl`), standalone Docker example files, and a developer `backtest/` package (not deployed to HA).
+
+### Changed
+
+- The day-ahead forecast is steadier: the heating-buffer feature is a trailing 24 h mean, the regime feature uses out-of-fold labels (no more flips when the weather source changes), and the heating projection runs once per day from the forecast daily mean instead of per hour.
+- With `ev_charging_sensor` set, EV-charging days are no longer excluded from regime clustering or MAE tracking.
+- The earlier physics space-heating model was evaluated, found to add no measurable accuracy, and removed before this release; the DHW/legionella and scenario features that remain do not depend on it.
+
+### Fixed
+
+- Over-forecast of heating-season consumption after heating onset (indoor-temperature projection, per-room setpoints, live-setpoint blend).
+- DST fall-back crashes (duplicate 02:00 hour, ambiguous floor) and a weather-fetch failure that broke the whole sensor update.
+- Open-bucket cache poisoning for high-frequency meters, the 10 s history timeout on weekly resync, Open-Meteo archive retry on 5xx/429, counter resets zeroing battery/appliance sub-sensors.
+- Retrain-age gates read in the wrong time zone; `set_dhw_schedule` no longer blanks `get_scenario` until the next publish; today's P10/P90 block totals now blend elapsed actuals like the P50.
+
+---
+
+## [0.12.0-alpha-44] - alpha development log (summarised in 0.12.0 above)
+
 ### Added
 - `backtest/arms.py`, `backtest/runner.py`, `backtest/experiments/halflife.py`, `backtest/README.md` — `Arm` gets an optional `patch(fold, weather)` hook, a context manager entered around `train()`, for arms that need to change something `train_kwargs` cannot reach (for example scaling the LightGBM `sample_weight`). New experiment `halflife` compares `weight_halflife_days` 30–180 and temperature-similarity sample weights against the live 60 days; result in ROADMAP #88 (no gain on cold days, 60 kept). Backtest tooling only, not uploaded by `deploy.py`, no change to forecasts.
 - `apps/energy_forecast/model.py`, `energy_forecast.py`, `const.py` — new opt-in config key `drop_feature_groups` (default `[]`, no change to forecasts). Listing `thermal_pressure` trains the model without the six thermal-pressure and infiltration features; listing `heating_buffer` also drops `heating_buffer_temp`. It takes effect at the next retrain, including when you remove it again; a saved model keeps its own feature list, so a restart in between changes nothing. An unknown group name stops startup with an error instead of silently training the full model. `sensor.energy_forecast_thermal_pressure_net` keeps its value when the features are dropped. Experimental: leave it empty until the shadow check passes (ROADMAP #120).
@@ -139,6 +180,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `apps/energy_forecast/energy_forecast.py`, `apps/energy_forecast/heating_season.py` — `heating_temp_on` / `heating_temp_off` are now optional overrides of daily-mean thresholds (previously hourly outdoor temps, defaults 14/18 °C). They must be set together; one alone is ignored with a warning. When unset, thresholds are learned per installation at each retrain from historical data (fallback 12/16 °C until ≥60 labelled days with ≥4 season transitions exist).
 - `apps/energy_forecast/model.py`, `apps/energy_forecast/energy_forecast.py` — when `physics.heating_sub_meter_sensor` is configured, the `heating_active` training feature now uses the sub-meter "heating day" label (>0.5 kWh space heating per day) rather than the raw switch state. The switch is still used for τ and physics calibration.
 - `apps/energy_forecast/ha_data.py`, `apps/energy_forecast/model.py`, `apps/energy_forecast/energy_forecast.py` — with `ev_charging_sensor` configured, EV-charging days are no longer excluded from regime clustering and EV hours are no longer dropped from MAE tracking — the wallbox subtraction is exact (sensor EV hours are stored net of wallbox kWh in the actuals history). Threshold-only setups unchanged. Expect `mae_*` to shift slightly at deploy (more scored hours).
+
+---
+
+## [0.11.18] - 2026-10-26
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — on the DST fall-back night, the four energy-cache writers (`fetch_energy_history`, `fetch_recent_energy`, `fetch_energy_history_15m`, `fetch_recent_energy_15m`) raised `AmbiguousTimeError` when computing the open-bucket cutoff, losing lag features and skipping the 15 m cache write for the ambiguous hour. `fetch_climate_history` and `fetch_recent_climate` had the same class of bug via `.dt.floor("1h")` on tz-aware HA history timestamps, crashing for any fetch window that contained the fall-back hour (2 days on the hourly run, 30 days on the weekly retrain) and leaving the climate cache stale. Energy writers now strip the timezone before flooring so the operation is unambiguous; climate writers drop the redundant floor — the following `resample("1h")` is DST-safe and already performs the bucketing.
+- `tests/test_ha_data.py` — test helpers with the same tz-aware floor pattern are updated so the suite no longer fails when run during the ~3 h window around a DST fall-back.
+
+---
+
+## [0.11.17] - 2026-10-22
+
+### Fixed
+- `apps/energy_forecast/const.py`, `energy_forecast.py`, `ha_data.py` — DST fall-back (last Sunday of October): converting timestamps to naive local time maps both 02:00 hours onto one `02:00` label, and later timestamp-indexed lookups failed with `cannot reindex on an axis with duplicate labels`. With SRG-SSR weather (UTC timestamps) the duplicate already appears once the forecast horizon reaches the fall-back night, about 2.5 days early, and the heating-active projection fails with a warning. From that night on, appliances with a `program_sensor` dropped out of the hourly update and of every retrain for up to 30 days. New `const.drop_dst_duplicates` keeps the first (summer-time) row; it is applied to the forecast frame after the timezone strip, to the away-mode and presence hourly histories, and to the fresh frame in both sub-sensor fetchers. Trade-off: the fall-back day has 24 hourly rows for 25 real hours, so its forecast and training total under-count about one hour.
+- `apps/energy_forecast/energy_forecast.py` — "Sensor update failed" now logs the full traceback, so the failing line is visible in the AppDaemon log.
+
+---
+
+## [0.11.16] - 2026-10-19
+
+### Fixed
+- `apps/energy_forecast/weather.py`, `model.py` — when the Open-Meteo forecast request failed (timeout, 5xx), `fetch_open_meteo()` returned a columns-only frame with `object` dtype. The all-NaN `temp_c` then made `np.exp()` in the defrost-risk feature raise, failing the whole sensor update. The fallback now returns float64/datetime64 columns, `_engineer_features()` coerces weather columns with `pd.to_numeric(errors="coerce")` so the existing median/NaN imputation applies, and the failure is logged as a warning instead of degrading silently. (Ported from GitHub PR #25 by @housemaister.)
+
+---
+
+## [0.11.15] - 2026-10-06
+
+### Fixed
+- `apps/energy_forecast/ha_data.py` — the still-open hourly or 15-min bucket (at most ~1 min of accumulated kWh when the update runs at HH:01) was stripped from the return value of all four energy-cache writers but written to `energy_history.csv` / `energy_history_15m.csv` before the strip. Because the hourly append-only path skips timestamps already present in the CSV, the partial value persisted indefinitely — only the weekly 30-day compaction could overwrite it. Until compaction ran, the partial row was read back as `lag_72h`, `lag_168h`, and `lag_336h` at prediction time, producing train/serve skew for all users. When the compaction also failed (e.g. due to the API timeout fixed below), the model retrained on a near-zero pattern and forecasts collapsed toward 0. All four writers (`fetch_energy_history`, `fetch_recent_energy`, `fetch_energy_history_15m`, `fetch_recent_energy_15m`) now strip the open bucket before the write rather than after, so the partial row never enters the CSV. Existing poisoned rows up to 30 days old are corrected on the next successful weekly resync. Reported in GitHub issue #24 by @Yersi88.
+- `apps/energy_forecast/ha_data.py` — the weekly 30-day history resync exceeded AppDaemon's hard 10 s HA API timeout for high-frequency meters (~10 s update interval, ~120k+ recorder states over 30 days); AppDaemon returned `None` and `_fetch_history` silently treated it as an empty window, leaving the cache unchanged and allowing partial-bucket rows (see above) to go uncorrected. `_fetch_history` now fetches windows longer than 2 days (`_HISTORY_CHUNK_DAYS`) as contiguous 2-day chunks — the window size already proven safe by the hourly `fetch_recent_*` path. Chunked fetching is all-or-nothing: a failed chunk returns an empty DataFrame rather than forward-filling a gap into 0-kWh rows that would overwrite good cached data. Boundary states between chunks are deduplicated. A new `_history_states()` helper parses AppDaemon's response more defensively, covering dict, flat-list, and nested-list formats and guarding against AppDaemon versions that may ignore the entity filter when `end_time` is set. `_fetch_history` logs a WARNING when `get_history` returns a `None`/unusable response; `fetch_energy_history` and `fetch_energy_history_15m` also WARN when the full 30-day resync returns no usable data. GitHub issue #24. Chunk bounds are passed as naive local datetimes (AppDaemon 4.2–4.4 pytz-localize them and reject tz-aware values), with 1 day of slack on the final window so an AppDaemon/HA timezone mismatch can't cut off the latest hours.
+- `README.md` — Requirements now note that high-frequency meters are supported via the chunked resync, and what the new `30-day history resync ... returned no data` warning means. Test badge updated to 851. GitHub #24.
+- `apps/energy_forecast/weather.py` — `fetch_historical_weather()` (Open-Meteo Archive API, used during backfill/retrain) now retries up to 3 times with exponential backoff (2/4/8 s) on HTTP 5xx, HTTP 429, and connection/timeout errors before falling back to the existing median-imputation path. Previously a single transient 503 degraded a whole retrain's weather features. Other 4xx responses and JSON-parsing failures still fail immediately, unchanged. Worst case on a hung connection is ~134 s (4 × 30 s timeout + 14 s backoff) before the fallback. ROADMAP #97, GitHub Issue #21.
+- `apps/energy_forecast/model.py`, `tests/test_setpoint_projection.py` — `sensor.energy_forecast_thermal_pressure_net` could report a stale, non-zero deficit when heating was genuinely off (e.g. summer mode), because indoor-temperature projection used the seasonal hysteresis-projected setpoint instead of the live thermostat setpoint for the current hour — a manual override (thermostats set to 7°C) was masked by the model's own "should be on" projection, producing a spurious ~7.2 reading. Fixed by blending the live setpoint (near-term, full trust) with the hysteresis-projected setpoint (far-term forecast) in `_project_indoor_temps()`/`_engineer_features()`. The multi-hour-ahead forecast horizon (beyond the blend window) still transitions to the seasonal hysteresis projection as before — only the current-hour published sensor and the near-term blend window are affected by this fix.
+
+---
+
+## [0.11.14] - 2026-09-21
+
+### Added
+- `README.md`, `standalone/` — added a Standalone Docker Deployment section and example files (`Dockerfile`, `docker-compose.yml`, `appdaemon.yaml.example`, `secrets.yaml.example`) for running AppDaemon outside the HA Supervisor add-on. Uses a plain `python:3.12-slim` base rather than an Alpine image, and wires credentials through AppDaemon's `!secret` mechanism against a gitignored `secrets.yaml` instead of typing them directly into `appdaemon.yaml`. Addresses discussion #6. (Ported from GitHub PR #23 by @housemaister.)
 
 ---
 
