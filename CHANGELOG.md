@@ -8,6 +8,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.12.0] - 2026-11-22
+
+First release since 0.11.18 that brings the whole 0.12 line to `main`. It adds accuracy reporting you can read in HA, a more stable day-ahead forecast, and several fixes found on live installs. Details are per-feature below; the alpha-by-alpha history is in the git log.
+
+### Upgrading from 0.11.x
+
+- **Replace the whole `apps/energy_forecast/` folder**, do not copy single files. Four modules are new (`accuracy.py`, `capture.py`, `heating_season.py`, `physics.py`); an old install with only some files updated fails on import. No new Python packages are needed.
+- Your existing model, caches and `pred_history.json` keep working. The next scheduled retrain builds the new feature set (87 columns).
+- **Check `heating_temp_on` / `heating_temp_off` if you set them.** They are now thresholds on the *daily mean* outdoor temperature (before: hourly temperatures, defaults 14/18 °C). Set both or neither; one alone is ignored with a warning. Unset, they are learned per installation at each retrain.
+- With `baseline_mode: true`, the actuals used for MAE/bias now exclude the baseline sub-meters (same definition the model trains on). Expect `mae_*` values to shift once; it is a measurement change, not a forecast change.
+- Hourly forecast publishing and sub-sensor history re-derived from HA are unaffected by the upgrade.
+
+### Added
+
+- Accuracy sensors: `sensor.energy_forecast_block_mae_7d` / `_30d` (MAE of 3 h block totals) and `sensor.energy_forecast_daily_bias_7d` / `_30d` (mean forecast minus actual per calendar day, negative = under-forecast), plus a naive same-hour baseline for comparison.
+- `get_scenario`: schedule values may be `{"start": "HH:MM", "program": "<label>"}`; appliance bookings can be sized by their upper-quartile profile (`delta_kwh_hi`).
+- DHW override handling (`set_dhw_schedule`, `recalibrate_physics`): committed legionella and comfort-boost cycles now correct the published forecast and are replayed in training only if the tank data shows they ran.
+- Heating-season detection from daily-mean outdoor temperature with learned thresholds; `heating_season` attribute on `sensor.energy_forecast_today`; example automation in `docs/examples/heating_season_automation.yaml`.
+- Daily update check: a persistent notification when a newer release exists (skipped on alpha/beta builds; `update_check_enabled`).
+- Opt-in `capture_inputs` (default `false`) records exact retrain inputs for offline replay; opt-in `drop_feature_groups` (default `[]`).
+- Regime stability log (`regime_log.jsonl`), standalone Docker example files, and a developer `backtest/` package (not deployed to HA).
+
+### Changed
+
+- The day-ahead forecast is steadier: the heating-buffer feature is a trailing 24 h mean, the regime feature uses out-of-fold labels (no more flips when the weather source changes), and the heating projection runs once per day from the forecast daily mean instead of per hour.
+- With `ev_charging_sensor` set, EV-charging days are no longer excluded from regime clustering or MAE tracking.
+- The earlier physics space-heating model was evaluated, found to add no measurable accuracy, and removed before this release; the DHW/legionella and scenario features that remain do not depend on it.
+
+### Fixed
+
+- Over-forecast of heating-season consumption after heating onset (indoor-temperature projection, per-room setpoints, live-setpoint blend).
+- DST fall-back crashes (duplicate 02:00 hour, ambiguous floor) and a weather-fetch failure that broke the whole sensor update.
+- Open-bucket cache poisoning for high-frequency meters, the 10 s history timeout on weekly resync, Open-Meteo archive retry on 5xx/429, counter resets zeroing battery/appliance sub-sensors.
+- Retrain-age gates read in the wrong time zone; `set_dhw_schedule` no longer blanks `get_scenario` until the next publish; today's P10/P90 block totals now blend elapsed actuals like the P50.
+
+---
+
+## [0.12.0-alpha-44] - alpha development log (summarised in 0.12.0 above)
+
 ### Added
 - `apps/energy_forecast/model.py`, `energy_forecast.py`, `const.py` — new opt-in config key `drop_feature_groups` (default `[]`, no change to forecasts). Listing `thermal_pressure` trains the model without the six thermal-pressure and infiltration features; listing `heating_buffer` also drops `heating_buffer_temp`. It takes effect at the next retrain, including when you remove it again; a saved model keeps its own feature list, so a restart in between changes nothing. An unknown group name stops startup with an error instead of silently training the full model. `sensor.energy_forecast_thermal_pressure_net` keeps its value when the features are dropped. Experimental: leave it empty until the shadow check passes (ROADMAP #120).
 - `backtest/walkforward.py`, `backtest/wf_score.py`, `backtest/README.md` — the `droptp` arm now trains through the real `drop_features` argument, a new `droptp_nb` arm also drops `heating_buffer_temp`, and `wf_score.shadow_verdict()` applies the #120 criteria (hourly and 3 h MAE non-inferior at 2 %, next-day swing at least 25 % lower, cold-day bias not larger in magnitude) and returns PASS, FAIL or INCONCLUSIVE. The README gains a "Shadow check for #120" runbook. Developer tooling, not deployed to HA.
