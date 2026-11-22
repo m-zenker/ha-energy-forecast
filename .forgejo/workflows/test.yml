@@ -18,6 +18,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt ruff scikit-learn lightgbm pandas numpy requests holidays
       - name: Lint
-        run: ruff check apps/ tests/
+        run: ruff check apps/ tests/ backtest/
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short

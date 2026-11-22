@@ -16,6 +16,8 @@ apps/energy_forecast/energy_model.pkl.sha256
 apps/energy_forecast/meta.pkl
 apps/energy_forecast/meta.pkl.sha256
 apps/energy_forecast/energy_history.csv
+apps/energy_forecast/regime_log.jsonl
+apps/energy_forecast/models/
 
 # HA database (large, local only)
 *.db
@@ -33,4 +35,7 @@ data/
 # Claude Code — local only, not for sharing
 CLAUDE.md
 MEMORY.md
+memory/
 scripts/
+.worktrees/
+.superpowers/

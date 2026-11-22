@@ -15,7 +15,14 @@ if TYPE_CHECKING:
     import hassapi as hass
     import pandas as pd
 
-from .const import CACHE_PATH, CACHE_PATH_15M, MAX_15MIN_KWH, MAX_HOURLY_KWH, drop_dst_duplicates
+from .const import (
+    CACHE_PATH,
+    CACHE_PATH_15M,
+    COUNTER_RESET_FRACTION,
+    MAX_15MIN_KWH,
+    MAX_HOURLY_KWH,
+    drop_dst_duplicates,
+)
 
 _LOGGER = logging.getLogger("energy_forecast")
 
@@ -738,6 +745,7 @@ def split_ev_charging(
     ev_mask = df["gross_kwh"] > threshold_kwh
 
     ev_df = df[ev_mask].copy()
+    ev_df["ev_source"] = "threshold"
 
     df.loc[ev_mask, "gross_kwh"] = np.maximum(0.0, df.loc[ev_mask, "gross_kwh"] - charger_kw)
 
@@ -772,6 +780,7 @@ def split_ev_charging_from_sensor(
 
     ev_df = energy_df[ev_mask].copy()
     ev_df["gross_kwh"] = ev_kwh[ev_mask]
+    ev_df["ev_source"] = "sensor"
 
     return energy_df, ev_df
 
@@ -832,6 +841,15 @@ def split_ev_charging_hybrid(
     baseline_df = pd.concat([sensor_baseline, threshold_baseline]).sort_values("timestamp").reset_index(drop=True)
     ev_df = pd.concat([sensor_ev, threshold_ev]).sort_values("timestamp").reset_index(drop=True)
     return baseline_df, ev_df
+
+
+def residual_ev_rows(ev_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """EV rows whose subtraction was inferred (threshold), i.e. whose baseline may still
+    carry EV residue. Wallbox-sensor rows are exact and returned as clean. Untagged
+    frames are treated as threshold-sourced (conservative)."""
+    if ev_df is None or ev_df.empty or "ev_source" not in ev_df.columns:
+        return ev_df
+    return ev_df[ev_df["ev_source"] == "threshold"]
 
 
 def _merge_sub_sensor_frames(df_winner: pd.DataFrame, df_loser: pd.DataFrame) -> pd.DataFrame:
@@ -935,6 +953,33 @@ def _resolve_programs_for_series(
     return result
 
 
+def _hourly_counter_increments(raw_ha: pd.DataFrame) -> pd.DataFrame:
+    """Per-hour kWh from a cumulative counter's raw samples, reset-aware.
+
+    Diffs consecutive raw samples (not hourly last values) so a mid-hour counter
+    restart keeps both the pre-reset increments and the post-reset value. A drop
+    below COUNTER_RESET_FRACTION × previous reading is a restart (increment = new
+    value) unless it recovers at the next sample (glitch, ignored); smaller dips are
+    jitter (increment 0). For a monotonic counter the hourly sum telescopes to
+    last(H) − last(H−1), i.e. unchanged behaviour.
+    The first bucket has no prior reading and is dropped.
+    """
+    s = raw_ha.set_index("timestamp")["value"].sort_index().dropna()
+    # A dip that recovers at the very next sample is a transient glitch (e.g. a lifetime
+    # counter briefly reading 0 on integration restart), not a restart — drop the sample.
+    prev, nxt = s.shift(1), s.shift(-1)
+    glitch = (s < COUNTER_RESET_FRACTION * prev) & (nxt >= COUNTER_RESET_FRACTION * prev)
+    s = s[~glitch]
+    prev = s.shift(1)
+    inc = s - prev
+    restart = (inc < 0) & (s < COUNTER_RESET_FRACTION * prev)
+    inc = inc.where(~restart, s).clip(lower=0)
+    hourly = inc.resample("1h").sum().iloc[1:]
+    out = hourly.reset_index()
+    out.columns = ["timestamp", "kwh"]
+    return out
+
+
 def fetch_sub_sensor_history(
     app: hass.Hass,
     entity_id: str,
@@ -977,9 +1022,7 @@ def fetch_sub_sensor_history(
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "kwh"]
+        diff = _hourly_counter_increments(raw_ha)
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
@@ -1043,9 +1086,7 @@ def fetch_recent_sub_sensor(
         return pd.DataFrame(columns=["timestamp", "kwh"])
 
     if not raw_ha.empty:
-        hourly = raw_ha.set_index("timestamp")["value"].resample("1h").last().ffill()
-        diff = hourly.diff().clip(lower=0).reset_index()
-        diff.columns = ["timestamp", "kwh"]
+        diff = _hourly_counter_increments(raw_ha)
         if diff["timestamp"].dt.tz is not None:
             diff["timestamp"] = diff["timestamp"].dt.tz_localize(None)
         df_new = drop_dst_duplicates(diff[diff["kwh"] < MAX_HOURLY_KWH].copy())
@@ -1120,8 +1161,15 @@ def fetch_recent_generic_sensor(
     cache_path: Path,
     column_name: str = "value",
     timezone: str = "Europe/Zurich",
+    quiet_if_empty: bool = False,
 ) -> pd.DataFrame:
-    """Lightweight update for generic absolute sensor hourly refreshes."""
+    """Lightweight update for generic absolute sensor hourly refreshes.
+
+    `quiet_if_empty` logs the "no recent data" case at DEBUG instead of WARNING —
+    for sensors with a known, expected idle period (e.g. a heat pump's live COP
+    sensor, which only reports while actively heating) an empty result every hour
+    is normal, not something to page-noise on.
+    """
     import pandas as pd
 
     df_cache = pd.DataFrame(columns=["timestamp", column_name])
@@ -1138,7 +1186,8 @@ def fetch_recent_generic_sensor(
     raw_ha = _fetch_history(app, entity_id, days=2, timezone=timezone)
 
     if raw_ha.empty and df_cache.empty:
-        _LOGGER.warning(f"No recent data for sensor {entity_id}.")
+        log = _LOGGER.debug if quiet_if_empty else _LOGGER.warning
+        log(f"No recent data for sensor {entity_id}.")
         return pd.DataFrame(columns=["timestamp", column_name])
 
     if not raw_ha.empty:
@@ -1158,6 +1207,36 @@ def fetch_recent_generic_sensor(
         _LOGGER.error(f"Failed to save generic sensor cache {cache_path.name}: {e}")
 
     return combined
+
+
+def _hourly_climate(ha_df: pd.DataFrame) -> pd.DataFrame:
+    """Hourly climate frame from attribute rows (timestamps already floored to the hour).
+
+    current_temp / setpoint: last state in the hour, forward-filled (unchanged behaviour).
+    heating_power_request (Netatmo valve demand, optional): max over the states in the hour
+    AND the state in force at the start of the hour (a valve open at :00 that closes at :10
+    still delivered heat). HA history only records changes, so a state persists across hours
+    without rows — it is carried until the next row. A row whose attribute is null
+    (unavailable) ends the carry: hours after it stay NaN until a real value arrives, so
+    unknown is never turned into 0 (closed).
+    """
+    import numpy as np
+    import pandas as pd
+
+    g = ha_df.set_index("timestamp").sort_index()
+    hourly = g[["current_temp", "setpoint"]].resample("1h").last().ffill()
+    if "heating_power_request" in g.columns:
+        _NULL = -1.0  # sentinel: an explicit null state, distinct from "no row this hour"
+        hpr = pd.to_numeric(g["heating_power_request"], errors="coerce")
+        in_hour_max = hpr.resample("1h").max()
+        end_state = hpr.fillna(_NULL).resample("1h").last()  # NaN only for hours without rows
+        end_state = end_state.ffill()  # state persists across empty hours
+        start_state = end_state.shift(1).where(lambda x: x != _NULL)
+        hourly["heating_power_request"] = np.fmax(in_hour_max, start_state)
+    hourly = hourly.reset_index()
+    if hourly["timestamp"].dt.tz is not None:
+        hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
+    return hourly
 
 
 def fetch_climate_history(
@@ -1188,19 +1267,13 @@ def fetch_climate_history(
 
     if not raw_ha.empty:
         # No .dt.floor here: flooring tz-aware local times raises on the DST fall-back hour;
-        # the resample("1h") below buckets by hour and is DST-safe.
+        # _hourly_climate's resample("1h") buckets by hour and is DST-safe.
         raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"])
-        # For climate, we need to extract and resample both 'current_temperature' and 'temperature'
-        # attributes from the raw attribute rows.
-        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
-        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
-        ha_df = ha_df.sort_values("timestamp")
-
-        # Resample to hourly grid
-        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
-        if hourly["timestamp"].dt.tz is not None:
-            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
-        df_new = hourly.copy()
+        cols = ["timestamp", "current_temperature", "temperature"]
+        if "heating_power_request" in raw_ha.columns:
+            cols.append("heating_power_request")
+        ha_df = raw_ha[cols].rename(columns={"current_temperature": "current_temp", "temperature": "setpoint"})
+        df_new = _hourly_climate(ha_df)
     else:
         df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 
@@ -1249,15 +1322,13 @@ def fetch_recent_climate(
 
     if not raw_ha.empty:
         # No .dt.floor here: flooring tz-aware local times raises on the DST fall-back hour;
-        # the resample("1h") below buckets by hour and is DST-safe.
+        # _hourly_climate's resample("1h") buckets by hour and is DST-safe.
         raw_ha["timestamp"] = pd.to_datetime(raw_ha["timestamp"])
-        ha_df = raw_ha[["timestamp", "current_temperature", "temperature"]].copy()
-        ha_df.columns = ["timestamp", "current_temp", "setpoint"]
-        ha_df = ha_df.sort_values("timestamp")
-        hourly = ha_df.set_index("timestamp").resample("1h").last().ffill().reset_index()
-        if hourly["timestamp"].dt.tz is not None:
-            hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(None)
-        df_new = hourly.copy()
+        cols = ["timestamp", "current_temperature", "temperature"]
+        if "heating_power_request" in raw_ha.columns:
+            cols.append("heating_power_request")
+        ha_df = raw_ha[cols].rename(columns={"current_temperature": "current_temp", "temperature": "setpoint"})
+        df_new = _hourly_climate(ha_df)
     else:
         df_new = pd.DataFrame(columns=["timestamp", "current_temp", "setpoint"])
 

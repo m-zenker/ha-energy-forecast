@@ -124,6 +124,40 @@ class TestClimateAndGenericHistory:
         assert df.iloc[0]["buffer_temp"] == 54.5
         assert cache_file.exists()
 
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_recent_generic_sensor_warns_by_default_on_empty(self, mock_fetch, mock_app, tmp_path, caplog):
+        """No cache, no HA data: defaults to a WARNING (unchanged prior behaviour)."""
+        mock_fetch.return_value = pd.DataFrame(columns=["timestamp", "value"])
+        cache_file = tmp_path / "empty_sensor.csv"
+
+        with caplog.at_level(logging.WARNING, logger="energy_forecast"):
+            df = ha_data.fetch_recent_generic_sensor(mock_app, "sensor.kermi_cop", cache_file, column_name="cop")
+
+        assert df.empty
+        assert any("No recent data for sensor sensor.kermi_cop" in r.message for r in caplog.records)
+        assert all(r.levelno == logging.WARNING for r in caplog.records if "No recent data" in r.message)
+
+    @patch("energy_forecast.ha_data._fetch_history")
+    def test_fetch_recent_generic_sensor_quiet_if_empty_logs_debug_not_warning(
+        self, mock_fetch, mock_app, tmp_path, caplog
+    ):
+        """quiet_if_empty=True: same empty result, but logged at DEBUG — for sensors with
+        a known, expected idle period (e.g. a heat pump's live COP sensor, only reporting
+        while actively heating) so an hourly empty result doesn't read as an error."""
+        mock_fetch.return_value = pd.DataFrame(columns=["timestamp", "value"])
+        cache_file = tmp_path / "empty_sensor.csv"
+
+        with caplog.at_level(logging.DEBUG, logger="energy_forecast"):
+            df = ha_data.fetch_recent_generic_sensor(
+                mock_app, "sensor.kermi_cop", cache_file, column_name="cop", quiet_if_empty=True
+            )
+
+        assert df.empty
+        no_data_records = [r for r in caplog.records if "No recent data for sensor sensor.kermi_cop" in r.message]
+        assert no_data_records, "expected the message to still be logged, just at DEBUG"
+        assert all(r.levelno == logging.DEBUG for r in no_data_records)
+        assert not any(r.levelno == logging.WARNING for r in no_data_records)
+
     def test_fetch_history_boolean_states(self, mock_app):
         """_fetch_history maps 'on'→1.0 and 'off'→0.0 for input_boolean entities."""
         states = [
@@ -784,6 +818,53 @@ class TestSplitEvChargingHybrid:
         assert len(ev) == len(expected_ev)
 
 
+# ── ev_source tagging / residual_ev_rows ─────────────────────────────────────
+
+
+class TestEvSource:
+    def _energy(self):
+        ts = pd.date_range("2026-07-26 10:00", periods=4, freq="h").append(
+            pd.date_range("2026-07-28 10:00", periods=2, freq="h")
+        )
+        return pd.DataFrame({"timestamp": ts, "gross_kwh": [9.5, 0.4, 0.3, 0.3, 3.0, 0.5]})
+
+    def test_threshold_rows_tagged(self):
+        _, ev = ha_data.split_ev_charging(self._energy(), 7.0, charger_kw=9.0)
+        assert set(ev["ev_source"]) == {"threshold"}
+
+    def test_sensor_rows_tagged(self):
+        evk = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-28 10:00"]), "kwh": [2.5]})
+        _, ev = ha_data.split_ev_charging_from_sensor(self._energy(), evk)
+        assert list(ev["ev_source"]) == ["sensor"]
+
+    def test_hybrid_mixes_sources_by_coverage(self):
+        evk = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-27 10:00", "2026-07-28 10:00"]), "kwh": [0.0, 2.5]})
+        _, ev = ha_data.split_ev_charging_hybrid(self._energy(), evk, 7.0, charger_kw=9.0)
+        src = ev.set_index("timestamp")["ev_source"]
+        assert src[pd.Timestamp("2026-07-26 10:00")] == "threshold"
+        assert src[pd.Timestamp("2026-07-28 10:00")] == "sensor"
+
+    def test_residual_ev_rows_keeps_threshold_only(self):
+        ev = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-07-26 10:00", "2026-07-28 10:00"]),
+                "gross_kwh": [9.5, 2.5],
+                "ev_source": ["threshold", "sensor"],
+            }
+        )
+        out = ha_data.residual_ev_rows(ev)
+        assert list(out["timestamp"]) == [pd.Timestamp("2026-07-26 10:00")]
+
+    def test_residual_ev_rows_untagged_is_conservative(self):
+        ev = pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-28 10:00"]), "gross_kwh": [2.5]})
+        assert len(ha_data.residual_ev_rows(ev)) == 1
+
+    def test_residual_ev_rows_none_and_empty(self):
+        assert ha_data.residual_ev_rows(None) is None
+        empty = pd.DataFrame(columns=["timestamp", "gross_kwh"])
+        assert ha_data.residual_ev_rows(empty).empty
+
+
 # ── fetch_sub_sensor_history / fetch_recent_sub_sensor ────────────────────────
 
 
@@ -900,6 +981,127 @@ class TestFetchSubSensorHistory:
 
         assert result.empty
         assert list(result.columns) == ["timestamp", "kwh"]
+
+
+class TestHourlyCounterIncrements:
+    """Cumulative counters that reset (SolarEdge b1 battery meters reset ~06:50/~20:55 daily)."""
+
+    def test_monotonic_matches_last_minus_last(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:50:00Z", "2026-01-10T09:30:00Z"],
+            [10.0, 10.4, 11.0, 11.5],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        # local 08:00 bucket is first → dropped; 09:00 = 11.0-10.0; 10:00 = 11.5-11.0
+        assert list(out.round(3)) == [1.0, 0.5]
+
+    def test_reset_mid_hour_keeps_pre_and_post_reset_energy(self):
+        # October: UTC+2. Local 06:00 bucket = 04:00–05:00 UTC.
+        raw = make_ha_raw(
+            [
+                "2026-10-14T03:30:00Z",
+                "2026-10-14T04:10:00Z",
+                "2026-10-14T04:40:00Z",
+                "2026-10-14T04:50:00Z",
+                "2026-10-14T04:55:00Z",
+                "2026-10-14T05:20:00Z",
+            ],
+            [2.0, 3.135, 3.302, 0.0, 0.045, 0.2],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        out.index = out.index.tz_localize(None)
+        assert out[pd.Timestamp("2026-10-14 06:00")] == pytest.approx(1.135 + 0.167 + 0.045)
+        assert out[pd.Timestamp("2026-10-14 07:00")] == pytest.approx(0.155)
+
+    def test_reset_to_small_nonzero_value_counts_that_value(self):
+        raw = make_ha_raw(
+            ["2026-10-14T17:30:00Z", "2026-10-14T18:40:00Z", "2026-10-14T18:59:00Z"],
+            [1.9, 2.012, 0.027],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.112 + 0.027)
+
+    def test_reset_at_hour_boundary(self):
+        raw = make_ha_raw(
+            [
+                "2026-10-14T02:30:00Z",
+                "2026-10-14T03:10:00Z",
+                "2026-10-14T03:59:00Z",
+                "2026-10-14T04:01:00Z",
+                "2026-10-14T04:30:00Z",
+            ],
+            [2.8, 3.0, 3.3, 0.01, 0.2],
+        )
+        out = ha_data._hourly_counter_increments(raw).set_index("timestamp")["kwh"]
+        # 04:00 bucket dropped (first); 05:00 = 0.2 + 0.3 (pre-reset, unaffected); 06:00 = 0.01 + 0.19
+        assert list(out.round(3)) == [0.5, 0.2]
+
+    def test_transient_glitch_on_lifetime_counter_ignored(self):
+        raw = make_ha_raw(
+            [
+                "2026-10-14T03:30:00Z",
+                "2026-10-14T04:05:00Z",
+                "2026-10-14T04:10:00Z",
+                "2026-10-14T04:20:00Z",
+                "2026-10-14T04:40:00Z",
+            ],
+            [1200.0, 1203.0, 0.0, 1207.0, 1208.0],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(8.0)  # not 1210
+
+    def test_nan_sample_dropped_not_losing_energy(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:30:00Z", "2026-01-10T08:50:00Z"],
+            [10.0, 10.4, float("nan"), 11.5],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(1.5)
+
+    def test_appliance_cycle_counter_new_cycle_counted(self):
+        # Dishwasher per-cycle counter: 0.6 at end of last cycle → 0.0 → next cycle 0.1, 0.4 within the hour
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:05:00Z", "2026-10-14T04:20:00Z", "2026-10-14T04:50:00Z"],
+            [0.6, 0.0, 0.1, 0.4],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.4)  # old method: 0.4 − 0.6 < 0 → 0.0
+
+    def test_small_dip_is_jitter_not_reset(self):
+        raw = make_ha_raw(
+            ["2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z", "2026-01-10T08:20:00Z", "2026-01-10T08:40:00Z"],
+            [10.0, 10.0, 9.99, 10.5],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(0.51)
+
+    def test_unsorted_input_is_sorted(self):
+        raw = make_ha_raw(
+            ["2026-01-10T08:50:00Z", "2026-01-10T07:10:00Z", "2026-01-10T08:05:00Z"],
+            [11.0, 10.0, 10.4],
+        )
+        out = ha_data._hourly_counter_increments(raw)["kwh"]
+        assert out.iloc[-1] == pytest.approx(1.0)
+
+    def test_fetch_recent_sub_sensor_keeps_reset_hour(self, mock_app, tmp_path):
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:40:00Z", "2026-10-14T04:50:00Z", "2026-10-14T04:55:00Z"],
+            [2.0, 3.302, 0.0, 0.045],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            result = ha_data.fetch_recent_sub_sensor(mock_app, "sensor.b1_export", tmp_path / "battery_discharge.csv")
+        row = result[result["timestamp"] == pd.Timestamp("2026-10-14 06:00")]
+        assert row.iloc[0]["kwh"] == pytest.approx(1.302 + 0.045)
+
+    def test_fetch_sub_sensor_history_keeps_reset_hour(self, mock_app, tmp_path):
+        raw = make_ha_raw(
+            ["2026-10-14T03:30:00Z", "2026-10-14T04:40:00Z", "2026-10-14T04:50:00Z", "2026-10-14T04:55:00Z"],
+            [2.0, 3.302, 0.0, 0.045],
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            result = ha_data.fetch_sub_sensor_history(mock_app, "sensor.b1_export", tmp_path / "battery_discharge.csv")
+        row = result[result["timestamp"] == pd.Timestamp("2026-10-14 06:00")]
+        assert row.iloc[0]["kwh"] == pytest.approx(1.302 + 0.045)
 
 
 # ── Stage 6 — CSV append-only writes (#19) ────────────────────────────────────
@@ -2684,6 +2886,107 @@ class TestEmptyResyncWarning:
                 ha_data.fetch_energy_history(mock_app, "sensor.energy", cache_path=cache_path)
 
         assert not any("resync" in r.getMessage() for r in caplog.records)
+
+
+# ── Climate valve demand (heating_power_request) ─────────────────────────────
+
+
+def _climate_raw(rows):
+    """rows: (utc_iso, current_temperature, temperature, heating_power_request | None | "missing")."""
+    out = []
+    for ts, cur, sp, hpr in rows:
+        r = {
+            "timestamp": pd.Timestamp(ts).tz_convert("Europe/Zurich").floor("1h"),
+            "current_temperature": cur,
+            "temperature": sp,
+        }
+        if hpr != "missing":
+            r["heating_power_request"] = hpr
+        out.append(r)
+    return pd.DataFrame(out)
+
+
+def _hpr_series(out):
+    return out.assign(timestamp=pd.to_datetime(out["timestamp"])).set_index("timestamp")["heating_power_request"]
+
+
+class TestClimateValveDemand:
+    def test_hpr_hourly_max_includes_carried_state(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:50:00Z", 20.0, 20.0, 40),  # local 22:xx → valve open
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, 0),  # local 23:xx → closes
+                ("2026-10-14T23:30:00Z", 19.5, 20.0, 0),  # local 01:xx
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert h[pd.Timestamp("2026-10-14 22:00")] == 40
+        assert h[pd.Timestamp("2026-10-14 23:00")] == 40  # open at hour start (carried), closed during the hour
+        assert h[pd.Timestamp("2026-10-15 00:00")] == 0
+        assert h[pd.Timestamp("2026-10-15 01:00")] == 0
+
+    def test_carry_does_not_cross_missing_attribute(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 0),
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, None),  # attribute present but null (unavailable)
+                ("2026-10-14T23:10:00Z", 20.0, 20.0, 0),
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert pd.isna(h[pd.Timestamp("2026-10-15 00:00")])  # no state in hour, carry blocked by the null
+
+    def test_state_persists_across_quiet_hours(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 0),  # local 22:xx closed
+                ("2026-10-15T00:10:00Z", 19.0, 20.0, 0),  # local 02:xx — no rows at 23, 00, 01
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert list(h[pd.Timestamp("2026-10-14 23:00") : pd.Timestamp("2026-10-15 01:00")]) == [0, 0, 0]
+
+    def test_null_state_hour_itself_uses_start_state_only(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [
+                ("2026-10-14T20:10:00Z", 20.0, 20.0, 30),
+                ("2026-10-14T21:10:00Z", 20.0, 20.0, None),  # local 23:10 → unavailable
+            ]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        h = _hpr_series(out)
+        assert h[pd.Timestamp("2026-10-14 23:00")] == 30  # open at hour start, then unknown
+
+    def test_without_attribute_column_absent(self, mock_app, tmp_path):
+        raw = _climate_raw(
+            [("2026-10-14T20:50:00Z", 20.0, 20.0, "missing"), ("2026-10-14T22:50:00Z", 20.0, 20.0, "missing")]
+        )
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        assert "heating_power_request" not in out.columns or out["heating_power_request"].isna().all()
+
+    def test_old_cache_without_column_merges(self, mock_app, tmp_path):
+        p = tmp_path / "climate_room.csv"
+        pd.DataFrame({"timestamp": ["2026-10-13 10:00:00"], "current_temp": [20.0], "setpoint": [20.0]}).to_csv(
+            p, index=False
+        )
+        raw = _climate_raw([("2026-10-14T20:50:00Z", 20.0, 20.0, 0)])
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_climate_history(mock_app, "climate.room", p)
+        assert len(out) >= 2 and pd.isna(out.iloc[0]["heating_power_request"])
+
+    def test_recent_climate_also_caches_hpr(self, mock_app, tmp_path):
+        raw = _climate_raw([("2026-10-14T20:50:00Z", 20.0, 20.0, 15)])
+        with patch.object(ha_data, "_fetch_history", return_value=raw):
+            out = ha_data.fetch_recent_climate(mock_app, "climate.room", tmp_path / "climate_room.csv")
+        assert out["heating_power_request"].iloc[-1] == 15
 
 
 class TestHourlyStateHistoryDstFallback:
