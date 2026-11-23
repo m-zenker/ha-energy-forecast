@@ -1154,19 +1154,27 @@ class TestServingOverrideCorrection:
         """A past hour whose override leaks into `future` when simulated over the whole tail.
 
         Searched, not fixed: whether a given offset leaks depends on the hour-of-day draw
-        profile, and the harness runs on the real clock.
+        profile, and the harness runs on the real clock. Searched on the UNTRIMMED shared
+        delta: since #122 the serving entry point keeps only the override-hour leg and
+        cannot leak by itself, but the app-level cut to the first predicted hour still
+        guards the tank seeding and must stay covered.
         """
         t_ambient = pm._t_indoor_for_window(None, tail, pd.Series(5.0, index=tail))
         initial_t_tank = pm._initial_t_tank_for_window(None, tail)
-        try:
-            for hours_back in range(1, 72):
-                candidate = now - pd.Timedelta(hours=hours_back)
-                pm._schedule["committed_override"] = {"legionella": [candidate.strftime("%Y-%m-%d"), candidate.hour]}
-                delta = pm.compute_serving_override_delta(tail, t_ambient, initial_t_tank)
-                if delta.reindex(future).abs().max() > 0.01:
-                    return candidate
-        finally:
-            pm._schedule["committed_override"] = None
+        baseline_kwh, baseline_t_tank, _ = pm._dhw_kwh_series(tail, t_ambient, initial_t_tank, override_lookup=None)
+        for hours_back in range(1, 72):
+            candidate = now - pd.Timedelta(hours=hours_back)
+            committed = {"legionella": [candidate.strftime("%Y-%m-%d"), candidate.hour]}
+            delta = pm._compute_override_delta_series(
+                tail,
+                t_ambient,
+                initial_t_tank,
+                lambda ts, c=committed: pm._dhw_override_for_hour(ts, c),
+                baseline_kwh,
+                baseline_t_tank,
+            )
+            if delta.reindex(future).abs().max() > 0.01:
+                return candidate
         pytest.fail("no past override leaks into the future window: the test no longer exercises the bug")
 
     def _spy_on_serving_delta(self, pm, monkeypatch):

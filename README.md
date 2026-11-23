@@ -164,6 +164,7 @@ Within a minute, `sensor.energy_forecast_setup_status` will read `ok` and foreca
       legionella: ["2026-06-25", 10]  # [date string, hour]
   ```
   `get_scenario` ignores its `dhw_schedule` kwarg; this service is the only way to change the DHW schedule, and it **persists** into the physics model; the next hourly cycle picks it up. It's a one-shot exact `(date, hour)` match — inert for every other timestamp, including the next calendar day; it does not "persist until superseded." No response event is fired; check the AppDaemon log for `DHW schedule committed: ...` (success) or a WARNING/ERROR (rejected — e.g. `dhw_schedule` not a dict, or physics not configured).
+  A committed override adds its cycle energy to the published forecast **at the committed hour only**; the tank's knock-on effects on later hours are not applied to the forecast (they are still removed from the training data).
 
 ---
 

@@ -456,7 +456,8 @@ class ThermalPhysicsModel:
         """The one shared joint trajectory-diff-and-cutoff function (R2-#3) — called
         identically by both compute_training_override_delta and
         compute_serving_override_delta so the two never resolve an equivalent override
-        to different tail lengths. Computes ONE with-overrides trajectory (applying
+        differently (serving then keeps only the override-hour leg, #122). Computes
+        ONE with-overrides trajectory (applying
         every override the given lookup can see, in chronological order — R2-#1, not a
         per-override sum), diffs it against the already-computed baseline, terminates
         the tail at the first hour the two trajectories reconverge within 0.1°C, and
@@ -505,7 +506,12 @@ class ThermalPhysicsModel:
     ) -> pd.Series:
         """Serving-side entry point (Goal 1): the deterministic post-model forecast
         correction. Callers add this UNCONDITIONALLY to the model's already-final
-        published forecast — never fed back into the trained model."""
+        published forecast — never fed back into the trained model.
+
+        Only the override-hour leg is kept (#122): the modelled carryover tail (a later
+        second reheat and negative "natural reheat" legs at drifting hours) made the
+        published forecast worse on live captures (3 h-block MAE +0.021 kWh, 45 hours
+        floored to exact 0.0, measured 2026-11-23). Training keeps the full tail."""
         baseline_kwh, baseline_t_tank, _ = self._dhw_kwh_series(
             timestamps, t_ambient, initial_t_tank, override_lookup=None
         )
@@ -516,9 +522,11 @@ class ThermalPhysicsModel:
         def lookup(ts: pd.Timestamp) -> float | None:
             return self._dhw_override_for_hour(ts, committed)
 
-        return self._compute_override_delta_series(
+        delta = self._compute_override_delta_series(
             timestamps, t_ambient, initial_t_tank, lookup, baseline_kwh, baseline_t_tank
         )
+        override_hours = np.array([lookup(ts) is not None for ts in timestamps], dtype=bool)
+        return delta.where(override_hours, 0.0)
 
     def _area_weighted_t_indoor(
         self, climate_data: dict[str, pd.DataFrame], timestamps: pd.DatetimeIndex, room_areas: dict[str, float] | None
