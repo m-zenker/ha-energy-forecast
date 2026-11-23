@@ -236,6 +236,21 @@ Training subtracts a DHW override delta for every non-cancelled entry in `overri
 
 **Fix.** At training replay keep the last-committed entry per (kind, date) and verify it against the tank series: drop it when the tank did not rise ≥ 2 °C within hour..hour + 3 h, cap its target at the observed peak, keep it unchanged when tank data is missing. This also covers lost service calls. A clear-on-abandon in `ha-energy-manager` is optional. Size S. Details: `memory/project_dhw_override_phase_a.md`.
 
+### #126 — Legionella / High-Target DHW Cycle Energy (Auxiliary Heater)
+
+**Priority:** Medium-low. **Status:** investigation, added 2026-11-23. Not started.
+
+**Problem (general).** The DHW physics model treats every override as heat-pump work: the override hour bills `dhw_power_w / COP` and the tank jumps to the target. Many heat pumps cannot reach a legionella target (≈ 60 °C) on their own. They stop at a maximum flow/tank temperature and an auxiliary electric heater (COP 1) covers the rest, or the whole cycle when the tank already starts above the heat pump's limit. The heater is often unmetered. For those installs hef under-forecasts each cycle and puts the energy in one hour; installs whose heat pump reaches the target, or that have no auxiliary heater, must stay exactly as today.
+
+**Evidence (this install, one example).** Heat pump stops at ≈ 57 °C flow / ≈ 54 °C tank; the electric heater has no sensor, so neither the DHW nor the heating counter sees it. Total-consumption excess over the cycle window: 11-09 ≈ 5.1 + 1.8 kWh (13–14 h, committed 12 h), 11-18 ≈ 2.8 + 2.7 kWh (09–10 h), i.e. ≈ 4–5 kWh over ≈ 2 h; `ha-energy-manager`'s independent whole-house-excess calibration gives 3.3–4.0 kWh. hef adds ≈ 1 kWh in one hour. The training replay (#124) has the same gap: ≈ 3 kWh per cycle stays in the target as unexplained load (≈ 0.4 kWh/day on a 9-day cadence). Measurement: `memory/project_122_override_trim_measurement_2026_11_23.md`.
+
+**Investigation, before any design.**
+1. Quantify on captures and history how far the override cycle energy and duration are off, for legionella and for comfort-boost targets near the heat pump's limit, using total-consumption excess (not sub-meters, which may miss the heater).
+2. Decide the general model: e.g. split the cycle at an optional heat-pump DHW ceiling (heat pump at COP below it, auxiliary heater at COP 1 above it, heater power bounding the duration), or learn per-install cycle energy from past verified cycles (#124's tank check already identifies them). Prefer learned/derived values over new required config; any new key is optional with a default that reproduces today's behaviour.
+3. Apply the same model to serving (override correction, see #122) and training (override replay), so the two stay consistent.
+
+**Constraints.** Forecast-changing → own deploy window. A new optional `physics:` key extends the config schema: check against the v1.0 gate (schema unchanged for 4 weeks after v0.12.0; earliest v1.0 2026-12-20) before shipping. Measure on captures first, like #122.
+
 ### #83 — Add `predicted_day_total` Feature (Temperature Regression)
 
 **Priority:** Low (lowered 2026-11-13).
@@ -652,7 +667,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
 | 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) |
 | 125 | NaN-robust indoor averaging (would switch the training override subtraction on for 34 overrides and move the target) | forecast-changing | S | follow-up of physics heating removal (2026-11-16); low, own ship window |
-| 126 | Measured vs simulated override correction (hef models about 1 kWh for a legionella hour, EM measures 5 kWh) | override delta accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
+| 126 | Legionella / high-target DHW cycle energy with an auxiliary heater (hef models about 1 kWh in one hour; measured 4–5 kWh over about 2 h on one install) | override delta accuracy, serving and training | S–M | medium-low — investigation added 2026-11-23, see section |
 | 127 | Open-window down-weighting on/off backtest | verifies the 0.5x weight pays off | S | follow-up of physics heating removal (2026-11-16); low |
 | 128 | DHW draw calibration (`Q_dhw_daily` 2.79 vs sub-meter about 0.83 kWh/day) | DHW tank model accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
 | 129 | Move open-window detection into `model.py` and decouple `model.py` from `physics.py` | structure only | M | follow-up of physics heating removal (2026-11-16); low |
