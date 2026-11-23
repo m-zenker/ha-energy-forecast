@@ -409,14 +409,18 @@ class TestOverrideDeltaSeries:
         bound = pd.concat([with_override_kwh, baseline_kwh], axis=1).max(axis=1)
         assert (delta.abs() <= bound + 1e-9).all()
 
-    def test_tail_termination_matches_between_training_and_serving_entry_points(self, tmp_path):
-        """R2-#3 direct regression: both public entry points delegate to the same
-        shared function, so they resolve an equivalent override to the identical
-        tail length."""
+    @staticmethod
+    def _trim_fixture(tmp_path):
         pm = ThermalPhysicsModel(tmp_path / "models", DEFAULT_CONFIG)
         pm._calib.update(UA_dhw=15.0, Q_dhw_daily=3.5, Q_base_el=0.35)
-        timestamps = pd.date_range("2026-08-04 00:00", periods=24, freq="h")
+        timestamps = pd.date_range("2026-08-04 00:00", periods=48, freq="h")
         t_ambient = pd.Series(10.0, index=timestamps)
+        return pm, timestamps, t_ambient
+
+    def test_training_delta_keeps_full_tail(self, tmp_path):
+        """#122: only serving is trimmed. Training still removes the override's full
+        multi-hour carryover tail from the target."""
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
         history = [
             {
                 "kind": "legionella",
@@ -428,13 +432,58 @@ class TestOverrideDeltaSeries:
             },
         ]
         training_delta = pm.compute_training_override_delta(timestamps, t_ambient, 45.0, history)
+        assert (training_delta != 0.0).sum() > 1
 
+    def test_serving_trim_keeps_only_override_hour(self, tmp_path):
+        """#122: the published correction is the override-hour leg only."""
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
         pm._schedule["committed_override"] = {"legionella": ["2026-08-04", 12]}
-        serving_delta = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        serving = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        nz = serving[serving != 0.0]
+        assert list(nz.index) == [pd.Timestamp("2026-08-04 12:00")]
+        assert nz.iloc[0] > 0
 
-        training_tail_end = (training_delta != 0.0).to_numpy().nonzero()[0][-1]
-        serving_tail_end = (serving_delta != 0.0).to_numpy().nonzero()[0][-1]
-        assert training_tail_end == serving_tail_end
+    def test_serving_trim_override_hour_value_unchanged(self, tmp_path):
+        """The kept leg is the untrimmed delta at that hour (incl. sanity clip), not recomputed."""
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
+        committed = {"legionella": ["2026-08-04", 12]}
+        pm._schedule["committed_override"] = committed
+        baseline_kwh, baseline_t_tank, _ = pm._dhw_kwh_series(timestamps, t_ambient, 45.0, override_lookup=None)
+        untrimmed = pm._compute_override_delta_series(
+            timestamps,
+            t_ambient,
+            45.0,
+            lambda ts: pm._dhw_override_for_hour(ts, committed),
+            baseline_kwh,
+            baseline_t_tank,
+        )
+        serving = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        hour = pd.Timestamp("2026-08-04 12:00")
+        assert serving[hour] == untrimmed[hour]
+        assert (untrimmed.drop(hour) != 0.0).any()  # the fixture really has a tail to trim
+
+    def test_serving_trim_keeps_both_pending_override_hours(self, tmp_path):
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
+        legionella_hour = pd.Timestamp("2026-08-04 12:00")
+        boost_hour = pd.Timestamp("2026-08-05 06:00")
+        pm._schedule["committed_override"] = {
+            "legionella": ["2026-08-04", 12],
+            "comfort_boost": ["2026-08-05", 6, 55.0],
+        }
+        serving = pm.compute_serving_override_delta(timestamps, t_ambient, 45.0)
+        assert set(serving[serving != 0.0].index) <= {legionella_hour, boost_hour}
+        assert serving[legionella_hour] > 0
+
+    def test_serving_trim_past_override_is_zero(self, tmp_path):
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
+        pm._schedule["committed_override"] = {"legionella": ["2026-08-03", 12]}
+        assert (pm.compute_serving_override_delta(timestamps, t_ambient, 45.0) == 0.0).all()
+
+    def test_serving_trim_has_no_negative_legs(self, tmp_path):
+        """Negative 'natural reheat' legs floored published hours to exact 0.0 (#122)."""
+        pm, timestamps, t_ambient = self._trim_fixture(tmp_path)
+        pm._schedule["committed_override"] = {"legionella": ["2026-08-04", 12]}
+        assert (pm.compute_serving_override_delta(timestamps, t_ambient, 45.0) >= 0.0).all()
 
     def test_two_separate_episodes_both_keep_their_own_tail(self, tmp_path):
         """Final-review regression (#1): the tail-termination logic used to find only the
