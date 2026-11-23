@@ -663,7 +663,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
 | 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag shipped alpha-41 2026-11-15 (off); 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
-| 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; 3 h-block MAE −0.021 kWh | S | medium-low — implemented on `fix/override-hour-trim` 2026-11-23, own deploy window |
+| 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; 3 h-block MAE −0.021 kWh | S | medium-low — deployed v0.12.1-alpha-1 2026-11-23, awaiting live observation |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
 | 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) |
 | 125 | NaN-robust indoor averaging (would switch the training override subtraction on for 34 overrides and move the target) | forecast-changing | S | follow-up of physics heating removal (2026-11-16); low, own ship window |
