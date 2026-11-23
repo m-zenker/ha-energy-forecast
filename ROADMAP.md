@@ -1,6 +1,6 @@
 # Forecast Accuracy Roadmap
 
-Current: **dev v0.12.0-alpha-43** (2026-11-17, deployed, 1475 tests) · **main v0.12.0** (2026-11-22).
+Current: **dev v0.12.0-alpha-44** (2026-11-19, deployed, 1495 tests; `set_dhw_schedule` accepts a `clear` list, EM alpha-164 uses it) · **main v0.12.0** (2026-11-22).
 
 ---
 
@@ -32,7 +32,9 @@ Start here. Everything below this section is detail and history.
 - One forecast-changing step per deploy window. Steps 4–6 do not change the published forecast at default config; the #120 flip (step 9) and #105 (step 10) do, and each gets its own window.
 - Phase 2 (`use_physics_residual`) was removed on 2026-11-16 together with the physics space-heating model (physics heating removal); there is no activation path left.
 
-**Open decision, not scheduled:** physics release strategy (v0.12.0 opt-in on `main`, or more cherry-picks). `dev` is over 110 commits ahead of `main` and this batch adds six branches.
+**Resolved 2026-11-22:** physics release strategy. The physics heating model was removed, so no Rule 3 opt-in release was needed; `dev` shipped to `main` as v0.12.0 via `release/v0.12.0` and `main` was merged back into `dev` (dev now on the 0.12.1 alpha line).
+
+**v1.0 gate clock started 2026-11-22**; earliest v1.0.0 = 2026-12-20 (tag date + 28 days).
 
 **Parked or closed, so not on this list:** #111 (parked), #112 and #115 (closed), #96 cooling mode (parked 2026-11-09), #103 (closed 2026-11-16, physics heating removal), #104 and #106 (parked 2026-11-16), #105 (closed 2026-11-16; branch `feat/ua-eff-daily` and its worktree parked 2026-11-17, continues offline only, unpark if its PASS is to re-enter as an ML feature), HACS items #46/#16/#18.
 
@@ -40,7 +42,7 @@ Start here. Everything below this section is detail and history.
 
 ## Current Status
 
-**dev:** v0.12.0-alpha-43 (2026-11-17): physics heating removal (physics model, UA_eff, physics sensors, model_phase gone); alpha-42 (2026-11-16): #124 tank-verified override replay, daily-bias sensors on complete calendar days; alpha-41 (2026-11-15): #116 retrain-age time zone, #113 Phase 2 reconstruction (dormant), #120 `drop_feature_groups` flag (off), #118 live cold-day gate tooling; alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
+**dev:** v0.12.0-alpha-44 (2026-11-19): `set_dhw_schedule` accepts a `clear` list (`fix/dhw-clear-kwarg`); alpha-43 (2026-11-17): physics heating removal (physics model, UA_eff, physics sensors, model_phase gone); alpha-42 (2026-11-16): #124 tank-verified override replay, daily-bias sensors on complete calendar days; alpha-41 (2026-11-15): #116 retrain-age time zone, #113 Phase 2 reconstruction (dormant), #120 `drop_feature_groups` flag (off), #118 live cold-day gate tooling; alpha-40 (2026-11-14): #117 appliance-free actuals, #114 block/daily accuracy sensors, #119 backtest capture frame; alpha-39 (2026-11-13): `get_scenario` accepts dict schedule values + returns `delta_kwh_hi` (upper-quartile appliance profile, `fix/scenario-hi-profile-program`); alpha-38 (2026-11-11): pre-train snapshot for capture replay (`fix/capture-pre-train-seed`); alpha-37 (2026-11-08): backtest kit, cop-scale analysis, live input capture; alpha-36 (2026-11-07): `set_dhw_schedule` keeps the scenario cache; alpha-35 (2026-11-05): #110 soft OOF regime labels; alpha-34 (2026-11-04, deploy 16:11Z, startup retrain 16:14Z): DHW override past-tail fix + today-block P10/P90 blend, on top of alpha-33 (2026-11-03): #110 Part A regime stability log, and alpha-32 (2026-10-27, A+B: #101 reset-aware increments + #102 EV sensor trust), alpha-31 (2026-10-25, DST ambiguous-floor fix) and alpha-30/29 (DST duplicate hour, #109 heating-buffer smoothing). **main:** v0.11.18 released 2026-10-26 (DST ambiguous-floor fix only; v0.11.17 DST duplicate hour 2026-10-22). Rule-3 curated releases off main; dev carries the unreleased physics-ML / UA_eff / DHW-override / heating-season / cold-onset work.
 
 **Cold-onset over-forecast (2026-10-15): C verdict PASSED 2026-10-27 (pooled); A+B re-baseline FAILED the bias criterion 2026-11-03 — see the re-baseline paragraph below.** `mae_7d` jumped 0.196 → 0.477 after heating onset on 2026-10-08. Root cause: the 48 h indoor projection had no heating term and compared every room to one shared setpoint. **C Task 1** (alpha-26, 2026-10-16): thermostat floor + per-room setpoint; replay 2026-10-08..14 MAE 24–47 h 0.485 → 0.255. **D Task 1** (alpha-25, 2026-10-16): `heating_power_request` valve demand cached in `climate_*.csv`; the ≥ 14 valve-closed-night data gate was met 2026-10-21.
 - **C check 2026-10-21: NOT MET.** 10-17 −2.2 (pass), 10-18 +6.2 and 10-19 +4.7 kWh/day (fail); pooled ≈ +3.5 vs +5.9 before C; point-in-band 87.5 % (< 90 %). Night hours (22–03 h) over-forecast ≈ 0.3–0.5 kWh/h.
@@ -204,7 +206,7 @@ Hourly P10–P90 covers 59 % on live captures and 69–76 % in the autumn replay
 
 ### #122 — Trim the DHW Override Correction to the Override Hour
 
-**Priority:** Medium-low. **Status:** mechanism confirmed 2026-11-13; accuracy cost not measured.
+**Priority:** Medium-low. **Status:** implemented on `fix/override-hour-trim` 2026-11-23 (plan `docs/superpowers/plans/2026-11-23-122-override-hour-trim.md`). Measured on live captures 2026-11-08..11-23 (47 updates, 6 override episodes): 3 h-block MAE −0.021 kWh [95 % CI −0.080, −0.003], hourly −0.024, exact-0.0 published hours 45 → 0; branch code reproduces live at the override hour on 47/47 captures. Forecast-changing: own deploy window. Override-hour leg size for legionella is tracked in #126.
 
 With an override pending, each update adds about +1 kWh at the override hour, a second +1 kWh about 23 h later, and subtracts 0.8–1.05 kWh at a "natural reheat" hour that drifts from update to update. The ML forecast holds no discrete reheat at those hours, so the negative leg floors to an exact 0.0 where the forecast is low (4 of 7 affected updates on 11-13). Since `ha-energy-manager` knows the DHW hour only a few hours ahead, this intra-day correction is the only DHW lever left.
 
@@ -233,6 +235,21 @@ Training subtracts a DHW override delta for every non-cancelled entry in `overri
 **Effect.** Replaying the real delta function with and without the 14 bad entries (constant 21 °C ambient, so an estimate): the training target differs on 37 of 1 867 hours, on 20 of 78 days, about 1.9 kWh moved per affected day, daily net near zero. Noon hours are about 1 kWh too low, evening hours too high. Timing only; same size class as #123.
 
 **Fix.** At training replay keep the last-committed entry per (kind, date) and verify it against the tank series: drop it when the tank did not rise ≥ 2 °C within hour..hour + 3 h, cap its target at the observed peak, keep it unchanged when tank data is missing. This also covers lost service calls. A clear-on-abandon in `ha-energy-manager` is optional. Size S. Details: `memory/project_dhw_override_phase_a.md`.
+
+### #126 — Legionella / High-Target DHW Cycle Energy (Auxiliary Heater)
+
+**Priority:** Medium-low. **Status:** investigation, added 2026-11-23. Not started.
+
+**Problem (general).** The DHW physics model treats every override as heat-pump work: the override hour bills `dhw_power_w / COP` and the tank jumps to the target. Many heat pumps cannot reach a legionella target (≈ 60 °C) on their own. They stop at a maximum flow/tank temperature and an auxiliary electric heater (COP 1) covers the rest, or the whole cycle when the tank already starts above the heat pump's limit. The heater is often unmetered. For those installs hef under-forecasts each cycle and puts the energy in one hour; installs whose heat pump reaches the target, or that have no auxiliary heater, must stay exactly as today.
+
+**Evidence (this install, one example).** Heat pump stops at ≈ 57 °C flow / ≈ 54 °C tank; the electric heater has no sensor, so neither the DHW nor the heating counter sees it. Total-consumption excess over the cycle window: 11-09 ≈ 5.1 + 1.8 kWh (13–14 h, committed 12 h), 11-18 ≈ 2.8 + 2.7 kWh (09–10 h), i.e. ≈ 4–5 kWh over ≈ 2 h; `ha-energy-manager`'s independent whole-house-excess calibration gives 3.3–4.0 kWh. hef adds ≈ 1 kWh in one hour. The training replay (#124) has the same gap: ≈ 3 kWh per cycle stays in the target as unexplained load (≈ 0.4 kWh/day on a 9-day cadence). Measurement: `memory/project_122_override_trim_measurement_2026_11_23.md`.
+
+**Investigation, before any design.**
+1. Quantify on captures and history how far the override cycle energy and duration are off, for legionella and for comfort-boost targets near the heat pump's limit, using total-consumption excess (not sub-meters, which may miss the heater).
+2. Decide the general model: e.g. split the cycle at an optional heat-pump DHW ceiling (heat pump at COP below it, auxiliary heater at COP 1 above it, heater power bounding the duration), or learn per-install cycle energy from past verified cycles (#124's tank check already identifies them). Prefer learned/derived values over new required config; any new key is optional with a default that reproduces today's behaviour.
+3. Apply the same model to serving (override correction, see #122) and training (override replay), so the two stay consistent.
+
+**Constraints.** Forecast-changing → own deploy window. A new optional `physics:` key extends the config schema: check against the v1.0 gate (schema unchanged for 4 weeks after v0.12.0; earliest v1.0 2026-12-20) before shipping. Measure on captures first, like #122.
 
 ### #83 — Add `predicted_day_total` Feature (Temperature Regression)
 
@@ -378,9 +395,11 @@ Both columns added to `_FEATURES_BASE`. At prediction time, `trend_deviation` an
 
 ### #88 — Temperature-Similarity Sample Weighting
 
-**Priority:** Low-Medium — re-scoped 2026-11-13: test on the capture frame (#119) with the cold-onset stability metric.
+**Priority:** Low — **tested and not adopted 2026-11-20** (result below). Re-scoped 2026-11-13: test on the capture frame (#119) with the cold-onset stability metric.
 
-**2026-11-13:** the full-year prerequisite is met. For: rows at ≤ 3 °C hold 2.3 % of training weight (about 56 effective rows), and one more day of data moved the 2 °C forecast by 45 %. Against: this autumn runs lower than last winter at the same temperature (18.9 against 24.5 kWh/day at 3–6 °C, 5 days), so up-weighting old cold rows may over-forecast.
+**2026-11-20 result (`backtest/experiments/halflife.py`, lean frame, archive weather, 4 folds / 61 days, seed noise floor ±1.6 %):** neither a longer `weight_halflife_days` (live 60) nor temperature-similarity weighting beats the live setting. Cold days (48): hl90 +2.5 % hourly / +1.5 % 3 h, hl120 +0.1 % / −2.0 %, hl180 +2.3 % / +1.2 %, hl30 +2.5 % / +3.8 %; the order is not monotone, so it is noise. Longer half-lives push cold-day bias from +0.01 to +0.5…+0.9 kWh/day (wrong way: live already over-forecasts cold days by about +2.9). No recency weighting (`hl0`) is best on cold days (−1.6 % / −5.0 %, |bias| −13 %) but inside the noise floor overall and it would break the migration down-weight that relies on the half-life. Gaussian temperature kernel (centred on the 7 days before the fold): `ts5` +6.3 % on 3 h blocks on cold days, `ts8` neutral; both gain 4–9 % on warm days, where the forecast is not failing, and pull bias negative. Limits: the lean frame shows no cold over-forecast (base cold bias 0.0 vs +2.9 live), so it cannot say whether a longer half-life would fix the live bias. Keep `weight_halflife_days: 60`. Re-open only if the #120 shadow or the 14-cold-day gate (step 8) points at training weight; the right test then is a capture-frame walk-forward of `hl120` / `hl0`.
+
+**2026-11-13:** the full-year prerequisite is met. For: rows at ≤ 3 °C hold 2.3 % of training weight (about 56 effective rows), and one more day of data moved the 2 °C forecast by 45 %. Against (weak, re-checked 2026-11-20): this autumn may run lower than last winter at the same temperature. The 13 Nov figure (18.9 against 24.5 kWh/day at 3–6 °C) was 5 days; 18.9 reproduces from live actuals (11-02..11-06), 24.5 has no recorded source. Re-measured on one basis (backtest loader target series, autumn 10-15..11-19 vs winter 12-01..03-15): 3–6 °C 19.3 (6 days) vs 26.9 (21 days, sd 6.3), 6–9 °C 16.9 vs 17.5; pooled 2–10 °C the autumn offset is −1.6 kWh/day (se 1.2, about −7 %), not significant. So up-weighting old cold rows may over-forecast, but this is unproven; the half-life backtest below measured the effect directly.
 
 **Context:** Simulation (2026-06-21) compared three weighting schemes on 30-day holdout (May 22 – Jun 21):
 
@@ -610,7 +629,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 84 | Legionella/DHW boost hour feature | — | — | **SUPERSEDED (2026-08-22) by #93** — see below |
 | 93 | DHW override commit + deterministic forecast correction (cross-repo, supersedes #84) | medium-high | ~1 day+ | done — Phase A deployed 2026-08-27 (hef `v0.12.0-alpha-13`), exit gate passed 2026-09-18, Phase B live (EM). Open follow-up moved to #124 (override entries that never ran are replayed in training) |
 | 87 | `trend_deviation` feature (recent vs baseline) | low-medium | 1 h | low — inputs degenerate at day-ahead lead; retest first |
-| 88 | Temperature-similarity sample weighting | low-medium | 3 h | low-medium — re-scoped: test on #119 with the cold-onset stability metric |
+| 88 | Temperature-similarity sample weighting | low | 3 h | low — tested 2026-11-20, not adopted (no gain on cold days; half-life 60 kept); see #88 |
 | 15 | HVAC flow setpoint | high (heat pump) | 3 h | escalate if bouncing |
 | 10 | School holidays | medium | 4 h | long-term |
 | 46 | Dashboard entity ID cleanup | UX / sharing | 30 min | partial — interval entity IDs fixed in fix/review-critical |
@@ -644,11 +663,11 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
 | 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag shipped alpha-41 2026-11-15 (off); 14-day shadow earliest 2026-11-27 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
-| 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; gain unmeasured | S | medium-low — measure on captures first |
+| 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; 3 h-block MAE −0.021 kWh | S | medium-low — implemented on `fix/override-hour-trim` 2026-11-23, own deploy window |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
 | 124 | Verify override history against the tank before training replay (hef only) | target differs on 2 % of hours, daily net ≈ 0 | S | low-medium — shipped alpha-42 2026-11-16; deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) |
 | 125 | NaN-robust indoor averaging (would switch the training override subtraction on for 34 overrides and move the target) | forecast-changing | S | follow-up of physics heating removal (2026-11-16); low, own ship window |
-| 126 | Measured vs simulated override correction (hef models about 1 kWh for a legionella hour, EM measures 5 kWh) | override delta accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
+| 126 | Legionella / high-target DHW cycle energy with an auxiliary heater (hef models about 1 kWh in one hour; measured 4–5 kWh over about 2 h on one install) | override delta accuracy, serving and training | S–M | medium-low — investigation added 2026-11-23, see section |
 | 127 | Open-window down-weighting on/off backtest | verifies the 0.5x weight pays off | S | follow-up of physics heating removal (2026-11-16); low |
 | 128 | DHW draw calibration (`Q_dhw_daily` 2.79 vs sub-meter about 0.83 kWh/day) | DHW tank model accuracy | S–M | follow-up of physics heating removal (2026-11-16); low |
 | 129 | Move open-window detection into `model.py` and decouple `model.py` from `physics.py` | structure only | M | follow-up of physics heating removal (2026-11-16); low |
@@ -674,6 +693,7 @@ Open decision at the C verdict: physics release strategy (v0.12.0 opt-in vs furt
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v0.12.0 | 2026-11-22 | First `main` release of the 0.12 line: block/daily accuracy sensors, steadier day-ahead forecast, DHW override handling, heating-season detection, update check, DST/cache/archive fixes. 1483 tests on the release branch. |
 | v0.11.4-alpha | 2026-06-13 | 15-minute energy history cache (#85); strip partial day from clustering input (#86). 643 tests. |
 | v0.11.0-alpha-16 | 2026-04-23 | Fix EV day exclusion from centroid fitting (#82). 535 tests. |
 | v0.11.0-alpha-15 | 2026-04-22 | Regime logging improvements (#82 alpha-15 prep). 535 tests. |
@@ -766,7 +786,7 @@ Open decision at the C verdict: physics release strategy (v0.12.0 opt-in vs furt
 | 81 | `_project_indoor_temps()` stale-sensor threshold already documented — confirmed, no change needed | v0.11.0-alpha-14 |
 | 82 | Fix EV contamination in regime clustering — EV days excluded from `DailyProfileClusterer.fit()` | v0.11.0-alpha-16 |
 | 89 | Dedup physics sensor history fetches — DHW tank temp and room thermostat temp now reuse the ML pipeline's already-fetched data instead of redundant HA history API calls | Unreleased |
-| 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents | Unreleased |
+| 90 | Fill gaps in `_SHAP_FEATURE_LABELS` dashboard narrative dictionary — 5 missing labels added, 3 stale untagged `lag_*h` entries replaced with `_tgated` equivalents; follow-on: dynamic per-sub-sensor columns (`sub_<entity>_{lag_24h,lag_168h,active_24h,runs_7d}`) resolve by pattern (`fix/shap-sub-sensor-labels`) | Unreleased |
 | 91 | Daily update-check + notification — compares `__version__` against latest GitHub release tag daily at 09:00, fires `persistent_notification` when `main`-track users are behind; `update_check_enabled` config flag | v0.12.0-alpha-10 |
 | 92 | Temperature-based UA_eff calibration window — tiered eligibility instead of a hardcoded month list; tier 1 (`heating_sub_meter_sensor`) activated live 2026-09-26 | v0.12.0-alpha-19 |
 | 95 | Dedupe hourly excluded-range escalation/malformed-CSV warnings — `_warn_once()` in `ha_data.py` fires WARNING once per condition per AppDaemon process lifetime via `self._excluded_range_warned`, then INFO on repeats; resets on restart. **Follow-up correction:** alpha-11 only demoted severity — `filter_excluded_ranges()` still logged an INFO line every hourly cycle for a range matching zero rows (e.g. once it ages out of the data window), which was the actual source of ongoing noise reported live. Now gated on `n_dropped > 0`; a no-op range logs nothing. | v0.12.0-alpha-11 |

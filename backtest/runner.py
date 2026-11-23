@@ -8,6 +8,7 @@ origin because ``_prepare_prediction_X`` prepends the 400-row weather tail froze
 
 from __future__ import annotations
 
+import contextlib
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -44,7 +45,12 @@ def _train(arm: Arm, fold: Fold, inputs: Inputs, weather: pd.DataFrame, defaults
 
     energy = inputs.energy
     ev = inputs.ev_df
-    with feature_drop(arm.drop), frozen_now(fold.start), lgbm_seed(arm.seed):
+    with (
+        feature_drop(arm.drop),
+        frozen_now(fold.start),
+        lgbm_seed(arm.seed),
+        arm.patch(fold, weather) if arm.patch else contextlib.nullcontext(),
+    ):
         model = EnergyForecastModel(Path(tempfile.mkdtemp()), timezone=TZ)
         model.train(
             energy[energy["timestamp"] < fold.start],

@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -153,13 +154,43 @@ _SHAP_FEATURE_LABELS: dict[str, str] = {
 }
 
 
+# Per-sub-sensor feature columns are generated per entity (model.py), so they cannot be listed statically.
+_SUB_SENSOR_SUFFIX_LABELS: dict[str, str] = {
+    "lag_24h": "yesterday's {name} consumption",
+    "lag_168h": "last week's {name} consumption",
+    "active_24h": "{name} active in past 24h",
+    "runs_7d": "{name} starts in past 7d",
+}
+_SUB_SENSOR_RE = re.compile(r"^sub_(?P<slug>.+)_(?P<suffix>" + "|".join(_SUB_SENSOR_SUFFIX_LABELS) + r")$")
+
+
+def _humanize_sub_slug(slug: str) -> str:
+    """Entity slug -> readable name: drop the EM-publisher prefixes (em_, kermi_bridge_), underscores to spaces."""
+    name = slug
+    for prefix in ("em_", "kermi_bridge_"):
+        if name.startswith(prefix) and len(name) > len(prefix):
+            name = name[len(prefix) :]
+    return name.replace("_", " ")
+
+
+def _shap_label(feat: str) -> str:
+    """Narrative label for a feature column: static dict, then sub-sensor pattern, else the raw name."""
+    static = _SHAP_FEATURE_LABELS.get(feat)
+    if static is not None:
+        return static
+    m = _SUB_SENSOR_RE.match(feat) if isinstance(feat, str) else None
+    if m:
+        return _SUB_SENSOR_SUFFIX_LABELS[m["suffix"]].format(name=_humanize_sub_slug(m["slug"]))
+    return feat
+
+
 def _build_shap_narrative(shap_features: dict[str, float]) -> str:
     """Build a human-readable narrative from top SHAP features (#53)."""
     if not shap_features:
         return ""
     parts = []
     for feat, val in shap_features.items():
-        label = _SHAP_FEATURE_LABELS.get(feat, feat)
+        label = _shap_label(feat)
         parts.append(f"{label} ({val:+.2f} kWh)")
     return "Mainly driven by: " + "; ".join(parts) + "."
 

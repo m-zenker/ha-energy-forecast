@@ -20,6 +20,8 @@ class Arm:
     weather: Callable[[pd.DataFrame], pd.DataFrame] | None = None
     train_kwargs: Mapping[str, Any] = field(default_factory=dict)
     seed: int | None = None
+    # (fold, weather) -> context manager entered around train(), e.g. to patch sample weights
+    patch: Callable[[Any, pd.DataFrame], contextlib.AbstractContextManager] | None = None
 
 
 @contextlib.contextmanager
