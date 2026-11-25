@@ -10,6 +10,7 @@ Needs the env that matches the HA host, like every capture replay. HA is never c
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import hashlib
@@ -23,6 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import capture_replay as cr
+from . import wf_score as ws
 from .env import REPO, TZ, frozen_now, lgbm_seed
 from .walkforward import ARMS as WF_ARMS
 from .walkforward import WfArm
@@ -235,3 +237,117 @@ def exit_code(status: dict) -> int:
     if "FAIL" in status["parity"].values():
         return 2
     return 1 if status["errors"] else 0
+
+
+DEFAULT_SINCE = "2026-11-26"  # first target day of the fresh window (earlier days were used to find the cause)
+SHADOW_ARMS = ("droptp", "droptp_nb")
+CANDIDATE_ARMS = ("shapecl", "clrecent", "rescale", "s1")
+GAP = pd.Timedelta(days=2)
+
+
+def load_rows(out: Path) -> pd.DataFrame:
+    """All logged rows, empty frame when there are none."""
+    files = sorted((Path(out) / "rows").glob("*.pkl"))
+    return (
+        pd.concat([pd.read_pickle(f, compression=None) for f in files], ignore_index=True) if files else pd.DataFrame()
+    )
+
+
+def score_rows(rows: pd.DataFrame, actuals: pd.Series, daily_temp: pd.Series, since: pd.Timestamp) -> dict:
+    """#120 shadow verdicts and cold-bias candidate verdicts for target days from *since* on.
+
+    Dates are filtered before the day table and the swing, so burn-in days never count. Rows from different arm code
+    make every verdict INCONCLUSIVE; a changed app code is only listed, because a live deploy changes it.
+    """
+    res: dict = dict(days=0, reason=None, codes=[], app_codes=[], blind_share=None, table=None, swing=None)
+    res["shadow"] = {a: {"verdict": "INCONCLUSIVE"} for a in SHADOW_ARMS}
+    res["candidate"] = {a: {"verdict": "INCONCLUSIVE"} for a in CANDIDATE_ARMS}
+    if rows.empty:
+        return {**res, "reason": "no rows logged"}
+    scored = ws.attach_actuals(rows, actuals, daily_temp)
+    scored = scored[scored["day"] >= pd.Timestamp(since)]
+    table = ws.day_table(ws.day_ahead(scored))
+    if table.empty:
+        return {**res, "reason": "no rows with complete actuals in the window"}
+    scored = scored[scored["day"].isin(table.index.get_level_values("day"))]
+    swing = ws.next_day_swing(scored)
+    res.update(
+        days=int(table.xs("base", level="arm").shape[0]) if "base" in table.index.get_level_values("arm") else 0,
+        codes=sorted(scored["code"].unique()),
+        app_codes=sorted(scored["app_code"].unique()),
+        blind_share=float(scored["blind"].mean()),
+        table=table,
+        swing=swing,
+    )
+    if len(res["codes"]) > 1:
+        return {**res, "reason": f"rows come from different arm code: {', '.join(res['codes'])}"}
+    res["shadow"] = {a: ws.shadow_verdict(table, swing, a) for a in SHADOW_ARMS}
+    res["candidate"] = {a: ws.candidate_verdict(table, swing, daily_temp, a) for a in CANDIDATE_ARMS}
+    return res
+
+
+def score(out: Path, root: Path, since: pd.Timestamp) -> dict:
+    """``score_rows`` with actuals and archive temperature of the newest retrain capture."""
+    from .capture_frame import CaptureFrame
+
+    frame = CaptureFrame.from_capture(Path(root))
+    weather = frame.weather
+    daily_temp = weather["temp_c"].groupby(pd.to_datetime(weather["timestamp"]).dt.normalize()).mean()
+    return score_rows(load_rows(out), frame.actuals(), daily_temp, since)
+
+
+def status_text(out: Path, now: pd.Timestamp) -> str:
+    """Last run, its problems, and gaps of more than two days between logged origins."""
+    path = Path(out) / "status.json"
+    if not path.exists():
+        return "no run yet"
+    st = json.loads(path.read_text())
+    lines = [f"last run: {st['last_run']} (now {now})"]
+    for key in ("errors", "skipped"):
+        lines += [f"{key[:-1] if key == 'errors' else key}: {cid}: {msg}" for cid, msg in st.get(key, {}).items()]
+    lines += [f"parity {res}: {cid}" for cid, res in st.get("parity", {}).items() if res != "PASS"]
+    rows = load_rows(out)
+    origins = [] if rows.empty else sorted(rows["origin"].unique())
+    lines.append(f"logged origins: {len(origins)}" + (f", newest {pd.Timestamp(origins[-1])}" if origins else ""))
+    for a, b in zip(origins, origins[1:], strict=False):
+        if pd.Timestamp(b) - pd.Timestamp(a) > GAP:
+            lines.append(f"gap: no origin between {pd.Timestamp(a)} and {pd.Timestamp(b)}")
+    if origins and _naive_local(now) - pd.Timestamp(origins[-1]) > GAP:
+        lines.append(f"gap: newest origin is {_naive_local(now) - pd.Timestamp(origins[-1])} old")
+    return "\n".join(lines)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m backtest.shadow", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for cmd in ("run", "score", "status"):
+        p = sub.add_parser(cmd)
+        if cmd != "status":
+            p.add_argument("captures_dir", type=Path)
+            p.add_argument("--since", default=None, help=f"first target day (default {DEFAULT_SINCE})")
+        if cmd == "run":
+            p.add_argument("--arms", nargs="+", default=list(ARM_NAMES), choices=sorted(ARMS))
+        p.add_argument("--out", type=Path, required=True)
+    args = ap.parse_args(argv)
+    now = pd.Timestamp.now(tz=TZ).tz_localize(None).floor("s")
+    if args.cmd == "status":
+        print(status_text(args.out, now))
+        return 0
+    since = pd.Timestamp(args.since or DEFAULT_SINCE)
+    if args.cmd == "run":
+        # day-ahead rows of the first target day come from the two origin days before it
+        status = run(args.captures_dir, args.out, args.arms, now, since - pd.Timedelta(days=2), log=print)
+        print(status_text(args.out, now))
+        return exit_code(status)
+    res = score(args.out, args.captures_dir, since)
+    print(f"days {res['days']}, blind rows {res['blind_share']}, arm code {res['codes']}, app code {res['app_codes']}")
+    if res["reason"]:
+        print(f"INCONCLUSIVE: {res['reason']}")
+    for kind in ("shadow", "candidate"):
+        for arm, verdict in res[kind].items():
+            print(kind, arm, verdict)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
