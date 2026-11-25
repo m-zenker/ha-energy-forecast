@@ -148,3 +148,39 @@ def test_run_arm_writes_four_origins_a_day_and_cleans_up(frame, tmp_path):
 def test_jitter_arm_trains_one_hour_earlier(frame, tmp_path):
     rows = run_arm(ARMS["jit"], frame, pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-02"), tmp_path)
     assert set(rows["cutoff"].dt.hour) == {17}
+
+
+def test_run_arm_patch_active_in_train_not_predict(frame, tmp_path, monkeypatch):
+    import contextlib
+
+    from backtest import walkforward as wf
+
+    state, seen = {"on": False}, {"train": [], "predict": []}
+
+    @contextlib.contextmanager
+    def patch():
+        state["on"] = True
+        try:
+            yield
+        finally:
+            state["on"] = False
+
+    class _Model:
+        model = object()
+
+    def fake_train(frame, cutoff, work_root, seed_dir=None, patch=None, train_kwargs=None):
+        with patch():
+            seen["train"].append(state["on"])
+        work = tmp_path / f"w{len(seen['train'])}"
+        work.mkdir()
+        return _Model(), work
+
+    def fake_predict(frame, model, work, origin, kwargs=None):
+        seen["predict"].append(state["on"])
+        return pd.DataFrame({"ts": [origin], "lead": [0], "p50": [1.0]})
+
+    monkeypatch.setattr(wf, "train", fake_train)
+    monkeypatch.setattr(wf, "predict", fake_predict)
+    day = pd.Timestamp("2026-03-02")
+    run_arm(WfArm("p", patch=patch), frame, day, day, tmp_path)
+    assert seen["train"] and all(seen["train"]) and seen["predict"] and not any(seen["predict"])

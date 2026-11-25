@@ -18,7 +18,7 @@ import argparse
 import contextlib
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,7 @@ class WfArm:
     cutoff_shift_h: int = 0  # retrain this many hours off the nominal cutoff (jitter control: -1)
     every_days: int = 1  # retrain cadence
     live_frame: bool = False  # serve with live's 3-day weather tail instead of a contiguous one
+    patch: Callable[[], contextlib.AbstractContextManager] | None = None  # entered around train() only
 
 
 ARMS: dict[str, WfArm] = {
@@ -81,6 +82,22 @@ def single_thread_lgbm(n_jobs: int | None):
         lgb.LGBMRegressor.fit = orig
 
 
+def _compose(*patches):
+    """One context-manager factory entering every non-None factory in order; None when there is none."""
+    active = [p for p in patches if p is not None]
+    if not active:
+        return None
+
+    @contextlib.contextmanager
+    def combined():
+        with contextlib.ExitStack() as stack:
+            for p in active:
+                stack.enter_context(p())
+            yield
+
+    return combined
+
+
 def retrain_days(start: pd.Timestamp, end: pd.Timestamp, every_days: int) -> list[pd.Timestamp]:
     """Days on which the arm retrains: the day before *start*, then every *every_days* days up to *end*."""
     first = pd.Timestamp(start).normalize() - pd.Timedelta(days=1)
@@ -102,6 +119,7 @@ def run_arm(
     last_origin = min(end + pd.Timedelta(days=1), frame.end)
     retrain_on = set(retrain_days(start, end, arm.every_days))
     patch = (lambda: feature_drop(arm.drop)) if arm.drop else None
+    train_patch = _compose(patch, arm.patch)
     rows: list[pd.DataFrame] = []
     model = work = cutoff = None
     day = start.normalize() - pd.Timedelta(days=1)
@@ -109,7 +127,9 @@ def run_arm(
         if day in retrain_on:
             cutoff = day + pd.Timedelta(hours=retrain_hour + arm.cutoff_shift_h)
             previous = work
-            model, work = train(frame, cutoff, work_root, seed_dir=previous, patch=patch, train_kwargs=arm.train_kwargs)
+            model, work = train(
+                frame, cutoff, work_root, seed_dir=previous, patch=train_patch, train_kwargs=arm.train_kwargs
+            )
             if model.model is None:
                 raise RuntimeError(f"arm {arm.name!r}: train() skipped at {cutoff} (too little history?)")
             if previous is not None and not keep_models:
