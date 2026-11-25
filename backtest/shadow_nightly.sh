@@ -22,8 +22,8 @@ export PYTHONPATH=apps:. PYTHONDONTWRITEBYTECODE=1
   else timeout 600 "$ENVS/ha-energy-forecast/bin/python" "$DATA/../scripts/pull_captures.py"; fi
   pull=$?
   [ $pull -eq 0 ] || echo "pull failed (exit $pull); continuing with local captures"
-  if [ -n "${SHADOW_RUN:-}" ]; then "$SHADOW_RUN" run "$DATA/captures" --out "$OUT"
-  else "$ENVS/ha-energy-forecast-live/bin/python" -m backtest.shadow run "$DATA/captures" --out "$OUT"; fi
+  if [ -n "${SHADOW_RUN:-}" ]; then "$SHADOW_RUN" run "$DATA/captures" --out "$OUT" --pull-exit $pull
+  else "$ENVS/ha-energy-forecast-live/bin/python" -m backtest.shadow run "$DATA/captures" --out "$OUT" --pull-exit $pull; fi
   run=$?
   echo "== $(date -Is) done: pull $pull, run $run"
 } >>"$LOG" 2>&1

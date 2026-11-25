@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -32,12 +33,15 @@ from .walkforward import WfArm
 ORIGIN_HOURS = (0, 6, 12, 18)
 BURN_IN = pd.Timedelta(days=7)  # arm chains start this long before the first logged origin
 KEEP_MODELS = 3
+MIN_DAYS = 14  # below this every verdict is INCONCLUSIVE
+META = "shadow_meta.json"
 PARITY_TOL_KWH = 1e-6
 ARM_FILES = (
     "backtest/walkforward.py",
     "backtest/regime_arms.py",
     "backtest/shadow.py",
     "backtest/capture_replay.py",
+    "backtest/env.py",  # lgbm_seed (the s1 arm) and frozen_now
 )
 # "s1" is base with another LightGBM seed: the noise floor (a captured retrain cannot be shifted an hour like jit)
 ARMS: dict[str, WfArm] = {
@@ -87,11 +91,31 @@ def _replace_dir(tmp: Path, final: Path) -> None:
     os.replace(tmp, final)
 
 
-def _ensure_model(root: Path, out: Path, name: str, chain: Sequence[dict], rc: dict) -> Path:
-    """Model dir of arm *name* after retrain *rc*, training forward from the newest link that exists.
+def _read_meta(model_dir: Path, code: str | None, start: str | None) -> dict | None:
+    """Meta of a finished model dir trained by this arm code from this chain start, else None (rebuild it)."""
+    try:
+        meta = json.loads((model_dir / META).read_text())
+    except (OSError, ValueError):
+        return None
+    return meta if (meta["code"], meta["start"]) == (code, start) else None
+
+
+def _ensure_model(
+    root: Path,
+    out: Path,
+    name: str,
+    chain: Sequence[dict],
+    rc: dict,
+    code: str | None = None,
+    app: str | None = None,
+) -> tuple[Path, dict]:
+    """Model dir (and its meta) of arm *name* after retrain *rc*, training forward from the newest usable link.
 
     ``base`` starts every retrain from the captured pre-train state, so it reproduces live even across a missing
     capture. Every other arm continues from its own previous model; its first link starts from the captured state.
+    Links trained by other arm code or from another chain start are rebuilt; an app-code change is not a rebuild,
+    because live also continues from the model it had. A link that cannot be trained is skipped and counted in
+    ``chain_skips``, so one bad retrain capture does not block every later one; *rc* itself must train.
     """
     arm = ARMS[name]
     if arm.drop:
@@ -100,14 +124,16 @@ def _ensure_model(root: Path, out: Path, name: str, chain: Sequence[dict], rc: d
     ids = [c["capture_id"] for c in chain]
     if rc["capture_id"] not in ids:
         raise SkipCapture(f"retrain capture {rc['capture_id']} is before the chain start")
+    start = None if name == "base" else ids[0]
     upto = ids[: ids.index(rc["capture_id"]) + 1]
     if name == "base":
         upto = upto[-1:]
-    done = [i for i, cid in enumerate(upto) if (folder / cid).is_dir()]
-    if done and done[-1] == len(upto) - 1:
-        return folder / upto[-1]
-    previous = folder / upto[done[-1]] if done else None
-    for cid in upto[(done[-1] + 1 if done else 0) :]:
+    metas = {i: m for i, cid in enumerate(upto) if (m := _read_meta(folder / cid, code, start)) is not None}
+    newest = max(metas) if metas else None
+    previous = folder / upto[newest] if newest is not None else None
+    meta = metas[newest] if newest is not None else {}
+    skips = meta.get("chain_skips", 0)
+    for cid in upto[(newest + 1 if newest is not None else 0) :]:
         tmp = folder / f"{cid}.tmp"
         shutil.rmtree(tmp, ignore_errors=True)
         try:
@@ -122,16 +148,29 @@ def _ensure_model(root: Path, out: Path, name: str, chain: Sequence[dict], rc: d
             )
         except cr.NoSeedError as exc:
             raise SkipCapture(f"no seed: {exc}") from exc
+        except Exception:
+            if cid == upto[-1]:
+                raise
+            skips += 1
+            shutil.rmtree(tmp, ignore_errors=True)
+            continue
+        meta = dict(code=code, app=app, start=start, chain_skips=skips)
+        (tmp / META).write_text(json.dumps(meta))
         _replace_dir(tmp, folder / cid)
         previous = folder / cid
-    return folder / upto[-1]
+    return folder / upto[-1], meta
 
 
 def _prune_models(out: Path, name: str, chain: Sequence[dict]) -> None:
     folder = out / "models" / name
     ids = [c["capture_id"] for c in chain if (folder / c["capture_id"]).is_dir()]
     for cid in ids[:-KEEP_MODELS]:
-        shutil.rmtree(folder / cid, ignore_errors=True)
+        # rename first: a kill inside rmtree must not leave a half-deleted dir under a usable name
+        doomed = folder / f"{cid}.tmp"
+        if doomed.exists():
+            shutil.rmtree(doomed, ignore_errors=True)
+        os.replace(folder / cid, doomed)
+        shutil.rmtree(doomed, ignore_errors=True)
 
 
 def _forecast(model_dir: Path, payload: dict, init: dict) -> pd.DataFrame:
@@ -156,13 +195,13 @@ def _forecast(model_dir: Path, payload: dict, init: dict) -> pd.DataFrame:
     return rows
 
 
-def _process(root: Path, out: Path, arms: Sequence[str], sc: dict, chain: Sequence[dict], now: pd.Timestamp):
-    """Rows of every arm for one predict capture, and whether base reproduced live."""
+def _process(root: Path, out: Path, arms: Sequence[str], sc: dict, chain: Sequence[dict], now, code: str, app: str):
+    """Rows of *arms* for one predict capture; ``parity`` is set when base is among them."""
     capture = cr._capture_mod()
     want = sc.get("last_trained")
     rc = next((c for c in chain if want is not None and c.get("last_trained_after") == want), None)
     if rc is None:
-        raise SkipCapture(f"no retrain capture in the chain for last_trained {want}")
+        raise SkipCapture(f"no finished retrain capture in the chain for last_trained {want}")
     payload, _ = capture.load_capture(root, "predict", sc["capture_id"])
     init = cr._model_init_for(root, want)
     origin = _naive_local(payload["now_local"]).floor("h")
@@ -170,17 +209,19 @@ def _process(root: Path, out: Path, arms: Sequence[str], sc: dict, chain: Sequen
     live = payload["model_predictions"]["predicted_kwh"].to_numpy(dtype=float)
     parts, parity = [], None
     for name in arms:
-        rows = _forecast(_ensure_model(root, out, name, chain, rc), payload, init)
+        model_dir, meta = _ensure_model(root, out, name, chain, rc, code, app)
+        rows = _forecast(model_dir, payload, init)
         if name == "base":
             ok = len(rows) == len(live) and abs(rows["p50"].to_numpy() - live).max() <= PARITY_TOL_KWH
             parity = "PASS" if ok else "FAIL"
         rows.insert(0, "arm", name)
+        rows["model_app_code"], rows["chain_skips"] = meta.get("app"), meta.get("chain_skips", 0)
         parts.append(rows)
     df = pd.concat(parts, ignore_index=True)
     df["origin"], df["cutoff"] = origin, cutoff
     df["lead"] = ((df["ts"] - origin) / pd.Timedelta(hours=1)).astype(int)
     df["logged_at"], df["blind"] = now, now < df["ts"]
-    df["code"], df["app_code"] = code_hash(), app_hash()
+    df["code"], df["app_code"] = code, app
     return df, parity
 
 
@@ -197,23 +238,54 @@ def run(
     now: pd.Timestamp,
     since: pd.Timestamp,
     log: Callable[[str], None] = lambda _msg: None,
+    pull_exit: int | None = None,
 ) -> dict:
-    """Process every selected predict capture from *since* on that has no rows file yet; returns the status."""
+    """Log every selected predict capture from *since* on that lacks an arm; returns the status of this run.
+
+    ``base`` is always included. A slot already logged stays with the capture it has; rows of arms logged before are
+    kept as they are.
+    """
     capture = cr._capture_mod()
     root, out = Path(root), Path(out)
     rows_dir = out / "rows"
     rows_dir.mkdir(parents=True, exist_ok=True)
+    arms = list(dict.fromkeys(("base", *arms)))
     now, since = _naive_local(now), _naive_local(since)
-    chain = [c for c in capture.list_captures(root, "retrain") if _naive_local(c["ts_utc"]) >= since - BURN_IN]
-    status: dict = dict(last_run=str(now), since=str(since), processed=[], skipped={}, parity={}, errors={})
-    for sc in select_origins(capture.list_captures(root, "predict")):
+    code, app = code_hash(), app_hash()
+    chain = [
+        c
+        for c in capture.list_captures(root, "retrain")
+        if c.get("last_trained_after") and _naive_local(c["ts_utc"]) >= since - BURN_IN
+    ]
+    status: dict = dict(
+        last_run=str(now), since=str(since), pull_exit=pull_exit, processed=[], skipped={}, parity={}, errors={}
+    )
+    predicts = capture.list_captures(root, "predict")
+    if not predicts:
+        status["errors"]["captures"] = f"no predict captures under {root}"
+    logged = {}
+    for path in sorted(rows_dir.glob("*.pkl")):
+        rows = pd.read_pickle(path, compression=None)
+        logged[rows["origin"].iloc[0]] = path, rows
+    for sc in select_origins(predicts):
         cid = sc["capture_id"]
-        path = rows_dir / f"{cid}.pkl"
-        if _naive_local(sc["ts_utc"]) < since or path.exists():
+        at = _naive_local(sc["ts_utc"])
+        if at < since:
+            continue
+        path, old = logged.get(at.floor("h"), (rows_dir / f"{cid}.pkl", None))
+        if old is not None and path.stem != cid:
+            # the slot was logged from another capture: complete it from that one, never from this one
+            sc = next((p for p in predicts if p["capture_id"] == path.stem), None)
+            if sc is None:
+                continue
+            cid = path.stem
+        missing = [a for a in arms if old is None or a not in set(old["arm"])]
+        if not missing:
             continue
         try:
-            df, parity = _process(root, out, arms, sc, chain, now)
-            _write(df, path)
+            df, parity = _process(root, out, missing, sc, chain, now, code, app)
+            df["parity"] = parity if old is None else old["parity"].iloc[0]
+            _write(df if old is None else pd.concat([old, df], ignore_index=True), path)
         except SkipCapture as exc:
             status["skipped"][cid] = str(exc)
         except Exception as exc:  # noqa: BLE001  one broken capture must not stop the catch-up
@@ -233,7 +305,7 @@ def run(
 
 
 def exit_code(status: dict) -> int:
-    """2 when base did not reproduce live, 1 when a capture errored, else 0 (skipped captures are only reported)."""
+    """2 when base did not reproduce live in this run, 1 when a capture errored, else 0 (skips are only reported)."""
     if "FAIL" in status["parity"].values():
         return 2
     return 1 if status["errors"] else 0
@@ -257,13 +329,26 @@ def score_rows(rows: pd.DataFrame, actuals: pd.Series, daily_temp: pd.Series, si
     """#120 shadow verdicts and cold-bias candidate verdicts for target days from *since* on.
 
     Dates are filtered before the day table and the swing, so burn-in days never count. Rows from different arm code
-    make every verdict INCONCLUSIVE; a changed app code is only listed, because a live deploy changes it.
+    make every verdict INCONCLUSIVE; a changed app code is only listed, because a live deploy changes it. Origins
+    where base did not reproduce live, or which lack an arm, are left out for every arm, so all arms are compared on
+    the same origins.
     """
     res: dict = dict(days=0, reason=None, codes=[], app_codes=[], blind_share=None, table=None, swing=None)
+    res.update(parity_failed=[], incomplete_origins=0, chain_skips=0, origins=None)
     res["shadow"] = {a: {"verdict": "INCONCLUSIVE"} for a in SHADOW_ARMS}
     res["candidate"] = {a: {"verdict": "INCONCLUSIVE"} for a in CANDIDATE_ARMS}
     if rows.empty:
         return {**res, "reason": "no rows logged"}
+    failed = rows.loc[rows["parity"] != "PASS", "origin"].unique()
+    res["parity_failed"] = sorted(pd.Timestamp(o) for o in failed)
+    rows = rows[~rows["origin"].isin(failed)]
+    if rows.empty:
+        return {**res, "reason": "no origin where base reproduced live"}
+    per_origin = rows.groupby("origin")["arm"].nunique()
+    short = per_origin.index[per_origin < rows["arm"].nunique()]
+    res["incomplete_origins"] = len(short)
+    rows = rows[~rows["origin"].isin(short)]
+    res["chain_skips"] = int(rows["chain_skips"].max()) if len(rows) else 0
     scored = ws.attach_actuals(rows, actuals, daily_temp)
     scored = scored[scored["day"] >= pd.Timestamp(since)]
     table = ws.day_table(ws.day_ahead(scored))
@@ -278,10 +363,14 @@ def score_rows(rows: pd.DataFrame, actuals: pd.Series, daily_temp: pd.Series, si
         blind_share=float(scored["blind"].mean()),
         table=table,
         swing=swing,
+        origins=scored[["arm", "origin"]].drop_duplicates(),
     )
     if len(res["codes"]) > 1:
         return {**res, "reason": f"rows come from different arm code: {', '.join(res['codes'])}"}
     res["shadow"] = {a: ws.shadow_verdict(table, swing, a) for a in SHADOW_ARMS}
+    if res["days"] < MIN_DAYS:  # shadow_verdict has no day minimum of its own
+        for verdict in res["shadow"].values():
+            verdict["verdict"] = "INCONCLUSIVE"
     res["candidate"] = {a: ws.candidate_verdict(table, swing, daily_temp, a) for a in CANDIDATE_ARMS}
     return res
 
@@ -305,7 +394,11 @@ def status_text(out: Path, now: pd.Timestamp) -> str:
     lines = [f"last run: {st['last_run']} (now {now})"]
     for key in ("errors", "skipped"):
         lines += [f"{key[:-1] if key == 'errors' else key}: {cid}: {msg}" for cid, msg in st.get(key, {}).items()]
-    lines += [f"parity {res}: {cid}" for cid, res in st.get("parity", {}).items() if res != "PASS"]
+    if st.get("pull_exit"):
+        lines.append(f"pull failed (exit {st['pull_exit']}): HA drops captures after 45 days")
+    for path in sorted((Path(out) / "rows").glob("*.pkl")):  # from the rows: a later run must not hide it
+        if not (pd.read_pickle(path, compression=None)["parity"] == "PASS").all():
+            lines.append(f"parity FAIL: {path.stem}")
     rows = load_rows(out)
     origins = [] if rows.empty else sorted(rows["origin"].unique())
     lines.append(f"logged origins: {len(origins)}" + (f", newest {pd.Timestamp(origins[-1])}" if origins else ""))
@@ -326,6 +419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             p.add_argument("captures_dir", type=Path)
             p.add_argument("--since", default=None, help=f"first target day (default {DEFAULT_SINCE})")
         if cmd == "run":
+            p.add_argument("--pull-exit", type=int, default=None, help="exit code of the capture pull, for the status")
             p.add_argument("--arms", nargs="+", default=list(ARM_NAMES), choices=sorted(ARMS))
         p.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
@@ -335,12 +429,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     since = pd.Timestamp(args.since or DEFAULT_SINCE)
     if args.cmd == "run":
-        # day-ahead rows of the first target day come from the two origin days before it
-        status = run(args.captures_dir, args.out, args.arms, now, since - pd.Timedelta(days=2), log=print)
+        args.out.mkdir(parents=True, exist_ok=True)
+        with open(args.out / ".run.lock", "w") as lock:  # also covers a run by hand next to the container
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("another shadow run is active")
+                return 0
+            # day-ahead rows of the first target day come from the two origin days before it
+            first = since - pd.Timedelta(days=2)
+            status = run(args.captures_dir, args.out, args.arms, now, first, log=print, pull_exit=args.pull_exit)
         print(status_text(args.out, now))
         return exit_code(status)
     res = score(args.out, args.captures_dir, since)
     print(f"days {res['days']}, blind rows {res['blind_share']}, arm code {res['codes']}, app code {res['app_codes']}")
+    print(f"left out: parity FAIL {res['parity_failed']}, incomplete origins {res['incomplete_origins']}")
+    print(f"most skipped retrain links in a chain: {res['chain_skips']}")
     if res["reason"]:
         print(f"INCONCLUSIVE: {res['reason']}")
     for kind in ("shadow", "candidate"):

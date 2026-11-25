@@ -34,13 +34,13 @@ def _call(tmp_path, pull="exit 0", run="exit 0"):
 def test_success_pulls_then_runs(tmp_path):
     res, calls, data = _call(tmp_path)
     assert res.returncode == 0 and calls[0] == "pulled"
-    assert calls[1] == f"ran run {data}/captures --out {data}/backtest/shadow"
+    assert calls[1] == f"ran run {data}/captures --out {data}/backtest/shadow --pull-exit 0"
     assert len(list((data / "backtest/shadow/log").glob("*.log"))) == 1
 
 
 def test_failed_pull_still_runs_and_is_reported(tmp_path):
     res, calls, data = _call(tmp_path, pull="exit 7")
-    assert res.returncode == 1 and len(calls) == 2
+    assert res.returncode == 1 and calls[1].endswith("--pull-exit 7")
     assert "pull failed" in next((data / "backtest/shadow/log").glob("*.log")).read_text()
 
 

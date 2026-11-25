@@ -180,7 +180,10 @@ def replay_train(
     kwargs["physics_model"] = _retarget_physics(payload["physics_model"], scratch)
     with frozen_now(payload["now_local"], init.get("timezone", TZ)), patch() if patch else contextlib.nullcontext():
         model = EnergyForecastModel(scratch, **init)
+        before = model.last_trained
         model.train(**kwargs)
+        if model.model is None or model.last_trained == before:
+            raise RuntimeError(f"train() skipped on retrain capture {retrain_id}")
     return scratch
 
 

@@ -172,6 +172,9 @@ PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m bac
 - `blind` marks rows written before their target hour. Frozen arms can be replayed later from the captures, so
   blindness is a record of when, not extra data. Do not let captures age out on HA (45 days).
 - `score` refuses rows from different arm code (`code`); a changed `app_code` is only listed.
+- `score` leaves out origins where `base` did not reproduce live or an arm is missing, and needs 14 days. `status` keeps
+  listing parity failures. Arm code is hashed (`walkforward.py`, `regime_arms.py`, `shadow.py`, `capture_replay.py`,
+  `env.py`): any edit there makes the window mixed, so delete `rows/` and let it replay.
 - `backtest/shadow_nightly.sh` pulls new captures and runs this. It takes a lock and keeps 30 logs.
 
 ## Gate on live data
