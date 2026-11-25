@@ -155,6 +155,25 @@ for arm in ("shapecl", "clrecent", "rescale", "jit"):
 sub-meter lags of the same rows keep their unscaled values. PASS makes an arm a candidate for its own plan, not a change: three arms share
 one window, so a winner needs a second, later window. Days <= 0 degC are not covered.
 
+## Shadow runner
+
+`python -m backtest.shadow run` trains the frozen arms on every live retrain capture and serves them on the live
+predict captures of 00, 06, 12 and 18 h, so they see the real weather forecast. It skips what is already logged, so a
+missed night is caught up by the next run. Forecasts go to `<out>/rows/`, models to `<out>/models/`.
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.shadow \
+    run data/captures --out data/backtest/shadow                 # log new forecasts
+... -m backtest.shadow status --out data/backtest/shadow         # last run, errors, gaps
+... -m backtest.shadow score data/captures --out data/backtest/shadow   # verdicts, target days from 2026-11-26
+```
+
+- `base` must reproduce what live computed (exit code 2 if not); `s1` is base with another seed, the noise floor.
+- `blind` marks rows written before their target hour. Frozen arms can be replayed later from the captures, so
+  blindness is a record of when, not extra data. Do not let captures age out on HA (45 days).
+- `score` refuses rows from different arm code (`code`); a changed `app_code` is only listed.
+- `backtest/shadow_nightly.sh` pulls new captures and runs this. It takes a lock and keeps 30 logs.
+
 ## Gate on live data
 
 ```
