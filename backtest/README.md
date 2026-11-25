@@ -96,7 +96,8 @@ ws.summarize(table); ws.paired(table, "droptp", metric="mae3"); ws.next_day_swin
 
 ## Shadow check for #120
 
-Needs captures covering at least 14 target days after 2026-11-12 (the earlier holdout is spent). Start the run one
+Needs captures covering at least 14 target days after 2026-11-25 (earlier days are spent: `droptp` was scored on
+2026-11-08..24). Start the run one
 week before the first scored day (burn-in).
 
 ```bash
@@ -127,6 +128,23 @@ set `drop_feature_groups: [thermal_pressure]`; the flip is a forecast-changing d
 
 Limits: perfect weather (measured cost of real forecast weather: 1–2 %); history is today's view of the past; the
 physics state is the capture's at every cutoff; days before a sensor existed have no such inputs, as live had none.
+
+## Cold-bias candidates
+
+Three arms for the cold-day over-forecast of November 2026 (history from before the facade was insulated):
+`shapecl` (regimes cluster on shape only), `clrecent` (regime centroids from 2026-03-01 on) and `rescale` (training
+target before 2026-10-01 scaled to the newer heating load). Score only target days from 2026-11-26 on; the earlier
+days were used to find the cause. Run together with the #120 arms, on the same window:
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.walkforward \
+    data/captures --start 2026-11-19 --end <last day> \
+    --arms base jit droptp droptp_nb shapecl clrecent rescale --out data/backtest/wf_cold_bias
+```
+
+After `attach_actuals` and the date filter, `ws.candidate_verdict(table, swing, daily_temp, arm)` applies the fixed
+criteria (its docstring lists them). PASS makes an arm a candidate for its own plan, not a change: three arms share
+one window, so a winner needs a second, later window. Days <= 0 degC are not covered.
 
 ## Gate on live data
 

@@ -126,6 +126,21 @@ def test_arm_registry_has_a_jitter_control():
     assert set(ARMS["droptp"].train_kwargs["drop_features"]) < set(ARMS["droptp_nb"].train_kwargs["drop_features"])
 
 
+def test_arm_registry_cold_bias_candidates(monkeypatch):
+    from backtest import regime_arms as ra
+
+    seen = {}
+    monkeypatch.setattr(ra, "centroids_since", lambda since: seen.setdefault("since", since))
+    monkeypatch.setattr(ra, "rescale_target", lambda kw, before: (seen.setdefault("before", before), 1.0))
+    monkeypatch.setattr(ra, "shape_only", lambda: seen.setdefault("shape", True))
+    ARMS["clrecent"].patch()
+    ARMS["shapecl"].patch()
+    assert ARMS["rescale"].energy_transform({}) == pd.Timestamp("2026-10-01")
+    assert seen == {"since": pd.Timestamp("2026-03-01"), "shape": True, "before": pd.Timestamp("2026-10-01")}
+    for name in ("base", "jit", "droptp"):
+        assert ARMS[name].patch is None and ARMS[name].energy_transform is None
+
+
 def test_train_and_predict_run_the_real_model(frame, tmp_path):
     model, work = train(frame, CUTOFF, tmp_path)
     assert model.model is not None and work.parent == tmp_path
