@@ -17,11 +17,14 @@ solely for ``last_trained`` / archive stamps, which do not influence predictions
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import math
 import shutil
 import tempfile
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -139,17 +142,29 @@ def seed_dir_for(root: Path, retrain_id: str) -> Path | None:
     return _previous_reference(root, retrain_id)
 
 
-def replay_train(root: Path, retrain_id: str, scratch: Path, *, allow_unseeded: bool = False) -> Path:
-    """Re-run train() on a retrain capture into *scratch*, seeded from ``seed_dir_for``.
+def replay_train(
+    root: Path,
+    retrain_id: str,
+    scratch: Path,
+    *,
+    allow_unseeded: bool = False,
+    seed_dir: Path | None = None,
+    patch: Callable[[], contextlib.AbstractContextManager] | None = None,
+    energy_transform: Callable[[dict], pd.DataFrame] | None = None,
+    train_kwargs: Mapping[str, Any] | None = None,
+) -> Path:
+    """Re-run train() on a retrain capture into *scratch*, seeded from *seed_dir* (default ``seed_dir_for``).
 
-    Raises ``NoSeedError`` when there is no seed, unless *allow_unseeded* (then it trains from an empty dir).
+    Raises ``NoSeedError`` when there is no seed, unless *allow_unseeded* (then it trains from an empty dir). The
+    last three arguments apply a backtest arm: *patch* is entered around train(), *energy_transform* rewrites the
+    training target, *train_kwargs* override the captured ones.
     """
     from energy_forecast.model import EnergyForecastModel
 
     capture = _capture_mod()
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    seed = seed_dir_for(root, retrain_id)
+    seed = seed_dir if seed_dir is not None else seed_dir_for(root, retrain_id)
     if seed is None and not allow_unseeded:
         raise NoSeedError(f"retrain capture {retrain_id} has no .pre/ and no previous .ref/ to seed from")
     if seed is not None:
@@ -158,10 +173,13 @@ def replay_train(root: Path, retrain_id: str, scratch: Path, *, allow_unseeded: 
                 shutil.copy2(p, scratch / p.name)
     payload, _ = capture.load_capture(root, "retrain", retrain_id)
     init = dict(payload.get("model_init") or {})
-    with frozen_now(payload["now_local"], init.get("timezone", TZ)):
+    kwargs = strip_legacy_train_kwargs(payload["train_kwargs"])
+    if energy_transform is not None:
+        kwargs["energy_df"] = energy_transform(kwargs)
+    kwargs.update(train_kwargs or {})
+    kwargs["physics_model"] = _retarget_physics(payload["physics_model"], scratch)
+    with frozen_now(payload["now_local"], init.get("timezone", TZ)), patch() if patch else contextlib.nullcontext():
         model = EnergyForecastModel(scratch, **init)
-        kwargs = strip_legacy_train_kwargs(payload["train_kwargs"])
-        kwargs["physics_model"] = _retarget_physics(payload["physics_model"], scratch)
         model.train(**kwargs)
     return scratch
 
