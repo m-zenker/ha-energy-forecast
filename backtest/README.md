@@ -142,8 +142,17 @@ PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m bac
     --arms base jit droptp droptp_nb shapecl clrecent rescale --out data/backtest/wf_cold_bias
 ```
 
-After `attach_actuals` and the date filter, `ws.candidate_verdict(table, swing, daily_temp, arm)` applies the fixed
-criteria (its docstring lists them). PASS makes an arm a candidate for its own plan, not a change: three arms share
+```python
+from backtest import wf_score as ws
+rows = ws.attach_actuals(rows, frame.actuals(), daily_temp)   # daily_temp: mean temp_c per day
+rows = rows[rows["day"] >= "2026-11-26"]                      # before table AND swing: burn-in days must not count
+table, swing = ws.day_table(ws.add_naive(ws.day_ahead(rows))), ws.next_day_swing(rows)
+for arm in ("shapecl", "clrecent", "rescale", "jit"):
+    print(arm, ws.candidate_verdict(table, swing, daily_temp, arm))
+```
+
+`candidate_verdict` applies the fixed criteria (its docstring lists them). `rescale` changes only the training target:
+sub-meter lags of the same rows keep their unscaled values. PASS makes an arm a candidate for its own plan, not a change: three arms share
 one window, so a winner needs a second, later window. Days <= 0 degC are not covered.
 
 ## Gate on live data

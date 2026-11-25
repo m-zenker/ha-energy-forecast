@@ -164,3 +164,59 @@ def test_input_not_mutated():
     copy = kw["energy_df"].copy()
     ra.rescale_target(kw, BEFORE)
     pd.testing.assert_frame_equal(kw["energy_df"], copy)
+
+
+def _messy_kwargs() -> dict:
+    """Old (-4..12 degC) and new (4..12 degC) days differ in range; the ratio inside the new days' band is 0.6.
+
+    Outside the band the old rate is four times higher, the warm days scatter (median 8, mean higher), one old
+    in-band day is an EV day, one old in-band day has only 10 (very high) hours, one warm old day sits above base.
+    """
+    t_old = np.r_[np.linspace(-4.0, 12.0, 40), np.full(10, 6.0)]
+    t_new = np.linspace(4.0, 12.0, 30)
+    lo, hi = np.quantile(t_new, 0.1), np.quantile(t_new, 0.9)
+    rate_old = np.where((t_old >= lo) & (t_old <= hi), 2.0, 8.0)
+    rate_new = np.where((t_new >= lo) & (t_new <= hi), 1.2, 0.1)
+    warm = np.array([6.0, 8.0, 8.0, 8.0, 30.0])
+    blocks = [
+        ("2026-01-01", t_old, BASE_KWH + rate_old * (15 - t_old)),
+        ("2026-07-01", np.full(5, 20.0), warm),
+        ("2026-10-01", t_new, BASE_KWH + rate_new * (15 - t_new)),
+    ]
+    energy = pd.concat([_profile_days(s, list(y)) for s, _, y in blocks], ignore_index=True)
+    temp = np.concatenate([np.repeat(t, 24) for _, t, _ in blocks])
+    weather = pd.DataFrame({"timestamp": energy["timestamp"], "temp_c": temp})
+    ev_day = pd.Timestamp("2026-02-10")  # old, 6.0 degC
+    on_ev = energy["timestamp"].dt.normalize() == ev_day
+    energy.loc[on_ev, "gross_kwh"] += 30.0 / 24
+    ev_df = pd.DataFrame({"timestamp": energy.loc[on_ev, "timestamp"], "gross_kwh": 30.0 / 24, "ev_source": "sensor"})
+    short = energy["timestamp"].dt.normalize() == pd.Timestamp("2026-02-12")  # old, 6.0 degC
+    energy = energy[~(short & (energy["timestamp"].dt.hour >= 10))].copy()
+    energy.loc[energy["timestamp"].dt.normalize() == pd.Timestamp("2026-02-12"), "gross_kwh"] = 5.0
+    return {"energy_df": energy.reset_index(drop=True), "weather_df": weather, "ev_df": ev_df}
+
+
+def test_ratio_uses_only_clean_days_in_the_band_per_heating_degree():
+    out, r = ra.rescale_target(_messy_kwargs(), BEFORE)
+    assert r == pytest.approx(0.6, abs=1e-9)
+
+
+def test_warm_day_above_base_is_not_scaled():
+    kw = _messy_kwargs()
+    out, _ = ra.rescale_target(kw, BEFORE)
+    assert _daily(out)["2026-07-05"] == pytest.approx(30.0) == pytest.approx(_daily(kw["energy_df"])["2026-07-05"])
+
+
+def test_old_ev_day_is_scaled_although_not_fitted():
+    kw = _messy_kwargs()
+    out, r = ra.rescale_target(kw, BEFORE)
+    before = _daily(kw["energy_df"])["2026-02-10"]
+    assert _daily(out)["2026-02-10"] == pytest.approx(BASE_KWH + r * (before - BASE_KWH)) != pytest.approx(before)
+
+
+@pytest.mark.parametrize("n_old, n_new, acts", [(14, 14, True), (14, 13, False), (13, 14, False)])
+def test_fourteen_fit_days_on_each_side(n_old, n_new, acts):
+    kw = _rescale_kwargs(0.6, n_old=n_old, n_new=n_new)
+    cold = kw["weather_df"]["temp_c"] < 15
+    kw["weather_df"] = kw["weather_df"].assign(temp_c=kw["weather_df"]["temp_c"].mask(cold, 8.0))  # all in band
+    assert (ra.rescale_target(kw, BEFORE)[1] < 1.0) is acts

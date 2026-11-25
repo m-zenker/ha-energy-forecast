@@ -219,3 +219,20 @@ def test_candidate_verdict_inconclusive_without_swing():
     table, swing, temp = _candidate_inputs()
     v = ws.candidate_verdict(table, swing.drop("cand"), temp, arm="cand")
     assert v["checks"]["swing"] is None and v["verdict"] == "INCONCLUSIVE"
+
+
+def test_candidate_verdict_band_edges_belong_to_the_colder_band():
+    table, swing, temp = _candidate_inputs()
+    edge = temp.copy()
+    edge[temp == 4.0], edge[temp == 8.0] = 6.0, 10.0
+    v = ws.candidate_verdict(table, swing, edge, arm="cand")
+    assert v["n_le6"] == 5 and v["bias610_delta"] == pytest.approx(0.5) and v["verdict"] == "PASS"
+    edge[temp == 8.0] = 10.1  # no day left in 6..10
+    assert ws.candidate_verdict(table, swing, edge, arm="cand")["verdict"] == "INCONCLUSIVE"
+
+
+def test_candidate_verdict_uses_the_mean_signed_bias_of_a_band():
+    table, swing, temp = _candidate_inputs(n_le6=6)
+    le6 = temp.index[temp <= 6]
+    table.loc[[("cand", d) for d in le6], "bias"] = [2.0, -2.0] * 3  # cancels: mean signed bias 0
+    assert ws.candidate_verdict(table, swing, temp, arm="cand")["bias6_pct"] == pytest.approx(-100)
