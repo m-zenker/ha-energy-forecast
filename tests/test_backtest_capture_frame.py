@@ -126,6 +126,21 @@ def test_arm_registry_has_a_jitter_control():
     assert set(ARMS["droptp"].train_kwargs["drop_features"]) < set(ARMS["droptp_nb"].train_kwargs["drop_features"])
 
 
+def test_arm_registry_cold_bias_candidates(monkeypatch):
+    from backtest import regime_arms as ra
+
+    seen = {}
+    monkeypatch.setattr(ra, "centroids_since", lambda since: seen.setdefault("since", since))
+    monkeypatch.setattr(ra, "rescale_target", lambda kw, before: (seen.setdefault("before", before), 1.0))
+    monkeypatch.setattr(ra, "shape_only", lambda: seen.setdefault("shape", True))
+    ARMS["clrecent"].patch()
+    ARMS["shapecl"].patch()
+    assert ARMS["rescale"].energy_transform({}) == pd.Timestamp("2026-10-01")
+    assert seen == {"since": pd.Timestamp("2026-03-01"), "shape": True, "before": pd.Timestamp("2026-10-01")}
+    for name in ("base", "jit", "droptp"):
+        assert ARMS[name].patch is None and ARMS[name].energy_transform is None
+
+
 def test_train_and_predict_run_the_real_model(frame, tmp_path):
     model, work = train(frame, CUTOFF, tmp_path)
     assert model.model is not None and work.parent == tmp_path
@@ -148,3 +163,68 @@ def test_run_arm_writes_four_origins_a_day_and_cleans_up(frame, tmp_path):
 def test_jitter_arm_trains_one_hour_earlier(frame, tmp_path):
     rows = run_arm(ARMS["jit"], frame, pd.Timestamp("2026-03-02"), pd.Timestamp("2026-03-02"), tmp_path)
     assert set(rows["cutoff"].dt.hour) == {17}
+
+
+def test_run_arm_patch_active_in_train_not_predict(frame, tmp_path, monkeypatch):
+    import contextlib
+
+    from backtest import walkforward as wf
+
+    state, seen = {"on": False}, {"train": [], "predict": []}
+
+    @contextlib.contextmanager
+    def patch():
+        state["on"] = True
+        try:
+            yield
+        finally:
+            state["on"] = False
+
+    class _Model:
+        model = object()
+
+    def fake_train(frame, cutoff, work_root, seed_dir=None, patch=None, train_kwargs=None):
+        with patch():
+            seen["train"].append(state["on"])
+        work = tmp_path / f"w{len(seen['train'])}"
+        work.mkdir()
+        return _Model(), work
+
+    def fake_predict(frame, model, work, origin, kwargs=None):
+        seen["predict"].append(state["on"])
+        return pd.DataFrame({"ts": [origin], "lead": [0], "p50": [1.0]})
+
+    monkeypatch.setattr(wf, "train", fake_train)
+    monkeypatch.setattr(wf, "predict", fake_predict)
+    day = pd.Timestamp("2026-03-02")
+    run_arm(WfArm("p", patch=patch), frame, day, day, tmp_path)
+    assert seen["train"] and all(seen["train"]) and seen["predict"] and not any(seen["predict"])
+
+
+def test_only_rows_before_cutoff(frame, tmp_path, monkeypatch):
+    from backtest import walkforward as wf
+
+    seen, trained = [], []
+
+    def transform(kwargs):
+        seen.append(kwargs["energy_df"]["timestamp"].max())
+        return kwargs["energy_df"].assign(gross_kwh=7.0)
+
+    class _Model:
+        model = object()
+
+    def fake_train(frame, cutoff, work_root, seed_dir=None, patch=None, train_kwargs=None):
+        trained.append((cutoff, train_kwargs))
+        work = tmp_path / f"w{len(trained)}"
+        work.mkdir()
+        return _Model(), work
+
+    monkeypatch.setattr(wf, "train", fake_train)
+    monkeypatch.setattr(
+        wf, "predict", lambda f, m, w, origin, kwargs=None: pd.DataFrame({"ts": [origin], "lead": [0], "p50": [1.0]})
+    )
+    day = pd.Timestamp("2026-03-02")
+    run_arm(WfArm("t", train_kwargs={"drop_features": ("x",)}, energy_transform=transform), frame, day, day, tmp_path)
+    assert len(seen) == len(trained) == 2
+    for ts, (cutoff, kw) in zip(seen, trained, strict=True):
+        assert ts < cutoff and kw["energy_df"]["gross_kwh"].eq(7.0).all() and kw["drop_features"] == ("x",)

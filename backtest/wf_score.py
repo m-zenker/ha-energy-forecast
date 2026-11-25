@@ -196,6 +196,43 @@ def shadow_verdict(
     )
 
 
+def candidate_verdict(
+    table: pd.DataFrame, swing: pd.DataFrame, daily_temp: pd.Series, arm: str, ref: str = "base"
+) -> dict:
+    """Pre-registered cold-bias criteria for *arm* against *ref* (2026-11-25, owner-approved; do not tune).
+
+    Over the days both arms scored: |mean bias| on days <= 6 degC at least 30 % lower, on days 6-10 degC at most
+    0.5 kWh/day higher, 3 h-block MAE at most 2 % worse, next-day swing (``range``) at most 10 % higher. Fewer than
+    14 days or 5 days <= 6 degC, or a check that cannot be computed, is INCONCLUSIVE. The caller filters the dates.
+    """
+    eps = 1e-9
+    out: dict = dict(days=0, n_le6=0, bias6_pct=None, bias610_delta=None, mae3_pct=None, swing_pct=None)
+    arms = table.index.get_level_values("arm")
+    if arm in arms and ref in arms:
+        a, r = table.xs(arm, level="arm"), table.xs(ref, level="arm")
+        common = a.index.intersection(r.index)
+        a, r = a.loc[common], r.loc[common]
+        temp = daily_temp.reindex(common).to_numpy()
+        le6, mid = temp <= 6, (temp > 6) & (temp <= 10)
+        out["days"], out["n_le6"] = len(common), int(le6.sum())
+        if le6.any() and r["bias"][le6].mean() != 0:
+            out["bias6_pct"] = float(100 * (abs(a["bias"][le6].mean()) / abs(r["bias"][le6].mean()) - 1))
+        if mid.any():
+            out["bias610_delta"] = float(abs(a["bias"][mid].mean()) - abs(r["bias"][mid].mean()))
+        res = paired(table, arm, ref, "mae3")
+        out["mae3_pct"] = None if res is None else float(res["pct"])
+    if arm in swing.index and ref in swing.index and swing.loc[ref, "range"]:
+        out["swing_pct"] = float(100 * (swing.loc[arm, "range"] / swing.loc[ref, "range"] - 1))
+    limits = {"bias6": ("bias6_pct", -30.0), "bias610": ("bias610_delta", 0.5), "mae3": ("mae3_pct", 2.0)}
+    limits["swing"] = ("swing_pct", 10.0)
+    checks = {name: None if out[key] is None else out[key] <= limit + eps for name, (key, limit) in limits.items()}
+    if out["days"] < 14 or out["n_le6"] < 5 or any(v is None for v in checks.values()):
+        verdict = "INCONCLUSIVE"
+    else:
+        verdict = "PASS" if all(checks.values()) else "FAIL"
+    return dict(**out, checks=checks, verdict=verdict)
+
+
 def next_day_swing(rows: pd.DataFrame) -> pd.DataFrame:
     """Per arm: how much the next-day total moves across the previous day's origins (kWh).
 
