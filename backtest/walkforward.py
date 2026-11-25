@@ -45,6 +45,7 @@ class WfArm:
     every_days: int = 1  # retrain cadence
     live_frame: bool = False  # serve with live's 3-day weather tail instead of a contiguous one
     patch: Callable[[], contextlib.AbstractContextManager] | None = None  # entered around train() only
+    energy_transform: Callable[[dict], pd.DataFrame] | None = None  # train kwargs at the cutoff -> training target
 
 
 ARMS: dict[str, WfArm] = {
@@ -127,9 +128,10 @@ def run_arm(
         if day in retrain_on:
             cutoff = day + pd.Timedelta(hours=retrain_hour + arm.cutoff_shift_h)
             previous = work
-            model, work = train(
-                frame, cutoff, work_root, seed_dir=previous, patch=train_patch, train_kwargs=arm.train_kwargs
-            )
+            train_kw = dict(arm.train_kwargs)
+            if arm.energy_transform is not None:
+                train_kw["energy_df"] = arm.energy_transform(frame.train_kwargs(cutoff))
+            model, work = train(frame, cutoff, work_root, seed_dir=previous, patch=train_patch, train_kwargs=train_kw)
             if model.model is None:
                 raise RuntimeError(f"arm {arm.name!r}: train() skipped at {cutoff} (too little history?)")
             if previous is not None and not keep_models:

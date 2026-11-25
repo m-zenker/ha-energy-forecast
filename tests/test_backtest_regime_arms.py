@@ -88,3 +88,79 @@ def test_patches_restore_on_exit_and_on_error(ctx):
     with pytest.raises(RuntimeError), ctx():
         raise RuntimeError
     assert cl.DailyProfileClusterer.fit is fit and cl.find_optimal_k is k
+
+
+BEFORE = pd.Timestamp("2026-10-01")
+BASE_KWH = 8.0
+
+
+def _rescale_kwargs(factor: float, n_old: int = 40, n_new: int = 40, ev_kwh: float = 0.0) -> dict:
+    """Old heating days + 20 warm days (8 kWh, 20 degC) + new heating days whose excess is *factor* x the old one."""
+    temps = lambda n: np.linspace(2.0, 12.0, n)  # noqa: E731
+    t_old, t_new = temps(n_old), temps(n_new)
+    blocks = [
+        ("2026-01-01", t_old, BASE_KWH + 2.0 * (15 - t_old)),
+        ("2026-07-01", np.full(20, 20.0), np.full(20, BASE_KWH)),
+        ("2026-10-01", t_new, BASE_KWH + factor * 2.0 * (15 - t_new)),
+    ]
+    energy = pd.concat([_profile_days(s, list(y)) for s, _, y in blocks], ignore_index=True)
+    weather = pd.DataFrame(
+        {"timestamp": energy["timestamp"], "temp_c": np.concatenate([np.repeat(t, 24) for _, t, _ in blocks])}
+    )
+    ev_df = None
+    if ev_kwh:
+        day = pd.date_range("2026-10-05", periods=24, freq="h")
+        energy.loc[energy["timestamp"].isin(day), "gross_kwh"] += ev_kwh / 24
+        ev_df = pd.DataFrame({"timestamp": day, "gross_kwh": ev_kwh / 24, "ev_source": "sensor"})
+    return {"energy_df": energy, "weather_df": weather, "ev_df": ev_df}
+
+
+def _daily(df: pd.DataFrame) -> pd.Series:
+    return df["gross_kwh"].groupby(df["timestamp"].dt.normalize()).sum()
+
+
+def test_ratio_recovers_known_factor():
+    kw = _rescale_kwargs(0.6)
+    out, r = ra.rescale_target(kw, BEFORE)
+    assert r == pytest.approx(0.6, abs=0.02)
+    before, after = _daily(kw["energy_df"]), _daily(out)
+    old = before.index < "2026-03-01"
+    assert after[old].to_numpy() == pytest.approx(BASE_KWH + r * (before[old] - BASE_KWH).to_numpy(), abs=1e-6)
+    assert after[~old].to_numpy() == pytest.approx(before[~old].to_numpy())  # warm days and new days unchanged
+    d = out["timestamp"].dt.normalize() == "2026-01-01"
+    assert (out.loc[d, "gross_kwh"] / out.loc[d, "gross_kwh"].sum()).to_numpy() == pytest.approx(SHAPE / SHAPE.sum())
+
+
+@pytest.mark.parametrize("factor, expected", [(1.4, 1.0), (0.2, 0.5)])
+def test_ratio_clips(factor, expected):
+    kw = _rescale_kwargs(factor)
+    out, r = ra.rescale_target(kw, BEFORE)
+    assert r == expected
+    if expected == 1.0:
+        pd.testing.assert_frame_equal(out, kw["energy_df"])
+
+
+@pytest.mark.parametrize("n_old, n_new", [(40, 13), (13, 40)])
+def test_too_few_days_is_noop(n_old, n_new):
+    kw = _rescale_kwargs(0.6, n_old=n_old, n_new=n_new)
+    out, r = ra.rescale_target(kw, BEFORE)
+    assert r == 1.0
+    pd.testing.assert_frame_equal(out, kw["energy_df"])
+
+
+def test_no_warm_days_is_noop():
+    kw = _rescale_kwargs(0.6)
+    kw["weather_df"] = kw["weather_df"].assign(temp_c=kw["weather_df"]["temp_c"].clip(upper=12.0))
+    assert ra.rescale_target(kw, BEFORE)[1] == 1.0
+
+
+def test_ev_days_excluded_from_fit():
+    plain, with_ev = ra.rescale_target(_rescale_kwargs(0.6), BEFORE)[1], _rescale_kwargs(0.6, ev_kwh=30.0)
+    assert ra.rescale_target(with_ev, BEFORE)[1] == pytest.approx(plain, abs=0.01)
+
+
+def test_input_not_mutated():
+    kw = _rescale_kwargs(0.6)
+    copy = kw["energy_df"].copy()
+    ra.rescale_target(kw, BEFORE)
+    pd.testing.assert_frame_equal(kw["energy_df"], copy)

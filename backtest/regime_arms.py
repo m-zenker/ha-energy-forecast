@@ -65,3 +65,59 @@ def centroids_since(since: pd.Timestamp) -> contextlib.AbstractContextManager:
         return orig_k(energy_df[pd.to_datetime(energy_df["timestamp"]) >= since], *args, **kwargs)
 
     return _rebind(fit, find_optimal_k)
+
+
+HEAT_LIMIT_C = 15.0  # days warmer than this carry no heating load
+RATIO_BOUNDS = (0.5, 1.0)
+MIN_DAY_HOURS = 22
+
+
+def _daily_frame(train_kwargs: dict) -> pd.DataFrame:
+    """Per day: mean-rate kWh, number of hours, mean outdoor temperature and whether an EV charged."""
+    energy, weather, ev = (train_kwargs.get(k) for k in ("energy_df", "weather_df", "ev_df"))
+    by_day = energy["gross_kwh"].groupby(pd.to_datetime(energy["timestamp"]).dt.normalize())
+    days = pd.DataFrame({"kwh": by_day.mean() * 24, "hours": by_day.count()})
+    days["temp"] = weather["temp_c"].groupby(pd.to_datetime(weather["timestamp"]).dt.normalize()).mean()
+    ev_days = [] if ev is None else pd.to_datetime(ev.loc[ev["gross_kwh"] > 0, "timestamp"]).dt.normalize()
+    days["ev"] = days.index.isin(ev_days)
+    return days
+
+
+def rescale_target(train_kwargs: dict, before: pd.Timestamp, min_days: int = 14) -> tuple[pd.DataFrame, float]:
+    """``energy_df`` with the heating load of days before *before* scaled to the newer load, and the ratio used.
+
+    Heat excess is the daily kWh above the warm-day median. The ratio compares excess per heating degree after and
+    before *before*, over days in the 10th..90th percentile of the newer heating days' temperatures, clipped to
+    ``RATIO_BOUNDS``. With fewer than *min_days* fit days on either side, or no warm day, nothing changes (1.0).
+    Only the data in *train_kwargs* is used, so a frame cut at a cutoff cannot leak.
+    """
+    energy = train_kwargs["energy_df"]
+    before = pd.Timestamp(before)
+    days = _daily_frame(train_kwargs)
+    fit = days[(days["hours"] >= MIN_DAY_HOURS) & ~days["ev"]].dropna(subset=["temp"])
+    warm = fit.loc[fit["temp"] >= HEAT_LIMIT_C, "kwh"]
+    heating = fit[fit["temp"] < HEAT_LIMIT_C]
+    new = heating[heating.index >= before]
+    if warm.empty or new.empty:
+        return energy, 1.0
+    base = float(warm.median())
+    heating = heating[heating["temp"].between(new["temp"].quantile(0.1), new["temp"].quantile(0.9))]
+    new, old = heating[heating.index >= before], heating[heating.index < before]
+    if len(new) < min_days or len(old) < min_days:
+        return energy, 1.0
+
+    def excess_per_degree(d: pd.DataFrame) -> float:
+        return (d["kwh"] - base).clip(lower=0).sum() / (HEAT_LIMIT_C - d["temp"]).sum()
+
+    old_rate = excess_per_degree(old)
+    if old_rate <= 0:
+        return energy, 1.0
+    ratio = float(min(max(excess_per_degree(new) / old_rate, RATIO_BOUNDS[0]), RATIO_BOUNDS[1]))
+    excess = (days["kwh"] - base).clip(lower=0)
+    scaled = (days.index < before) & (days["temp"] < HEAT_LIMIT_C) & (excess > 0)
+    factor = ((base + ratio * excess) / days["kwh"]).where(scaled, 1.0)
+    if ratio == 1.0:
+        return energy, ratio
+    out = energy.copy()
+    out["gross_kwh"] = out["gross_kwh"] * pd.to_datetime(out["timestamp"]).dt.normalize().map(factor).to_numpy()
+    return out, ratio
