@@ -22,7 +22,7 @@ Start here. Everything below this section is detail and history.
 | 6 | Audit batch, track C: #116 retrain age read in the wrong time zone | one session | **done**, shipped alpha-41 (2026-11-15); live retrain-age check PASS | independent |
 | 7 | Ship the rest of the batch (#113, #116, #118, #120; alpha-41, shipped 2026-11-15 evening, 3afc50c). #117 and #114 are already live since alpha-40, so the `"actuals_basis": "target"` marker and the `mae_*` step date from the alpha-40 migration (2026-11-14), not from this ship: use that time as the #118 gate anchor. Confirm the marker and the one-time migration log line if the dawn check is still open | `/pm evening` | **done** — alpha-41 2026-11-15 (3afc50c); marker present, migration confirmed by code path (the log line had left the 100-line log buffer) | steps 4–6 |
 | 8 | Read the cold-day gate on live data: `python -m backtest.live_gate data --since "<anchor>"` | owner / PM | — | step 7 and ≥ 14 cold days on the new actuals |
-| 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-12 (earliest 2026-11-27) |
+| 9 | #120 shadow: walk-forward `base jit droptp droptp_nb`, then decide the flip | owner | — | step 5 and ≥ 14 capture days after 2026-11-25 (earliest 2026-12-10; moved from 11-27 by owner 2026-11-25) |
 | 10 | **Closed 2026-11-16** (continues offline only; a PASS re-enters as an ML feature). #105: merge `train/next` into `feat/ua-eff-daily`, build the harness items listed in the criteria draft, run the verdict once | plan to be written | criteria approved and frozen 2026-11-14 | steps 4, 5, 8 (gate PASS) and the minimum data: ≥ 14 cold days in ≥ 4 weeks, ≥ 8 low-edge days, ≥ 3 days ≤ 5 °C |
 | 11 | #124 verify override history against the tank before training replay | shipped alpha-42 2026-11-16 (own window, without the #120 flip or #105); deployed; first retrain ran 2026-11-17 18:19 (alpha-43 startup retrain, override_history 34 of 52 replayed; `memory/project_physics_removal_deploy_note.md`) | live check 2026-11-16: 48 → 34 replayed | none |
 | 12 | #121, #122, #123 | — | as capacity allows | #122 deployed v0.12.1-alpha-1 2026-11-23 |
@@ -192,7 +192,7 @@ Walk-forward on a retrain capture: truncate the captured live inputs at each cut
 
 ### #120 — Drop the Thermal-Pressure Feature Family
 
-**Priority:** Medium. **Status:** flag (`drop_feature_groups`, default off) and shadow tooling (`droptp` / `droptp_nb` arms, `wf_score.shadow_verdict`) shipped alpha-41 (2026-11-15), default off; shadow not started. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow needs ≥ 14 capture days after 2026-11-12.
+**Priority:** Medium. **Status:** flag (`drop_feature_groups`, default off) and shadow tooling (`droptp` / `droptp_nb` arms, `wf_score.shadow_verdict`) shipped alpha-41 (2026-11-15), default off; shadow not started. Plan: `docs/superpowers/plans/2026-11-14-audit-batch-5-drop-feature-flag.md`. The shadow needs ≥ 14 capture days after 2026-11-25 (earliest 2026-12-10): `droptp` was already scored on 11-08..24 in the over-forecast diagnosis, so those days are no longer a blind holdout (owner, 2026-11-25).
 
 `thermal_pressure`, `_max`, `_std`, `_cop`, `_net` and `infiltration_pressure`: the served values have about zero correlation with the values later trained on (−0.06 at 24–47 h, −0.03 at 1–5 h), and a 0.4 K projected room deficit moved the 11-14 forecast between 25.0 and 31.4 kWh. Dropping them: hourly +0.2 % (CI −1.0..+1.3) and 3 h −0.4 % pooled over dev; holdout hourly −0.8 %, cold-day bias +0.95 against +1.76; spread of the next-day total across the previous day's four forecasts 1.25 → 0.57 kWh (Sep), 1.41 → 1.33 (Oct), 2.44 → 1.39 (holdout). Not testable on last winter (no climate data then).
 
@@ -661,7 +661,7 @@ Deferred from #98's final whole-branch review (plan `docs/superpowers/plans/2026
 | 117 | Store appliance-free actuals for MAE/bias | bias readings +0.8 kWh/day | S | **high — first** — shipped alpha-40 (2026-11-14), marker verified 2026-11-15 |
 | 118 | Cold-day gate: −12 % to +6 % of daily consumption, ≥ 14 cold days | trustworthy gate | S | **high** — gate shipped alpha-41 (2026-11-15); first valid reading pending |
 | 119 | Backtest capture-frame mode | enabler for #105, #120 | M | **done**, shipped alpha-40 2026-11-14 (b03b19d) |
-| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag shipped alpha-41 2026-11-15 (off); 14-day shadow earliest 2026-11-27 |
+| 120 | Drop thermal-pressure features behind a flag | next-day swing −43 % on the holdout, accuracy neutral | S–M | medium — flag shipped alpha-41 2026-11-15 (off); 14-day shadow earliest 2026-12-10 |
 | 121 | Interval calibration on served errors; daily band method | hourly coverage 69–73 % → 79–84 % | S + open design | medium-low |
 | 122 | Trim DHW override correction to the override hour | removes exact-0.0 forecasts; 3 h-block MAE −0.021 kWh | S | medium-low — deployed v0.12.1-alpha-1 2026-11-23, awaiting live observation |
 | 123 | Training-data hygiene (NaN-lag rows, time-based look-backs, imputation, dead features) | inside the noise floor | M | low |
