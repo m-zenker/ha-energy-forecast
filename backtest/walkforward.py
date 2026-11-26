@@ -18,14 +18,17 @@ import argparse
 import contextlib
 import shutil
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from . import env  # noqa: F401  (apps/ on sys.path before the app import below)
+from . import (
+    env,  # noqa: F401  (apps/ on sys.path before the app import below)
+    regime_arms,
+)
 from .arms import feature_drop
 from .capture_frame import SERVE_PAST, CaptureFrame, predict, train
 
@@ -44,6 +47,8 @@ class WfArm:
     cutoff_shift_h: int = 0  # retrain this many hours off the nominal cutoff (jitter control: -1)
     every_days: int = 1  # retrain cadence
     live_frame: bool = False  # serve with live's 3-day weather tail instead of a contiguous one
+    patch: Callable[[], contextlib.AbstractContextManager] | None = None  # entered around train() only
+    energy_transform: Callable[[dict], pd.DataFrame] | None = None  # train kwargs at the cutoff -> training target
 
 
 ARMS: dict[str, WfArm] = {
@@ -54,6 +59,10 @@ ARMS: dict[str, WfArm] = {
         WfArm("droptp", train_kwargs={"drop_features": _DROP_TP}),
         WfArm("droptp_nb", train_kwargs={"drop_features": (*_DROP_TP, *FEATURE_GROUPS["heating_buffer"])}),
         WfArm("noreg", train_kwargs={"enable_regimes": False}),
+        # cold-bias candidates (README "Cold-bias candidates"); dates are pre-registered, do not tune them
+        WfArm("shapecl", patch=lambda: regime_arms.shape_only()),
+        WfArm("clrecent", patch=lambda: regime_arms.centroids_since(pd.Timestamp("2026-03-01"))),
+        WfArm("rescale", energy_transform=lambda kw: regime_arms.rescale_target(kw, pd.Timestamp("2026-10-01"))[0]),
         WfArm("weekly", every_days=7),
         WfArm("weekly_gap", every_days=7, live_frame=True),
     )
@@ -81,6 +90,22 @@ def single_thread_lgbm(n_jobs: int | None):
         lgb.LGBMRegressor.fit = orig
 
 
+def _compose(*patches):
+    """One context-manager factory entering every non-None factory in order; None when there is none."""
+    active = [p for p in patches if p is not None]
+    if not active:
+        return None
+
+    @contextlib.contextmanager
+    def combined():
+        with contextlib.ExitStack() as stack:
+            for p in active:
+                stack.enter_context(p())
+            yield
+
+    return combined
+
+
 def retrain_days(start: pd.Timestamp, end: pd.Timestamp, every_days: int) -> list[pd.Timestamp]:
     """Days on which the arm retrains: the day before *start*, then every *every_days* days up to *end*."""
     first = pd.Timestamp(start).normalize() - pd.Timedelta(days=1)
@@ -102,6 +127,7 @@ def run_arm(
     last_origin = min(end + pd.Timedelta(days=1), frame.end)
     retrain_on = set(retrain_days(start, end, arm.every_days))
     patch = (lambda: feature_drop(arm.drop)) if arm.drop else None
+    train_patch = _compose(patch, arm.patch)
     rows: list[pd.DataFrame] = []
     model = work = cutoff = None
     day = start.normalize() - pd.Timedelta(days=1)
@@ -109,7 +135,10 @@ def run_arm(
         if day in retrain_on:
             cutoff = day + pd.Timedelta(hours=retrain_hour + arm.cutoff_shift_h)
             previous = work
-            model, work = train(frame, cutoff, work_root, seed_dir=previous, patch=patch, train_kwargs=arm.train_kwargs)
+            train_kw = dict(arm.train_kwargs)
+            if arm.energy_transform is not None:
+                train_kw["energy_df"] = arm.energy_transform(frame.train_kwargs(cutoff))
+            model, work = train(frame, cutoff, work_root, seed_dir=previous, patch=train_patch, train_kwargs=train_kw)
             if model.model is None:
                 raise RuntimeError(f"arm {arm.name!r}: train() skipped at {cutoff} (too little history?)")
             if previous is not None and not keep_models:

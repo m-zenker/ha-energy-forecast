@@ -165,3 +165,74 @@ def test_shadow_verdict_fails_each_criterion():
 def test_shadow_verdict_inconclusive_without_cold_days():
     v = ws.shadow_verdict(*_shadow_inputs(cold=False), arm="droptp")
     assert v["checks"]["cold_bias"] is None and v["verdict"] == "INCONCLUSIVE"
+
+
+def _candidate_inputs(bias6=0.7, bias610=1.5, mae3=1.02, rng=1.1, n_le6=5, n_mid=9, arm="cand"):
+    days = pd.date_range("2026-11-26", periods=n_le6 + n_mid, freq="D")
+    temp = pd.Series([4.0] * n_le6 + [8.0] * n_mid, index=days)
+    cold6 = (temp <= 6).to_numpy()
+
+    def block(name, b6, b610, m3):
+        return pd.DataFrame(
+            {"n": 24, "mae": 1.0, "mae3": m3, "mae6": 2.0, "bias": np.where(cold6, b6, b610), "y": 24.0, "cold": True},
+            index=pd.MultiIndex.from_product([[name], days], names=["arm", "day"]),
+        )
+
+    table = pd.concat([block("base", 1.0, 1.0, 1.0), block(arm, bias6, bias610, mae3)])
+    swing = pd.DataFrame({"range": [1.0, rng]}, index=["base", arm])
+    return table, swing, temp
+
+
+def test_candidate_verdict_pass():
+    """Every criterion exactly at its threshold passes."""
+    v = ws.candidate_verdict(*_candidate_inputs(), arm="cand")
+    assert v["verdict"] == "PASS" and all(v["checks"].values()) and len(v["checks"]) == 4
+    assert (v["days"], v["n_le6"]) == (14, 5)
+    assert v["bias6_pct"] == pytest.approx(-30) and v["bias610_delta"] == pytest.approx(0.5)
+    assert v["mae3_pct"] == pytest.approx(2) and v["swing_pct"] == pytest.approx(10)
+
+
+@pytest.mark.parametrize(
+    "kw, check",
+    [
+        ({"bias6": 0.71}, "bias6"),
+        ({"bias6": -0.71}, "bias6"),
+        ({"bias610": 1.51}, "bias610"),
+        ({"bias610": -1.51}, "bias610"),
+        ({"mae3": 1.021}, "mae3"),
+        ({"rng": 1.11}, "swing"),
+    ],
+)
+def test_candidate_verdict_fail_each_criterion(kw, check):
+    v = ws.candidate_verdict(*_candidate_inputs(**kw), arm="cand")
+    assert v["verdict"] == "FAIL" and [c for c, ok in v["checks"].items() if not ok] == [check]
+
+
+@pytest.mark.parametrize(
+    "kw", [{"n_le6": 5, "n_mid": 8}, {"n_le6": 4, "n_mid": 10}, {"n_le6": 14, "n_mid": 0}, {"arm": "other"}]
+)
+def test_candidate_verdict_inconclusive(kw):
+    assert ws.candidate_verdict(*_candidate_inputs(**kw), arm="cand")["verdict"] == "INCONCLUSIVE"
+
+
+def test_candidate_verdict_inconclusive_without_swing():
+    table, swing, temp = _candidate_inputs()
+    v = ws.candidate_verdict(table, swing.drop("cand"), temp, arm="cand")
+    assert v["checks"]["swing"] is None and v["verdict"] == "INCONCLUSIVE"
+
+
+def test_candidate_verdict_band_edges_belong_to_the_colder_band():
+    table, swing, temp = _candidate_inputs()
+    edge = temp.copy()
+    edge[temp == 4.0], edge[temp == 8.0] = 6.0, 10.0
+    v = ws.candidate_verdict(table, swing, edge, arm="cand")
+    assert v["n_le6"] == 5 and v["bias610_delta"] == pytest.approx(0.5) and v["verdict"] == "PASS"
+    edge[temp == 8.0] = 10.1  # no day left in 6..10
+    assert ws.candidate_verdict(table, swing, edge, arm="cand")["verdict"] == "INCONCLUSIVE"
+
+
+def test_candidate_verdict_uses_the_mean_signed_bias_of_a_band():
+    table, swing, temp = _candidate_inputs(n_le6=6)
+    le6 = temp.index[temp <= 6]
+    table.loc[[("cand", d) for d in le6], "bias"] = [2.0, -2.0] * 3  # cancels: mean signed bias 0
+    assert ws.candidate_verdict(table, swing, temp, arm="cand")["bias6_pct"] == pytest.approx(-100)

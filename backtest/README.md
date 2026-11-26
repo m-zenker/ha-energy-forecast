@@ -96,7 +96,8 @@ ws.summarize(table); ws.paired(table, "droptp", metric="mae3"); ws.next_day_swin
 
 ## Shadow check for #120
 
-Needs captures covering at least 14 target days after 2026-11-12 (the earlier holdout is spent). Start the run one
+Needs captures covering at least 14 target days after 2026-11-25 (earlier days are spent: `droptp` was scored on
+2026-11-08..24). Start the run one
 week before the first scored day (burn-in).
 
 ```bash
@@ -127,6 +128,54 @@ set `drop_feature_groups: [thermal_pressure]`; the flip is a forecast-changing d
 
 Limits: perfect weather (measured cost of real forecast weather: 1–2 %); history is today's view of the past; the
 physics state is the capture's at every cutoff; days before a sensor existed have no such inputs, as live had none.
+
+## Cold-bias candidates
+
+Three arms for the cold-day over-forecast of November 2026 (history from before the facade was insulated):
+`shapecl` (regimes cluster on shape only), `clrecent` (regime centroids from 2026-03-01 on) and `rescale` (training
+target before 2026-10-01 scaled to the newer heating load). Score only target days from 2026-11-26 on; the earlier
+days were used to find the cause. Run together with the #120 arms, on the same window:
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.walkforward \
+    data/captures --start 2026-11-19 --end <last day> \
+    --arms base jit droptp droptp_nb shapecl clrecent rescale --out data/backtest/wf_cold_bias
+```
+
+```python
+from backtest import wf_score as ws
+rows = ws.attach_actuals(rows, frame.actuals(), daily_temp)   # daily_temp: mean temp_c per day
+rows = rows[rows["day"] >= "2026-11-26"]                      # before table AND swing: burn-in days must not count
+table, swing = ws.day_table(ws.add_naive(ws.day_ahead(rows))), ws.next_day_swing(rows)
+for arm in ("shapecl", "clrecent", "rescale", "jit"):
+    print(arm, ws.candidate_verdict(table, swing, daily_temp, arm))
+```
+
+`candidate_verdict` applies the fixed criteria (its docstring lists them). `rescale` changes only the training target:
+sub-meter lags of the same rows keep their unscaled values. PASS makes an arm a candidate for its own plan, not a change: three arms share
+one window, so a winner needs a second, later window. Days <= 0 degC are not covered.
+
+## Shadow runner
+
+`python -m backtest.shadow run` trains the frozen arms on every live retrain capture and serves them on the live
+predict captures of 00, 06, 12 and 18 h, so they see the real weather forecast. It skips what is already logged, so a
+missed night is caught up by the next run. Forecasts go to `<out>/rows/`, models to `<out>/models/`.
+
+```bash
+PYTHONPATH=apps:. /home/jovyan/my_envs/ha-energy-forecast-live/bin/python -m backtest.shadow \
+    run data/captures --out data/backtest/shadow                 # log new forecasts
+... -m backtest.shadow status --out data/backtest/shadow         # last run, errors, gaps
+... -m backtest.shadow score data/captures --out data/backtest/shadow   # verdicts, target days from 2026-11-26
+```
+
+- `base` must reproduce what live computed (exit code 2 if not); `s1` is base with another seed, the noise floor.
+- `blind` marks rows written before their target hour. Frozen arms can be replayed later from the captures, so
+  blindness is a record of when, not extra data. Do not let captures age out on HA (45 days).
+- `score` refuses rows from different arm code (`code`); a changed `app_code` is only listed.
+- `score` leaves out origins where `base` did not reproduce live or an arm is missing, and needs 14 days. `status` keeps
+  listing parity failures. Arm code is hashed (`walkforward.py`, `regime_arms.py`, `shadow.py`, `capture_replay.py`,
+  `env.py`): any edit there makes the window mixed, so delete `rows/` and let it replay.
+- `backtest/shadow_nightly.sh` pulls new captures and runs this. It takes a lock and keeps 30 logs.
 
 ## Gate on live data
 

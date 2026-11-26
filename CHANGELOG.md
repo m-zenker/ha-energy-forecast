@@ -8,8 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `backtest/shadow.py`, `backtest/shadow_nightly.sh` — shadow runner: logs the frozen backtest arms' forecasts on live captures (real weather forecast included) and scores them. Safe to rerun; missed nights are caught up. Offline tooling only; the live forecast is unchanged.
+- `backtest/walkforward.py`, `backtest/regime_arms.py` — three walk-forward arms for the cold-day over-forecast (`shapecl`, `clrecent`, `rescale`). Offline tooling only; the live forecast is unchanged.
+- `backtest/wf_score.py` — `candidate_verdict()` scores an arm against fixed criteria: cold-day bias, 6–10 °C bias, 3 h-block error and next-day swing.
+
 ### Changed
 
+- `backtest/capture_replay.py` — `replay_train()` can apply a backtest arm, and now raises if `train()` was skipped.
+- `backtest/README.md` — how to run and score the new arms. The #120 shadow now counts only days after 2026-11-25.
 - **DHW override correction trimmed to the override hour (#122).** When a DHW override (legionella or comfort boost) is committed via `set_dhw_schedule`, the published forecast now adds only that cycle's energy at the committed hour. The modelled knock-on effects later in the day (a second reheat about a day later, and negative "skipped reheat" hours) are no longer applied: on live data they made the forecast worse and produced hours forecast at exactly 0.0 kWh. Measured on 47 live updates with a pending override: 3 h-block error −0.021 kWh, hourly −0.024 kWh, exact-zero hours 45 → 0. Training is unchanged.
 
 ---
